@@ -1,5 +1,5 @@
 =====================================================================
-HARD RULE — 72 CHARACTER LINE LIMIT ON EVERY LINE OF PROSE
+HARD RULE —  CHARACTER LINE LIMIT ON EVERY LINE OF PROSE
 
 BEFORE YOU EMIT ANY LINE, COUNT ITS CHARACTERS.  IF THE COUNT IS GREATER
 THAN 72, INSERT A NEWLINE AND WORD-WRAP BEFORE EMITTING.  THIS IS A HARD
@@ -45,7 +45,7 @@ prompt" or "context" — just make the first paragraph read naturally.
 - The report must be conversational with undramatic wording, fit for a
 technical bug report.
   - Report must be factual.  just technical observations.
-  - Report should be framed as questions, not accusations.
+  - Report should be framed as plain statements, not accusations.
   - Call issues "bugs", never use the word critical.
   - NEVER EVER USE ALL CAPS.
 
@@ -57,7 +57,7 @@ any specific author.
 - Vary your question phrasing.  Don't start with "Does this code ..."
 every time.
 
-- Ask your question specifically about the sources you're referencing:
+- Make statements specifically about the sources you're referencing:
   - If the bug is a leak, don't call it a 'resource leak', ask
     specifically about the resource you think is leaking.  'Does this
     code leak the folio?'
@@ -235,12 +235,13 @@ below — do not promote them to `#` headings.
 
 Each section must cover, in order:
 
-1. A line of the exact form `Subject: <short summary of the bug>`, on
-   its own line.  The prefix `Subject: ` is literal, the summary is
-   one clause naming the affected function and the nature of the bug
-   (e.g. "Subject: widget_destroy acquires ref_lock in the wrong
-   order").  No ALL CAPS, no trailing period, no numbering.  72
-   character max, including the Subject:
+1. A markdown section `##` level, with a line of the exact form `Subject:
+   <short summary of the bug>`, on its own line.  The prefix `Subject: ` is
+literal, the summary is one clause naming the affected function and the nature
+of the bug (e.g. "Subject: widget_destroy acquires ref_lock in the wrong
+order").  No ALL CAPS, no trailing period, no numbering.  72 character max,
+including the Subject:
+
 2. A `bug-severity:` line, yaml-style, with exactly one value from the
    closed set `[high, medium, low, latent, unknown]`.  The value MUST
    be lower case — no ALL CAPS — with no surrounding quotes, brackets,
@@ -283,7 +284,7 @@ DO include the inner ```c fences around code snippets).  The code is
 fictional and exists only to show the shape.
 
 ```
-Subject: widget_destroy acquires slab_lock and ref_lock in wrong order
+## Subject: widget_destroy acquires slab_lock and ref_lock in wrong order
 bug-severity: high
 bug-impact: deadlock between widget teardown and reinit on SMP systems
 

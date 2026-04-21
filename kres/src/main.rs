@@ -44,12 +44,14 @@ struct ReplArgs {
     #[arg(long)]
     fast_agent: Option<PathBuf>,
     /// Slow agent tag — picks ~/.kres/slow-code-agent-<tag>.json
-    /// (or the shipped configs/ default). Default: sonnet. Shipped
-    /// tags: sonnet, opus. When the tag is a known shorthand
-    /// (sonnet/opus) it also overrides the slow model id from
-    /// settings.json; pass --slow-model to override explicitly.
-    #[arg(long, default_value = "sonnet")]
-    slow: String,
+    /// (or the shipped configs/ default). When omitted the file
+    /// resolver falls back to "sonnet" but the slow model id from
+    /// settings.json is left alone. When passed AND the tag is a
+    /// known shorthand (sonnet/opus) the matching model id ALSO
+    /// overrides settings.models.slow — pass --slow-model to
+    /// override the model independently.
+    #[arg(long)]
+    slow: Option<String>,
     /// Explicit slow-agent config path (overrides --slow).
     #[arg(long)]
     slow_agent: Option<PathBuf>,
@@ -359,7 +361,11 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // --slow is a tag; --slow-agent is an explicit path override.
     // Resolution for --slow: prefer ~/.kres/slow-code-agent-<tag>.json,
     // then fall back to <binary-repo>/configs/slow-code-agent-<tag>.json.
-    let slow_tag_name = format!("slow-code-agent-{}.json", args.slow);
+    // When the operator didn't pass --slow at all, default the file
+    // resolver to "sonnet" — the model id is left to settings.json
+    // (see the override block below).
+    let slow_tag_for_file = args.slow.as_deref().unwrap_or("sonnet");
+    let slow_tag_name = format!("slow-code-agent-{}.json", slow_tag_for_file);
     let slow_agent = args
         .slow_agent
         .clone()
@@ -404,8 +410,16 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // it to a model id, so `--slow sonnet` actually switches the
     // slow model. Explicit --slow-model still beats the tag mapping.
     let mut settings = kres_repl::Settings::load_default();
-    if let Some(id) = slow_tag_to_model_id(&args.slow) {
-        settings.set_model(kres_repl::ModelRole::Slow, Some(id.to_string()));
+    // Only map the --slow tag to a model id when the operator
+    // actually passed --slow. Without this gate the clap default
+    // "sonnet" would unconditionally overwrite settings.models.slow
+    // every run, masking whatever the operator set in
+    // ~/.kres/settings.json (user report 2026-04-21: settings.json
+    // said claude-mythos-preview, banner reported claude-sonnet-4-6).
+    if let Some(tag) = args.slow.as_deref() {
+        if let Some(id) = slow_tag_to_model_id(tag) {
+            settings.set_model(kres_repl::ModelRole::Slow, Some(id.to_string()));
+        }
     }
     settings.set_model(kres_repl::ModelRole::Fast, args.fast_model.clone());
     settings.set_model(kres_repl::ModelRole::Slow, args.slow_model.clone());
@@ -980,9 +994,18 @@ mod tests {
     }
 
     #[test]
-    fn slow_tag_default_is_sonnet() {
+    fn slow_tag_unset_when_not_passed() {
+        // --slow is now Option<String> with no clap default, so the
+        // settings.json slow model is not silently overridden when
+        // the operator omits the flag (user report 2026-04-21).
         let c = Cli::try_parse_from(["kres"]).unwrap();
-        assert_eq!(c.repl.slow, "sonnet");
+        assert_eq!(c.repl.slow, None);
+    }
+
+    #[test]
+    fn slow_tag_passes_through_when_set() {
+        let c = Cli::try_parse_from(["kres", "--slow", "opus"]).unwrap();
+        assert_eq!(c.repl.slow.as_deref(), Some("opus"));
     }
 
     #[test]

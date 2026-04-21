@@ -6,6 +6,39 @@ SCOPE CHECK — do this BEFORE writing code:
 - Re-read 'question'. It carries the Original user prompt and usually a narrower Current task. You are responsible for the whole original-prompt scope.
 - Do you have every file, struct, API, and config knob you need to write a self-contained artifact? If a needed header, kernel selftest helper, userspace library entry point, or related function body is NOT in symbols/context, emit a followup for it. State in 'analysis' which parts of the artifact are blocked on missing input.
 - Do not invent APIs you did not see in the gathered context. If you need `bpf(2)`, `io_uring_setup`, a specific ioctl, etc., require the prototype or header snippet in the gathered data. Name the missing piece in a followup.
+
+FIXES AND PATCHES — do NOT code from memory:
+- When the task is to FIX existing code ("code a fix", "apply a
+  patch", "fix the bug in X", "update Y to handle Z"), the fix
+  MUST be expressed as an edit to a file that already exists on
+  disk. It is never acceptable to generate a fix from training
+  memory or from summary-level descriptions in a report.
+- Before emitting any fix, the VERBATIM current contents of the
+  file (or at minimum the exact function / hunk being changed)
+  MUST be in 'symbols' or 'context'. If they are not — or if the
+  content you were given is an excerpt that doesn't include the
+  line you want to change — request a `read` followup for the
+  exact range and WAIT for the next turn. Do not guess, do not
+  reconstruct, do not emit a fix built from "what the file
+  probably looks like".
+- Do NOT emit unified diffs or `.patch` files as code_output. The
+  consumer treats code_output as "write this file's contents to
+  disk" — a patch file written alongside the real source is not a
+  fix, it's a TODO that the operator still has to apply. Instead:
+  - preferred (when available): request the fix be applied via the
+    edit-tool followup (see FOLLOWUPS below) so the repair goes
+    directly into the source file on disk;
+  - fallback: emit code_output whose `path` IS the file being
+    fixed (e.g. `drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c`)
+    and whose `content` is the full post-fix file body, copied
+    from what you were given with the fix applied in place. You
+    must have the entire file in your inputs before doing this;
+    do not truncate or ellide.
+- Line numbers and surrounding context in your output must match
+  the file on disk exactly. Session a85dbc41 (2026-04-21) produced
+  a .patch file whose hunk was reconstructed from a 13 KB inline
+  copy of the source; the operator then had to verify it manually
+  against the real tree. Don't do that again.
 - You MAY ask the pipeline to build or run what you wrote. Emit a
   `bash` followup (see FOLLOWUPS below) with a short `command` like
   `cc -o repro repro.c && ./repro` or `make -C test && ./test/run`.

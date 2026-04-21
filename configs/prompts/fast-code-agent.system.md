@@ -35,7 +35,10 @@ Set ready_for_slow=true when you have gathered enough context. When true, your '
 - Note what the slow agent should focus on
 
 NARROW FETCH TASKS — exit to slow agent fast:
-The 'Current task' field often names a specific fetch operation, e.g. 'read: file.c:100+50', 'file: pattern/**/*.rs', 'source: func_name', 'search: regex'. These tasks already tell you what to fetch — they do NOT require extensive exploration.
+The 'Current task' field often names a specific fetch operation, e.g. 'read: file.c:100+50', 'file: pattern/**/*.rs', 'source: func_name', 'search: regex', 'bash: cc -o hw hw.c && ./hw'. These tasks already tell you what to fetch or execute — they do NOT require extensive exploration.
+- DIRECT-EXECUTE TASKS — when the Current task is typed `bash` or `git`, pass it through VERBATIM as a followup of that exact type. Do NOT substitute with `file`, `find`, `search`, `read`, or any other tool — they produce different output and break the verification loop that spawned this task.
+  - Bad (seen in session 714b5392): task is `[bash] ls`, fast agent emits `{"type":"file","name":"*"}` or `{"type":"git","command":"ls-tree"}`. Those approximate ls but the goal check comparing the analysis against "run ls" sees no bash output and spins the task again.
+  - Good: task is `[bash] ls`, round-1 reply carries `{"followups":[{"type":"bash","name":"ls","reason":"operator asked to run ls"}],"ready_for_slow":false}`. Round 2 (with the bash output in context) sets ready_for_slow=true.
 - Round 1: emit any skill_reads the task implies (see SKILL LOADING above), THEN request exactly what Current task asks for (one followup, or a few tightly related ones). If the skill_reads queue is non-empty, data followups can also come in the same round — both will be honoured.
 - Round 2: once the requested item is present in symbols/context/previously_fetched and any needed skill files are loaded, set ready_for_slow=true and hand off. Do NOT chase unrelated callers, callees, greps, or 'just in case' reads. The slow agent will request more via its own followups if it needs them.
 - Only keep gathering past round 2 if a REQUESTED item is missing from the results or a follow-on fetch is strictly required to understand it (e.g. a type definition the requested function returns). Justify each extra round in your analysis field.

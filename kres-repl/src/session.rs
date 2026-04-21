@@ -1595,15 +1595,36 @@ impl Session {
     async fn cmd_stop(&self) {
         let out = self.mgr.stop_all(self.cfg.stop_grace).await;
         // Latch auto-continue off until the operator explicitly
-        // resumes with /continue or submits a new prompt. Without
-        // this, /stop only killed the currently-running tasks and
-        // then the 5s idle-auto-continue redispatched whatever was
-        // still pending — which defeated the point of /stop.
+        // resumes with /continue or submits a new prompt.
         self.stop_latched
             .store(true, std::sync::atomic::Ordering::Release);
+        // Move pending / blocked / in-progress todo items to the
+        // deferred list and clear the active queue. Otherwise
+        // /stop leaves the queue full and the next /continue (or
+        // the reaper's goal-not-met injection after the next task
+        // completes) immediately redispatches what the operator
+        // just stopped. Operator can get them back with /followup.
+        let remaining = self.mgr.todo_snapshot().await;
+        let mut deferred = self.deferred.lock().await;
+        let mut carry = 0usize;
+        for item in remaining {
+            if matches!(
+                item.status,
+                kres_core::TodoStatus::Pending
+                    | kres_core::TodoStatus::Blocked
+                    | kres_core::TodoStatus::InProgress
+            ) {
+                deferred.push(item);
+                carry += 1;
+            }
+        }
+        drop(deferred);
+        if carry > 0 {
+            self.mgr.replace_todo(Vec::new()).await;
+        }
         println!(
-            "/stop: requested={} stopped={} grace_expired={} (auto-continue paused; /continue or a new prompt resumes)",
-            out.requested, out.stopped, out.grace_expired
+            "/stop: requested={} stopped={} grace_expired={} (auto-continue paused; {} pending item(s) moved to /followup; /continue or a new prompt resumes)",
+            out.requested, out.stopped, out.grace_expired, carry
         );
     }
 

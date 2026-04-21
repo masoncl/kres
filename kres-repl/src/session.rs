@@ -536,6 +536,14 @@ impl Session {
         let mut last_sig: Vec<(String, String, String, String, usize, usize)> = Vec::new();
         let mut quiescent: u32 = 0;
         let mut quiescent_announced = false;
+        // When --turns 0 (unlimited) we still want a natural stopping
+        // point. Track consecutive completed slow-agent runs that
+        // produced analysis but did not grow the findings list; 3 in
+        // a row means the agents are spinning without producing
+        // actionable output and we exit. Reset whenever the findings
+        // count strictly increases.
+        let mut no_new_findings_streak: u32 = 0;
+        const NO_NEW_FINDINGS_STOP: u32 = 3;
         let reaper_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(250));
             loop {
@@ -681,6 +689,21 @@ impl Session {
                         if quiescent >= 5 && !quiescent_announced {
                             kres_core::async_eprintln!("=== ANALYSIS CONSIDERED COMPLETE ===",);
                             quiescent_announced = true;
+                        }
+                    }
+                    // §turns0: only count tasks that actually produced
+                    // analysis (mirrors the completed_run_count rule in
+                    // task.rs). A strict growth in the merged findings
+                    // list resets the streak; anything else — whether
+                    // the delta was empty, or the merger folded it into
+                    // existing findings — counts as "no new findings".
+                    if !r.analysis.is_empty() {
+                        let grew = final_list.len() > pre_size;
+                        if grew {
+                            no_new_findings_streak = 0;
+                        } else {
+                            no_new_findings_streak =
+                                no_new_findings_streak.saturating_add(1);
                         }
                     }
                     if had_delta {
@@ -929,6 +952,69 @@ impl Session {
                         // which breaks on root_shutdown.cancelled(),
                         // sees the flag already asserted when it
                         // reaches the post-loop /summary gate.
+                        turns_exhausted_for_reaper
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        kres_core::async_eprintln!("exiting REPL.");
+                        mgr_for_reaper.root_shutdown().cancel();
+                        break;
+                    }
+                } else {
+                    // --turns 0 (unlimited) — still stop naturally
+                    // when either (a) nothing is queued/running, so
+                    // the agents have drained the followup pipeline,
+                    // or (b) we've had NO_NEW_FINDINGS_STOP completed
+                    // runs in a row that added nothing new to the
+                    // findings list. Without this the REPL idles
+                    // forever waiting for input it will never get.
+                    let active = mgr_for_reaper.active_count().await;
+                    let todo = mgr_for_reaper.todo_snapshot().await;
+                    let pending_or_blocked = todo
+                        .iter()
+                        .filter(|t| {
+                            matches!(
+                                t.status,
+                                kres_core::TodoStatus::Pending
+                                    | kres_core::TodoStatus::Blocked
+                            )
+                        })
+                        .count();
+                    let followups_drained = active == 0 && pending_or_blocked == 0;
+                    let no_progress = no_new_findings_streak >= NO_NEW_FINDINGS_STOP;
+                    if followups_drained || no_progress {
+                        let reason = if followups_drained {
+                            "followup list empty".to_string()
+                        } else {
+                            format!(
+                                "no new findings for {no_new_findings_streak} consecutive run(s)"
+                            )
+                        };
+                        kres_core::async_eprintln!(
+                            "\n=== --turns 0 stop: {reason} ==="
+                        );
+                        // Mirror the --turns N exit: move any leftover
+                        // pending/blocked items to /followup's
+                        // deferred list, clear the todo queue, flag
+                        // the REPL as exhausted, cancel root.
+                        let remaining = mgr_for_reaper.todo_snapshot().await;
+                        let mut deferred = deferred_for_reaper.lock().await;
+                        let mut carry = 0usize;
+                        for item in remaining {
+                            if matches!(
+                                item.status,
+                                kres_core::TodoStatus::Pending
+                                    | kres_core::TodoStatus::Blocked
+                            ) {
+                                deferred.push(item);
+                                carry += 1;
+                            }
+                        }
+                        drop(deferred);
+                        mgr_for_reaper.replace_todo(Vec::new()).await;
+                        if carry > 0 {
+                            kres_core::async_eprintln!(
+                                "[{carry} pending item(s) deferred — see /followup]"
+                            );
+                        }
                         turns_exhausted_for_reaper
                             .store(true, std::sync::atomic::Ordering::Release);
                         kres_core::async_eprintln!("exiting REPL.");

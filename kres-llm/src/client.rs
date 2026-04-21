@@ -161,7 +161,8 @@ impl Client {
             if attempt < MAX_RETRIES && is_retryable_status(status) {
                 if status.as_u16() == 429 {
                     consecutive_429s += 1;
-                    let wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                    let base_wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                    let wait = extended_wait(base_wait, consecutive_429s);
                     // Count the payload exactly so we can decide
                     // whether it's a size problem or a pacing
                     // problem. `count_tokens` may itself 429 — None
@@ -259,6 +260,7 @@ impl Client {
         let body = MessagesRequest::from_config(cfg, messages, true);
         let max_retries = 8;
         let mut last_err: Option<LlmError> = None;
+        let mut consecutive_429s: u32 = 0;
         for attempt in 0..=max_retries {
             let resp_result = self
                 .http
@@ -301,11 +303,19 @@ impl Client {
             let retry_after = parse_retry_after(&resp);
             let body_text = resp.text().await.unwrap_or_default();
             if attempt < max_retries && is_retryable_status(status) {
-                let wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                let base_wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                let wait = if status.as_u16() == 429 {
+                    consecutive_429s += 1;
+                    extended_wait(base_wait, consecutive_429s)
+                } else {
+                    consecutive_429s = 0;
+                    base_wait
+                };
                 if status.as_u16() == 429 {
                     kres_core::async_eprintln!(
-                        "[rate-limit] 429 (stream) attempt={} retry_after={:?} wait={:?}",
+                        "[rate-limit] 429 (stream) attempt={} consecutive={} retry_after={:?} wait={:?}",
                         attempt,
+                        consecutive_429s,
                         retry_after,
                         wait
                     );
@@ -415,7 +425,8 @@ impl Client {
             if attempt < MAX_RETRIES && is_retryable_status(status) {
                 if status.as_u16() == 429 {
                     consecutive_429s += 1;
-                    let wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                    let base_wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                    let wait = extended_wait(base_wait, consecutive_429s);
                     let exact = self.count_tokens_exact(cfg, &working_messages).await;
                     let limit = cfg.max_input_tokens;
                     let over_limit = match (exact, limit) {
@@ -730,6 +741,25 @@ fn backoff_duration(attempt: u32) -> Duration {
     apply_jitter(base, attempt)
 }
 
+/// Extend a server-supplied retry_after (or our own backoff) when we've
+/// already slept through several consecutive 429s and nothing has
+/// opened up. A short retry_after that keeps coming back means the
+/// workspace budget is oversubscribed, not that the caller was briefly
+/// unlucky; sleeping for the same 5–15s window on every retry then
+/// burns through MAX_RETRIES without ever letting the bucket refill.
+/// Starting at the 5th consecutive 429 we layer an exponentially
+/// growing extra on top of `base`, capped so we never sleep for more
+/// than ~2min at once: consec=5 → +5s, 6 → +10s, 7 → +20s, 8 → +40s,
+/// 9 → +80s, 10+ → +120s.
+fn extended_wait(base: Duration, consecutive: u32) -> Duration {
+    if consecutive < 5 {
+        return base;
+    }
+    let shift = (consecutive - 5).min(5);
+    let extra_secs = 5u64.saturating_mul(1u64 << shift).min(120);
+    base.saturating_add(Duration::from_secs(extra_secs))
+}
+
 fn backoff_duration_base(attempt: u32) -> Duration {
     let secs = (1u64 << attempt.min(5)).min(30);
     Duration::from_secs(secs)
@@ -840,6 +870,27 @@ mod tests {
         assert_eq!(backoff_duration_base(2), Duration::from_secs(4));
         assert_eq!(backoff_duration_base(5), Duration::from_secs(30));
         assert_eq!(backoff_duration_base(10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn extended_wait_noop_below_threshold() {
+        let base = Duration::from_secs(10);
+        for c in 0..5 {
+            assert_eq!(extended_wait(base, c), base);
+        }
+    }
+
+    #[test]
+    fn extended_wait_grows_and_caps() {
+        let base = Duration::from_secs(10);
+        // consec=5: +5s, 6: +10, 7: +20, 8: +40, 9: +80, 10+: +120
+        assert_eq!(extended_wait(base, 5), Duration::from_secs(15));
+        assert_eq!(extended_wait(base, 6), Duration::from_secs(20));
+        assert_eq!(extended_wait(base, 7), Duration::from_secs(30));
+        assert_eq!(extended_wait(base, 8), Duration::from_secs(50));
+        assert_eq!(extended_wait(base, 9), Duration::from_secs(90));
+        assert_eq!(extended_wait(base, 10), Duration::from_secs(130));
+        assert_eq!(extended_wait(base, 20), Duration::from_secs(130));
     }
 
     #[test]

@@ -9,6 +9,15 @@ Map each followup type to a tool:
 - "file" → find
 - "read" → read
 - "git" → git (readonly commands only)
+- "bash" → run `bash -c <command>` from the workspace root. Use
+  {"type": "bash", "command": "cc -o hw hw.c && ./hw", "timeout_secs": 60, "cwd": "subdir"}.
+  `command` is mandatory; `cmd` and `name` are accepted aliases so
+  followup-shaped requests work too. `timeout_secs` defaults to 60
+  (hard cap 600). `cwd` is workspace-relative; absolute paths and
+  `..` are rejected. Output is `[exit N]` + `[stdout]` + `[stderr]`,
+  capped at 20k chars. This tool is mainly used by the coding flow
+  to compile and run generated source — do NOT use it to fish around
+  with grep/find/rm or to query external services.
 - "question" → respond directly
 
 You can issue MULTIPLE tool calls at once using <actions> (plural). This runs them in parallel:

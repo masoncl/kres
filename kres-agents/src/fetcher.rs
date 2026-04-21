@@ -8,6 +8,9 @@
 //! - `read` — name = "file.c:100+50" or "file.c"; delegates to tools::read_file_range.
 //! - `search` / `grep` — name = regex; `path` = search root.
 //! - `git` — name = command string.
+//! - `bash` — name = shell command; dispatched to tools::bash_run
+//!   with default timeout and workspace-root cwd. Mainly used by the
+//!   coding flow to compile and run emitted source.
 //! - `question` — no-op (answered by the LLM, not by data fetch).
 //!
 //! Types routed through a plugin in Phase 8: `source`, `callers`,
@@ -23,7 +26,10 @@ use crate::{
     error::AgentError,
     followup::Followup,
     pipeline::{DataFetcher, FetchResult},
-    tools::{find, git, grep, read_file_range, FindArgs, GitArgs, GrepArgs, ReadArgs},
+    tools::{
+        bash_run, find, git, grep, read_file_range, BashArgs, FindArgs, GitArgs, GrepArgs,
+        ReadArgs,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -109,6 +115,31 @@ impl DataFetcher for WorkspaceFetcher {
                         })),
                         Err(e) => out.context.push(json!({
                             "source": format!("git:{}", fu.name),
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
+                "bash" => {
+                    // `name` carries the command string (same shape
+                    // the main-agent `<actions>` branch accepts).
+                    // timeout_secs and cwd aren't currently plumbed
+                    // through Followup; default to 60s / workspace
+                    // root. If an operator needs either, they should
+                    // run with a main-agent configured (the richer
+                    // LLM-driven dispatch path that can emit full
+                    // args).
+                    let args = BashArgs {
+                        command: fu.name.clone(),
+                        timeout_secs: None,
+                        cwd: None,
+                    };
+                    match bash_run(&self.workspace, &args).await {
+                        Ok(content) => out.context.push(json!({
+                            "source": format!("bash:{}", fu.name),
+                            "content": content,
+                        })),
+                        Err(e) => out.context.push(json!({
+                            "source": format!("bash:{}", fu.name),
                             "error": e.to_string(),
                         })),
                     }

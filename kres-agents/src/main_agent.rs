@@ -41,8 +41,8 @@ use crate::{
         append_context, append_symbol, parse_semcode_symbol, propagate_tool_result, tool_source,
     },
     tools::{
-        find, git, grep, read_file_range, truncate_output, FindArgs, GitArgs, GrepArgs, ReadArgs,
-        TOOL_OUTPUT_CAP_MCP,
+        bash_run, find, git, grep, read_file_range, truncate_output, BashArgs, FindArgs, GitArgs,
+        GrepArgs, ReadArgs, TOOL_OUTPUT_CAP_MCP,
     },
 };
 
@@ -537,6 +537,37 @@ async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (Strin
                 Err(e) => (format!("[error] {e}"), None),
             }
         }
+        "bash" => {
+            // Accept `command`, `cmd`, and `name` — `name` is what
+            // the slow/fast agents emit when a bash call comes in as
+            // a followup ({type:"bash", name:"cc -o hw hw.c && ./hw",
+            // reason:"verify"}) since followup schema uses `name` for
+            // the primary argument.
+            let command = action
+                .get("command")
+                .or_else(|| action.get("cmd"))
+                .or_else(|| action.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timeout_secs = action
+                .get("timeout_secs")
+                .or_else(|| action.get("timeout"))
+                .and_then(|v| v.as_u64());
+            let cwd = action
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let args = BashArgs {
+                command,
+                timeout_secs,
+                cwd,
+            };
+            match bash_run(workspace, &args).await {
+                Ok(t) => (t, None),
+                Err(e) => (format!("[error] {e}"), None),
+            }
+        }
         other => (format!("unknown action type: {other}"), None),
     }
 }
@@ -574,6 +605,15 @@ fn action_label(action: &Value) -> String {
             "git {}",
             action
                 .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+        ),
+        "bash" => format!(
+            "bash {}",
+            action
+                .get("command")
+                .or_else(|| action.get("cmd"))
+                .or_else(|| action.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
         ),

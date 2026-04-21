@@ -1,7 +1,9 @@
 //! Internal tool implementations for the main-agent data path.
 //!
-//! Three low-dependency tools: `read` (file range), `grep` (regex
-//! over a path), `git` (readonly whitelisted commands). MCP tools
+//! Four low-dependency tools: `read` (file range), `grep` (regex
+//! over a path), `git` (readonly whitelisted commands), and `bash`
+//! (arbitrary shell command, scoped to the workspace, mainly used by
+//! the coding flow to compile and run generated source). MCP tools
 //! route through a separate adapter in kres-repl; keeping those
 //! out of kres-agents avoids a transitive kres-mcp dependency here.
 
@@ -220,6 +222,124 @@ pub struct GitArgs {
     pub command: String,
 }
 
+/// Bash tool: execute an arbitrary shell command with the workspace
+/// as cwd. Primarily used by the coding flow so the slow agent can
+/// ask the main agent to `cc reproducer.c && ./a.out`. Kept simple
+/// on purpose — full shell capability, no allowlist — because the
+/// coding flow produces an open-ended set of compile/run commands
+/// (make, cc, python, cargo, go, kselftest Makefile, bpftrace, …)
+/// and an allowlist would either be too narrow to be useful or too
+/// broad to be safer than no list at all. The operator's trust
+/// boundary is kres's own `--workspace` directory and the model they
+/// pointed at it.
+///
+/// Safeguards:
+/// - Default 60s timeout (BASH_DEFAULT_TIMEOUT_SECS), capped at
+///   BASH_MAX_TIMEOUT_SECS. On timeout the bash child is dropped and
+///   SIGKILL'd via tokio's `kill_on_drop(true)`.
+/// - Output (stdout + stderr + exit code) is captured and capped at
+///   TOOL_OUTPUT_CAP_BASH chars — same envelope size as grep/find.
+/// - cwd defaults to the workspace root; a relative `cwd` is
+///   resolved via resolve_workspace so `..` traversal is rejected.
+///   Absolute cwd paths are also rejected.
+/// - The command is passed to `bash -c` verbatim. No attempt is
+///   made to parse / filter / allowlist.
+///
+/// Known gap: kill_on_drop sends SIGKILL to the bash process, not to
+/// its descendants. `bash -c "make -j8"` on timeout kills bash but
+/// the make+cc grandchildren are reparented to init and keep
+/// running until they finish or crash. A cleaner fix would use
+/// setsid + killpg; deferred until a real user hits it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BashArgs {
+    /// The shell command to run, passed verbatim to `bash -c`.
+    pub command: String,
+    /// Optional per-invocation timeout in seconds. Defaults to 60,
+    /// clamped to 600.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Optional workspace-relative cwd. When `Some`, the command
+    /// runs from `<workspace>/<cwd>`. Absolute paths and `..`
+    /// traversal are rejected by resolve_workspace.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// Max output captured from a bash command. Same cap as grep/find
+/// so the slow agent's input budget can't be blown by a runaway
+/// build log.
+pub const TOOL_OUTPUT_CAP_BASH: usize = 20_000;
+
+/// Default timeout for `bash`. Enough for most compile-and-run
+/// cycles without letting a stuck process stall the main agent for
+/// minutes.
+pub const BASH_DEFAULT_TIMEOUT_SECS: u64 = 60;
+pub const BASH_MAX_TIMEOUT_SECS: u64 = 600;
+
+pub async fn bash_run(workspace: &Path, args: &BashArgs) -> Result<String, AgentError> {
+    if args.command.trim().is_empty() {
+        return Err(AgentError::Other("bash: empty command".into()));
+    }
+    let run_cwd = match &args.cwd {
+        Some(p) => resolve_workspace(workspace, p)?,
+        None => workspace.to_path_buf(),
+    };
+    let timeout = Duration::from_secs(
+        args.timeout_secs
+            .unwrap_or(BASH_DEFAULT_TIMEOUT_SECS)
+            .min(BASH_MAX_TIMEOUT_SECS)
+            .max(1),
+    );
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c").arg(&args.command);
+    cmd.current_dir(&run_cwd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // kill_on_drop so the timeout branch reaps the child instead of
+    // leaking it until shell exit.
+    cmd.kill_on_drop(true);
+    let child_fut = cmd.output();
+    let out_result = tokio::time::timeout(timeout, child_fut).await;
+    let out = match out_result {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(AgentError::Other(format!("bash spawn: {e}"))),
+        Err(_) => {
+            return Ok(truncate_output(
+                &format!(
+                    "[error] bash timed out after {}s; cwd={} cmd={}",
+                    timeout.as_secs(),
+                    run_cwd.display(),
+                    args.command
+                ),
+                TOOL_OUTPUT_CAP_BASH,
+            ));
+        }
+    };
+    let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
+    let code_line = match out.status.code() {
+        Some(c) => format!("[exit {c}]"),
+        None => "[exit ?]".to_string(),
+    };
+    let mut body = String::new();
+    body.push_str(&code_line);
+    body.push('\n');
+    if !stdout_text.is_empty() {
+        body.push_str("[stdout]\n");
+        body.push_str(&stdout_text);
+        if !stdout_text.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    if !stderr_text.is_empty() {
+        body.push_str("[stderr]\n");
+        body.push_str(&stderr_text);
+        if !stderr_text.ends_with('\n') {
+            body.push('\n');
+        }
+    }
+    Ok(truncate_output(&body, TOOL_OUTPUT_CAP_BASH))
+}
+
 pub async fn git(workspace: &Path, args: &GitArgs) -> Result<String, AgentError> {
     let parts = shell_split(&args.command)
         .ok_or_else(|| AgentError::Other(format!("unparseable git command: {}", args.command)))?;
@@ -420,6 +540,77 @@ mod tests {
         p.push(format!("kres-tools-{}-{}", nonce, std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[tokio::test]
+    async fn bash_captures_stdout_stderr_and_exit() {
+        let dir = tmpdir("bash1");
+        let args = BashArgs {
+            command: "echo out; echo err 1>&2; exit 7".into(),
+            timeout_secs: Some(5),
+            cwd: None,
+        };
+        let got = bash_run(&dir, &args).await.unwrap();
+        assert!(got.starts_with("[exit 7]"), "got {got}");
+        assert!(got.contains("[stdout]\nout"), "got {got}");
+        assert!(got.contains("[stderr]\nerr"), "got {got}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_surfaces_error() {
+        let dir = tmpdir("bash2");
+        let args = BashArgs {
+            command: "sleep 5".into(),
+            timeout_secs: Some(1),
+            cwd: None,
+        };
+        let got = bash_run(&dir, &args).await.unwrap();
+        assert!(got.contains("bash timed out"), "got {got}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bash_runs_in_workspace_cwd() {
+        let dir = tmpdir("bash3");
+        let args = BashArgs {
+            command: "pwd".into(),
+            timeout_secs: Some(5),
+            cwd: None,
+        };
+        let got = bash_run(&dir, &args).await.unwrap();
+        // canonicalize-free compare: the tmpdir may resolve to a
+        // realpath under /tmp or /var/tmp depending on platform, so
+        // just look for the trailing basename.
+        let basename = dir.file_name().unwrap().to_str().unwrap();
+        assert!(got.contains(basename), "got {got}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bash_rejects_traversal_cwd() {
+        let dir = tmpdir("bash4");
+        let args = BashArgs {
+            command: "true".into(),
+            timeout_secs: Some(5),
+            cwd: Some("../escape".into()),
+        };
+        let res = bash_run(&dir, &args).await;
+        assert!(res.is_err(), "expected rejection, got {res:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bash_empty_command_errors() {
+        let dir = tmpdir("bash5");
+        let args = BashArgs {
+            command: "   ".into(),
+            timeout_secs: None,
+            cwd: None,
+        };
+        let res = bash_run(&dir, &args).await;
+        assert!(res.is_err(), "expected rejection for empty command");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

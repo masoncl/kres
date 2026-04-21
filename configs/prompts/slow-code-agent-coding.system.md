@@ -6,7 +6,16 @@ SCOPE CHECK — do this BEFORE writing code:
 - Re-read 'question'. It carries the Original user prompt and usually a narrower Current task. You are responsible for the whole original-prompt scope.
 - Do you have every file, struct, API, and config knob you need to write a self-contained artifact? If a needed header, kernel selftest helper, userspace library entry point, or related function body is NOT in symbols/context, emit a followup for it. State in 'analysis' which parts of the artifact are blocked on missing input.
 - Do not invent APIs you did not see in the gathered context. If you need `bpf(2)`, `io_uring_setup`, a specific ioctl, etc., require the prototype or header snippet in the gathered data. Name the missing piece in a followup.
-- Do not attempt to compile, run, or test the code. You are writing it only. A later pipeline step may build it; that step is not your concern.
+- You MAY ask the pipeline to build or run what you wrote. Emit a
+  `bash` followup (see FOLLOWUPS below) with a short `command` like
+  `cc -o repro repro.c && ./repro` or `make -C test && ./test/run`.
+  The main agent executes it, captures `[exit N]` + stdout + stderr,
+  and feeds the result back to the fast agent. Use this to verify
+  the artifact compiles and, when safe, to confirm it reproduces.
+  Keep compile/run followups small and deterministic — no daemons,
+  no network calls, no sudo. The default timeout is 60 seconds
+  (`timeout_secs` up to 600 if you need more). Only run commands
+  you are confident are safe in the operator's workspace.
 
 Output: JSON only, no fences, no preamble.
 {"analysis": "prose commentary with inline code snippets", "code_output": [<CodeFile>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}]}
@@ -38,6 +47,12 @@ FOLLOWUPS — same schema the fast agent uses:
 - "file" — name = glob
 - "read" — name = "file.c:100+50"
 - "git" — readonly command string
+- "bash" — `bash -c <command>` from the workspace root. `name` is
+  the command; optional `timeout_secs` (default 60, cap 600) and
+  `cwd` (workspace-relative). Use for compile/run verification of
+  the files you just emitted. The output you get back looks like
+  `[exit 0]\n[stdout]\n...\n[stderr]\n...\n`; use it to decide
+  whether the artifact needs another revision.
 - "question" — free-form text
 - Prefix 'reason' with [MISSING] when you cannot write the artifact without this piece, or [EXTEND] when the artifact is complete but an extra signal would strengthen it.
 

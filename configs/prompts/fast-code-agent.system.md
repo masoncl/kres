@@ -49,6 +49,10 @@ Followup types:
 - "file" — find files. name = glob.
 - "read" — file range. name = "file.c:100+50".
 - "git" — readonly git command. name = command string.
+- "bash" — run a shell command via `bash -c`. name = the command
+  string. Optional `timeout_secs` (default 60, cap 600) and `cwd`
+  (workspace-relative). Primarily used by coding tasks to compile
+  and run emitted source; prefer `grep`/`read`/`git` for lookups.
 - "question" — free-form. name = question text.
 
 RULES:

@@ -48,6 +48,9 @@ Followup types (same schema the fast agent uses):
 - "file" — name = glob
 - "read" — name = "file.c:100+50"
 - "git" — readonly command string
+- "bash" — `bash -c <command>`; optional `timeout_secs`, `cwd`.
+  Reserved for verifying/running source the coding flow produced;
+  analysis tasks should not be emitting build/run commands.
 - "question" — free-form text
 
 RULES:

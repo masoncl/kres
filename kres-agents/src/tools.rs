@@ -465,13 +465,22 @@ fn resolve_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, AgentError>
     let ws_canon = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
+    // Outside-workspace paths are accepted when the operator
+    // mentioned the containing directory in a prompt this session.
+    // The ConsentStore is populated by submit_prompt via
+    // consent::grant_paths_from_text before the task spawns.
+    let consent_allows = |p: &Path| -> bool {
+        kres_core::consent::get()
+            .map(|s| s.is_allowed(p))
+            .unwrap_or(false)
+    };
     match joined.canonicalize() {
         Ok(c) => {
-            if c.starts_with(&ws_canon) {
+            if c.starts_with(&ws_canon) || consent_allows(&c) {
                 Ok(c)
             } else {
                 Err(AgentError::Other(format!(
-                    "path {} escapes workspace {}",
+                    "path {} escapes workspace {} and no consent is on file — mention the containing directory in a prompt to grant this session read access",
                     c.display(),
                     ws_canon.display()
                 )))
@@ -480,13 +489,18 @@ fn resolve_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, AgentError>
         Err(_) => {
             // Target doesn't exist (or parent missing) — still
             // refuse paths that contain `..` traversal after
-            // normalising lexically.
+            // normalising lexically. Consent only bypasses the
+            // workspace gate; a missing file is still a missing
+            // file.
             let normalised = normalise_lexical(&joined);
-            if normalised.starts_with(&ws_canon) || normalised.starts_with(workspace) {
+            if normalised.starts_with(&ws_canon)
+                || normalised.starts_with(workspace)
+                || consent_allows(&normalised)
+            {
                 Ok(normalised)
             } else {
                 Err(AgentError::Other(format!(
-                    "path {} escapes workspace {}",
+                    "path {} escapes workspace {} and no consent is on file — mention the containing directory in a prompt to grant this session read access",
                     normalised.display(),
                     ws_canon.display()
                 )))

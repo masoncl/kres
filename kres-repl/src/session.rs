@@ -1203,6 +1203,15 @@ impl Session {
             }
         });
 
+        // Install a session-scoped consent store so reads outside
+        // --workspace can be auto-granted by mention in the
+        // operator's prompt (see consent::grant_paths_from_text in
+        // submit_prompt).  install() returns Err when the slot was
+        // already set; that's fine — subsequent Sessions in the
+        // same process (rare; tests) will see the first one's
+        // store, which is acceptable for the unit-test surface.
+        let _ =
+            kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
         print_banner();
         if !self.lenses.is_empty() {
             println!(
@@ -1446,6 +1455,30 @@ impl Session {
         // works again after this task completes.
         self.stop_latched
             .store(false, std::sync::atomic::Ordering::Release);
+        // Auto-grant read consent for any file or directory the
+        // operator just named in their prompt. Only fires for
+        // operator-typed submissions; pipeline-driven submits
+        // (cmd_next / cmd_continue) skip this — the model can't
+        // talk kres into reading new trees by hallucinating paths
+        // in its followups.
+        if include_recent_context {
+            if let Some(store) = kres_core::consent::get() {
+                let added = kres_core::consent::grant_paths_from_text(
+                    &store,
+                    &self.cfg.workspace,
+                    &text,
+                );
+                if !added.is_empty() {
+                    let label: Vec<String> =
+                        added.iter().map(|p| p.display().to_string()).collect();
+                    kres_core::async_eprintln!(
+                        "consent: granted read access to {} dir(s) named in the prompt: {}",
+                        added.len(),
+                        truncate(&label.join(", "), 200)
+                    );
+                }
+            }
+        }
 
         // §44: inline expand any `/load <path>` substring the user
         // wove into the prompt. Matches. Multiple

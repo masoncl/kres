@@ -14,6 +14,7 @@
 //! - L1: no parallel "completed_ids" vector — done tasks are queried
 //!   directly off the ordered task list.
 
+pub mod consent;
 pub mod cost;
 pub mod findings;
 pub mod io;
@@ -25,6 +26,7 @@ pub mod shutdown;
 pub mod task;
 pub mod todo;
 
+pub use consent::ConsentStore;
 pub use cost::{UsageEntry, UsageKey, UsageTracker};
 pub use findings::{Finding, FindingsFile, FindingsStore, Severity};
 pub use lens::LensSpec;

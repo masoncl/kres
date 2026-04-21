@@ -617,6 +617,7 @@ impl Session {
         // ~/.kres/sessions/<ts>/code/hello-world.c.
         let code_output_root_for_reaper: PathBuf = self.cfg.workspace.clone();
         let turns_exhausted_for_reaper = self.turns_exhausted.clone();
+        let stop_latched_for_reaper = self.stop_latched.clone();
         let turns_limit = self.cfg.turns_limit;
         let follow_followups = self.cfg.follow_followups;
         // §16: findings-signature watchdog. Every successful merge
@@ -758,6 +759,20 @@ impl Session {
                         .await;
                     }
                     let pre_size = mgr_for_reaper.findings_snapshot().await.len();
+                    // /stop is latched: skip every inference-heavy
+                    // reaper post-step (findings merger, goal check,
+                    // todo-agent update). The cancelled task is
+                    // already reaped; report.md + accumulated
+                    // already captured whatever prose survived.
+                    // Continuing through merger/goal/todo-update
+                    // would rack up API calls AND inject new todos
+                    // into the queue the operator just drained with
+                    // /stop, reproducing the "still going" feeling.
+                    let stop_latched_now = stop_latched_for_reaper
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    if stop_latched_now {
+                        continue;
+                    }
                     // Findings merger runs for both Analysis (review)
                     // and Generic tasks — both feed the findings
                     // pipeline. Coding tasks skip it: their output is

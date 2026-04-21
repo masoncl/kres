@@ -615,19 +615,68 @@ impl Session {
                     if matches!(r.state, TaskState::Done | TaskState::Errored) {
                         *interrupted_for_reaper.lock().await = None;
                     }
-                    if !r.analysis.is_empty() {
+                    // For Coding-mode tasks the slow agent is told to
+                    // keep prose short and put the artifact in
+                    // `code_output`. But check_goal only reads the
+                    // analysis string — so without help it sees a
+                    // paragraph that "describes the approach" and
+                    // keeps saying met=false while the file is
+                    // sitting on disk (session 597b4bf7). Append a
+                    // short trailer listing what landed so the goal
+                    // agent has concrete evidence to judge on.
+                    let effective_analysis = if r.code_output.is_empty() {
+                        r.analysis.clone()
+                    } else {
+                        let mut s = r.analysis.clone();
+                        if !s.is_empty() && !s.ends_with('\n') {
+                            s.push('\n');
+                        }
+                        s.push_str("\n---\nFiles written to workspace:\n");
+                        for f in &r.code_output {
+                            let purpose = if f.purpose.is_empty() {
+                                ""
+                            } else {
+                                &f.purpose
+                            };
+                            if purpose.is_empty() {
+                                s.push_str(&format!("- {}\n", f.path));
+                            } else {
+                                s.push_str(&format!("- {} — {}\n", f.path, purpose));
+                            }
+                            // Include the head of the file so the
+                            // goal agent can see the actual script
+                            // body, not just the filename. Cap at
+                            // 2000 chars so a very long artifact
+                            // doesn't blow out the goal-check token
+                            // budget.
+                            let head: String = f.content.chars().take(2000).collect();
+                            s.push_str("```\n");
+                            s.push_str(&head);
+                            if f.content.chars().count() > 2000 {
+                                s.push_str("\n… (truncated, full content at ");
+                                s.push_str(&f.path);
+                                s.push_str(")\n");
+                            }
+                            if !head.ends_with('\n') {
+                                s.push('\n');
+                            }
+                            s.push_str("```\n");
+                        }
+                        s
+                    };
+                    if !effective_analysis.is_empty() {
                         let mut la = last_analysis.lock().await;
-                        *la = Some(r.analysis.clone());
+                        *la = Some(effective_analysis.clone());
                     }
 
                     // §6: append every reaped task's
                     // (task_label, analysis) to the accumulated
                     // ledger so /summary + /report have the per-
                     // task narrative to work from.
-                    if !r.analysis.is_empty() {
+                    if !effective_analysis.is_empty() {
                         let entry = AccumulatedEntry {
                             task: r.name.clone(),
-                            analysis: r.analysis.clone(),
+                            analysis: effective_analysis.clone(),
                         };
                         accumulated_for_reaper.lock().await.push(entry);
                         // §26: append the analysis to the report
@@ -637,9 +686,11 @@ impl Session {
                         // `_append_report` for an always-up-to-date
                         // on-disk narrative.
                         if let Some(ref rp) = report_path_for_reaper {
-                            if let Err(e) =
-                                crate::report::append_task_section(rp, &r.name, &r.analysis)
-                            {
+                            if let Err(e) = crate::report::append_task_section(
+                                rp,
+                                &r.name,
+                                &effective_analysis,
+                            ) {
                                 tracing::warn!(
                                     target: "kres_repl",
                                     "report append to {}: {e}",

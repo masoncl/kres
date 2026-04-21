@@ -228,11 +228,14 @@ pub struct Session {
     /// the child's cursor drift visibly. Set in cmd_edit before
     /// spawn, cleared after return.
     status_paused: Arc<std::sync::atomic::AtomicBool>,
-    /// Held by cmd_edit while it has the terminal. The rustyline
-    /// reader loop (run() -> read_stdin) acquires it before each
-    /// readline() so it won't call readline at all — and redraw
-    /// the "> " prompt on top of vim — during /edit.
-    editor_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The main loop sends on this after finishing each command;
+    /// the rustyline reader waits for the send before calling
+    /// readline() again (see read_stdin). That way `/edit` can
+    /// block in cmd_edit without the reader painting `"> "` on
+    /// top of vim in the meantime. Optional because Session::new
+    /// constructs a Session without a running reader; the channel
+    /// is installed in run() when the reader thread is spawned.
+    input_ack_tx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
     /// §50: handles to every spawned MCP child process. On REPL
     /// exit we walk these and call `shutdown(2s)` on each so
     /// tracebacks flush cleanly instead of the child getting
@@ -329,7 +332,7 @@ impl Session {
                         any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        editor_lock: Arc::new(tokio::sync::Mutex::new(())),
+                        input_ack_tx: tokio::sync::Mutex::new(None),
                         mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                     };
                 }
@@ -359,7 +362,7 @@ impl Session {
             any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            editor_lock: Arc::new(tokio::sync::Mutex::new(())),
+            input_ack_tx: tokio::sync::Mutex::new(None),
             mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
@@ -451,8 +454,14 @@ impl Session {
         // on the retained outer-scope clone and ctrl-d appears to
         // hang the REPL.
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-        let reader_editor_lock = self.editor_lock.clone();
-        tokio::task::spawn_blocking(move || read_stdin(tx, reader_editor_lock));
+        // Ack channel: main loop sends after every command finishes,
+        // the reader waits for the ack before calling readline again.
+        // That keeps rustyline from painting "> " on top of a child
+        // process (vim) that cmd_edit is running, and keeps it from
+        // racing the main loop in general.
+        let (ack_tx, ack_rx) = mpsc::unbounded_channel::<()>();
+        *self.input_ack_tx.lock().await = Some(ack_tx);
+        tokio::task::spawn_blocking(move || read_stdin(tx, ack_rx));
 
         // Reserve the bottom two rows for a status bar + prompt.
         // Scrolling output stays above; status shows what each task
@@ -1311,7 +1320,7 @@ impl Session {
                 }
             };
             match parse_command(&line) {
-                Command::Noop => continue,
+                Command::Noop => {}
                 Command::Help => print_help(),
                 Command::Tasks => self.print_tasks().await,
                 Command::Stop => self.cmd_stop().await,
@@ -1392,6 +1401,13 @@ impl Session {
                         }
                     }
                 }
+            }
+            // Command done. Tell the stdin reader it may call
+            // readline again and paint the next "> " prompt. Skipped
+            // on Quit (that branch `return`s above, dropping the
+            // reader's channel).
+            if let Some(tx) = self.input_ack_tx.lock().await.as_ref() {
+                let _ = tx.send(());
             }
         }
 
@@ -1946,12 +1962,6 @@ impl Session {
             println!("/edit: create tempfile: {e}");
             return;
         }
-        // Hold the editor lock across the whole spawn so the
-        // stdin-reader thread can't call rustyline::readline("> ")
-        // while the editor owns the terminal — otherwise the "> "
-        // prompt gets painted on top of vim's frame as soon as the
-        // previous line (the one that typed "/edit") is sent.
-        let _rl_guard = self.editor_lock.lock().await;
         // Tear down kres's DECSTBM scroll region (status.rs:50) and
         // clear the status row BEFORE handing the terminal to the
         // editor. Without this, vim/nvim paint into a terminal
@@ -2889,7 +2899,7 @@ fn report_reaped(r: &kres_core::ReapedTask) {
 
 fn read_stdin(
     tx: mpsc::UnboundedSender<String>,
-    editor_lock: Arc<tokio::sync::Mutex<()>>,
+    mut ack_rx: mpsc::UnboundedReceiver<()>,
 ) {
     // rustyline: line-editing + ^R history search + arrow-key recall.
     // History persists to $HOME/.kres/history. Falls back to plain
@@ -2966,16 +2976,20 @@ fn read_stdin(
         }
         let _ = editor.load_history(p);
     }
+    let mut first_prompt = true;
     loop {
-        // Block while /edit holds the terminal. Without this,
-        // readline() would be re-called as soon as the previous
-        // line returned, and rustyline would paint "> " on top of
-        // vim's frame before the main loop has even dispatched
-        // Command::Edit. The lock is reacquired on every iteration
-        // so /edit only gates the NEXT readline, not an in-progress
-        // one. cmd_edit holds the lock across the editor spawn and
-        // releases it on return.
-        let _g = editor_lock.blocking_lock();
+        // After the first line, wait for the main loop to
+        // ack-complete the previous command before printing the
+        // next "> " prompt. Without this, readline() fires again
+        // the moment tx.send returns, and rustyline paints the
+        // prompt on top of vim's frame as soon as "/edit" is
+        // sent — well before cmd_edit has had a chance to take
+        // over the terminal. On None (channel closed) we break
+        // out; the REPL is tearing down.
+        if !first_prompt && ack_rx.blocking_recv().is_none() {
+            break;
+        }
+        first_prompt = false;
         match editor.readline("> ") {
             Ok(line) => {
                 if !line.trim().is_empty() {
@@ -2993,7 +3007,6 @@ fn read_stdin(
             Err(rustyline::error::ReadlineError::Eof) => break,
             Err(_) => break,
         }
-        drop(_g);
     }
     if let Some(ref p) = history_path {
         let _ = editor.save_history(p);

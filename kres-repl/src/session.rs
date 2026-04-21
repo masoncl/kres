@@ -1912,6 +1912,15 @@ impl Session {
             println!("/edit: create tempfile: {e}");
             return;
         }
+        // Tear down kres's DECSTBM scroll region (status.rs:50) and
+        // clear the status row BEFORE handing the terminal to the
+        // editor. Without this, vim/nvim paint into a terminal
+        // whose bottom two rows sit outside the scroll region: the
+        // editor's cursor math and input decoding drift, and key
+        // sequences (notably Esc) echo as on-screen garbage
+        // instead of reaching the editor. User report 2026-04-21:
+        // "Escape key doesn't work".  Reinstalled on return.
+        crate::status::restore();
         // Handing the terminal to the editor requires blocking on
         // its status. spawn_blocking keeps the runtime alive.
         let editor_path = tmp.clone();
@@ -1922,6 +1931,10 @@ impl Session {
                 .status()
         })
         .await;
+        // Reinstall the scroll region so the status row and REPL
+        // prompt re-appear. The background status poller will
+        // repaint the row on its next tick.
+        let _ = crate::status::install();
         // Trust the tempfile contents regardless of editor exit code.
         // A `:wq!` forced-quit or the
         // user saving and escaping without a clean exit shouldn't

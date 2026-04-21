@@ -596,6 +596,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         results_dir: args.results.clone(),
         template_path: args.template.clone(),
         stdio: args.stdio,
+        workspace: args.workspace.clone(),
     };
     let mut session = Session::new(mgr, cfg);
 

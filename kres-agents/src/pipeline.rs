@@ -93,6 +93,15 @@ pub struct Orchestrator {
     pub slow_max_tokens: u32,
     pub slow_max_input_tokens: Option<u32>,
 
+    /// Slow-agent system prompt used when a task runs in
+    /// `TaskMode::Coding`. The session loads
+    /// `configs/prompts/slow-code-agent-coding.system.md` (or its
+    /// `~/.kres/prompts/` override) into this field at startup. When
+    /// `None`, a coding task falls back to the normal `slow_system`
+    /// — cheap compatibility, but the slow agent will still try to
+    /// emit findings-shaped output, which the coding path ignores.
+    pub slow_coding_system: Option<String>,
+
     pub fetcher: Arc<dyn DataFetcher>,
 
     /// Max rounds of fast↔main before forcing the slow agent.
@@ -126,6 +135,12 @@ pub struct RunContext {
     /// chain. Prepended to every fast/slow/main user turn so a
     /// derived task doesn't lose the operator's original question
     pub original_prompt: String,
+    /// Which pipeline this task should run. `Analysis` (default)
+    /// feeds the findings merger; `Coding` swaps in
+    /// `slow_coding_system`, skips the lens fan-out, and returns a
+    /// TaskSummary with `code_output` populated and `findings`
+    /// empty. The session sets this from `define_goal`'s classifier.
+    pub mode: kres_core::TaskMode,
 }
 
 fn record_usage(
@@ -179,6 +194,14 @@ pub struct TaskSummary {
     pub followups: Vec<Followup>,
     pub fast_rounds: u8,
     pub strategy: ParseStrategy,
+    /// Pipeline the task ran through. `Analysis` is the default and
+    /// matches the historical shape (findings in `findings`); `Coding`
+    /// means the slow agent produced source files in `code_output`
+    /// instead and the merger/consolidator should be skipped.
+    pub mode: kres_core::TaskMode,
+    /// Source files emitted by a Coding-mode task. Empty for
+    /// Analysis-mode tasks.
+    pub code_output: Vec<kres_core::CodeFile>,
 }
 
 impl Orchestrator {
@@ -454,8 +477,30 @@ impl Orchestrator {
         }];
         let mut cfg = CallConfig::defaults_for(self.slow_model.clone())
             .with_max_tokens(self.slow_max_tokens)
-            .with_stream_label("slow");
-        if let Some(s) = &self.slow_system {
+            .with_stream_label(match ctx.mode {
+                kres_core::TaskMode::Analysis => "slow",
+                kres_core::TaskMode::Coding => "slow (coding)",
+            });
+        // Coding-mode tasks want a different system prompt: one that
+        // tells the slow agent to emit `code_output` rather than
+        // findings. Fall back to slow_system if the coding prompt
+        // wasn't loaded (fresh install pre-setup.sh), noisily — the
+        // analysis prompt will still produce something, just not a
+        // useful code artifact.
+        let slow_system_for_call = match ctx.mode {
+            kres_core::TaskMode::Coding => {
+                if self.slow_coding_system.is_some() {
+                    self.slow_coding_system.as_ref()
+                } else {
+                    kres_core::async_eprintln!(
+                        "[slow] coding-mode task but no slow_coding_system loaded — falling back to analysis prompt"
+                    );
+                    self.slow_system.as_ref()
+                }
+            }
+            kres_core::TaskMode::Analysis => self.slow_system.as_ref(),
+        };
+        if let Some(s) = slow_system_for_call {
             cfg = cfg.with_system(s.clone());
         }
         if let Some(n) = self.slow_max_input_tokens {
@@ -537,12 +582,23 @@ impl Orchestrator {
                 fus.join(", ")
             );
         }
+        // For coding tasks, surface the emitted files in code_output
+        // and drop any findings the model tried to emit anyway — a
+        // coding task is not supposed to participate in the findings
+        // pipeline (the reaper will skip merge/consolidator on this
+        // mode). Analysis tasks keep the historical shape.
+        let (findings_out, code_output) = match ctx.mode {
+            kres_core::TaskMode::Analysis => (slow_parsed.findings, Vec::new()),
+            kres_core::TaskMode::Coding => (Vec::new(), slow_parsed.code_output),
+        };
         Ok(TaskSummary {
             analysis: slow_parsed.analysis,
-            findings: slow_parsed.findings,
+            findings: findings_out,
             followups: slow_parsed.followups,
             fast_rounds,
             strategy: slow_parsed.strategy,
+            mode: ctx.mode,
+            code_output,
         })
     }
 }
@@ -709,6 +765,8 @@ impl Orchestrator {
             followups: all_followups,
             fast_rounds,
             strategy: ParseStrategy::WholeBody,
+            mode: kres_core::TaskMode::Analysis,
+            code_output: Vec::new(),
         })
     }
 

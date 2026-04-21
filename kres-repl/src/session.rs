@@ -54,6 +54,14 @@ pub struct ReplConfig {
     /// When true, skip the persistent status line (no DECSTBM scroll
     /// region). Useful for dumb terminals / pipes / finicky muxers.
     pub stdio: bool,
+    /// Root for coding-mode file output. Coding tasks emit a
+    /// `code_output` array whose paths are relative; the reaper
+    /// writes them under this directory (`<workspace>/<path>` —
+    /// not `<results>/code/<path>`, which buried files in the
+    /// auto-generated session dir and surprised operators who
+    /// expected "write hello-world.c" to land beside their cwd).
+    /// Defaults to `.`; overridden by `--workspace` in main.rs.
+    pub workspace: PathBuf,
 }
 
 impl Default for ReplConfig {
@@ -67,6 +75,7 @@ impl Default for ReplConfig {
             results_dir: None,
             template_path: None,
             stdio: false,
+            workspace: PathBuf::from("."),
         }
     }
 }
@@ -200,6 +209,11 @@ pub struct Session {
     /// select; when true, /summary is invoked before teardown so the
     /// operator gets a bug-report.txt on a clean --turns N run.
     turns_exhausted: Arc<std::sync::atomic::AtomicBool>,
+    /// True once any task has run in Coding mode during this session.
+    /// Suppresses the teardown bug-report summary — coding-mode
+    /// sessions don't have findings to summarise and the summary
+    /// template would produce gibberish.
+    any_coding_task: Arc<std::sync::atomic::AtomicBool>,
     /// §50: handles to every spawned MCP child process. On REPL
     /// exit we walk these and call `shutdown(2s)` on each so
     /// tracebacks flush cleanly instead of the child getting
@@ -293,6 +307,7 @@ impl Session {
                         deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                         interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                         turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                     };
                 }
@@ -319,6 +334,7 @@ impl Session {
             deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
             turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
@@ -541,6 +557,13 @@ impl Session {
         let store_for_reaper = self.findings_store.clone();
         let interrupted_for_reaper = self.interrupted_prompt.clone();
         let report_path_for_reaper = self.cfg.report_path.clone();
+        // Destination for coding-mode file output. Coding tasks emit
+        // path-relative files; they land under the workspace (i.e.
+        // the operator's cwd at kres-start time, or --workspace) so
+        // "write hello-world.c" does what it says on the tin
+        // instead of burying the file in
+        // ~/.kres/sessions/<ts>/code/hello-world.c.
+        let code_output_root_for_reaper: PathBuf = self.cfg.workspace.clone();
         let turns_exhausted_for_reaper = self.turns_exhausted.clone();
         let turns_limit = self.cfg.turns_limit;
         let follow_followups = self.cfg.follow_followups;
@@ -559,6 +582,13 @@ impl Session {
         // count strictly increases.
         let mut no_new_findings_streak: u32 = 0;
         const NO_NEW_FINDINGS_STOP: u32 = 3;
+        // Latch for the --turns 0 auto-stop banner. The stop check
+        // below runs on every 250ms tick, but the operator only
+        // wants to SEE "goal met" once; re-firing it every tick
+        // would spam the terminal. The latch is reset below as soon
+        // as new pending/blocked todos appear, so a fresh prompt
+        // re-arms the stop announcement.
+        let mut turns0_stop_announced = false;
         let reaper_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(250));
             loop {
@@ -609,8 +639,24 @@ impl Session {
                             }
                         }
                     }
+                    // Coding tasks skip the merger / consolidator / findings
+                    // pipeline entirely. Persist any emitted source files
+                    // under <results>/code/ and move on — the goal agent
+                    // still runs against r.analysis (treated as notes by
+                    // the goal system prompt).
+                    if matches!(r.mode, kres_core::TaskMode::Coding)
+                        && !r.code_output.is_empty()
+                    {
+                        persist_code_output(
+                            &code_output_root_for_reaper,
+                            &r.name,
+                            &r.code_output,
+                        )
+                        .await;
+                    }
                     let pre_size = mgr_for_reaper.findings_snapshot().await.len();
-                    let had_delta = !r.findings_delta.is_empty();
+                    let had_delta = matches!(r.mode, kres_core::TaskMode::Analysis)
+                        && !r.findings_delta.is_empty();
                     if had_delta {
                         // §16: when a consolidator client is available
                         // we reuse it as the findings merger too.
@@ -992,6 +1038,24 @@ impl Session {
                     //   No goal agent configured: fall back to
                     //   "active batch finished" so the REPL doesn't
                     //   loop forever in the no-goal-agent case.
+                    //
+                    // Gate the whole stop check on "at least one task
+                    // has actually produced work in this session".
+                    // This block lives at the reaper's tick level, not
+                    // inside the `for r in reaped` loop — so without
+                    // the gate it would tick once at startup with
+                    // active_count=0 and pending_or_blocked=0 and
+                    // report "goal met (todo list drained)" before
+                    // the operator had a chance to submit a prompt
+                    // (user report 2026-04-21).
+                    // completed_run_count is bumped in finish_ok only
+                    // when a task produced non-empty analysis OR
+                    // non-empty code_output, so it's the right signal
+                    // for "real work happened".
+                    let done_so_far = mgr_for_reaper.completed_run_count().await;
+                    if done_so_far == 0 {
+                        continue;
+                    }
                     let active = mgr_for_reaper.active_count().await;
                     let todo = mgr_for_reaper.todo_snapshot().await;
                     let pending_or_blocked = todo
@@ -1016,7 +1080,13 @@ impl Session {
                     } else {
                         no_goal_batch_stop
                     };
-                    if should_stop {
+                    // Reset the latch as soon as new work shows up so
+                    // the operator sees a fresh "goal met" banner
+                    // after submitting another prompt.
+                    if pending_or_blocked > 0 {
+                        turns0_stop_announced = false;
+                    }
+                    if should_stop && !turns0_stop_announced {
                         let reason = if no_goal_batch_stop && !followups_drained {
                             format!(
                                 "no goal agent; active batch finished ({pending_or_blocked} followup(s) deferred; pass --follow to chase them)"
@@ -1033,12 +1103,16 @@ impl Session {
                             )
                         };
                         kres_core::async_eprintln!(
-                            "\n=== --turns 0 stop: {reason} ==="
+                            "\n=== --turns 0: {reason} — REPL staying open; submit another prompt, /summary, or /quit ==="
                         );
-                        // Mirror the --turns N exit: move any leftover
-                        // pending/blocked items to /followup's
-                        // deferred list, clear the todo queue, flag
-                        // the REPL as exhausted, cancel root.
+                        // Move any leftover pending/blocked items to
+                        // /followup's deferred list and clear the
+                        // active queue so auto-continue doesn't
+                        // immediately redispatch them. Unlike the
+                        // --turns N path we do NOT cancel the root
+                        // shutdown or flag turns_exhausted — the user
+                        // wants to keep driving the REPL after goal
+                        // met.
                         let remaining = mgr_for_reaper.todo_snapshot().await;
                         let mut deferred = deferred_for_reaper.lock().await;
                         let mut carry = 0usize;
@@ -1056,14 +1130,10 @@ impl Session {
                         mgr_for_reaper.replace_todo(Vec::new()).await;
                         if carry > 0 {
                             kres_core::async_eprintln!(
-                                "[{carry} pending item(s) deferred — see /followup]"
+                                "[{carry} pending item(s) moved to /followup]"
                             );
                         }
-                        turns_exhausted_for_reaper
-                            .store(true, std::sync::atomic::Ordering::Release);
-                        kres_core::async_eprintln!("exiting REPL.");
-                        mgr_for_reaper.root_shutdown().cancel();
-                        break;
+                        turns0_stop_announced = true;
                     }
                 }
             }
@@ -1223,12 +1293,26 @@ impl Session {
         // --turns run, render a bug-report via /summary before
         // teardown so the operator gets the artifact without having
         // to run `kres --summary` afterwards.
+        //
+        // Suppress the auto-summary when the session ran any coding
+        // task: coding sessions don't produce findings, and the
+        // bug-summary template would emit gibberish against the
+        // coding notes in report.md.
+        let coding_session = self
+            .any_coding_task
+            .load(std::sync::atomic::Ordering::Acquire);
         if self
             .turns_exhausted
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            kres_core::async_eprintln!("--turns: rendering bug-report.txt before exit");
-            self.cmd_summary(None).await;
+            if coding_session {
+                kres_core::async_eprintln!(
+                    "--turns: skipping bug-report summary (coding session — see <workspace>/ for emitted files)"
+                );
+            } else {
+                kres_core::async_eprintln!("--turns: rendering bug-report.txt before exit");
+                self.cmd_summary(None).await;
+            }
         }
 
         let out = self.mgr.stop_all(self.cfg.stop_grace).await;
@@ -1314,17 +1398,31 @@ impl Session {
         // with multiple concurrent prompts the previous single
         // session-wide goal overwrote earlier ones and the reaper
         // checked task-A's analysis against task-B's goal.
-        let defined_goal: Option<String> = if let Some(gc) = &self.goal_client {
-            match kres_agents::define_goal(gc, &text).await {
-                Some(g) => {
-                    kres_core::async_eprintln!("goal: {}", truncate(&g, 160));
-                    Some(g)
+        let (defined_goal, task_mode): (Option<String>, kres_agents::TaskMode) =
+            if let Some(gc) = &self.goal_client {
+                match kres_agents::define_goal(gc, &text).await {
+                    Some(def) => {
+                        kres_core::async_eprintln!(
+                            "goal ({}): {}",
+                            def.mode.as_str(),
+                            truncate(&def.goal, 160)
+                        );
+                        (Some(def.goal), def.mode)
+                    }
+                    None => (None, kres_agents::TaskMode::default()),
                 }
-                None => None,
-            }
-        } else {
-            None
-        };
+            } else {
+                (None, kres_agents::TaskMode::default())
+            };
+        // Latch the session-wide "coding session" flag as soon as any
+        // task is submitted in coding mode. The teardown path reads
+        // this to suppress the bug-report summary — a coding session
+        // has no findings to summarise, and running the bug-summary
+        // template over coding notes produces nonsense.
+        if matches!(task_mode, kres_agents::TaskMode::Coding) {
+            self.any_coding_task
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let orc_task = orc.clone();
         // Snapshot findings BEFORE spawning so the task's
         // RunContext sees the running list. bugs.md#H1: the read is
@@ -1343,19 +1441,33 @@ impl Session {
                     previous_findings,
                     task_brief: task_brief_clone,
                     original_prompt,
+                    mode: task_mode,
                 };
-                let res = if lenses.is_empty() {
-                    orc_task
-                        .run_once_with_ctx(&text, &ctx, &handle.shutdown)
-                        .await
-                } else if let Some(c) = consolidator {
-                    orc_task
-                        .run_with_lenses(&text, &lenses, &c, &ctx, &handle.shutdown)
-                        .await
-                } else {
-                    orc_task
-                        .run_once_with_ctx(&text, &ctx, &handle.shutdown)
-                        .await
+                // Coding-mode tasks always run through run_once_with_ctx
+                // with the coding system prompt — lenses / consolidator
+                // are analysis-only concepts. Analysis tasks pick the
+                // lens-fanout path when lenses are installed.
+                let res = match task_mode {
+                    kres_agents::TaskMode::Coding => {
+                        orc_task
+                            .run_once_with_ctx(&text, &ctx, &handle.shutdown)
+                            .await
+                    }
+                    kres_agents::TaskMode::Analysis => {
+                        if lenses.is_empty() {
+                            orc_task
+                                .run_once_with_ctx(&text, &ctx, &handle.shutdown)
+                                .await
+                        } else if let Some(c) = consolidator {
+                            orc_task
+                                .run_with_lenses(&text, &lenses, &c, &ctx, &handle.shutdown)
+                                .await
+                        } else {
+                            orc_task
+                                .run_once_with_ctx(&text, &ctx, &handle.shutdown)
+                                .await
+                        }
+                    }
                 };
                 match res {
                     Ok(summary) => {
@@ -1373,6 +1485,8 @@ impl Session {
                                 .iter()
                                 .filter_map(|f| serde_json::to_value(f).ok())
                                 .collect(),
+                            mode: summary.mode,
+                            code_output: summary.code_output,
                         })
                     }
                     Err(e) => Err(e.to_string()),
@@ -2016,6 +2130,34 @@ impl Session {
     }
 }
 
+/// Compile-time fallback for the coding-mode slow-agent system prompt.
+/// Used when `~/.kres/prompts/slow-code-agent-coding.system.md` is
+/// absent (fresh install pre-setup.sh). Keeps coding tasks functional
+/// without requiring a rebuild of the binary.
+pub const SLOW_CODING_SYSTEM: &str =
+    include_str!("../../configs/prompts/slow-code-agent-coding.system.md");
+
+/// Load the coding-mode system prompt: prefer the operator-editable
+/// copy in `~/.kres/prompts/`, fall back to the compiled-in version.
+/// Returns `None` only when $HOME is unset AND the file isn't readable
+/// — the caller then leaves `slow_coding_system` as None and coding
+/// tasks fall back to the analysis prompt with a warning (see
+/// `pipeline::run_once_with_ctx`).
+fn load_slow_coding_system() -> Option<String> {
+    if let Some(home) = dirs::home_dir() {
+        let p = home
+            .join(".kres")
+            .join("prompts")
+            .join("slow-code-agent-coding.system.md");
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    Some(SLOW_CODING_SYSTEM.to_string())
+}
+
 /// Convenience: build an Orchestrator from paths to agent configs and
 /// a workspace directory. The DataFetcher is a WorkspaceFetcher over
 /// the given workspace; MCP integration is a Phase 8 add-on.
@@ -2112,6 +2254,7 @@ pub async fn build_orchestrator(
         max_input_tokens: fast_cfg.max_input_tokens,
     });
 
+    let slow_coding_system = load_slow_coding_system();
     let orchestrator = Arc::new(Orchestrator {
         fast_client,
         fast_model: fast_model.clone(),
@@ -2123,6 +2266,7 @@ pub async fn build_orchestrator(
         slow_system: slow_cfg.system,
         slow_max_tokens: slow_cfg.max_tokens.unwrap_or(slow_model.max_output_tokens),
         slow_max_input_tokens: slow_cfg.max_input_tokens,
+        slow_coding_system,
         fetcher,
         max_fast_rounds: gather_turns,
         skills,
@@ -2137,6 +2281,91 @@ pub async fn build_orchestrator(
 }
 
 /// Print a one-line summary of a reaped task.
+/// Write code_output files emitted by a Coding-mode task to
+/// `<workspace>/<path>`. Rejects absolute paths and traversal
+/// segments (`..`) so a malformed model reply can't drop files
+/// outside the workspace root. Each file is written with a
+/// tmp + rename so a crash doesn't leave a partial artifact.
+async fn persist_code_output(
+    workspace: &Path,
+    task_name: &str,
+    files: &[kres_core::CodeFile],
+) {
+    let base = workspace.to_path_buf();
+    if let Err(e) = tokio::fs::create_dir_all(&base).await {
+        kres_core::async_eprintln!(
+            "[coding] create {} failed: {e}",
+            base.display()
+        );
+        return;
+    }
+    let mut wrote = 0usize;
+    for f in files {
+        let rel = std::path::Path::new(&f.path);
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            kres_core::async_eprintln!(
+                "[coding] rejecting suspicious path '{}' (absolute or contains '..')",
+                f.path
+            );
+            continue;
+        }
+        let out = base.join(rel);
+        if let Some(parent) = out.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                kres_core::async_eprintln!(
+                    "[coding] mkdir {} failed: {e}",
+                    parent.display()
+                );
+                continue;
+            }
+        }
+        // tmp + rename so a crash leaves either the old content or
+        // the new content, never a truncated partial.
+        let tmp = out.with_extension(format!(
+            "{}.tmp",
+            out.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+        ));
+        if let Err(e) = tokio::fs::write(&tmp, f.content.as_bytes()).await {
+            kres_core::async_eprintln!(
+                "[coding] write {} failed: {e}",
+                tmp.display()
+            );
+            continue;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &out).await {
+            kres_core::async_eprintln!(
+                "[coding] rename {} -> {} failed: {e}",
+                tmp.display(),
+                out.display()
+            );
+            continue;
+        }
+        wrote += 1;
+        kres_core::async_eprintln!(
+            "[coding] wrote {} ({})",
+            out.display(),
+            if f.purpose.is_empty() {
+                "no purpose given".to_string()
+            } else {
+                f.purpose.clone()
+            }
+        );
+    }
+    kres_core::async_eprintln!(
+        "[coding] {}: persisted {}/{} file(s) under {}",
+        task_name,
+        wrote,
+        files.len(),
+        base.display()
+    );
+}
+
 fn report_reaped(r: &kres_core::ReapedTask) {
     match r.state {
         kres_core::TaskState::Done => {

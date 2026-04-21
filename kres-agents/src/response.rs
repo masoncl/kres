@@ -36,6 +36,12 @@ pub struct CodeResponse {
     pub skill_reads: Vec<String>,
     pub findings: Vec<Finding>,
     pub ready_for_slow: bool,
+    /// Source files emitted by a Coding-mode slow-agent turn. Empty
+    /// for Analysis-mode responses. The coding-mode system prompt
+    /// instructs the slow agent to return
+    /// `{"analysis": "...", "code_output": [{path, content, purpose}], "followups": [...]}`
+    /// and this field is populated from that `code_output` array.
+    pub code_output: Vec<kres_core::CodeFile>,
     /// Which parse strategy won — used for diagnostics.
     pub strategy: ParseStrategy,
 }
@@ -63,6 +69,8 @@ struct RawResponse {
     findings: Value,
     #[serde(default)]
     ready_for_slow: Value,
+    #[serde(default)]
+    code_output: Value,
 }
 
 pub fn parse_code_response(text: &str) -> CodeResponse {
@@ -122,6 +130,7 @@ pub fn parse_code_response(text: &str) -> CodeResponse {
         skill_reads: vec![],
         findings: vec![],
         ready_for_slow: false,
+        code_output: vec![],
         strategy: ParseStrategy::RawText,
     }
 }
@@ -138,6 +147,7 @@ fn raw_has_content(r: &RawResponse) -> bool {
         || list_nonempty(&r.followups)
         || list_nonempty(&r.findings)
         || list_nonempty(&r.skill_reads)
+        || list_nonempty(&r.code_output)
         || bool_true
 }
 
@@ -163,8 +173,20 @@ fn into_code_response(r: RawResponse, _original: &str, strategy: ParseStrategy) 
         skill_reads: value_to_string_list(r.skill_reads),
         findings: value_to_findings(r.findings),
         ready_for_slow: matches!(r.ready_for_slow, Value::Bool(true)),
+        code_output: value_to_code_output(r.code_output),
         strategy,
     }
+}
+
+fn value_to_code_output(v: Value) -> Vec<kres_core::CodeFile> {
+    let Value::Array(items) = v else {
+        return vec![];
+    };
+    items
+        .into_iter()
+        .filter_map(|i| serde_json::from_value::<kres_core::CodeFile>(i).ok())
+        .filter(|f| !f.path.is_empty() && !f.content.is_empty())
+        .collect()
 }
 
 fn value_to_string(v: Value) -> String {

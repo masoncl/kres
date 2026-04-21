@@ -52,10 +52,23 @@ pub struct GoalCheck {
     pub missing: Vec<String>,
 }
 
+/// Result of a `define_goal` call: the completion criterion + the
+/// classified work mode ("analysis" for reading code / surfacing
+/// bugs, "coding" for writing code / reproducers / PoCs).
+#[derive(Debug, Clone)]
+pub struct GoalDefinition {
+    pub goal: String,
+    pub mode: TaskMode,
+}
+
+pub use kres_core::TaskMode;
+
 #[derive(Debug, Deserialize)]
 struct DefineResponse {
     #[serde(default)]
     goal: String,
+    #[serde(default)]
+    mode: Option<TaskMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,15 +85,25 @@ struct CheckResponse {
 /// the agent fails to produce a well-shaped response — callers
 /// should treat "no goal" as "run until --turns or the todo list
 /// drains" and NOT invoke `check_goal` ( behaviour).
-pub async fn define_goal(gc: &GoalClient, prompt: &str) -> Option<String> {
+pub async fn define_goal(gc: &GoalClient, prompt: &str) -> Option<GoalDefinition> {
     let request = json!({
         "task": "define_goal",
         "query": prompt.chars().take(2000).collect::<String>(),
-        "instructions": "Define a clear, specific goal for this query. \
-                         What must be true for this query to be considered complete? \
-                         Be concrete: name specific things that must be found, verified, \
-                         or answered. Return JSON only:\n\
-                         {\"goal\": \"specific completion criteria\"}"
+        "instructions": "Define a clear, specific goal for this query \
+                         AND classify the work mode. What must be true \
+                         for this query to be considered complete? Be \
+                         concrete: name specific things that must be \
+                         found, verified, written, or answered. The \
+                         `mode` field selects the pipeline: \"analysis\" \
+                         (read code, surface bugs/invariants/notes) or \
+                         \"coding\" (write code — reproducer, PoC, \
+                         selftest, trigger program, harness). Choose \
+                         \"coding\" only when the operator's REQUESTED \
+                         OUTPUT is source code they will run. Default \
+                         to \"analysis\" when the prompt is ambiguous. \
+                         Return JSON only:\n\
+                         {\"goal\": \"specific completion criteria\", \
+                          \"mode\": \"analysis\" | \"coding\"}"
     });
     let body = serde_json::to_string_pretty(&request).ok()?;
     let mut cfg = CallConfig::defaults_for(gc.model.clone())
@@ -122,9 +145,14 @@ pub async fn define_goal(gc: &GoalClient, prompt: &str) -> Option<String> {
             None,
         );
     }
-    extract_json_with_key::<DefineResponse>(&text, "goal")
-        .map(|r| r.goal)
-        .filter(|s| !s.is_empty())
+    let parsed = extract_json_with_key::<DefineResponse>(&text, "goal")?;
+    if parsed.goal.is_empty() {
+        return None;
+    }
+    Some(GoalDefinition {
+        goal: parsed.goal,
+        mode: parsed.mode.unwrap_or_default(),
+    })
 }
 
 /// Ask the main agent whether `goal` has been met by `analysis`.

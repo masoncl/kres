@@ -75,6 +75,12 @@ struct TaskEntry {
     /// Raw followup objects from the task's response.
     followups: Vec<serde_json::Value>,
     analysis: String,
+    /// Pipeline this task ran through. Default `Analysis`; set by
+    /// finish_ok from the TaskOutcome.
+    mode: crate::TaskMode,
+    /// Code files the task produced. Only ever populated for
+    /// Coding-mode tasks.
+    code_output: Vec<crate::CodeFile>,
     handle: Option<JoinHandle<()>>,
     /// Gets notified when the task transitions into a terminal state.
     done_notify: Arc<Notify>,
@@ -281,6 +287,8 @@ impl TaskManager {
                 findings_delta: Vec::new(),
                 followups: Vec::new(),
                 analysis: String::new(),
+                mode: crate::TaskMode::default(),
+                code_output: Vec::new(),
                 handle: Some(handle),
                 done_notify,
             });
@@ -304,9 +312,15 @@ impl TaskManager {
             entry.analysis = outcome.analysis;
             entry.findings_delta = outcome.findings;
             entry.followups = outcome.followups;
+            entry.mode = outcome.mode;
+            entry.code_output = outcome.code_output;
             // Per bugs.md#H4: only count tasks that actually produced
-            // analysis and did not error.
-            if !entry.analysis.is_empty() {
+            // analysis and did not error. Coding-mode tasks count
+            // against --turns N the same way analysis tasks do: they
+            // consumed a slow-agent call, which is what the cap is
+            // meant to bound.
+            let produced = !entry.analysis.is_empty() || !entry.code_output.is_empty();
+            if produced {
                 g.completed_run_count = g.completed_run_count.saturating_add(1);
             }
         }
@@ -422,6 +436,8 @@ impl TaskManager {
                     analysis: entry.analysis,
                     findings_delta: entry.findings_delta,
                     followups: entry.followups,
+                    mode: entry.mode,
+                    code_output: entry.code_output,
                 });
             } else {
                 keep.push(entry);
@@ -554,8 +570,15 @@ pub struct ReapedTask {
     pub analysis: String,
     pub findings_delta: Vec<Finding>,
     pub followups: Vec<serde_json::Value>,
+    /// Pipeline the task ran through. Reaper consumes this to decide
+    /// whether to run the findings merger (Analysis) or persist code
+    /// files (Coding).
+    pub mode: crate::TaskMode,
+    /// Code files emitted by a Coding-mode task.
+    pub code_output: Vec<crate::CodeFile>,
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct TaskOutcome {
     pub analysis: String,
     pub findings: Vec<Finding>,
@@ -564,6 +587,14 @@ pub struct TaskOutcome {
     /// promote them to todo items without re-parsing the analysis
     /// prose.
     pub followups: Vec<serde_json::Value>,
+    /// Pipeline the task ran through. Reaper uses this to gate the
+    /// merge/consolidator work: Analysis tasks feed the findings
+    /// pipeline, Coding tasks write files and skip the merger.
+    pub mode: crate::TaskMode,
+    /// Code files produced by a Coding-mode task. Empty for
+    /// Analysis-mode tasks. The reaper writes each entry under
+    /// `<results>/code/<path>`.
+    pub code_output: Vec<crate::CodeFile>,
 }
 
 /// Handed to a task's work closure. Provides cancellation and access
@@ -642,8 +673,7 @@ mod tests {
             .spawn("t1", None, |_h| async {
                 Ok(TaskOutcome {
                     analysis: "done".into(),
-                    findings: vec![],
-                    followups: vec![],
+                    ..Default::default()
                 })
             })
             .await;
@@ -687,11 +717,7 @@ mod tests {
     async fn empty_analysis_does_not_increment_turn_counter() {
         let mgr = TaskManager::new();
         mgr.spawn("t-empty", None, |_h| async {
-            Ok(TaskOutcome {
-                analysis: String::new(),
-                findings: vec![],
-                followups: vec![],
-            })
+            Ok(TaskOutcome::default())
         })
         .await;
         loop {
@@ -717,8 +743,7 @@ mod tests {
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {
                         Ok(TaskOutcome {
                             analysis: "never".into(),
-                            findings: vec![],
-                            followups: vec![],
+                            ..Default::default()
                         })
                     }
                 }
@@ -745,8 +770,7 @@ mod tests {
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {
                         Ok(TaskOutcome {
                             analysis: "never".into(),
-                            findings: vec![],
-                            followups: vec![],
+                            ..Default::default()
                         })
                     }
                 }
@@ -779,8 +803,7 @@ mod tests {
             .spawn("fast", None, |_h| async {
                 Ok(TaskOutcome {
                     analysis: "ok".into(),
-                    findings: vec![],
-                    followups: vec![],
+                    ..Default::default()
                 })
             })
             .await;
@@ -831,8 +854,7 @@ mod tests {
                 mgr2.spawn(format!("t{i}"), None, |_h| async {
                     Ok(TaskOutcome {
                         analysis: "ok".into(),
-                        findings: vec![],
-                        followups: vec![],
+                        ..Default::default()
                     })
                 })
                 .await;

@@ -28,7 +28,10 @@ pub use consolidate::{consolidate_lenses, ConsolidatedTask, LensOutput};
 pub use error::AgentError;
 pub use fetcher::{parse_read_spec, WorkspaceFetcher};
 pub use followup::Followup;
-pub use goal::{check_goal, define_goal, GoalCheck, GoalClient, GOAL_INSTRUCTIONS};
+pub use goal::{
+    check_goal, define_goal, GoalCheck, GoalClient, GoalDefinition, GOAL_INSTRUCTIONS,
+};
+pub use kres_core::TaskMode;
 pub use main_agent::{parse_actions, MainAgent, DEFAULT_MAX_MAIN_TURNS};
 pub use mcp_fetcher::{McpFetcher, McpMethodMap};
 pub use merge::{merge_findings, MERGER_SYSTEM};

@@ -221,6 +221,13 @@ pub struct Session {
     /// was still sitting in the todo list — which is NOT what an
     /// operator who just hit Ctrl-C's moral equivalent wants.
     stop_latched: Arc<std::sync::atomic::AtomicBool>,
+    /// Pauses the 200ms status-row repainter while a child process
+    /// (vim launched by /edit, for instance) has the terminal.
+    /// Without this, the repainter absolute-positions to row H-1
+    /// every tick and scribbles through the child's display, making
+    /// the child's cursor drift visibly. Set in cmd_edit before
+    /// spawn, cleared after return.
+    status_paused: Arc<std::sync::atomic::AtomicBool>,
     /// §50: handles to every spawned MCP child process. On REPL
     /// exit we walk these and call `shutdown(2s)` on each so
     /// tracebacks flush cleanly instead of the child getting
@@ -316,6 +323,7 @@ impl Session {
                         turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                     };
                 }
@@ -344,6 +352,7 @@ impl Session {
             turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
@@ -452,6 +461,13 @@ impl Session {
         // handler re-runs install() and overwrites this.
         let status_geom_shared: Arc<tokio::sync::RwLock<Option<(u16, u16)>>> =
             Arc::new(tokio::sync::RwLock::new(status_geom));
+        // Pause flag for the paint task. /edit and /stop set it so a
+        // child process that's taken over the terminal (vim, say)
+        // doesn't get its display scribbled over every 200 ms by
+        // the status-row repainter. Cleared when the child exits.
+        self.status_paused
+            .store(false, std::sync::atomic::Ordering::Release);
+        let status_paused_for_paint = self.status_paused.clone();
         // Paint task: every 200ms repaint the status row. Every
         // ~1s (every 5 paint ticks) also poll term_size() — if the
         // terminal has resized since last check, clear the screen
@@ -467,6 +483,16 @@ impl Session {
                 let mut ticks_since_size_check: u32 = 0;
                 loop {
                     ticker.tick().await;
+                    // Skip the whole tick when something (cmd_edit,
+                    // etc.) has the terminal: the size-check branch
+                    // would re-install the scroll region behind the
+                    // child's back, and paint() would scribble
+                    // across the child's frame.
+                    if status_paused_for_paint
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        continue;
+                    }
                     ticks_since_size_check += 1;
                     if ticks_since_size_check >= 5 {
                         ticks_since_size_check = 0;
@@ -1920,6 +1946,14 @@ impl Session {
         // sequences (notably Esc) echo as on-screen garbage
         // instead of reaching the editor. User report 2026-04-21:
         // "Escape key doesn't work".  Reinstalled on return.
+        //
+        // Also pause the 200ms status-row repainter (see the paint
+        // task in Self::run). Without this, the painter continues
+        // to absolute-position to row H-1 and write to stderr
+        // every tick, scribbling across vim's frame and dragging
+        // the visible cursor around. Cleared on return.
+        self.status_paused
+            .store(true, std::sync::atomic::Ordering::Release);
         crate::status::restore();
         // Handing the terminal to the editor requires blocking on
         // its status. spawn_blocking keeps the runtime alive.
@@ -1932,9 +1966,11 @@ impl Session {
         })
         .await;
         // Reinstall the scroll region so the status row and REPL
-        // prompt re-appear. The background status poller will
-        // repaint the row on its next tick.
+        // prompt re-appear, then un-pause the status painter so it
+        // repaints the row on its next tick.
         let _ = crate::status::install();
+        self.status_paused
+            .store(false, std::sync::atomic::Ordering::Release);
         // Trust the tempfile contents regardless of editor exit code.
         // A `:wq!` forced-quit or the
         // user saving and escaping without a clean exit shouldn't

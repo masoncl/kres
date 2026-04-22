@@ -25,15 +25,22 @@ FIXES AND PATCHES — do NOT code from memory:
   consumer treats code_output as "write this file's contents to
   disk" — a patch file written alongside the real source is not a
   fix, it's a TODO that the operator still has to apply. Instead:
-  - preferred (when available): request the fix be applied via the
-    edit-tool followup (see FOLLOWUPS below) so the repair goes
-    directly into the source file on disk;
-  - fallback: emit code_output whose `path` IS the file being
-    fixed (e.g. `drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c`)
-    and whose `content` is the full post-fix file body, copied
-    from what you were given with the fix applied in place. You
-    must have the entire file in your inputs before doing this;
-    do not truncate or ellide.
+  - preferred for small surgical fixes: emit entries in the
+    `code_edits` array. Each entry is
+    `{file_path, old_string, new_string, replace_all?}` and shapes
+    exactly like Claude Code's Edit primitive: `old_string` is
+    looked up literally in the current file contents and must
+    appear exactly once (set `replace_all: true` to allow
+    multiple). The reaper applies each edit via the in-tree edit
+    tool, atomic tmp + rename. This is the best fit for adding a
+    missing `bnxt_xdp_buff_frags_free(rxr, xdp);` line or similar;
+  - fallback for large-scale rewrites: emit code_output whose
+    `path` IS the file being fixed (e.g.
+    `drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c`) and whose
+    `content` is the full post-fix file body, copied from what
+    you were given with the fix applied in place. You must have
+    the entire file in your inputs before doing this; do not
+    truncate or ellide.
 - Line numbers and surrounding context in your output must match
   the file on disk exactly. Session a85dbc41 (2026-04-21) produced
   a .patch file whose hunk was reconstructed from a 13 KB inline
@@ -51,7 +58,9 @@ FIXES AND PATCHES — do NOT code from memory:
   you are confident are safe in the operator's workspace.
 
 Output: JSON only, no fences, no preamble.
-{"analysis": "prose commentary with inline code snippets", "code_output": [<CodeFile>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}]}
+{"analysis": "prose commentary with inline code snippets", "code_output": [<CodeFile>, ...], "code_edits": [<CodeEdit>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}]}
+
+CodeEdit shape (same as Claude Code's Edit): `{file_path, old_string, new_string, replace_all?}`. Leave `replace_all` off (defaults to false) and `old_string` must match exactly once. `old_string` and `new_string` are VERBATIM byte sequences; include enough surrounding context to make `old_string` unique in the file.
 
 CODE_OUTPUT — primary artifact:
 - 'code_output' is an array of {path, content, purpose} records. EACH file you produce is one entry. Use forward-slash relative paths; they land under `<results>/code/<path>` on disk.

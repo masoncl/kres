@@ -41,8 +41,8 @@ use crate::{
         append_context, append_symbol, parse_semcode_symbol, propagate_tool_result, tool_source,
     },
     tools::{
-        bash_run, find, git, grep, read_file_range, truncate_output, BashArgs, FindArgs, GitArgs,
-        GrepArgs, ReadArgs, TOOL_OUTPUT_CAP_MCP,
+        bash_run, edit_file, find, git, grep, read_file_range, truncate_output, BashArgs, EditArgs,
+        FindArgs, GitArgs, GrepArgs, ReadArgs, TOOL_OUTPUT_CAP_MCP,
     },
 };
 
@@ -537,6 +537,42 @@ async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (Strin
                 Err(e) => (format!("[error] {e}"), None),
             }
         }
+        "edit" => {
+            // Accept Claude-Code-style `file_path` + `old_string` +
+            // `new_string`; allow `path` and `file` as aliases for
+            // the path so follow-up-shape requests work.
+            let file_path = action
+                .get("file_path")
+                .or_else(|| action.get("path"))
+                .or_else(|| action.get("file"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let old_string = action
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let new_string = action
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let replace_all = action
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let args = EditArgs {
+                file_path,
+                old_string,
+                new_string,
+                replace_all,
+            };
+            match edit_file(workspace, &args).await {
+                Ok(t) => (t, None),
+                Err(e) => (format!("[error] {e}"), None),
+            }
+        }
         "bash" => {
             // Accept `command`, `cmd`, and `name` — `name` is what
             // the slow/fast agents emit when a bash call comes in as
@@ -614,6 +650,15 @@ fn action_label(action: &Value) -> String {
                 .get("command")
                 .or_else(|| action.get("cmd"))
                 .or_else(|| action.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+        ),
+        "edit" => format!(
+            "edit {}",
+            action
+                .get("file_path")
+                .or_else(|| action.get("path"))
+                .or_else(|| action.get("file"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
         ),

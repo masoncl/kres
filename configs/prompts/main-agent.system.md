@@ -13,6 +13,14 @@ Map each followup type to a tool:
   they wrote. `--amend`, `--no-verify`, `--no-gpg-sign` are
   rejected; `push`/`pull`/`fetch` are absent on purpose (the tool
   is workspace-local).
+- "edit" → surgical string-replacement edit to an existing file.
+  Use {"type": "edit", "file_path": "rel/path.c", "old_string": "...",
+  "new_string": "...", "replace_all": false}. Same shape and
+  semantics as Claude Code's Edit primitive: `old_string` is looked
+  up literally; it must appear exactly once unless `replace_all` is
+  true. Writes via tmp+rename for crash safety. Aliases accepted:
+  `path` / `file` for `file_path`. Mainly used by the coding flow
+  to apply fixes in-place.
 - "bash" → run `bash -c <command>` from the workspace root. Use
   {"type": "bash", "command": "cc -o hw hw.c && ./hw", "timeout_secs": 60, "cwd": "subdir"}.
   `command` is mandatory; `cmd` and `name` are accepted aliases so

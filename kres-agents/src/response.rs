@@ -42,9 +42,20 @@ pub struct CodeResponse {
     /// `{"analysis": "...", "code_output": [{path, content, purpose}], "followups": [...]}`
     /// and this field is populated from that `code_output` array.
     pub code_output: Vec<kres_core::CodeFile>,
+    /// Surgical string-replacement edits to existing files, the
+    /// coding-mode equivalent of code_output but for FIXES rather
+    /// than new artifacts. Shape mirrors Claude Code's Edit
+    /// primitive: `{file_path, old_string, new_string, replace_all}`.
+    /// The reaper applies each entry via `tools::edit_file`.
+    pub code_edits: Vec<kres_core::CodeEdit>,
     /// Which parse strategy won — used for diagnostics.
     pub strategy: ParseStrategy,
 }
+
+/// Re-export of kres_core::CodeEdit so older callers that import
+/// `kres_agents::CodeEdit` continue to compile. The canonical type
+/// lives in kres-core so TaskOutcome can carry it.
+pub use kres_core::CodeEdit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParseStrategy {
@@ -71,6 +82,8 @@ struct RawResponse {
     ready_for_slow: Value,
     #[serde(default)]
     code_output: Value,
+    #[serde(default)]
+    code_edits: Value,
 }
 
 pub fn parse_code_response(text: &str) -> CodeResponse {
@@ -131,6 +144,7 @@ pub fn parse_code_response(text: &str) -> CodeResponse {
         findings: vec![],
         ready_for_slow: false,
         code_output: vec![],
+        code_edits: vec![],
         strategy: ParseStrategy::RawText,
     }
 }
@@ -148,6 +162,7 @@ fn raw_has_content(r: &RawResponse) -> bool {
         || list_nonempty(&r.findings)
         || list_nonempty(&r.skill_reads)
         || list_nonempty(&r.code_output)
+        || list_nonempty(&r.code_edits)
         || bool_true
 }
 
@@ -174,8 +189,20 @@ fn into_code_response(r: RawResponse, _original: &str, strategy: ParseStrategy) 
         findings: value_to_findings(r.findings),
         ready_for_slow: matches!(r.ready_for_slow, Value::Bool(true)),
         code_output: value_to_code_output(r.code_output),
+        code_edits: value_to_code_edits(r.code_edits),
         strategy,
     }
+}
+
+fn value_to_code_edits(v: Value) -> Vec<CodeEdit> {
+    let Value::Array(items) = v else {
+        return vec![];
+    };
+    items
+        .into_iter()
+        .filter_map(|i| serde_json::from_value::<CodeEdit>(i).ok())
+        .filter(|e| !e.file_path.is_empty() && !e.old_string.is_empty())
+        .collect()
 }
 
 fn value_to_code_output(v: Value) -> Vec<kres_core::CodeFile> {

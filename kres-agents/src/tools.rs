@@ -1,11 +1,14 @@
 //! Internal tool implementations for the main-agent data path.
 //!
-//! Four low-dependency tools: `read` (file range), `grep` (regex
-//! over a path), `git` (readonly whitelisted commands), and `bash`
-//! (arbitrary shell command, scoped to the workspace, mainly used by
-//! the coding flow to compile and run generated source). MCP tools
-//! route through a separate adapter in kres-repl; keeping those
-//! out of kres-agents avoids a transitive kres-mcp dependency here.
+//! Five low-dependency tools: `read` (file range), `grep` (regex
+//! over a path), `git` (readonly whitelisted commands), `bash`
+//! (arbitrary shell command, scoped to the workspace, mainly used
+//! by the coding flow to compile and run generated source), and
+//! `edit` (string-replacement edit to an existing file, matching
+//! Claude Code's Edit primitive — `old_string` must appear exactly
+//! once unless `replace_all=true`). MCP tools route through a
+//! separate adapter in kres-repl; keeping those out of kres-agents
+//! avoids a transitive kres-mcp dependency here.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -348,6 +351,152 @@ pub async fn bash_run(workspace: &Path, args: &BashArgs) -> Result<String, Agent
     Ok(truncate_output(&body, TOOL_OUTPUT_CAP_BASH))
 }
 
+/// String-replacement edit to an existing file, modelled on
+/// Claude Code's Edit primitive. `old_string` is looked up
+/// literally in the current file contents; it must appear exactly
+/// once unless `replace_all=true`, in which case every occurrence
+/// is replaced. Writes via tmp + rename for crash safety.
+///
+/// Matches Claude Code's field names (`file_path`, `old_string`,
+/// `new_string`, `replace_all`) on purpose — models already know
+/// that shape, and the semantics carry over: the `old_string`
+/// anchor forces the agent to quote bytes from the real file
+/// instead of reconstructing them from memory.
+///
+/// The tool accepts `path` as an alias for `file_path` so follow-up
+/// requests that happen to use the common `path` key still land.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditArgs {
+    /// Path to the file to edit. Workspace-relative or absolute
+    /// (must resolve inside the workspace or a consent-granted
+    /// tree). Alias: `path`.
+    #[serde(alias = "path")]
+    pub file_path: String,
+    /// Exact byte-sequence to look for in the file. Must appear
+    /// at least once; must appear exactly once unless
+    /// `replace_all` is true.
+    pub old_string: String,
+    /// Replacement bytes.
+    pub new_string: String,
+    /// When false (the default), `old_string` must match exactly
+    /// once and exactly one replacement is made. When true, every
+    /// occurrence is replaced in one pass.
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+/// Envelope size for the post-edit preview in the returned text.
+const EDIT_PREVIEW_LINES: usize = 5;
+
+pub async fn edit_file(workspace: &Path, args: &EditArgs) -> Result<String, AgentError> {
+    if args.old_string.is_empty() {
+        return Err(AgentError::Other(
+            "edit: old_string is empty — refusing to insert new_string at position 0; use a read+full-file-rewrite instead".into(),
+        ));
+    }
+    if args.old_string == args.new_string {
+        return Err(AgentError::Other(
+            "edit: old_string == new_string — nothing to do".into(),
+        ));
+    }
+    let abs = resolve_workspace(workspace, &args.file_path)?;
+    let original = tokio::fs::read_to_string(&abs).await.map_err(|e| {
+        AgentError::Other(format!("edit: read {}: {e}", abs.display()))
+    })?;
+    let count = count_occurrences(&original, &args.old_string);
+    if count == 0 {
+        return Err(AgentError::Other(format!(
+            "edit: old_string not found in {} — re-read the file and supply bytes copied verbatim from the current contents",
+            abs.display()
+        )));
+    }
+    let replacements;
+    let updated = if args.replace_all {
+        replacements = count;
+        original.replace(&args.old_string, &args.new_string)
+    } else if count > 1 {
+        return Err(AgentError::Other(format!(
+            "edit: old_string matches {count} locations in {} — narrow it (include more surrounding context) or pass replace_all=true",
+            abs.display()
+        )));
+    } else {
+        replacements = 1;
+        original.replacen(&args.old_string, &args.new_string, 1)
+    };
+    // Atomic write: tmp + fsync + rename. Keeps the file either
+    // fully-pre-edit or fully-post-edit on crash.
+    let tmp = abs.with_extension(format!(
+        "{}.kres-edit.tmp",
+        abs.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut f = tokio::fs::File::create(&tmp).await.map_err(|e| {
+            AgentError::Other(format!("edit: create {}: {e}", tmp.display()))
+        })?;
+        f.write_all(updated.as_bytes()).await.map_err(|e| {
+            AgentError::Other(format!("edit: write {}: {e}", tmp.display()))
+        })?;
+        f.sync_all().await.map_err(|e| {
+            AgentError::Other(format!("edit: fsync {}: {e}", tmp.display()))
+        })?;
+    }
+    tokio::fs::rename(&tmp, &abs).await.map_err(|e| {
+        AgentError::Other(format!(
+            "edit: rename {} -> {}: {e}",
+            tmp.display(),
+            abs.display()
+        ))
+    })?;
+    // Build the preview — EDIT_PREVIEW_LINES lines of context
+    // centred on the first replacement site. Gives the fast agent
+    // a cheap sanity-check it can relay to the slow agent without
+    // re-reading the whole file.
+    let preview = build_edit_preview(&updated, &args.new_string, EDIT_PREVIEW_LINES);
+    Ok(format!(
+        "[edit {}] {replacements} replacement(s) (before: {}c, after: {}c)\n{preview}",
+        abs.display(),
+        original.len(),
+        updated.len()
+    ))
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let mut start = 0usize;
+    while let Some(off) = haystack[start..].find(needle) {
+        n += 1;
+        start += off + needle.len();
+    }
+    n
+}
+
+fn build_edit_preview(body: &str, new_string: &str, window_lines: usize) -> String {
+    let Some(pos) = body.find(new_string) else {
+        return String::new();
+    };
+    let line_of_pos = body[..pos].matches('\n').count(); // 0-indexed
+    let all_lines: Vec<&str> = body.split_inclusive('\n').collect();
+    let first = line_of_pos.saturating_sub(window_lines / 2);
+    let last = (line_of_pos + window_lines / 2 + 1).min(all_lines.len());
+    let mut out = String::from("preview:\n");
+    for (i, line) in all_lines[first..last].iter().enumerate() {
+        out.push_str(&format!(
+            "{:>6}: {}",
+            first + i + 1,
+            if line.ends_with('\n') {
+                line.to_string()
+            } else {
+                format!("{line}\n")
+            }
+        ));
+    }
+    out
+}
+
 pub async fn git(workspace: &Path, args: &GitArgs) -> Result<String, AgentError> {
     let parts = shell_split(&args.command)
         .ok_or_else(|| AgentError::Other(format!("unparseable git command: {}", args.command)))?;
@@ -610,6 +759,128 @@ mod tests {
         p.push(format!("kres-tools-{}-{}", nonce, std::process::id()));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[tokio::test]
+    async fn edit_replaces_unique_old_string() {
+        let dir = tmpdir("edit-unique");
+        let path = dir.join("foo.c");
+        std::fs::write(&path, "line one\nhello world\nline three\n").unwrap();
+        let args = EditArgs {
+            file_path: "foo.c".into(),
+            old_string: "hello world".into(),
+            new_string: "hola mundo".into(),
+            replace_all: false,
+        };
+        let msg = edit_file(&dir, &args).await.unwrap();
+        assert!(msg.starts_with("[edit "), "got {msg}");
+        assert!(msg.contains("1 replacement(s)"), "got {msg}");
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(updated, "line one\nhola mundo\nline three\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_missing_old_string() {
+        let dir = tmpdir("edit-missing");
+        let path = dir.join("foo.c");
+        std::fs::write(&path, "line one\nhello\n").unwrap();
+        let args = EditArgs {
+            file_path: "foo.c".into(),
+            old_string: "not present".into(),
+            new_string: "xxx".into(),
+            replace_all: false,
+        };
+        let res = edit_file(&dir, &args).await;
+        match res {
+            Err(AgentError::Other(m)) => {
+                assert!(m.contains("old_string not found"), "got {m}");
+                assert!(m.contains("re-read"), "got {m}");
+            }
+            _ => panic!("expected not-found error, got {res:?}"),
+        }
+        // File untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "line one\nhello\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_ambiguous_without_replace_all() {
+        let dir = tmpdir("edit-ambig");
+        let path = dir.join("foo.c");
+        std::fs::write(&path, "x\nx\nx\n").unwrap();
+        let args = EditArgs {
+            file_path: "foo.c".into(),
+            old_string: "x".into(),
+            new_string: "y".into(),
+            replace_all: false,
+        };
+        let res = edit_file(&dir, &args).await;
+        match res {
+            Err(AgentError::Other(m)) => {
+                assert!(m.contains("matches 3 locations"), "got {m}");
+                assert!(m.contains("replace_all=true"), "got {m}");
+            }
+            _ => panic!("expected ambiguity error, got {res:?}"),
+        }
+        // File untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x\nx\nx\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_flips_every_match() {
+        let dir = tmpdir("edit-all");
+        let path = dir.join("foo.c");
+        std::fs::write(&path, "x\nx\nx\n").unwrap();
+        let args = EditArgs {
+            file_path: "foo.c".into(),
+            old_string: "x".into(),
+            new_string: "y".into(),
+            replace_all: true,
+        };
+        let msg = edit_file(&dir, &args).await.unwrap();
+        assert!(msg.contains("3 replacement(s)"), "got {msg}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "y\ny\ny\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_traversal() {
+        let dir = tmpdir("edit-traversal");
+        let args = EditArgs {
+            file_path: "../escape.c".into(),
+            old_string: "anything".into(),
+            new_string: "other".into(),
+            replace_all: false,
+        };
+        let res = edit_file(&dir, &args).await;
+        assert!(matches!(res, Err(AgentError::Other(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_empty_old_and_identity() {
+        let dir = tmpdir("edit-empty");
+        let path = dir.join("foo.c");
+        std::fs::write(&path, "some body\n").unwrap();
+        let empty_old = EditArgs {
+            file_path: "foo.c".into(),
+            old_string: String::new(),
+            new_string: "x".into(),
+            replace_all: false,
+        };
+        assert!(matches!(edit_file(&dir, &empty_old).await, Err(_)));
+        let identity = EditArgs {
+            file_path: "foo.c".into(),
+            old_string: "some body".into(),
+            new_string: "some body".into(),
+            replace_all: false,
+        };
+        assert!(matches!(edit_file(&dir, &identity).await, Err(_)));
+        // File untouched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "some body\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

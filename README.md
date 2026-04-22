@@ -4,6 +4,13 @@ Kernel code RESearch agent — an LLM-driven multi-agent REPL for
 reviewing, auditing, and finding bugs in C source trees (the kernel
 is the primary target).
 
+# NEWS
+
+April 21: I've updated the system prompts, you'll need to copy them into
+~/.kres/prompts, or run setup.sh with --overwrite
+
+There's new support for writing patches as well, more details below.
+
 ## Quick start
 
 1. Build:

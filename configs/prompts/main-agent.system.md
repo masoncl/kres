@@ -50,6 +50,14 @@ Map each followup type to a tool:
   capped at 20k chars. This tool is mainly used by the coding flow
   to compile and run generated source — do NOT use it to fish around
   with grep/find/rm or to query external services.
+  NOTE: `bash` is OFF by default — it is only available when the
+  operator adds it to the action allowlist (via settings.json or
+  `--allow bash`). When it is not enabled, a `bash` action will
+  come back with `[error] action type 'bash' is not in the
+  allowed-action list for this session (...)`. Do not re-emit the
+  same bash action hoping it lands: pick one of the typed tools
+  (`read` for a file range, `grep` for text search, `find` for
+  filenames, `git` for repo history) instead.
 - "question" → respond directly
 
 You can issue MULTIPLE tool calls at once using <actions> (plural). This runs them in parallel:

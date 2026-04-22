@@ -216,7 +216,30 @@ impl McpClient {
             if line.is_empty() {
                 continue;
             }
-            let resp: Response = serde_json::from_str(&line).map_err(|source| McpError::Json {
+            // JSON-RPC 2.0 allows the server to interleave notifications
+            // (no `id`, no `result`, no `error` — just `method`/`params`)
+            // with responses. semcode-mcp emits
+            // `notifications/message` log lines before the real
+            // response; parsing those as `Response` fails because
+            // ResponseResult is untagged over {result}|{error}. Inspect
+            // the line as a generic Value first and skip notifications.
+            let raw: Value = serde_json::from_str(&line).map_err(|source| McpError::Json {
+                server: self.transport.server_name.clone(),
+                source,
+            })?;
+            if raw.get("method").is_some()
+                && raw.get("result").is_none()
+                && raw.get("error").is_none()
+            {
+                tracing::debug!(
+                    target: "kres_mcp",
+                    server = %self.transport.server_name,
+                    method = raw.get("method").and_then(|v| v.as_str()).unwrap_or(""),
+                    "dropping jsonrpc notification"
+                );
+                continue;
+            }
+            let resp: Response = serde_json::from_value(raw).map_err(|source| McpError::Json {
                 server: self.transport.server_name.clone(),
                 source,
             })?;
@@ -405,6 +428,37 @@ done
             .unwrap();
         // Two text blocks joined with "\n"; the image block is dropped.
         assert_eq!(s, "first\nsecond");
+        c.shutdown(Duration::from_secs(2)).await.unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Server that interleaves a JSON-RPC notification line BEFORE the
+    /// real response. Mirrors semcode-mcp's behaviour of emitting
+    /// `notifications/message` log lines on stdout during a call.
+    fn notification_then_response_cfg() -> ServerConfig {
+        let script = r#"
+while IFS= read -r line; do
+    id=$(printf '%s' "$line" | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d.get("id",0))')
+    printf '{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","message":"working..."}}\n'
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"ok":true}}\n' "$id"
+done
+"#;
+        ServerConfig {
+            command: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env: BTreeMap::new(),
+            cwd: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_before_response_is_skipped() {
+        let dir = tmp_dir("notify");
+        let mut c = McpClient::spawn_raw("notify", &notification_then_response_cfg(), &dir)
+            .await
+            .unwrap();
+        let v = c.call("anything", None).await.unwrap();
+        assert_eq!(v.get("ok").and_then(|v| v.as_bool()), Some(true));
         c.shutdown(Duration::from_secs(2)).await.unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }

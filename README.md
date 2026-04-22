@@ -258,6 +258,143 @@ At the end of a run you get a plain-text bug report via `/summary`
 You can point `--template PATH` at a custom file to override the
 shipped summariser prompt without rebuilding.
 
+## Coding tasks: reproducers and in-place fixes
+
+Not every prompt is a review. Ask kres `--prompt 'write a
+reproducer for the UAF in net/sched/cls_bpf.c'` or `--prompt 'fix
+the missing frag-free in bnxt_xdp_redirect'` and the goal agent
+classifies the task as **coding mode** instead of analysis. Coding
+mode swaps out the review pipeline's lens fan-out and findings
+consolidator for a single slow-agent call whose job is to produce
+source code. Two output channels:
+
+- **`code_output`** — a list of `{path, content, purpose}`
+  records. Each entry is a full file body that the reaper writes
+  under `<workspace>/code/<path>` via tmp + rename. Use this for
+  fresh artifacts (reproducers, test harnesses, trigger programs,
+  scratch fixes that rewrite a whole file).
+
+- **`code_edits`** — a list of `{file_path, old_string,
+  new_string, replace_all}` records, same shape as Claude Code's
+  Edit primitive. The reaper applies each edit in order via
+  `kres_agents::tools::edit_file`: `old_string` must appear
+  exactly once in the current file contents (unless
+  `replace_all: true`), and the file is rewritten atomically via
+  tmp + rename (`kres-agents/src/tools.rs`). This is the
+  preferred channel for surgical one-line fixes — the
+  `old_string` anchor forces the slow agent to quote bytes from
+  the real file rather than reconstruct them from summary-level
+  descriptions. Each edit's result (replacement count for
+  success, verbatim error message for failure) is folded into
+  the task's analysis trailer under `Edits applied (N/M[, K
+  FAILED]):` so the next slow-agent turn can see which edits
+  landed and correct any that didn't.
+
+The slow-code prompt (`configs/prompts/slow-code-agent-coding.system.md`)
+enforces two rules that matter in practice: the verbatim current
+contents of the file being fixed must be in the gathered symbols
+or context before any edit is emitted (a `read` followup is
+requested and waited on otherwise — the slow agent is explicitly
+told not to fix from memory), and a multi-edit batch applies in
+emission order with each `old_string` matching the file state
+AFTER prior edits in the same batch have landed.
+
+**Verification via `bash`** — the slow agent can emit a `bash`
+followup (e.g. `cc -o repro repro.c && ./repro`, `make -C test`)
+to build and run what it just wrote. The main agent executes it
+from the workspace root, captures `[exit N]` + stdout + stderr,
+and feeds the result back. This is the one flow where `bash` is
+genuinely useful — but it is OFF by default (see "Action
+allowlist" below) and must be explicitly enabled for the session.
+
+On a coding run you typically invoke kres with:
+
+```
+kres --prompt 'write a reproducer for the stack OOB in x_tables' \
+     --allow bash \
+     --results repro-run
+```
+
+Artifacts land in `<results>/code/<path>` (for `code_output`) and
+in-place under `<workspace>` (for `code_edits`). The ordinary
+`report.md` + `findings.json` ledger continues to accumulate
+narrative; coding tasks skip the findings-merger path since their
+output is source files, not bug records.
+
+## Action allowlist
+
+The main agent's non-MCP tools are gated by a session-wide
+allowlist. Defaults: `grep`, `find`, `read`, `git`, `edit`.
+`bash` is **OFF by default** because operators report it being
+reached for as a general escape hatch for things the typed tools
+already cover (`bash sed` for range reads, `bash find` for
+filename locates). An action whose `type` isn't in the allowlist
+is rejected at dispatch time with a message naming the allowed
+set and pointing at the two ways to fix it.
+
+**Three precedence levels:**
+
+1. `--allow ACTION` CLI flags — additive on top of whatever the
+   files resolved to. Repeatable (`--allow bash --allow git`) or
+   comma-separated (`--allow bash,git`). The special value
+   `--allow all` enables every action type the dispatcher knows.
+2. Per-project `<cwd>/.kres/settings.json` — overrides global
+   values field-by-field; an explicit allowlist replaces rather
+   than unions with the global one.
+3. Global `~/.kres/settings.json` — the default resting place
+   for a per-user policy.
+
+**Example — enable bash for this session only:**
+
+```
+kres --allow bash --prompt 'reproduce the RDS UAF'
+```
+
+**Example — enable bash permanently in settings.json:**
+
+```json
+{
+  "actions": {
+    "allowed": ["grep", "find", "read", "git", "edit", "bash"]
+  }
+}
+```
+
+**Example — deny every non-MCP action (tight lockdown, leaves
+only MCP tools available to the main agent):**
+
+```json
+{
+  "actions": {
+    "allowed": []
+  }
+}
+```
+
+The empty array is the explicit "lock it down" signal — kres
+dispatcher enforces it and does not fall back to defaults.
+A missing or absent `actions.allowed` (i.e. `null` or the key
+unset) is different: it means "use the built-in default list".
+
+**Typo detection** — tokens in `--allow` or `actions.allowed`
+that aren't recognised action names produce a startup warning
+with a closest-match suggestion (Levenshtein ≤ 2), e.g.
+`settings: unknown action token 'bsah' (--allow) — did you mean
+'bash'? known: grep, find, read, git, edit, bash, mcp`. Unknown
+tokens are dropped rather than silently inserted, so a typo
+never leaves a dead entry in the allowlist.
+
+**Startup banner** — when a main-agent config is resolved, kres
+prints the effective allowlist on startup and distinguishes
+"bash disabled by default" from "bash disabled by explicit
+allowlist in settings.json". Both point at `--allow bash` as the
+fix but the wording respects the source of the decision.
+
+MCP tools are gated separately (by mcp.json server registration,
+not this allowlist) and don't enter the allowlist's dispatch
+path. `--allow mcp` is a no-op and does not produce a typo
+warning.
+
 ## Review prompts
 
 kres can leverage the kernel review prompts for additional subsystem knowledge.
@@ -445,7 +582,7 @@ kres [--fast-agent ...] [--slow TAG | --slow-agent ...] [--main-agent ...]
      [--results DIR] [--findings PATH] [--report PATH] [--todo PATH]
      [--prompt PROMPT] [--template PATH] [--turns N]
      [--gather-turns N] [--stop-grace-ms MS] [--stdio]
-     [--summary]
+     [--allow ACTION]... [--summary]
 ```
 
 Interactive REPL commands: `/help`, `/tasks`, `/findings`, `/stop`,

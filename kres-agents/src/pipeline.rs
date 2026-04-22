@@ -654,17 +654,45 @@ impl Orchestrator {
                 t
             }
         };
-        let slow_parsed = parse_code_response(&text);
+        let mut slow_parsed = parse_code_response(&text);
         // bugs.md#M3: surface the non-JSON case instead of letting it
         // masquerade as a valid-but-empty analysis. The strategy
         // field is also on TaskSummary for callers that want to
         // react in-band.
+        //
+        // Rescue path: when the slow agent returned pure prose, any
+        // bug claims in that prose would otherwise be lost (findings
+        // stays empty, the merger has nothing to promote — see
+        // slow-code-agent.system.md:37 "a bug that exists only in
+        // prose will be LOST"). Ask the fast agent to translate the
+        // prose into the expected envelope. If the translation also
+        // fails to produce parseable JSON, keep the original
+        // RawText result so the prose at least survives as analysis.
         if slow_parsed.strategy == ParseStrategy::RawText {
             tracing::warn!(
                 target: "kres_agents",
                 fast_rounds,
-                "slow agent returned no parseable JSON; analysis contains raw text"
+                "slow agent returned no parseable JSON; attempting fast-agent translation"
             );
+            match self
+                .translate_slow_raw_text(&slow_parsed.analysis, &ctx.task_brief, shutdown)
+                .await
+            {
+                Some(translated) => {
+                    kres_core::async_eprintln!(
+                        "[slow] rescued via fast-agent translation: {} finding(s), {} followup(s)",
+                        translated.findings.len(),
+                        translated.followups.len(),
+                    );
+                    slow_parsed = translated;
+                }
+                None => {
+                    tracing::warn!(
+                        target: "kres_agents",
+                        "fast-agent translation failed; prose preserved as analysis with no structured findings"
+                    );
+                }
+            }
         }
         kres_core::async_eprintln!(
             "[slow] parsed: analysis {}k chars, {} finding(s), {} followup(s), strategy={:?}",
@@ -730,6 +758,104 @@ impl Orchestrator {
             code_edits,
             plan: slow_plan,
         })
+    }
+
+    /// Re-emit a prose-only slow-agent reply as the JSON envelope the
+    /// pipeline expects. Invoked from `run_once_with_ctx` when the
+    /// slow call produced `ParseStrategy::RawText`. The fast agent is
+    /// told to transcribe — not augment — so this should not invent
+    /// findings the prose doesn't already make.
+    ///
+    /// Returns the reparsed response, or `None` when the translation
+    /// itself couldn't be parsed (the caller then keeps the original
+    /// prose-as-analysis result so the content isn't lost entirely).
+    /// Deliberately skips `self.fast_system` — the fast-agent system
+    /// prompt pushes toward the fast-agent schema (ready_for_slow /
+    /// skill_reads), which is the wrong target here. Also skips the
+    /// prompt cache — this path fires on the rare non-JSON turn, so
+    /// the ~4KB translation prompt isn't worth a breakpoint.
+    async fn translate_slow_raw_text(
+        &self,
+        prose: &str,
+        task_brief: &str,
+        shutdown: &Shutdown,
+    ) -> Option<CodeResponse> {
+        let user_content = format!(
+            "The slow agent returned the analysis below as free-form prose \
+             instead of the required JSON envelope. Re-emit the SAME CONTENT \
+             as strict JSON with this shape:\n\
+             {{\"analysis\": \"<prose narrative>\", \"findings\": [<Finding>, ...], \
+             \"followups\": [{{\"type\": \"T\", \"name\": \"N\", \"reason\": \"R\"}}]}}\n\n\
+             Rules:\n\
+             - Do NOT invent new bugs or analysis. Transcribe the prose.\n\
+             - Every actionable bug described in the prose MUST appear as a \
+               Finding record with this schema: id (snake_case slug), title, \
+               severity (low|medium|high|critical), status ('active'), \
+               relevant_symbols (array of {{name, filename, line, definition}}), \
+               relevant_file_sections (array of {{filename, line_start, \
+               line_end, content}}), summary, reproducer_sketch, impact. \
+               Optional: mechanism_detail, fix_sketch, open_questions, \
+               related_finding_ids.\n\
+             - If the prose made a bug claim without enough detail for a \
+               concrete Finding (no file:line, no reproducer), omit it \
+               rather than fabricate fields.\n\
+             - Output JSON only, no fences, no preamble.\n\n\
+             ---\n\
+             Task brief: {task_brief}\n\n\
+             Prose analysis to translate:\n\n{prose}"
+        );
+        let messages = vec![Message {
+            role: "user".into(),
+            content: user_content.clone(),
+            cache: false,
+            cached_prefix: None,
+        }];
+        let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
+            .with_max_tokens(self.fast_max_tokens)
+            .with_stream_label("fast translate raw slow");
+        if let Some(n) = self.fast_max_input_tokens {
+            cfg = cfg.with_max_input_tokens(n);
+        }
+        if let Some(lg) = &self.logger {
+            lg.log_code("user", &user_content, None, None);
+        }
+        let text = tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            r = self.fast_client.messages_streaming(&cfg, &messages) => {
+                match r {
+                    Ok(resp) => {
+                        record_usage(&self.usage, "fast", &self.fast_model, &resp.usage);
+                        let t = extract_text(&resp);
+                        if let Some(lg) = &self.logger {
+                            let thinking = extract_thinking(&resp);
+                            lg.log_code(
+                                "assistant",
+                                &t,
+                                Some(log_usage(&resp.usage)),
+                                thinking.as_deref(),
+                            );
+                        }
+                        t
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "kres_agents",
+                            "raw-text translation call failed: {e}"
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+        let reparsed = parse_code_response(&text);
+        if reparsed.strategy == ParseStrategy::RawText {
+            tracing::warn!(
+                target: "kres_agents",
+                "raw-text translation also returned non-JSON"
+            );
+            return None;
+        }
+        Some(reparsed)
     }
 }
 

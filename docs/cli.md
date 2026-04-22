@@ -11,7 +11,7 @@ kres [--fast-agent ...] [--slow TAG | --slow-agent ...] [--main-agent ...]
      [--prompt PROMPT] [--template PATH] [--turns N]
      [--follow] [--resume]
      [--gather-turns N] [--stop-grace-ms MS] [--stdio]
-     [--allow ACTION]... [--summary] [--markdown]
+     [--allow ACTION]... [--summary | --summary-markdown]
 ```
 
 Pass `kres --help` for the full list with argument-by-argument
@@ -23,8 +23,8 @@ Related docs:
   `--turns 0`, `--follow`, stagnation cap.
 - [action-allowlist.md](action-allowlist.md) — `--allow ACTION`
   and the dispatcher's non-MCP allowlist.
-- [summary.md](summary.md) — `--summary`, `--template`,
-  `--markdown`.
+- [summary.md](summary.md) — `--summary`,
+  `--summary-markdown`, `--template`.
 - [configuration.md](configuration.md) — model-id overrides
   (`--fast-model`, `--slow-model`, `--main-model`,
   `--todo-model`).
@@ -44,8 +44,8 @@ Related docs:
 | `/plan`                        | Show the current plan + per-step status |
 | `/resume [PATH]`               | Load a persisted `session.json` |
 | `/followup`                    | List items deferred by goal-met or `--turns` cap |
-| `/summary [FILE]`              | Render `report.md` + `findings.json` to a plain-text bug report |
-| `/summary-markdown [FILE]`     | Same as `/summary`, markdown output |
+| `/summary [FILE]`              | Render `report.md` + `findings.json` to a plain-text summary (default `summary.txt`) |
+| `/summary-markdown [FILE]`     | Same as `/summary`, markdown output (default `summary.md`) |
 | `/review <target>`             | Compose the review template + target, submit |
 | `/extract …`                   | Copy artifacts out (`--dir`, `--report`, `--todo`, `--findings`) |
 | `/done N`                      | Remove the N'th pending todo |

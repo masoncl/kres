@@ -64,7 +64,7 @@ parallel-lens review.
    `--prompt 'review: X'` invokes the embedded review template —
    a five-lens parallel audit over the target. `--results DIR`
    keeps the run's artifacts under `DIR/` (findings.json,
-   report.md, bug-report.txt). `--turns 2` stops after two
+   report.md, summary.txt). `--turns 2` stops after two
    completed tasks; see
    [docs/turns-and-follow.md](docs/turns-and-follow.md) for the
    other stop modes.
@@ -84,7 +84,7 @@ configured via `setup.sh` flags — see
 - [docs/coding-tasks.md](docs/coding-tasks.md) — reproducer and
   fix generation (`code_output`, `code_edits`, `bash` verify).
 - [docs/summary.md](docs/summary.md) — `/summary`,
-  `kres --summary`, and the bug-report output format.
+  `kres --summary`, and the summary output format.
 - [docs/turns-and-follow.md](docs/turns-and-follow.md) — when
   kres decides a non-interactive run is done.
 - [docs/action-allowlist.md](docs/action-allowlist.md) — which

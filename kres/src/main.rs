@@ -168,34 +168,37 @@ struct ReplArgs {
     #[arg(long, default_value_t = false)]
     stdio: bool,
 
-    /// Render a bug report from a prior run's report.md +
+    /// Render a summary from a prior run's report.md +
     /// findings.json and exit without starting the REPL. Uses the
-    /// fast agent for the one-shot call and the bug-summary template as
-    /// the system prompt. Pairs with --report, --findings, and
+    /// fast agent with the embedded `summary` template as the
+    /// system prompt. Single-shot when the inputs fit
+    /// `max_input_tokens`; on overflow, splits findings into chunks,
+    /// renders one partial summary per chunk, then runs a combine
+    /// pass to merge them. Pairs with --report, --findings, and
     /// --results (or their defaults) to locate the inputs. The
-    /// output filename is always bug-report.txt, placed in the
-    /// results directory when --results was supplied, otherwise in
-    /// the current working directory.
+    /// output filename is `summary.txt`, placed in the results
+    /// directory when --results was supplied, otherwise in the
+    /// current working directory.
     #[arg(long, default_value_t = false)]
     summary: bool,
 
-    /// Override the bug-summary template path for --summary. Accepted
-    /// by `/summary` too. When omitted, kres reads
-    /// ~/.kres/commands/summary.md (the operator-override path —
-    /// empty by default) and falls back to the compiled-in copy
-    /// bundled in the binary (see
-    /// `kres-agents/src/user_commands.rs`). `--markdown` selects
-    /// `summary-markdown.md` at each hop instead.
+    /// Markdown variant of --summary. Selects the
+    /// `summary-markdown` template and writes `summary.md` instead
+    /// of `summary.txt`. Mutually useful with --template FILE, in
+    /// which case the explicit template wins over the variant
+    /// picker but the filename still defaults to `summary.md`.
+    #[arg(long, default_value_t = false)]
+    summary_markdown: bool,
+
+    /// Override the summary template path for --summary /
+    /// --summary-markdown. Accepted by `/summary` too. When
+    /// omitted, kres reads `~/.kres/commands/summary.md` (or
+    /// `summary-markdown.md` for the markdown variant — the
+    /// operator-override path, empty by default) and falls back to
+    /// the compiled-in copy bundled in the binary (see
+    /// `kres-agents/src/user_commands.rs`).
     #[arg(long, value_name = "FILE")]
     template: Option<PathBuf>,
-
-    /// Render the bug report as markdown instead of plain text.
-    /// Selects the `bug-summary-markdown.md` template variant and
-    /// writes `bug-report.md` (instead of `bug-report.txt`). Pairs
-    /// with `--summary`. Ignored when `--template FILE` is passed —
-    /// an explicit template wins over the variant picker.
-    #[arg(long, default_value_t = false)]
-    markdown: bool,
 
     /// Allow one additional non-MCP action type for this session.
     /// Repeatable (`--allow bash --allow git`) or comma-separated
@@ -344,9 +347,7 @@ fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
         // (disk-first + embedded fallback + name-validation). The
         // validation inside compose covers the same character set
         // we'd enforce here, so there's no need to pre-filter.
-        if let Some((src, composed)) =
-            kres_agents::user_commands::compose(head, rest)
-        {
+        if let Some((src, composed)) = kres_agents::user_commands::compose(head, rest) {
             return Ok((src, composed));
         }
         // Legacy: ~/.kres/prompts/<word>-template.md. Kept for
@@ -359,9 +360,7 @@ fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if is_word {
             if let Some(dir) = kres_dir() {
-                let tmpl = dir
-                    .join("prompts")
-                    .join(format!("{}-template.md", head));
+                let tmpl = dir.join("prompts").join(format!("{}-template.md", head));
                 if tmpl.exists() {
                     let body = std::fs::read_to_string(&tmpl)
                         .with_context(|| format!("reading template {}", tmpl.display()))?;
@@ -473,8 +472,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // When --slow is passed as a known tag (sonnet/opus) we also map
     // it to a model id, so `--slow sonnet` actually switches the
     // slow model. Explicit --slow-model still beats the tag mapping.
-    let mut settings =
-        kres_repl::Settings::load_merged(&args.workspace);
+    let mut settings = kres_repl::Settings::load_merged(&args.workspace);
     // Only map the --slow tag to a model id when the operator
     // actually passed --slow. Without this gate the clap default
     // "sonnet" would unconditionally overwrite settings.models.slow
@@ -496,9 +494,15 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // Individual `--findings FILE`, `--report FILE`, `--todo FILE`
     // override their own slot. When --results is absent, the default
     // is ~/.kres/sessions/<session-id>/ (session-id is a timestamp).
+    // Treat --summary and --summary-markdown as the same "standalone
+    // summary" entry; the markdown flag just picks the variant
+    // template and filename further down.
+    let summary_mode = args.summary || args.summary_markdown;
+    let markdown = args.summary_markdown;
+
     // In --summary mode we avoid creating a fresh session directory
     // because the operator points at an existing run's artifacts.
-    let results_dir = match (args.results.clone(), args.summary) {
+    let results_dir = match (args.results.clone(), summary_mode) {
         (Some(d), _) => d,
         (None, true) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         (None, false) => {
@@ -521,13 +525,13 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| results_dir.join("todo.md"));
 
-    // --- --summary: standalone bug-report rendering ---------------
+    // --- --summary / --summary-markdown: standalone rendering ----
     // Inputs come from --report / --findings / --results (or their
-    // defaults above). Output is always bug-report.txt, living in
-    // the results dir when --results was set and the cwd otherwise.
-    // Exits right after the file is written; no REPL, no MCP, no
-    // orchestrator, no turn logger.
-    if args.summary {
+    // defaults above). Output is `summary.txt` (or `summary.md` with
+    // --summary-markdown), living in the results dir when --results
+    // was set and the cwd otherwise. Exits right after the file is
+    // written; no REPL, no MCP, no orchestrator, no turn logger.
+    if summary_mode {
         let fast_cfg_path = match fast_agent.as_ref() {
             Some(p) => p.clone(),
             None => {
@@ -557,17 +561,11 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             kres_repl::summary::load_fast_for_summary(&fast_cfg_path, &settings)?;
         // `results_dir` is already cwd when --results was absent (see
         // the match at the top of run_repl), so the output lands
-        // alongside the inputs either way. `--markdown` flips the
-        // default filename to bug-report.md.
-        let default_filename = if args.markdown {
-            Some("bug-report.md")
-        } else {
-            None
-        };
-        let output_path = kres_repl::summary::default_output_path(
-            Some(results_dir.as_path()),
-            default_filename,
-        );
+        // alongside the inputs either way. `--summary-markdown` flips
+        // the default filename to summary.md.
+        let default_filename = if markdown { Some("summary.md") } else { None };
+        let output_path =
+            kres_repl::summary::default_output_path(Some(results_dir.as_path()), default_filename);
         // Original prompt lookup: prompt.md in the results dir wins,
         // since we only ever write it there (and only when the user
         // passed --results). Nothing to read from memory in the
@@ -597,7 +595,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             findings_path: findings_opt,
             output_path,
             template_path: args.template.clone(),
-            markdown: args.markdown,
+            markdown,
             original_prompt,
             client: fast_client,
             model: fast_model,
@@ -1209,14 +1207,7 @@ mod tests {
         // into ["bash", "git"]. Repeatable-plus-delimited is what
         // clap's conventional pattern expects, and this pins it so
         // a future refactor can't silently drop the delimiter.
-        let c = Cli::try_parse_from([
-            "kres",
-            "--allow",
-            "bash,git",
-            "--allow",
-            "edit",
-        ])
-        .unwrap();
+        let c = Cli::try_parse_from(["kres", "--allow", "bash,git", "--allow", "edit"]).unwrap();
         assert_eq!(c.repl.allow, vec!["bash", "git", "edit"]);
     }
 
@@ -1230,8 +1221,8 @@ mod tests {
     fn resolve_prompt_arg_word_colon_form_hits_user_commands() {
         // --prompt "review: target" resolves via user_commands to the
         // embedded review template with the target prepended.
-        let (src, body) = resolve_prompt_arg("review: fs/btrfs/ctree.c")
-            .expect("review: form should resolve");
+        let (src, body) =
+            resolve_prompt_arg("review: fs/btrfs/ctree.c").expect("review: form should resolve");
         assert!(src.contains("review"), "source label: {src}");
         assert!(
             body.starts_with("fs/btrfs/ctree.c\n\n"),
@@ -1244,10 +1235,8 @@ mod tests {
     fn resolve_prompt_arg_slash_form_equivalent_to_colon_form() {
         // The whole point of the CLI slash-form: --prompt "/review X"
         // must produce the same composed prompt as --prompt "review: X".
-        let (_, colon_body) =
-            resolve_prompt_arg("review: fs/btrfs/ctree.c").unwrap();
-        let (_, slash_body) =
-            resolve_prompt_arg("/review fs/btrfs/ctree.c").unwrap();
+        let (_, colon_body) = resolve_prompt_arg("review: fs/btrfs/ctree.c").unwrap();
+        let (_, slash_body) = resolve_prompt_arg("/review fs/btrfs/ctree.c").unwrap();
         assert_eq!(
             colon_body, slash_body,
             "slash form and colon form must compose identically"
@@ -1259,8 +1248,7 @@ mod tests {
         // A slash prefix with no matching command and no legacy
         // template on disk must pass through as verbatim prompt
         // text — NOT error, NOT be silently dropped.
-        let (src, body) =
-            resolve_prompt_arg("/no-such-cmd hello world").unwrap();
+        let (src, body) = resolve_prompt_arg("/no-such-cmd hello world").unwrap();
         assert_eq!(src, "<inline>");
         assert_eq!(body, "/no-such-cmd hello world");
     }
@@ -1271,9 +1259,7 @@ mod tests {
         // doesn't start with a command word must stay inline — this
         // is the "question like 'when did btrfs: land?' shouldn't
         // look up a btrfs template" case.
-        let (src, body) =
-            resolve_prompt_arg("why does func() return: unusual values?")
-                .unwrap();
+        let (src, body) = resolve_prompt_arg("why does func() return: unusual values?").unwrap();
         assert_eq!(src, "<inline>");
         assert!(body.contains("unusual values"));
     }

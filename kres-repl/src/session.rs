@@ -33,6 +33,7 @@ pub struct ReplConfig {
     ///   * `true`: also accept 3 consecutive analysis-producing runs
     ///     with no new findings as a stop condition — a cost cap
     ///     for when the goal agent stays stubbornly "not met".
+    ///
     /// No effect when `turns_limit > 0`: the run-count cap still
     /// wins there.
     pub follow_followups: bool,
@@ -225,12 +226,12 @@ pub struct Session {
     /// Set to true by the reaper when the --turns cap is reached.
     /// The main REPL loop checks this after root_shutdown breaks the
     /// select; when true, /summary is invoked before teardown so the
-    /// operator gets a bug-report.txt on a clean --turns N run.
+    /// operator gets a summary.txt on a clean --turns N run.
     turns_exhausted: Arc<std::sync::atomic::AtomicBool>,
     /// True once any task has run in Coding mode during this session.
-    /// Suppresses the teardown bug-report summary — coding-mode
-    /// sessions don't have findings to summarise and the summary
-    /// template would produce gibberish.
+    /// Suppresses the teardown summary — coding-mode sessions don't
+    /// have findings to summarise and the summary template would
+    /// produce gibberish.
     any_coding_task: Arc<std::sync::atomic::AtomicBool>,
     /// Set by `/stop`; cleared by `submit_prompt` and `/continue`.
     /// While set, the idle-loop auto-continue does not fire. Without
@@ -422,7 +423,7 @@ impl Session {
                         deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                         interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                         last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
-            persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -544,7 +545,8 @@ impl Session {
     /// resume (no persist path or file absent), and `Err` on parse
     /// / I/O failure.
     pub async fn resume_state(&self) -> Result<Option<kres_core::SessionState>> {
-        self.resume_state_from(self.cfg.persist_path.as_deref()).await
+        self.resume_state_from(self.cfg.persist_path.as_deref())
+            .await
     }
 
     /// `resume_state` with an explicit source path override. `None`
@@ -665,9 +667,7 @@ impl Session {
                     // would re-install the scroll region behind the
                     // child's back, and paint() would scribble
                     // across the child's frame.
-                    if status_paused_for_paint
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
+                    if status_paused_for_paint.load(std::sync::atomic::Ordering::Acquire) {
                         continue;
                     }
                     ticks_since_size_check += 1;
@@ -837,27 +837,16 @@ impl Session {
                     // folded into effective_analysis so failures are
                     // visible to the next slow-agent turn, the goal
                     // agent, and /summary (not just stderr).
-                    if matches!(r.mode, kres_core::TaskMode::Coding)
-                        && !r.code_output.is_empty()
-                    {
-                        persist_code_output(
-                            &code_output_root_for_reaper,
-                            &r.name,
-                            &r.code_output,
-                        )
-                        .await;
+                    if matches!(r.mode, kres_core::TaskMode::Coding) && !r.code_output.is_empty() {
+                        persist_code_output(&code_output_root_for_reaper, &r.name, &r.code_output)
+                            .await;
                     }
                     let applied_edits: Vec<AppliedEdit> = if matches!(
                         r.mode,
                         kres_core::TaskMode::Coding
                     ) && !r.code_edits.is_empty()
                     {
-                        apply_code_edits(
-                            &code_output_root_for_reaper,
-                            &r.name,
-                            &r.code_edits,
-                        )
-                        .await
+                        apply_code_edits(&code_output_root_for_reaper, &r.name, &r.code_edits).await
                     } else {
                         Vec::new()
                     };
@@ -871,8 +860,7 @@ impl Session {
                     // sitting on disk (session 597b4bf7). Append a
                     // short trailer listing what landed so the goal
                     // agent has concrete evidence to judge on.
-                    let effective_analysis = if r.code_output.is_empty()
-                        && applied_edits.is_empty()
+                    let effective_analysis = if r.code_output.is_empty() && applied_edits.is_empty()
                     {
                         r.analysis.clone()
                     } else {
@@ -883,18 +871,11 @@ impl Session {
                         if !r.code_output.is_empty() {
                             s.push_str("\n---\nFiles written to workspace:\n");
                             for f in &r.code_output {
-                                let purpose = if f.purpose.is_empty() {
-                                    ""
-                                } else {
-                                    &f.purpose
-                                };
+                                let purpose = if f.purpose.is_empty() { "" } else { &f.purpose };
                                 if purpose.is_empty() {
                                     s.push_str(&format!("- {}\n", f.path));
                                 } else {
-                                    s.push_str(&format!(
-                                        "- {} — {}\n",
-                                        f.path, purpose
-                                    ));
+                                    s.push_str(&format!("- {} — {}\n", f.path, purpose));
                                 }
                                 // Include the head of the file so the
                                 // goal agent can see the actual script
@@ -902,14 +883,11 @@ impl Session {
                                 // 2000 chars so a very long artifact
                                 // doesn't blow out the goal-check
                                 // token budget.
-                                let head: String =
-                                    f.content.chars().take(2000).collect();
+                                let head: String = f.content.chars().take(2000).collect();
                                 s.push_str("```\n");
                                 s.push_str(&head);
                                 if f.content.chars().count() > 2000 {
-                                    s.push_str(
-                                        "\n… (truncated, full content at ",
-                                    );
+                                    s.push_str("\n… (truncated, full content at ");
                                     s.push_str(&f.path);
                                     s.push_str(")\n");
                                 }
@@ -944,11 +922,9 @@ impl Session {
                         // `_append_report` for an always-up-to-date
                         // on-disk narrative.
                         if let Some(ref rp) = report_path_for_reaper {
-                            if let Err(e) = crate::report::append_task_section(
-                                rp,
-                                &r.name,
-                                &effective_analysis,
-                            ) {
+                            if let Err(e) =
+                                crate::report::append_task_section(rp, &r.name, &effective_analysis)
+                            {
                                 tracing::warn!(
                                     target: "kres_repl",
                                     "report append to {}: {e}",
@@ -972,8 +948,8 @@ impl Session {
                     // would rack up API calls AND inject new todos
                     // into the queue the operator just drained with
                     // /stop, reproducing the "still going" feeling.
-                    let stop_latched_now = stop_latched_for_reaper
-                        .load(std::sync::atomic::Ordering::Acquire);
+                    let stop_latched_now =
+                        stop_latched_for_reaper.load(std::sync::atomic::Ordering::Acquire);
                     if stop_latched_now {
                         continue;
                     }
@@ -981,8 +957,7 @@ impl Session {
                     // and Generic tasks — both feed the findings
                     // pipeline. Coding tasks skip it: their output is
                     // source files, not findings.
-                    let had_delta = r.mode.produces_findings()
-                        && !r.findings_delta.is_empty();
+                    let had_delta = r.mode.produces_findings() && !r.findings_delta.is_empty();
                     if had_delta {
                         // §16: when a consolidator client is available
                         // we reuse it as the findings merger too.
@@ -1089,8 +1064,7 @@ impl Session {
                         if grew {
                             no_new_findings_streak = 0;
                         } else {
-                            no_new_findings_streak =
-                                no_new_findings_streak.saturating_add(1);
+                            no_new_findings_streak = no_new_findings_streak.saturating_add(1);
                         }
                     }
                     if had_delta {
@@ -1302,8 +1276,7 @@ impl Session {
                                     "[goal-not-met → todo update] injecting {} missing item(s) as question followups",
                                     missing_fus.len()
                                 );
-                                let plan_for_todo =
-                                    mgr_for_reaper.plan_snapshot().await;
+                                let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
                                 match kres_agents::update_todo_via_agent_with_logger(
                                     tc,
                                     &completed_query,
@@ -1324,18 +1297,14 @@ impl Session {
                                             updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Done).count(),
                                         );
                                         if let Some(rewrite) = updated.plan {
-                                            let prior =
-                                                mgr_for_reaper.plan_snapshot().await;
-                                            let new_plan =
-                                                rewrite.apply_to(prior.as_ref());
+                                            let prior = mgr_for_reaper.plan_snapshot().await;
+                                            let new_plan = rewrite.apply_to(prior.as_ref());
                                             log_plan_change(
                                                 "todo agent: plan rewrite (goal-not-met)",
                                                 prior.as_ref(),
                                                 &new_plan,
                                             );
-                                            mgr_for_reaper
-                                                .set_plan(Some(new_plan))
-                                                .await;
+                                            mgr_for_reaper.set_plan(Some(new_plan)).await;
                                         }
                                         mgr_for_reaper.replace_todo(updated.todo).await;
                                     }
@@ -1436,16 +1405,14 @@ impl Session {
                         .filter(|t| {
                             matches!(
                                 t.status,
-                                kres_core::TodoStatus::Pending
-                                    | kres_core::TodoStatus::Blocked
+                                kres_core::TodoStatus::Pending | kres_core::TodoStatus::Blocked
                             )
                         })
                         .count();
                     let followups_drained = active == 0 && pending_or_blocked == 0;
                     let no_progress = no_new_findings_streak >= NO_NEW_FINDINGS_STOP;
                     let goal_configured = goal_client_for_reaper.is_some();
-                    let no_goal_batch_stop =
-                        !goal_configured && !follow_followups && active == 0;
+                    let no_goal_batch_stop = !goal_configured && !follow_followups && active == 0;
                     let should_stop = if follow_followups {
                         followups_drained || no_progress
                     } else if goal_configured {
@@ -1531,8 +1498,7 @@ impl Session {
         // already set; that's fine — subsequent Sessions in the
         // same process (rare; tests) will see the first one's
         // store, which is acceptable for the unit-test surface.
-        let _ =
-            kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
+        let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
         print_banner();
         if !self.lenses.is_empty() {
             println!(
@@ -1617,9 +1583,7 @@ impl Session {
                 Command::Resume { path } => self.cmd_resume(path).await,
                 Command::Followup => self.cmd_followup().await,
                 Command::Summary { filename } => self.cmd_summary(filename, false).await,
-                Command::SummaryMarkdown { filename } => {
-                    self.cmd_summary(filename, true).await
-                }
+                Command::SummaryMarkdown { filename } => self.cmd_summary(filename, true).await,
                 Command::Review { target } => self.cmd_review(target).await,
                 Command::Extract {
                     dir,
@@ -1698,7 +1662,7 @@ impl Session {
         // --turns exit path: reaper flips turns_exhausted when the
         // slow-agent run count hits cfg.turns_limit, then cancels
         // root_shutdown to break the REPL loop above. On a clean
-        // --turns run, render a bug-report via /summary before
+        // --turns run, render a summary via /summary before
         // teardown so the operator gets the artifact without having
         // to run `kres --summary` afterwards.
         //
@@ -1715,10 +1679,10 @@ impl Session {
         {
             if coding_session {
                 kres_core::async_eprintln!(
-                    "--turns: skipping bug-report summary (coding session — see <workspace>/ for emitted files)"
+                    "--turns: skipping summary (coding session — see <workspace>/ for emitted files)"
                 );
             } else {
-                kres_core::async_eprintln!("--turns: rendering bug-report.txt before exit");
+                kres_core::async_eprintln!("--turns: rendering summary.txt before exit");
                 self.cmd_summary(None, false).await;
             }
         }
@@ -1797,11 +1761,8 @@ impl Session {
         // in its followups.
         if include_recent_context {
             if let Some(store) = kres_core::consent::get() {
-                let added = kres_core::consent::grant_paths_from_text(
-                    &store,
-                    &self.cfg.workspace,
-                    &text,
-                );
+                let added =
+                    kres_core::consent::grant_paths_from_text(&store, &self.cfg.workspace, &text);
                 if !added.is_empty() {
                     let label: Vec<String> =
                         added.iter().map(|g| g.dir.display().to_string()).collect();
@@ -1889,7 +1850,7 @@ impl Session {
             };
         // Latch the session-wide "coding session" flag as soon as any
         // task is submitted in coding mode. The teardown path reads
-        // this to suppress the bug-report summary — a coding session
+        // this to suppress the teardown /summary — a coding session
         // has no findings to summarise, and running the bug-summary
         // template over coding notes produces nonsense.
         if matches!(task_mode, kres_agents::TaskMode::Coding) {
@@ -1992,8 +1953,7 @@ impl Session {
                 //             multi-angle spread would be overkill for
                 //             this prompt.
                 let res = match task_mode {
-                    kres_agents::TaskMode::Coding
-                    | kres_agents::TaskMode::Generic => {
+                    kres_agents::TaskMode::Coding | kres_agents::TaskMode::Generic => {
                         orc_task
                             .run_once_with_ctx(&text, &ctx, &handle.shutdown)
                             .await
@@ -2033,11 +1993,7 @@ impl Session {
                                 // cannot silently clobber
                                 // identifying fields.
                                 let new_plan = rewrite.apply_to(prior.as_ref());
-                                log_plan_change(
-                                    "slow: plan rewrite",
-                                    prior.as_ref(),
-                                    &new_plan,
-                                );
+                                log_plan_change("slow: plan rewrite", prior.as_ref(), &new_plan);
                                 mgr.set_plan(Some(new_plan)).await;
                             }
                         }
@@ -2531,16 +2487,18 @@ impl Session {
             // links either way.
             let mut linked: Vec<&kres_core::TodoItem> = Vec::new();
             for tid in &s.todo_ids {
-                if let Some(t) = todo.iter().find(|i| {
-                    (!i.id.is_empty() && i.id == *tid) || i.name == *tid
-                }) {
+                if let Some(t) = todo
+                    .iter()
+                    .find(|i| (!i.id.is_empty() && i.id == *tid) || i.name == *tid)
+                {
                     if !linked.iter().any(|lt| std::ptr::eq(*lt, t)) {
                         linked.push(t);
                     }
                 }
             }
             for t in &todo {
-                if !t.step_id.is_empty() && t.step_id == s.id
+                if !t.step_id.is_empty()
+                    && t.step_id == s.id
                     && !linked.iter().any(|lt| std::ptr::eq(*lt, t))
                 {
                     linked.push(t);
@@ -2591,16 +2549,12 @@ impl Session {
         }
     }
 
-    /// `/summary` — synthesise every `(task, analysis)` entry in the
-    /// accumulated ledger into a single markdown narrative.
-    ///
-    /// The calls the main agent to generate a smart
-    /// synthesis; kres currently produces a deterministic concatenation
-    /// (TODO: add an LLM synthesiser once the summariser agent config
-    /// is defined). Matches the shape of `/summary`; pass
-    /// `markdown=true` (via the `/summary-markdown` slash command) to
-    /// select the markdown-variant template and default the output
-    /// filename to `bug-report.md` instead of `bug-report.txt`.
+    /// `/summary` — render the run's report.md + findings.json into
+    /// a plain-text summary via the fast agent using the `summary`
+    /// slash-command template. Pass `markdown=true` (via
+    /// `/summary-markdown`) to select the markdown-variant template
+    /// and default the output filename to `summary.md` instead of
+    /// `summary.txt`.
     async fn cmd_summary(&self, filename: Option<String>, markdown: bool) {
         let Some(orc) = self.orchestrator.as_ref() else {
             async_println(
@@ -2621,7 +2575,7 @@ impl Session {
         }
         // Output goes to the explicit --results dir when the operator
         // set one (so prompt.md, findings.json, report.md, and
-        // bug-report.txt all live together). Without --results, fall
+        // summary.txt all live together). Without --results, fall
         // back to the report.md's parent — that's still inside the
         // defaulted ~/.kres/sessions/<ts>/ tree, just not flagged as
         // operator-chosen.
@@ -2630,13 +2584,12 @@ impl Session {
             .results_dir
             .clone()
             .or_else(|| report_path.parent().map(std::path::Path::to_path_buf));
-        // /summary-markdown defaults the filename to bug-report.md
-        // instead of bug-report.txt so the operator's explicit
-        // filename wins (--summary --markdown behaves the same at
-        // the CLI).
+        // /summary-markdown defaults the filename to summary.md
+        // instead of summary.txt; --summary-markdown at the CLI
+        // behaves the same way.
         let default_name: Option<&str> = match filename.as_deref() {
             Some(_) => None,
-            None if markdown => Some("bug-report.md"),
+            None if markdown => Some("summary.md"),
             None => None,
         };
         let effective_name = filename.as_deref().or(default_name);
@@ -2678,9 +2631,13 @@ impl Session {
             max_tokens: orc.fast_max_tokens,
             max_input_tokens: orc.fast_max_input_tokens,
         };
-        let label = if markdown { "/summary-markdown" } else { "/summary" };
+        let label = if markdown {
+            "/summary-markdown"
+        } else {
+            "/summary"
+        };
         async_println(format!(
-            "{label}: rendering bug report to {}",
+            "{label}: rendering summary to {}",
             output_path.display()
         ));
         if let Err(e) = crate::summary::run_summary(inputs).await {
@@ -2697,14 +2654,10 @@ impl Session {
     async fn cmd_review(&self, target: String) {
         let target = target.trim();
         if target.is_empty() {
-            async_println(
-                "/review: expected a target, e.g. /review fs/btrfs/ctree.c",
-            );
+            async_println("/review: expected a target, e.g. /review fs/btrfs/ctree.c");
             return;
         }
-        let Some((src, body)) =
-            kres_agents::user_commands::compose("review", target)
-        else {
+        let Some((src, body)) = kres_agents::user_commands::compose("review", target) else {
             async_println(
                 "/review: `review` template missing from the embedded table — this is a build bug",
             );
@@ -2833,10 +2786,7 @@ impl Session {
         // /stop parks the latch. The operator has to re-consent
         // (via /continue or a new prompt) before auto-continue
         // resumes.
-        if self
-            .stop_latched
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.stop_latched.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
         let running = self.mgr.active_count().await;
@@ -2950,9 +2900,7 @@ impl Session {
         // grants from the prior topic in place and a follow-up
         // prompt on a different topic could quietly read paths the
         // operator forgot they'd allowed.
-        let dropped_grants = kres_core::consent::get()
-            .map(|s| s.clear())
-            .unwrap_or(0);
+        let dropped_grants = kres_core::consent::get().map(|s| s.clear()).unwrap_or(0);
         println!(
             "/clear: stopped {} task(s), reset findings + todo + accumulated context, dropped {} consent grant(s)",
             out.stopped + out.grace_expired,
@@ -2968,7 +2916,10 @@ impl Session {
     async fn cmd_compact(&self) {
         let entries = self.accumulated.lock().await.clone();
         if entries.len() <= 1 {
-            println!("/compact: nothing to compact (ledger has {} entry)", entries.len());
+            println!(
+                "/compact: nothing to compact (ledger has {} entry)",
+                entries.len()
+            );
             return;
         }
         let Some(orc) = self.orchestrator.as_ref() else {
@@ -3112,7 +3063,7 @@ fn build_recent_context_preamble(entries: &[AccumulatedEntry], cap: usize) -> St
         // Budget each entry: at most half the remaining cap, so an
         // early giant entry can't starve the rest. Cap at 2k chars
         // per entry regardless.
-        let entry_budget = (remaining / 2).max(400).min(2_000);
+        let entry_budget = (remaining / 2).clamp(400, 2_000);
         let head: String = e.analysis.chars().take(entry_budget).collect();
         out.push_str(&format!("### {}\n{}", e.task, head));
         if e.analysis.chars().count() > entry_budget {
@@ -3149,10 +3100,7 @@ fn build_recent_context_preamble(entries: &[AccumulatedEntry], cap: usize) -> St
 /// operator deliberately drops a file under the new path.
 fn load_prompt_disk_then_embedded(basename: &str) -> Option<String> {
     if let Some(home) = dirs::home_dir() {
-        let p = home
-            .join(".kres")
-            .join("system-prompts")
-            .join(basename);
+        let p = home.join(".kres").join("system-prompts").join(basename);
         if let Ok(s) = std::fs::read_to_string(&p) {
             if !s.trim().is_empty() {
                 return Some(s);
@@ -3348,10 +3296,7 @@ async fn apply_code_edits(
             Err(err) => {
                 failed += 1;
                 let text = err.to_string();
-                kres_core::async_eprintln!(
-                    "[coding-edit] {}: {text}",
-                    e.file_path
-                );
+                kres_core::async_eprintln!("[coding-edit] {}: {text}", e.file_path);
                 results.push(AppliedEdit {
                     file_path: e.file_path.clone(),
                     result: Err(text),
@@ -3396,7 +3341,7 @@ pub(crate) fn format_applied_edits_trailer(edits: &[AppliedEdit]) -> String {
                 // msg starts with "[edit <abs>] N replacement(s) (..."
                 // — drop the `[edit <abs>] ` prefix to keep the trailer
                 // tight; the path is already on the line.
-                let tail = msg.splitn(2, "] ").nth(1).unwrap_or(msg);
+                let tail = msg.split_once("] ").map(|x| x.1).unwrap_or(msg);
                 s.push_str(": ");
                 // Only keep the first line of the preview block — the
                 // full 5-line context lives in the stderr log.
@@ -3416,17 +3361,10 @@ pub(crate) fn format_applied_edits_trailer(edits: &[AppliedEdit]) -> String {
     s
 }
 
-async fn persist_code_output(
-    workspace: &Path,
-    task_name: &str,
-    files: &[kres_core::CodeFile],
-) {
+async fn persist_code_output(workspace: &Path, task_name: &str, files: &[kres_core::CodeFile]) {
     let base = workspace.to_path_buf();
     if let Err(e) = tokio::fs::create_dir_all(&base).await {
-        kres_core::async_eprintln!(
-            "[coding] create {} failed: {e}",
-            base.display()
-        );
+        kres_core::async_eprintln!("[coding] create {} failed: {e}", base.display());
         return;
     }
     let mut wrote = 0usize;
@@ -3446,10 +3384,7 @@ async fn persist_code_output(
         let out = base.join(rel);
         if let Some(parent) = out.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                kres_core::async_eprintln!(
-                    "[coding] mkdir {} failed: {e}",
-                    parent.display()
-                );
+                kres_core::async_eprintln!("[coding] mkdir {} failed: {e}", parent.display());
                 continue;
             }
         }
@@ -3457,15 +3392,10 @@ async fn persist_code_output(
         // the new content, never a truncated partial.
         let tmp = out.with_extension(format!(
             "{}.tmp",
-            out.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
+            out.extension().and_then(|e| e.to_str()).unwrap_or("")
         ));
         if let Err(e) = tokio::fs::write(&tmp, f.content.as_bytes()).await {
-            kres_core::async_eprintln!(
-                "[coding] write {} failed: {e}",
-                tmp.display()
-            );
+            kres_core::async_eprintln!("[coding] write {} failed: {e}", tmp.display());
             continue;
         }
         if let Err(e) = tokio::fs::rename(&tmp, &out).await {
@@ -3529,10 +3459,7 @@ fn report_reaped(r: &kres_core::ReapedTask) {
     }
 }
 
-fn read_stdin(
-    tx: mpsc::UnboundedSender<String>,
-    mut ack_rx: mpsc::UnboundedReceiver<()>,
-) {
+fn read_stdin(tx: mpsc::UnboundedSender<String>, mut ack_rx: mpsc::UnboundedReceiver<()>) {
     // rustyline: line-editing + ^R history search + arrow-key recall.
     // History persists to $HOME/.kres/history. Falls back to plain
     // stdin on any rustyline init failure so a weird terminal doesn't
@@ -3694,9 +3621,11 @@ fn print_help() {
     println!("  /load <path>           submit a file's contents as the next prompt");
     println!("  /edit                  open $EDITOR on a scratch file, submit on save");
     println!("  /followup              list items deferred by goal/--turns");
-    println!("  /review <target>       compose the embedded `review` template with <target> and submit");
-    println!("  /summary [FILE]        render report.md+findings.json into a plain-text bug report (default bug-report.txt)");
-    println!("  /summary-markdown [FILE]  render the markdown variant (default bug-report.md)");
+    println!(
+        "  /review <target>       compose the embedded `review` template with <target> and submit"
+    );
+    println!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
+    println!("  /summary-markdown [FILE]  render the markdown variant (default summary.md)");
     println!("  /extract ...           copy artifacts (--dir, --report, --todo, --findings)");
     println!("  /done N                remove the N'th pending todo");
     println!("  /todo --clear          drop every todo item");
@@ -3706,9 +3635,7 @@ fn print_help() {
     println!("  /quit, /exit           leave the REPL");
     println!("  <anything else>        submit as a prompt");
     println!();
-    println!(
-        "override slash-command templates by dropping a file at ~/.kres/commands/<name>.md"
-    );
+    println!("override slash-command templates by dropping a file at ~/.kres/commands/<name>.md");
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -3796,8 +3723,11 @@ pub(crate) fn log_plan_status_transitions(
     let (Some(prior), Some(after)) = (prior, after) else {
         return;
     };
-    let prior_by_id: std::collections::BTreeMap<&str, kres_core::PlanStepStatus> =
-        prior.steps.iter().map(|s| (s.id.as_str(), s.status)).collect();
+    let prior_by_id: std::collections::BTreeMap<&str, kres_core::PlanStepStatus> = prior
+        .steps
+        .iter()
+        .map(|s| (s.id.as_str(), s.status))
+        .collect();
     for s in &after.steps {
         if let Some(prior_status) = prior_by_id.get(s.id.as_str()) {
             if *prior_status != s.status {

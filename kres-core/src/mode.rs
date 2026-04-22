@@ -44,6 +44,21 @@ pub struct CodeFile {
     pub purpose: String,
 }
 
+/// One string-replacement edit emitted by a coding-mode slow-agent
+/// turn. Shape mirrors Claude Code's Edit primitive; `file_path` is
+/// resolved via the workspace / consent path the same way `read`
+/// and `edit` actions are. Reaper applies each entry via
+/// `kres_agents::tools::edit_file`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CodeEdit {
+    #[serde(alias = "path")]
+    pub file_path: String,
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
 impl Default for TaskMode {
     fn default() -> Self {
         Self::Analysis

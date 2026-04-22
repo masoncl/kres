@@ -214,6 +214,9 @@ pub struct TaskSummary {
     /// Source files emitted by a Coding-mode task. Empty for
     /// Analysis-mode tasks.
     pub code_output: Vec<kres_core::CodeFile>,
+    /// String-replacement edits emitted by a Coding-mode task.
+    /// The reaper applies each entry via tools::edit_file.
+    pub code_edits: Vec<kres_core::CodeEdit>,
 }
 
 impl Orchestrator {
@@ -614,12 +617,17 @@ impl Orchestrator {
         // coding task is not supposed to participate in the findings
         // pipeline (the reaper will skip merge/consolidator on this
         // mode). Analysis and Generic tasks keep the historical
-        // shape (findings go through the merger).
-        let (findings_out, code_output) = match ctx.mode {
+        // shape (findings go through the merger) and do not emit
+        // in-place edits — edits only flow from coding mode.
+        let (findings_out, code_output, code_edits) = match ctx.mode {
             kres_core::TaskMode::Analysis | kres_core::TaskMode::Generic => {
-                (slow_parsed.findings, Vec::new())
+                (slow_parsed.findings, Vec::new(), Vec::new())
             }
-            kres_core::TaskMode::Coding => (Vec::new(), slow_parsed.code_output),
+            kres_core::TaskMode::Coding => (
+                Vec::new(),
+                slow_parsed.code_output,
+                slow_parsed.code_edits,
+            ),
         };
         Ok(TaskSummary {
             analysis: slow_parsed.analysis,
@@ -629,6 +637,7 @@ impl Orchestrator {
             strategy: slow_parsed.strategy,
             mode: ctx.mode,
             code_output,
+            code_edits,
         })
     }
 }
@@ -797,6 +806,7 @@ impl Orchestrator {
             strategy: ParseStrategy::WholeBody,
             mode: kres_core::TaskMode::Analysis,
             code_output: Vec::new(),
+            code_edits: Vec::new(),
         })
     }
 

@@ -31,7 +31,7 @@ pub use cost::{UsageEntry, UsageKey, UsageTracker};
 pub use findings::{Finding, FindingsFile, FindingsStore, Severity};
 pub use lens::LensSpec;
 pub use log::{LoggedUsage, TurnLogger};
-pub use mode::{CodeFile, TaskMode};
+pub use mode::{CodeEdit, CodeFile, TaskMode};
 pub use shrink::{
     estimate_tokens, finding_char_size, fit_payload, shrink_findings_to_budget,
     shrink_last_user_message, total_char_size,

@@ -40,7 +40,7 @@ pub use pipeline::{
     TaskSummary,
 };
 pub use prompt_file::{parse as parse_prompt_file, PromptFile};
-pub use response::{parse_code_response, CodeResponse};
+pub use response::{parse_code_response, CodeEdit, CodeResponse};
 pub use skills::{InvocationPolicy, Skill, Skills};
 pub use symbol::{
     append_context, append_symbol, ctx_identity, parse_semcode_symbol, previously_fetched_manifest,

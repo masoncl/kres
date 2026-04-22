@@ -758,6 +758,16 @@ impl Session {
                         )
                         .await;
                     }
+                    if matches!(r.mode, kres_core::TaskMode::Coding)
+                        && !r.code_edits.is_empty()
+                    {
+                        apply_code_edits(
+                            &code_output_root_for_reaper,
+                            &r.name,
+                            &r.code_edits,
+                        )
+                        .await;
+                    }
                     let pre_size = mgr_for_reaper.findings_snapshot().await.len();
                     // /stop is latched: skip every inference-heavy
                     // reaper post-step (findings merger, goal check,
@@ -1724,6 +1734,7 @@ impl Session {
                                 .collect(),
                             mode: summary.mode,
                             code_output: summary.code_output,
+                            code_edits: summary.code_edits,
                         })
                     }
                     Err(e) => Err(e.to_string()),
@@ -2799,6 +2810,44 @@ pub async fn build_orchestrator(
 /// segments (`..`) so a malformed model reply can't drop files
 /// outside the workspace root. Each file is written with a
 /// tmp + rename so a crash doesn't leave a partial artifact.
+/// Apply each CodeEdit emitted by a coding-mode task to its target
+/// file on disk via kres_agents::tools::edit_file. Logs one line
+/// per edit with replacement count + before/after sizes; errors
+/// are logged but don't abort the batch — other edits still run.
+async fn apply_code_edits(
+    workspace: &Path,
+    task_name: &str,
+    edits: &[kres_core::CodeEdit],
+) {
+    let mut applied = 0usize;
+    let mut failed = 0usize;
+    for e in edits {
+        let args = kres_agents::tools::EditArgs {
+            file_path: e.file_path.clone(),
+            old_string: e.old_string.clone(),
+            new_string: e.new_string.clone(),
+            replace_all: e.replace_all,
+        };
+        match kres_agents::tools::edit_file(workspace, &args).await {
+            Ok(msg) => {
+                applied += 1;
+                kres_core::async_eprintln!("[coding-edit] {msg}");
+            }
+            Err(err) => {
+                failed += 1;
+                kres_core::async_eprintln!(
+                    "[coding-edit] {}: {err}",
+                    e.file_path
+                );
+            }
+        }
+    }
+    kres_core::async_eprintln!(
+        "[coding-edit] {task_name}: applied {applied}/{} edit(s) ({failed} failed)",
+        edits.len()
+    );
+}
+
 async fn persist_code_output(
     workspace: &Path,
     task_name: &str,

@@ -81,6 +81,9 @@ struct TaskEntry {
     /// Code files the task produced. Only ever populated for
     /// Coding-mode tasks.
     code_output: Vec<crate::CodeFile>,
+    /// String-replacement edits the task emitted. Only ever
+    /// populated for Coding-mode tasks.
+    code_edits: Vec<crate::CodeEdit>,
     handle: Option<JoinHandle<()>>,
     /// Gets notified when the task transitions into a terminal state.
     done_notify: Arc<Notify>,
@@ -289,6 +292,7 @@ impl TaskManager {
                 analysis: String::new(),
                 mode: crate::TaskMode::default(),
                 code_output: Vec::new(),
+                code_edits: Vec::new(),
                 handle: Some(handle),
                 done_notify,
             });
@@ -314,12 +318,15 @@ impl TaskManager {
             entry.followups = outcome.followups;
             entry.mode = outcome.mode;
             entry.code_output = outcome.code_output;
+            entry.code_edits = outcome.code_edits;
             // Per bugs.md#H4: only count tasks that actually produced
             // analysis and did not error. Coding-mode tasks count
             // against --turns N the same way analysis tasks do: they
             // consumed a slow-agent call, which is what the cap is
             // meant to bound.
-            let produced = !entry.analysis.is_empty() || !entry.code_output.is_empty();
+            let produced = !entry.analysis.is_empty()
+                || !entry.code_output.is_empty()
+                || !entry.code_edits.is_empty();
             if produced {
                 g.completed_run_count = g.completed_run_count.saturating_add(1);
             }
@@ -438,6 +445,7 @@ impl TaskManager {
                     followups: entry.followups,
                     mode: entry.mode,
                     code_output: entry.code_output,
+                    code_edits: entry.code_edits,
                 });
             } else {
                 keep.push(entry);
@@ -576,6 +584,8 @@ pub struct ReapedTask {
     pub mode: crate::TaskMode,
     /// Code files emitted by a Coding-mode task.
     pub code_output: Vec<crate::CodeFile>,
+    /// String-replacement edits emitted by a Coding-mode task.
+    pub code_edits: Vec<crate::CodeEdit>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -595,6 +605,9 @@ pub struct TaskOutcome {
     /// Analysis-mode tasks. The reaper writes each entry under
     /// `<results>/code/<path>`.
     pub code_output: Vec<crate::CodeFile>,
+    /// Surgical edits produced by a Coding-mode task. The reaper
+    /// applies each entry via kres_agents::tools::edit_file.
+    pub code_edits: Vec<crate::CodeEdit>,
 }
 
 /// Handed to a task's work closure. Provides cancellation and access

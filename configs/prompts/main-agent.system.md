@@ -7,7 +7,15 @@ Map each followup type to a tool:
 - "callees" → MCP find_calls
 - "search" → use the grep tool type, NOT semcode grep_functions. Use {"type": "grep", "pattern": "REGEX", "path": "DIR"}
 - "file" → find
-- "read" → read
+- "read" → read a file or a line range from one. Use
+  {"type": "read", "file": "path/to/file.c", "line": 100,
+   "end_line": 200} to read lines 100-200 inclusive; use "count"
+  instead of "end_line" to read N lines starting at `line`; omit
+  the range entirely to read the whole file. Aliases: `path` for
+  `file`, `startLine` for `line`, `endLine` for `end_line`.
+  Prefer this over `bash sed -n '...p'` — read is workspace-scoped,
+  emits a clean slice without shell quoting, and doesn't race
+  against your 60s bash timeout.
 - "git" → git. Readonly subcommands (log/show/diff/blame/status/...)
   plus `add` and `commit` for coding tasks that need to commit what
   they wrote. `--amend`, `--no-verify`, `--no-gpg-sign` are

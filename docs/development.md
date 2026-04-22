@@ -26,7 +26,6 @@ kres/
 ├── CLAUDE.md                      project instructions for Claude Code
 ├── setup.sh                       bootstrap ~/.kres/ from configs/
 ├── .githooks/pre-commit           runs cargo fmt + clippy on every commit
-├── NEWS.md
 └── README.md
 ```
 

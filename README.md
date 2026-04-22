@@ -5,13 +5,9 @@ reviewing, auditing, and finding bugs in C source trees. The
 Linux kernel is the primary target; any large C codebase with
 source-level tooling works too.
 
-## Why kres exists
+## kres introduction
 
-A single LLM call over a C source file produces a prose summary
-that reads well but misses bugs — it has no structured way to
-dedup what it already covered, no budget left after loading the
-code for deep thinking, and no memory across questions. kres
-splits the job across cooperating roles:
+kres splits the job of reviewing code across a number of cooperating agents:
 
 - **fast** scopes the work, picks the code to look at, and emits
   a structured brief for deeper analysis.
@@ -28,12 +24,8 @@ splits the job across cooperating roles:
   deduplicated bug list; old findings get `invalidated` when a
   later one supersedes them.
 
-The REPL ties these together: one `--prompt 'review: X'` seeds a
-lens fan-out that audits `X` under five parallel angles (object
-lifetime, memory, bounds, races, general correctness), and
-follow-up tasks chase the threads the slow agent flags — all
-with persistent plan, todo list, and findings that survive
-interruptions.
+The results of every turn are used to reprioritize the todo list, and identify
+additional context needed for the next round.
 
 See [docs/agents.md](docs/agents.md) for the task flow and
 [docs/review-template.md](docs/review-template.md) for the
@@ -77,9 +69,14 @@ parallel-lens review.
    [docs/turns-and-follow.md](docs/turns-and-follow.md) for the
    other stop modes.
 
+Two optional integrations are worth wiring up while you're
+here: semcode-mcp for whole-program code navigation and the
+kernel `review-prompts` repo for subsystem knowledge. Both are
+configured via `setup.sh` flags — see
+[docs/configuration.md](docs/configuration.md) for details.
+
 ## Further reading
 
-- [NEWS.md](NEWS.md) — recent changes.
 - [docs/agents.md](docs/agents.md) — fast / main / slow / todo /
   merger flow and how follow-up tasks drive larger reviews.
 - [docs/review-template.md](docs/review-template.md) — the
@@ -94,12 +91,10 @@ parallel-lens review.
   non-MCP tools the main agent can dispatch and how to change
   that.
 - [docs/configuration.md](docs/configuration.md) — `~/.kres/`
-  layout, model selection, and system-prompt overrides.
+  layout, model selection, system-prompt overrides, semcode MCP
+  integration, and kernel review-prompts setup.
 - [docs/commands.md](docs/commands.md) — slash-command templates
   (`/review`, `/summary`, operator-authored additions).
-- [docs/review-prompts.md](docs/review-prompts.md) — integrating
-  the separate `review-prompts` repo with the kernel skill.
-- [docs/semcode.md](docs/semcode.md) — semcode-mcp integration.
 - [docs/cli.md](docs/cli.md) — every CLI flag and REPL command.
 - [docs/development.md](docs/development.md) — workspace layout,
   build / test / lint, pre-commit hook.

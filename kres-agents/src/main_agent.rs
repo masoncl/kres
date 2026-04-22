@@ -42,7 +42,7 @@ use crate::{
     },
     tools::{
         bash_run, edit_file, find, git, grep, read_file_range, truncate_output, BashArgs, EditArgs,
-        FindArgs, GitArgs, GrepArgs, ReadArgs, TOOL_OUTPUT_CAP_MCP,
+        FindArgs, GitArgs, GrepArgs, ReadArgs, TOOL_OUTPUT_CAP_GREP_FIND, TOOL_OUTPUT_CAP_MCP,
     },
 };
 
@@ -520,7 +520,21 @@ async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (Strin
                         "line": start,
                         "definition": def.clone(),
                     });
-                    let short = format!(
+                    // Include the actual content in the turn-log
+                    // text. The symbol pool (Some(sym) below) carries
+                    // `def` to the slow agent, but the main agent
+                    // itself reads `text` to decide its next action
+                    // — and without the bytes inline it can't. Before
+                    // this, a `read lines 270-370` came back as
+                    // "Read file:270-370 (2584 chars), symbol 'x'"
+                    // with no content, so the model resorted to
+                    // `bash sed -n '270,370p' ...` which DOES put the
+                    // bytes in [stdout] (session 04365bed, turn 3 of
+                    // 2026-04-21). Truncate at the same envelope
+                    // grep/find use so a runaway whole-file read
+                    // can't blow the turn budget.
+                    let body = truncate_output(&def, TOOL_OUTPUT_CAP_GREP_FIND);
+                    let header = format!(
                         "Read {}:{}-{} ({} chars), symbol '{}'",
                         sym.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
                         start,
@@ -528,7 +542,8 @@ async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (Strin
                         def.len(),
                         sym.get("name").and_then(|v| v.as_str()).unwrap_or(""),
                     );
-                    (short, Some(sym))
+                    let text = format!("{header}\n{body}");
+                    (text, Some(sym))
                 }
                 Err(e) => (format!("[error] {e}"), None),
             }
@@ -805,6 +820,33 @@ mod tests {
             !out.contains("other.md"),
             "filter not applied, got other.md: {out}"
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn read_text_result_contains_file_body() {
+        // Regression: session 04365bed (2026-04-21 turn 3/5) called
+        // `read lines 270-370` twice, each time received only a
+        // `Read file:N-M (X chars), symbol '...'` header with NO
+        // content in the turn-log text — the bytes were going into
+        // the symbol pool only. Model gave up and used `bash sed`.
+        // The turn-log text must carry the content inline.
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-read-text-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let body = (1..=10)
+            .map(|n| format!("line {n}\n"))
+            .collect::<String>();
+        std::fs::write(tmp.join("f.txt"), body).unwrap();
+        let action =
+            json!({"type":"read","file":"f.txt","line":3,"end_line":5});
+        let (text, _sym) = dispatch_non_mcp(&tmp, &action).await;
+        assert!(text.contains("line 3\n"), "no body in text: {text:?}");
+        assert!(text.contains("line 5\n"), "no body in text: {text:?}");
+        // Header still present for at-a-glance scanning.
+        assert!(text.contains("Read f.txt:"), "no header: {text:?}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 

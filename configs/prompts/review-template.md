@@ -7,6 +7,14 @@ Focus on just the target itself and the supporting code it calls,
 without expanding out into the rest of the kernel. Pay special
 attention to chains of events that trigger obscure bugs.
 
+Find *every* bug you can in the target area. Do not stop after the
+first finding. Each lens below must exhaustively enumerate its
+issues — list every distinct defect, not just the worst one. A
+lens that reports only one finding is acceptable only if you are
+confident no other bugs of that class exist in scope; otherwise
+keep going. Duplicate-suppression and severity ranking happen
+downstream in the merger, so err on the side of reporting more.
+
 - [ ] **[investigate]** object lifetime: #lifetime
   - where are pointers to objects stored
   - what flags control object behavior

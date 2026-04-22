@@ -12,18 +12,18 @@ override or add commands by dropping a file at
 | `summary`          | `kres --summary --results DIR`                                                           | `/summary [filename]`          |
 | `summary-markdown` | `kres --summary --markdown --results DIR`                                                | `/summary-markdown [filename]` |
 
-Both CLI and REPL forms compose the template body with the
-trailing target via `user_commands::compose` and submit the
-result as a new task.
+The three shipped templates play two different roles:
 
-The shipped three:
-
-- `review` — parallel-lens review template (see
-  [review-template.md](review-template.md)); invocation prepends
-  the operator's target to the template body.
-- `summary` — plain-text bug-report system prompt passed to the
-  fast agent by `/summary` and `kres --summary`.
-- `summary-markdown` — markdown variant selected by `--markdown`.
+- `review` — a task prompt. CLI and REPL invocations prepend
+  the operator's target to the template body via
+  `user_commands::compose` and submit the result as a new task
+  (see [review-template.md](review-template.md)).
+- `summary` — a system prompt. `/summary` and `kres --summary`
+  feed the template body to the fast agent alongside the run's
+  `report.md` + `findings.json` to render `bug-report.txt`
+  (`kres-repl/src/summary.rs`). No target composition.
+- `summary-markdown` — identical path; selected by `--markdown`
+  and writes `bug-report.md`.
 
 Adding your own: drop `~/.kres/commands/audit.md` and run
 `kres --prompt 'audit: net/...'` or `/audit net/...`. No rebuild

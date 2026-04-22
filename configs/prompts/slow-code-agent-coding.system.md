@@ -62,6 +62,16 @@ Output: JSON only, no fences, no preamble.
 
 CodeEdit shape (same as Claude Code's Edit): `{file_path, old_string, new_string, replace_all?}`. Leave `replace_all` off (defaults to false) and `old_string` must match exactly once. `old_string` and `new_string` are VERBATIM byte sequences; include enough surrounding context to make `old_string` unique in the file.
 
+Multi-edit ordering contract: entries in `code_edits` apply IN ORDER,
+each against the file's state AFTER prior entries in the same batch
+have landed. If two edits touch the same file, the second one's
+`old_string` must match the result of the first, not the original.
+Edits that fail (anchor not found, ambiguous, workspace escape) are
+not retried — the failure message is appended to the task analysis
+trailer under `[FAILED]` so you can re-emit a corrected edit on the
+next turn. Prefer one edit per file per turn unless you are certain
+the anchors don't collide.
+
 CODE_OUTPUT — primary artifact:
 - 'code_output' is an array of {path, content, purpose} records. EACH file you produce is one entry. Use forward-slash relative paths; they land under `<results>/code/<path>` on disk.
 - 'path' is a relative path with a sensible extension (e.g. `reproduce.c`, `Makefile`, `reproducer/trigger.py`, `tests/verify.sh`). Pick filenames that a reader cloning the results directory can run.

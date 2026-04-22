@@ -659,6 +659,37 @@ impl Session {
                     if matches!(r.state, TaskState::Done | TaskState::Errored) {
                         *interrupted_for_reaper.lock().await = None;
                     }
+                    // Coding-mode side effects: persist code_output
+                    // files and apply code_edits BEFORE we build the
+                    // analysis trailer — we want per-edit results
+                    // folded into effective_analysis so failures are
+                    // visible to the next slow-agent turn, the goal
+                    // agent, and /summary (not just stderr).
+                    if matches!(r.mode, kres_core::TaskMode::Coding)
+                        && !r.code_output.is_empty()
+                    {
+                        persist_code_output(
+                            &code_output_root_for_reaper,
+                            &r.name,
+                            &r.code_output,
+                        )
+                        .await;
+                    }
+                    let applied_edits: Vec<AppliedEdit> = if matches!(
+                        r.mode,
+                        kres_core::TaskMode::Coding
+                    ) && !r.code_edits.is_empty()
+                    {
+                        apply_code_edits(
+                            &code_output_root_for_reaper,
+                            &r.name,
+                            &r.code_edits,
+                        )
+                        .await
+                    } else {
+                        Vec::new()
+                    };
+
                     // For Coding-mode tasks the slow agent is told to
                     // keep prose short and put the artifact in
                     // `code_output`. But check_goal only reads the
@@ -668,44 +699,55 @@ impl Session {
                     // sitting on disk (session 597b4bf7). Append a
                     // short trailer listing what landed so the goal
                     // agent has concrete evidence to judge on.
-                    let effective_analysis = if r.code_output.is_empty() {
+                    let effective_analysis = if r.code_output.is_empty()
+                        && applied_edits.is_empty()
+                    {
                         r.analysis.clone()
                     } else {
                         let mut s = r.analysis.clone();
                         if !s.is_empty() && !s.ends_with('\n') {
                             s.push('\n');
                         }
-                        s.push_str("\n---\nFiles written to workspace:\n");
-                        for f in &r.code_output {
-                            let purpose = if f.purpose.is_empty() {
-                                ""
-                            } else {
-                                &f.purpose
-                            };
-                            if purpose.is_empty() {
-                                s.push_str(&format!("- {}\n", f.path));
-                            } else {
-                                s.push_str(&format!("- {} — {}\n", f.path, purpose));
+                        if !r.code_output.is_empty() {
+                            s.push_str("\n---\nFiles written to workspace:\n");
+                            for f in &r.code_output {
+                                let purpose = if f.purpose.is_empty() {
+                                    ""
+                                } else {
+                                    &f.purpose
+                                };
+                                if purpose.is_empty() {
+                                    s.push_str(&format!("- {}\n", f.path));
+                                } else {
+                                    s.push_str(&format!(
+                                        "- {} — {}\n",
+                                        f.path, purpose
+                                    ));
+                                }
+                                // Include the head of the file so the
+                                // goal agent can see the actual script
+                                // body, not just the filename. Cap at
+                                // 2000 chars so a very long artifact
+                                // doesn't blow out the goal-check
+                                // token budget.
+                                let head: String =
+                                    f.content.chars().take(2000).collect();
+                                s.push_str("```\n");
+                                s.push_str(&head);
+                                if f.content.chars().count() > 2000 {
+                                    s.push_str(
+                                        "\n… (truncated, full content at ",
+                                    );
+                                    s.push_str(&f.path);
+                                    s.push_str(")\n");
+                                }
+                                if !head.ends_with('\n') {
+                                    s.push('\n');
+                                }
+                                s.push_str("```\n");
                             }
-                            // Include the head of the file so the
-                            // goal agent can see the actual script
-                            // body, not just the filename. Cap at
-                            // 2000 chars so a very long artifact
-                            // doesn't blow out the goal-check token
-                            // budget.
-                            let head: String = f.content.chars().take(2000).collect();
-                            s.push_str("```\n");
-                            s.push_str(&head);
-                            if f.content.chars().count() > 2000 {
-                                s.push_str("\n… (truncated, full content at ");
-                                s.push_str(&f.path);
-                                s.push_str(")\n");
-                            }
-                            if !head.ends_with('\n') {
-                                s.push('\n');
-                            }
-                            s.push_str("```\n");
                         }
+                        s.push_str(&format_applied_edits_trailer(&applied_edits));
                         s
                     };
                     if !effective_analysis.is_empty() {
@@ -743,31 +785,11 @@ impl Session {
                             }
                         }
                     }
-                    // Coding tasks skip the merger / consolidator / findings
-                    // pipeline entirely. Persist any emitted source files
-                    // under <results>/code/ and move on — the goal agent
-                    // still runs against r.analysis (treated as notes by
-                    // the goal system prompt).
-                    if matches!(r.mode, kres_core::TaskMode::Coding)
-                        && !r.code_output.is_empty()
-                    {
-                        persist_code_output(
-                            &code_output_root_for_reaper,
-                            &r.name,
-                            &r.code_output,
-                        )
-                        .await;
-                    }
-                    if matches!(r.mode, kres_core::TaskMode::Coding)
-                        && !r.code_edits.is_empty()
-                    {
-                        apply_code_edits(
-                            &code_output_root_for_reaper,
-                            &r.name,
-                            &r.code_edits,
-                        )
-                        .await;
-                    }
+                    // Coding tasks skip the merger / consolidator /
+                    // findings pipeline entirely — the goal agent
+                    // runs against effective_analysis (now including
+                    // the edit trailer) and the reaped files already
+                    // landed above.
                     let pre_size = mgr_for_reaper.findings_snapshot().await.len();
                     // /stop is latched: skip every inference-heavy
                     // reaper post-step (findings merger, goal check,
@@ -2810,15 +2832,33 @@ pub async fn build_orchestrator(
 /// segments (`..`) so a malformed model reply can't drop files
 /// outside the workspace root. Each file is written with a
 /// tmp + rename so a crash doesn't leave a partial artifact.
+/// One applied (or attempted) CodeEdit. The reaper folds these
+/// back into the task's analysis trailer so a failure ("old_string
+/// not found", "ambiguous match") is visible to the NEXT slow-agent
+/// turn instead of dying on stderr.
+pub(crate) struct AppliedEdit {
+    pub file_path: String,
+    /// `Ok(msg)` carries the per-edit success preview from
+    /// `edit_file` (replacement count + before/after sizes +
+    /// 5-line context snippet). `Err(msg)` carries the error text
+    /// the slow agent needs to see to correct its next emission.
+    pub result: Result<String, String>,
+}
+
 /// Apply each CodeEdit emitted by a coding-mode task to its target
-/// file on disk via kres_agents::tools::edit_file. Logs one line
-/// per edit with replacement count + before/after sizes; errors
-/// are logged but don't abort the batch — other edits still run.
+/// file on disk via kres_agents::tools::edit_file. Returns a vector
+/// of `AppliedEdit`s so the reaper can fold outcomes into the
+/// task's analysis trailer; also logs one line per edit to stderr
+/// for the operator. Edits apply in emission order — a later edit
+/// whose `old_string` was invalidated by an earlier one in the same
+/// batch will fail with a normal "not found" error; the caller
+/// (slow agent) sees that in the trailer and can re-emit.
 async fn apply_code_edits(
     workspace: &Path,
     task_name: &str,
     edits: &[kres_core::CodeEdit],
-) {
+) -> Vec<AppliedEdit> {
+    let mut results: Vec<AppliedEdit> = Vec::with_capacity(edits.len());
     let mut applied = 0usize;
     let mut failed = 0usize;
     for e in edits {
@@ -2832,13 +2872,22 @@ async fn apply_code_edits(
             Ok(msg) => {
                 applied += 1;
                 kres_core::async_eprintln!("[coding-edit] {msg}");
+                results.push(AppliedEdit {
+                    file_path: e.file_path.clone(),
+                    result: Ok(msg),
+                });
             }
             Err(err) => {
                 failed += 1;
+                let text = err.to_string();
                 kres_core::async_eprintln!(
-                    "[coding-edit] {}: {err}",
+                    "[coding-edit] {}: {text}",
                     e.file_path
                 );
+                results.push(AppliedEdit {
+                    file_path: e.file_path.clone(),
+                    result: Err(text),
+                });
             }
         }
     }
@@ -2846,6 +2895,57 @@ async fn apply_code_edits(
         "[coding-edit] {task_name}: applied {applied}/{} edit(s) ({failed} failed)",
         edits.len()
     );
+    results
+}
+
+/// Render the list of AppliedEdit into a trailer section for the
+/// task's analysis text. Failed edits are called out with
+/// "[FAILED]" so the next slow-agent turn can grep for them; the
+/// full error message is included verbatim so the model has the
+/// exact anchor text it needs to re-emit a corrected edit.
+pub(crate) fn format_applied_edits_trailer(edits: &[AppliedEdit]) -> String {
+    if edits.is_empty() {
+        return String::new();
+    }
+    let applied = edits.iter().filter(|e| e.result.is_ok()).count();
+    let failed = edits.len() - applied;
+    let mut s = String::new();
+    s.push_str("\n---\nEdits applied (");
+    s.push_str(&applied.to_string());
+    s.push('/');
+    s.push_str(&edits.len().to_string());
+    if failed > 0 {
+        s.push_str(", ");
+        s.push_str(&failed.to_string());
+        s.push_str(" FAILED");
+    }
+    s.push_str("):\n");
+    for e in edits {
+        match &e.result {
+            Ok(msg) => {
+                s.push_str("- ");
+                s.push_str(&e.file_path);
+                // msg starts with "[edit <abs>] N replacement(s) (..."
+                // — drop the `[edit <abs>] ` prefix to keep the trailer
+                // tight; the path is already on the line.
+                let tail = msg.splitn(2, "] ").nth(1).unwrap_or(msg);
+                s.push_str(": ");
+                // Only keep the first line of the preview block — the
+                // full 5-line context lives in the stderr log.
+                let first = tail.split('\n').next().unwrap_or(tail);
+                s.push_str(first);
+                s.push('\n');
+            }
+            Err(err) => {
+                s.push_str("- [FAILED] ");
+                s.push_str(&e.file_path);
+                s.push_str(": ");
+                s.push_str(err);
+                s.push('\n');
+            }
+        }
+    }
+    s
 }
 
 async fn persist_code_output(
@@ -3248,6 +3348,48 @@ mod tests {
     #[test]
     fn truncate_preserves_short() {
         assert_eq!(truncate("abc", 5), "abc");
+    }
+
+    #[test]
+    fn applied_edits_trailer_reports_failures() {
+        let edits = vec![
+            AppliedEdit {
+                file_path: "a.c".into(),
+                result: Ok(
+                    "[edit /tmp/a.c] 1 replacement(s) (before: 100c, after: 98c)\n  ctx1\n  ctx2\n".into(),
+                ),
+            },
+            AppliedEdit {
+                file_path: "b.c".into(),
+                result: Err(
+                    "edit: old_string not found in /tmp/b.c — re-read the file and supply bytes copied verbatim from the current contents".into(),
+                ),
+            },
+        ];
+        let t = format_applied_edits_trailer(&edits);
+        assert!(t.contains("Edits applied (1/2, 1 FAILED):"), "got {t}");
+        assert!(t.contains("- a.c: 1 replacement(s)"), "got {t}");
+        assert!(t.contains("[FAILED] b.c"), "got {t}");
+        assert!(t.contains("old_string not found"), "got {t}");
+        // Success entry should keep first preview line only, not the
+        // multi-line context block.
+        assert!(!t.contains("ctx2"), "preview context leaked: {t}");
+    }
+
+    #[test]
+    fn applied_edits_trailer_empty_on_no_edits() {
+        assert_eq!(format_applied_edits_trailer(&[]), "");
+    }
+
+    #[test]
+    fn applied_edits_trailer_all_success_no_failed_marker() {
+        let edits = vec![AppliedEdit {
+            file_path: "a.c".into(),
+            result: Ok("[edit /tmp/a.c] 2 replacement(s) (...)\n".into()),
+        }];
+        let t = format_applied_edits_trailer(&edits);
+        assert!(t.contains("Edits applied (1/1):"), "got {t}");
+        assert!(!t.contains("FAILED"), "got {t}");
     }
 
     #[test]

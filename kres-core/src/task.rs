@@ -544,6 +544,26 @@ impl TaskManager {
         n
     }
 
+    /// Remove and return all `Pending` and `Blocked` todos. Done and
+    /// Skipped items stay on the manager's list so the next
+    /// `sync_plan_from_todo` pass can still roll a plan step up to
+    /// Done when its remaining linked todos are all terminal — the
+    /// goal-met / --turns drains used to clear the todo list
+    /// wholesale via `replace_todo(Vec::new())`, which erased the
+    /// `step_id` linkage from completed work and pinned every plan
+    /// step at Pending for the rest of the session.
+    ///
+    /// Callers that want InProgress items drained too should flip
+    /// them first with `reset_in_progress_to_pending`.
+    pub async fn drain_pending_blocked(&self) -> Vec<TodoItem> {
+        let mut g = self.inner.write().await;
+        let (drain, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut g.todo)
+            .into_iter()
+            .partition(|i| matches!(i.status, TodoStatus::Pending | TodoStatus::Blocked));
+        g.todo = keep;
+        drain
+    }
+
     // -- plan ----------------------------------------------------------
 
     pub async fn plan_snapshot(&self) -> Option<crate::plan::Plan> {
@@ -767,6 +787,58 @@ mod tests {
         assert_eq!(snap[1].status, TodoStatus::Pending);
         assert_eq!(snap[2].status, TodoStatus::Done);
         assert_eq!(snap[3].status, TodoStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_blocked_keeps_terminal_items() {
+        // Goal-met / --turns drains used to wipe the todo list via
+        // replace_todo(Vec::new()), erasing Done items' step_id
+        // linkage so the plan could never roll up to Done. The new
+        // drain keeps Done/Skipped on the list.
+        let mgr = TaskManager::new();
+        let mut a = TodoItem::new("a", "investigate");
+        a.status = TodoStatus::Pending;
+        let mut b = TodoItem::new("b", "investigate");
+        b.status = TodoStatus::Blocked;
+        let mut c = TodoItem::new("c", "investigate");
+        c.status = TodoStatus::Done;
+        let mut d = TodoItem::new("d", "investigate");
+        d.status = TodoStatus::Skipped;
+        mgr.replace_todo(vec![a, b, c, d]).await;
+        let drained = mgr.drain_pending_blocked().await;
+        let drained_names: Vec<_> = drained.iter().map(|i| i.name.clone()).collect();
+        assert_eq!(drained_names, vec!["a".to_string(), "b".to_string()]);
+        let snap = mgr.todo_snapshot().await;
+        let kept: Vec<_> = snap.iter().map(|i| i.name.clone()).collect();
+        assert_eq!(kept, vec!["c".to_string(), "d".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drain_preserves_step_id_linkage_for_plan_rollup() {
+        // End-to-end guard for the bug that inspired the drain
+        // change: a step with two linked todos, one done / one
+        // pending. Pre-fix the pending todo drained AND the done
+        // todo was wiped, leaving the step pending forever. Post-
+        // fix the done todo stays, sync_plan_from_todo sees a
+        // fully-terminal linkage, and the step flips to Done.
+        use crate::plan::{Plan, PlanStep, PlanStepStatus};
+        let mgr = TaskManager::new();
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        plan.steps.push(PlanStep::new("s1", "audit"));
+        mgr.set_plan(Some(plan)).await;
+        let mut a = TodoItem::new("a", "investigate");
+        a.step_id = "s1".into();
+        a.status = TodoStatus::Done;
+        let mut b = TodoItem::new("b", "investigate");
+        b.step_id = "s1".into();
+        b.status = TodoStatus::Pending;
+        mgr.replace_todo(vec![a, b]).await;
+        let drained = mgr.drain_pending_blocked().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].name, "b");
+        mgr.sync_plan_from_todo().await;
+        let out = mgr.plan_snapshot().await.unwrap();
+        assert_eq!(out.steps[0].status, PlanStepStatus::Done);
     }
 
     #[tokio::test]

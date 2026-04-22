@@ -1248,19 +1248,16 @@ impl Session {
                             mgr_for_reaper.reset_in_progress_to_pending().await;
                             // Drain pending todos into the deferred
                             // ledger so /followup can list them.
-                            let remaining = mgr_for_reaper.todo_snapshot().await;
+                            // Done/Skipped items stay on the todo
+                            // list so their step_id linkage survives
+                            // — the next sync_plan_from_todo tick
+                            // can then flip any fully-covered plan
+                            // step to Done.
+                            let drained = mgr_for_reaper.drain_pending_blocked().await;
+                            let carry = drained.len();
                             let mut deferred = deferred_for_reaper.lock().await;
-                            let mut carry = 0usize;
-                            for item in remaining {
-                                if item.status == kres_core::TodoStatus::Pending
-                                    || item.status == kres_core::TodoStatus::Blocked
-                                {
-                                    deferred.push(item);
-                                    carry += 1;
-                                }
-                            }
+                            deferred.extend(drained);
                             drop(deferred);
-                            mgr_for_reaper.replace_todo(Vec::new()).await;
                             if carry > 0 {
                                 kres_core::async_eprintln!(
                                     "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
@@ -1371,21 +1368,15 @@ impl Session {
                         mgr_for_reaper.reset_in_progress_to_pending().await;
                         // §32: move every pending/blocked todo item
                         // to the deferred list so /followup can list
-                        // them, then clear the todo list. Matches
-                        let remaining = mgr_for_reaper.todo_snapshot().await;
+                        // them. Done/Skipped items stay on the todo
+                        // list so their step_id linkage is still
+                        // available for sync_plan_from_todo on the
+                        // next persist tick.
+                        let drained = mgr_for_reaper.drain_pending_blocked().await;
+                        let carry = drained.len();
                         let mut deferred = deferred_for_reaper.lock().await;
-                        let mut carry = 0usize;
-                        for item in remaining {
-                            if matches!(
-                                item.status,
-                                kres_core::TodoStatus::Pending | kres_core::TodoStatus::Blocked
-                            ) {
-                                deferred.push(item);
-                                carry += 1;
-                            }
-                        }
+                        deferred.extend(drained);
                         drop(deferred);
-                        mgr_for_reaper.replace_todo(Vec::new()).await;
                         if carry > 0 {
                             kres_core::async_eprintln!(
                                 "[{carry} pending item(s) deferred — see /followup]"
@@ -1493,28 +1484,17 @@ impl Session {
                         // disappear.
                         mgr_for_reaper.reset_in_progress_to_pending().await;
                         // Move any leftover pending/blocked items to
-                        // /followup's deferred list and clear the
-                        // active queue so auto-continue doesn't
-                        // immediately redispatch them. Unlike the
-                        // --turns N path we do NOT cancel the root
-                        // shutdown or flag turns_exhausted — the user
-                        // wants to keep driving the REPL after goal
-                        // met.
-                        let remaining = mgr_for_reaper.todo_snapshot().await;
+                        // /followup's deferred list. Done/Skipped
+                        // items stay so the plan step rollup can
+                        // still see them. Unlike the --turns N path
+                        // we do NOT cancel the root shutdown or flag
+                        // turns_exhausted — the user wants to keep
+                        // driving the REPL after goal met.
+                        let drained = mgr_for_reaper.drain_pending_blocked().await;
+                        let carry = drained.len();
                         let mut deferred = deferred_for_reaper.lock().await;
-                        let mut carry = 0usize;
-                        for item in remaining {
-                            if matches!(
-                                item.status,
-                                kres_core::TodoStatus::Pending
-                                    | kres_core::TodoStatus::Blocked
-                            ) {
-                                deferred.push(item);
-                                carry += 1;
-                            }
-                        }
+                        deferred.extend(drained);
                         drop(deferred);
-                        mgr_for_reaper.replace_todo(Vec::new()).await;
                         if carry > 0 {
                             kres_core::async_eprintln!(
                                 "[{carry} pending item(s) moved to /followup]"
@@ -2161,29 +2141,21 @@ impl Session {
         self.stop_latched
             .store(true, std::sync::atomic::Ordering::Release);
         // Move pending / blocked / in-progress todo items to the
-        // deferred list and clear the active queue. Otherwise
-        // /stop leaves the queue full and the next /continue (or
-        // the reaper's goal-not-met injection after the next task
-        // completes) immediately redispatches what the operator
-        // just stopped. Operator can get them back with /followup.
-        let remaining = self.mgr.todo_snapshot().await;
+        // deferred list. Done/Skipped items stay on the active
+        // queue so the plan step rollup in sync_plan_from_todo can
+        // still see their step_id linkage. Flip InProgress to
+        // Pending first so `drain_pending_blocked` carries them
+        // with the rest. Otherwise /stop leaves the queue full and
+        // the next /continue (or the reaper's goal-not-met
+        // injection after the next task completes) immediately
+        // redispatches what the operator just stopped. Operator
+        // can get them back with /followup.
+        self.mgr.reset_in_progress_to_pending().await;
+        let drained = self.mgr.drain_pending_blocked().await;
+        let carry = drained.len();
         let mut deferred = self.deferred.lock().await;
-        let mut carry = 0usize;
-        for item in remaining {
-            if matches!(
-                item.status,
-                kres_core::TodoStatus::Pending
-                    | kres_core::TodoStatus::Blocked
-                    | kres_core::TodoStatus::InProgress
-            ) {
-                deferred.push(item);
-                carry += 1;
-            }
-        }
+        deferred.extend(drained);
         drop(deferred);
-        if carry > 0 {
-            self.mgr.replace_todo(Vec::new()).await;
-        }
         println!(
             "/stop: requested={} stopped={} grace_expired={} (auto-continue paused; {} pending item(s) moved to /followup; /continue or a new prompt resumes)",
             out.requested, out.stopped, out.grace_expired, carry

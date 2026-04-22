@@ -399,6 +399,21 @@ impl Orchestrator {
                 continue;
             }
 
+            // If every followup is a type:question (clarification
+            // for the operator), the main agent can't fetch data
+            // for it — looping would just re-ask the same question.
+            // Break out to the slow agent, which can surface the
+            // question to the operator via its own followups.
+            if !parsed.followups.is_empty()
+                && parsed.followups.iter().all(|f| f.kind == "question")
+            {
+                kres_core::async_eprintln!(
+                    "[fast round {}] only type:question followups — breaking to slow",
+                    fast_rounds
+                );
+                break;
+            }
+
             // Summarise the followups so operators can see what the
             // fast agent asked the main agent to fetch on their
             // behalf.
@@ -665,7 +680,8 @@ impl Orchestrator {
         let prompt: &str = composed.as_str();
         // Gather once via fast+main (same loop as run_once, up to the
         // point where we'd call the slow agent).
-        let (symbols, context, fast_rounds) = self.gather(prompt, shutdown).await?;
+        let (symbols, context, fast_rounds, live_skills) =
+            self.gather(prompt, shutdown).await?;
 
         // Fan out N slow-agent calls in parallel.
         let mut futures = Vec::with_capacity(lenses.len());
@@ -700,8 +716,11 @@ impl Orchestrator {
                 .with_previous_findings(&trimmed_prev)
                 .with_parallel_lenses(&parallel_lenses);
             // §cache: include skills in the lens prompt — same
-            // rationale as the single slow call above.
-            if let Some(sk) = &self.skills {
+            // rationale as the single slow call above. Use the
+            // post-gather `live_skills` so any skill files the
+            // fast agent pulled in mid-gather reach the lens slow
+            // agents too.
+            if let Some(sk) = &live_skills {
                 lens_cp = lens_cp.with_skills(sk);
             }
             let (lens_prefix, lens_suffix) = lens_cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
@@ -817,12 +836,17 @@ impl Orchestrator {
         &self,
         prompt: &str,
         shutdown: &Shutdown,
-    ) -> Result<(Vec<Value>, Vec<Value>, u8), AgentError> {
+    ) -> Result<(Vec<Value>, Vec<Value>, u8, Option<Value>), AgentError> {
         let mut symbols: Vec<Value> = Vec::new();
         let mut context: Vec<Value> = Vec::new();
         let mut prev_n_syms: usize = 0;
         let mut prev_n_ctx: usize = 0;
         let mut fast_rounds: u8 = 0;
+        // §27 parity: honour mid-loop `skill_reads` in the lens
+        // gather path just like `run_once_with_ctx` does. Without
+        // this, a skill file the fast agent requests mid-gather
+        // never lands in the lens slow-agent payload.
+        let mut live_skills: Option<Value> = self.skills.clone();
         for round in 0..self.max_fast_rounds {
             if shutdown.is_cancelled() {
                 return Err(AgentError::Other(format!(
@@ -854,7 +878,7 @@ impl Orchestrator {
             if let Some(ref pf) = pf_manifest {
                 cp = cp.with_previously_fetched(pf);
             }
-            if let Some(sk) = &self.skills {
+            if let Some(sk) = &live_skills {
                 cp = cp.with_skills(sk);
             }
             let (gp_prefix, gp_suffix) = cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
@@ -901,6 +925,9 @@ impl Orchestrator {
                 }
             };
             let parsed = parse_code_response(&text);
+            if !parsed.skill_reads.is_empty() {
+                apply_skill_reads(&mut live_skills, &parsed.skill_reads);
+            }
             let only_skill_reads = parsed.followups.is_empty()
                 && !parsed.ready_for_slow
                 && !parsed.skill_reads.is_empty();
@@ -913,6 +940,20 @@ impl Orchestrator {
             if only_skill_reads {
                 continue;
             }
+            // If every followup is a type:question (a clarification
+            // asked of the operator), the fetcher can't produce data
+            // for any of them — spinning another main-agent round
+            // just burns tokens while the fast agent re-asks. Break
+            // and let the slow/lens path surface the questions.
+            if !parsed.followups.is_empty()
+                && parsed.followups.iter().all(|f| f.kind == "question")
+            {
+                kres_core::async_eprintln!(
+                    "[fast gather round {}] only type:question followups — breaking",
+                    fast_rounds
+                );
+                break;
+            }
             let fetched = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fetch".into())),
                 f = self.fetcher.fetch(&parsed.followups) => f?,
@@ -920,7 +961,7 @@ impl Orchestrator {
             symbols.extend(fetched.symbols);
             context.extend(fetched.context);
         }
-        Ok((symbols, context, fast_rounds))
+        Ok((symbols, context, fast_rounds, live_skills))
     }
 }
 
@@ -1114,5 +1155,67 @@ mod tests {
             r#"{"analysis": "ready", "followups": [], "ready_for_slow": true}"#,
         );
         assert!(r.ready_for_slow);
+    }
+
+    /// Mirrors the new early-exit rule in `run_once_with_ctx` and
+    /// `gather`: if every followup has kind=="question", the fetcher
+    /// can't produce data for any of them, so the orchestrator
+    /// breaks out instead of spinning another round.
+    #[test]
+    fn question_only_followups_trip_early_exit() {
+        let r = parse_code_response(
+            r#"{"analysis": "need a target",
+                "followups": [
+                    {"type": "question", "name": "which file?"},
+                    {"type": "question", "name": "which function?"}
+                ],
+                "ready_for_slow": false}"#,
+        );
+        assert!(!r.followups.is_empty());
+        assert!(r.followups.iter().all(|f| f.kind == "question"));
+    }
+
+    #[test]
+    fn mixed_followups_do_not_trip_early_exit() {
+        let r = parse_code_response(
+            r#"{"analysis": "need a target",
+                "followups": [
+                    {"type": "question", "name": "which file?"},
+                    {"type": "source", "name": "foo"}
+                ],
+                "ready_for_slow": false}"#,
+        );
+        assert!(!r.followups.iter().all(|f| f.kind == "question"));
+    }
+
+    /// `apply_skill_reads` must graft the requested file into the
+    /// first skill's `files` map so a subsequent gather round (and
+    /// the lens slow agents that read `live_skills`) see it.
+    #[test]
+    fn apply_skill_reads_inserts_file_into_first_skill() {
+        let dir = std::env::temp_dir().join(format!(
+            "kres-apply-skill-reads-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("skill.md");
+        std::fs::write(&p, "hello skill body").unwrap();
+        let mut skills = Some(json!({
+            "kernel": {"content": "guide", "files": {}}
+        }));
+        apply_skill_reads(&mut skills, &[p.to_string_lossy().to_string()]);
+        let files = skills
+            .as_ref()
+            .and_then(|v| v.get("kernel"))
+            .and_then(|k| k.get("files"))
+            .and_then(|f| f.as_object())
+            .expect("files map");
+        let body = files
+            .get(p.to_str().unwrap())
+            .and_then(|v| v.as_str())
+            .expect("file body");
+        assert_eq!(body, "hello skill body");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

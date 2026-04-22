@@ -443,6 +443,12 @@ async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (Strin
             }
         }
         "find" => {
+            // `name` is the canonical `-name` glob. Accept `pattern`
+            // and `glob` as aliases: the model naturally reaches for
+            // `pattern` because `grep` uses that key, and session
+            // 9fee284e (2026-04-21) burned a turn when a bare
+            // `{"type":"find","pattern":"report.md"}` ran find with no
+            // filter at all and dumped the whole workspace tree.
             let args = FindArgs {
                 path: action
                     .get("path")
@@ -450,6 +456,8 @@ async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (Strin
                     .map(String::from),
                 name: action
                     .get("name")
+                    .or_else(|| action.get("pattern"))
+                    .or_else(|| action.get("glob"))
                     .and_then(|v| v.as_str())
                     .map(String::from),
                 kind: action
@@ -482,7 +490,8 @@ async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (Strin
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32),
                 end_line: action
-                    .get("endLine")
+                    .get("end_line")
+                    .or_else(|| action.get("endLine"))
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32),
             };
@@ -772,6 +781,64 @@ mod tests {
         };
         let s = a.mcp_tool_descriptions().await;
         assert!(s.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_accepts_pattern_alias_for_name() {
+        // Regression: the dispatcher used to read only `name`, so a
+        // model-emitted {"type":"find","pattern":"report.md"} ran
+        // find(1) with no -name filter and dumped the workspace tree.
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-find-pattern-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("report.md"), b"").unwrap();
+        std::fs::write(tmp.join("other.md"), b"").unwrap();
+        let action = json!({"type":"find","pattern":"report.md"});
+        let (out, _) = dispatch_non_mcp(&tmp, &action).await;
+        assert!(
+            out.contains("report.md"),
+            "output missing report.md: {out}"
+        );
+        assert!(
+            !out.contains("other.md"),
+            "filter not applied, got other.md: {out}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn read_accepts_end_line_snake_case() {
+        // The main-agent prompt advertises `end_line` as the canonical
+        // arg name, but the dispatcher used to only look up `endLine`.
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-read-snake-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let body = (1..=10)
+            .map(|n| format!("line {n}\n"))
+            .collect::<String>();
+        std::fs::write(tmp.join("f.txt"), body).unwrap();
+        let action =
+            json!({"type":"read","file":"f.txt","line":3,"end_line":5});
+        let (out, sym) = dispatch_non_mcp(&tmp, &action).await;
+        // dispatch returns a short summary string; the actual body
+        // lands on `sym.definition`.
+        assert!(!out.starts_with("[error]"), "unexpected error: {out}");
+        let def = sym
+            .as_ref()
+            .and_then(|v| v.get("definition"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(def.contains("line 3\n"), "def missing line 3: {def:?}");
+        assert!(def.contains("line 5\n"), "def missing line 5: {def:?}");
+        assert!(
+            !def.contains("line 6\n"),
+            "def leaked line 6 past end_line: {def:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[tokio::test]

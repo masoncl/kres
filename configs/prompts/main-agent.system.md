@@ -5,8 +5,18 @@ Map each followup type to a tool:
 - "source" → MCP find_function (or find_type for structs). Fallback: grep + read.
 - "callers" → MCP find_callers
 - "callees" → MCP find_calls
-- "search" → use the grep tool type, NOT semcode grep_functions. Use {"type": "grep", "pattern": "REGEX", "path": "DIR"}
-- "file" → find
+- "search" → use the grep tool type, NOT semcode grep_functions. Use
+  {"type": "grep", "pattern": "REGEX", "path": "DIR", "glob": "*.c",
+  "limit": 200}. `glob` filters files; `limit` caps matches.
+- "file" → locate a file by name via `find(1)`. Use
+  {"type": "find", "name": "report.md", "path": "sub/dir",
+   "kind": "f"}. `name` is the `-name` glob (accepts the literal
+  name or a `*.c`-style pattern); aliases `pattern` and `glob` are
+  accepted, but `name` matches the followup schema and is preferred.
+  `path` is the root dir (workspace-relative, defaults to the whole
+  workspace); `kind` is an optional `-type` char (`f`/`d`/`l`/...).
+  ALWAYS set `name` — a find with no filter dumps the entire tree
+  and is almost never what you want.
 - "read" → read a file or a line range from one. Use
   {"type": "read", "file": "path/to/file.c", "line": 100,
    "end_line": 200} to read lines 100-200 inclusive; use "count"
@@ -16,11 +26,13 @@ Map each followup type to a tool:
   Prefer this over `bash sed -n '...p'` — read is workspace-scoped,
   emits a clean slice without shell quoting, and doesn't race
   against your 60s bash timeout.
-- "git" → git. Readonly subcommands (log/show/diff/blame/status/...)
-  plus `add` and `commit` for coding tasks that need to commit what
-  they wrote. `--amend`, `--no-verify`, `--no-gpg-sign` are
-  rejected; `push`/`pull`/`fetch` are absent on purpose (the tool
-  is workspace-local).
+- "git" → git. Use {"type": "git", "command": "log --oneline -20 -- path"}.
+  `command` is the subcommand + args as one string. Readonly
+  subcommands (log/show/diff/blame/status/...) plus `add` and
+  `commit` for coding tasks that need to commit what they wrote.
+  `--amend`, `--no-verify`, `--no-gpg-sign` are rejected;
+  `push`/`pull`/`fetch` are absent on purpose (the tool is
+  workspace-local).
 - "edit" → surgical string-replacement edit to an existing file.
   Use {"type": "edit", "file_path": "rel/path.c", "old_string": "...",
   "new_string": "...", "replace_all": false}. Same shape and

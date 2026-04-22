@@ -17,7 +17,7 @@ Every task cycles through these roles, all configured under
   structured findings.
 - **todo** (`todo-agent.json`) — dedups the slow agent's
   followups against the current todo list, reprioritises, and
-  may reshape the plan (see [planning.md](planning.md) — TBD).
+  may reshape the plan.
 - **merger** — non-agent fast-client call that folds new
   findings into the cumulative list; supersedes become
   `invalidated`.

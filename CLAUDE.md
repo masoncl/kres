@@ -73,7 +73,7 @@ this repo's `configs/` tree:
 | `todo-agent.json` | Todo-list-maintenance agent (tools-disabled variant) |
 | `mcp.json` | MCP server definitions (installed only when semcode-mcp is available) |
 | `settings.json` | Per-user defaults (today: per-role model ids). CLI flags `--fast-model`, `--slow-model`, `--main-model`, `--todo-model` override the matching role; a known `--slow <tag>` (sonnet/opus) also overrides the slow model id unless `--slow-model` is given |
-| `prompts/*.system.md` | System prompts referenced by each agent config |
+| `system-prompts/*.system.md` | Optional operator overrides for agent system prompts. Default prompts are embedded in the kres binary (`kres-agents/src/embedded_prompts.rs`); a file at `~/.kres/system-prompts/<basename>` shadows the embedded copy. Empty by default |
 | `prompts/bug-summary.md` | Bug-report template for `/summary` and `kres --summary` |
 | `skills/*.md` | Domain knowledge files |
 

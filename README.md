@@ -6,10 +6,14 @@ is the primary target).
 
 # NEWS
 
-April 21: I've updated the system prompts, you'll need to copy them into
-~/.kres/prompts, or run setup.sh with --overwrite
+April 22: Agent system prompts are now embedded in the kres binary
+— rebuilding kres refreshes them. `setup.sh` no longer copies
+`*.system.md` anywhere. The override directory for a custom prompt
+is `~/.kres/system-prompts/` (NOT `~/.kres/prompts/`); any stale
+`.system.md` files left in `~/.kres/prompts/` from prior installs
+are ignored. See "System prompts" below.
 
-There's new support for writing patches as well, more details below.
+April 21: There's new support for writing patches, more details below.
 
 ## Quick start
 
@@ -253,7 +257,9 @@ At the end of a run you get a plain-text bug report via `/summary`
   subsequent `/summary` or `--summary` invocations know the original
   question), `<results>/report.md`, and `<results>/findings.json`.
 - Uses the fast agent with the `bug-summary.md` prompt template
-  (installed under `~/.kres/prompts/`) as a dedicated system prompt.
+  (embedded in the kres binary; overridable at
+  `~/.kres/system-prompts/bug-summary.md`) as a dedicated system
+  prompt.
 - Orders the resulting sections by `bug-severity` — `high` →
   `medium` → `low` → `latent` → `unknown` — with one section per
   bug, each led by `Subject:`, `bug-severity:`, and `bug-impact:`
@@ -532,6 +538,59 @@ The shipped agent configs no longer set `"model"`, so in a fresh
 install step 2 drives the actual choice. Reintroducing a `"model"`
 line in one of the agent configs still takes effect and overrides
 settings.json for that agent only.
+
+## System prompts
+
+Markdown files under `configs/prompts/` that carry LLM
+system-prompt text are compiled into the kres binary via
+`include_str!` (see `kres-agents/src/embedded_prompts.rs`).
+`setup.sh` does NOT install them anywhere on disk. Rebuilding
+kres is enough to pick up prompt changes; there is no
+`--overwrite` dance to run after every repo pull.
+
+Covered prompts:
+
+- `*.system.md` — one per agent role (fast / slow /
+  slow-coding / slow-generic / main / todo). Referenced by the
+  shipped agent configs via `system_file:
+  "system-prompts/<name>.system.md"`.
+- `bug-summary.md` / `bug-summary-markdown.md` — the system
+  prompt for the `/summary` and `kres --summary` call. The
+  second variant is selected by `--markdown`.
+
+Load order used by `AgentConfig::load` (for agent prompts) and
+`summary.rs::run_summary` (for the bug-summary templates):
+
+1. **Explicit path** (summary only): `--template PATH` wins
+   when set.
+2. **Disk override**: `~/.kres/system-prompts/<basename>`. If
+   this file exists and is non-empty it is used verbatim.
+3. **Embedded**: the compiled-in copy keyed by basename.
+4. **Error** (agent configs only — summary silently falls
+   back to embedded): neither disk nor embedded → config load
+   fails with a message that names both paths.
+
+To customize a prompt for your own install, drop the edited file
+at `~/.kres/system-prompts/<basename>`. The default install has
+no files there; the embedded copies do all the work.
+
+Why `system-prompts/` and not `prompts/`? Older installs
+populated `~/.kres/prompts/` directly from setup.sh (both
+`*.system.md` and `bug-summary*.md`). Keeping the override in
+the same directory would mean those leftover files shadow the
+embedded defaults and produce stale behaviour after an upgrade.
+A new directory name sidesteps that — a fresh kres reads only
+the embedded prompts until the operator deliberately drops one
+under the new path. Stale files under `~/.kres/prompts/` are
+safe to delete (they are never consulted).
+
+Files that ARE still copied to disk by `setup.sh` (their job is
+per-install prompt-template content, not an LLM system prompt)
+continue to live in `~/.kres/prompts/`:
+
+- `review-template.md` and any `<word>-template.md` — backs
+  `--prompt "word: extra details"`. Parsed into lenses via
+  `parse_prompt_file`.
 
 ## Workspace layout
 

@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod consolidate;
+pub mod embedded_prompts;
 pub mod error;
 pub mod fetcher;
 pub mod followup;

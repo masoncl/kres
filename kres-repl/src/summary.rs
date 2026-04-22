@@ -2,13 +2,19 @@
 //! a research run's report.md + findings.json.
 //!
 //! The communication rules live in `bug-summary.md`. The binary
-//! carries a compile-time copy as a last-resort fallback, but callers
-//! can (and normally do) point at an on-disk template so operators can
-//! tune the prompt without rebuilding. Resolution order in
-//! `run_summary`:
+//! carries a compile-time copy via `kres_agents::embedded_prompts`,
+//! and callers can (but normally don't need to) point at an on-disk
+//! template so operators can tune the prompt without rebuilding.
+//! Resolution order in `run_summary`:
 //!   1. `inputs.template_path` (explicit `--template FILE`),
-//!   2. `~/.kres/prompts/bug-summary.md` (installed by setup.sh),
-//!   3. the compiled-in `BUG_SUMMARY_TEMPLATE` constant.
+//!   2. `~/.kres/system-prompts/bug-summary.md` (operator override
+//!      — empty by default; kres never installs this file),
+//!   3. the compiled-in prompt from `embedded_prompts::lookup`.
+//!
+//! The override directory is `system-prompts/`, matching the agent
+//! system-prompt override path. Old installs populated
+//! `~/.kres/prompts/bug-summary.md` directly; those stale files
+//! are ignored.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,31 +26,45 @@ use kres_agents::AgentConfig;
 use kres_core::findings::FindingsFile;
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
-/// Compile-time fallback copy of the plain-text bug-report template.
-/// Used when neither `SummaryInputs.template_path` nor
-/// `~/.kres/prompts/bug-summary.md` resolves to a readable file —
-/// keeps a freshly built kres usable on a host that hasn't run
-/// setup.sh yet.
-pub const BUG_SUMMARY_TEMPLATE: &str = include_str!("../../configs/prompts/bug-summary.md");
+/// Compile-time fallback copy of the plain-text bug-report template,
+/// sourced from `kres_agents::embedded_prompts`. Kept as a module-
+/// level `fn()` rather than a `const` so the lookup stays in one
+/// place and the table owns the source of truth. Panics only if the
+/// embedded table is missing the key — which the table's own unit
+/// test (`bug_summary_templates_are_present`) prevents.
+pub fn bug_summary_template() -> &'static str {
+    kres_agents::embedded_prompts::lookup("bug-summary.md")
+        .expect("bug-summary.md missing from embedded_prompts table")
+}
 
 /// Compile-time fallback for the markdown variant, selected by
 /// `--markdown`. Same content guidance, different output format
 /// (markdown with fenced code blocks instead of plain text).
-pub const BUG_SUMMARY_MARKDOWN_TEMPLATE: &str =
-    include_str!("../../configs/prompts/bug-summary-markdown.md");
-
-/// Default on-disk location for operator-editable templates. Populated
-/// by setup.sh; run_summary reads this when no explicit template path
-/// was given. Returns None when $HOME is unset.
-pub fn default_template_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".kres").join("prompts").join("bug-summary.md"))
+pub fn bug_summary_markdown_template() -> &'static str {
+    kres_agents::embedded_prompts::lookup("bug-summary-markdown.md")
+        .expect("bug-summary-markdown.md missing from embedded_prompts table")
 }
 
-/// Default on-disk location for the markdown variant of the template.
+/// Default on-disk override location for the plain-text template.
+/// Empty by default; an operator who wants to shadow the embedded
+/// prompt drops a file at `~/.kres/system-prompts/bug-summary.md`.
+/// Returns None when $HOME is unset.
+pub fn default_template_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".kres")
+            .join("system-prompts")
+            .join("bug-summary.md")
+    })
+}
+
+/// Default on-disk override location for the markdown variant.
 /// `--markdown` selects this instead of the plain-text one.
 pub fn default_markdown_template_path() -> Option<PathBuf> {
-    dirs::home_dir()
-        .map(|h| h.join(".kres").join("prompts").join("bug-summary-markdown.md"))
+    dirs::home_dir().map(|h| {
+        h.join(".kres")
+            .join("system-prompts")
+            .join("bug-summary-markdown.md")
+    })
 }
 
 /// All the inputs to one summary run. Constructed once by either the
@@ -55,9 +75,10 @@ pub struct SummaryInputs {
     pub output_path: PathBuf,
     /// Explicit override for the system prompt template. When Some,
     /// run_summary reads the file and errors if it cannot. When None,
-    /// `~/.kres/prompts/bug-summary.md` wins if it exists; else the
-    /// compiled-in fallback is used. When `markdown` is true the
-    /// markdown variant of each resolution step is tried instead.
+    /// `~/.kres/system-prompts/bug-summary.md` wins if it exists;
+    /// else the compiled-in fallback is used. When `markdown` is
+    /// true the markdown variant of each resolution step is tried
+    /// instead.
     pub template_path: Option<PathBuf>,
     /// Select the markdown variant of the template + the `.md` output
     /// filename default. Ignored when `template_path` is set (the
@@ -163,11 +184,11 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     }))?;
 
     // Resolve the system prompt template: explicit --template wins,
-    // then the on-disk operator-editable copy in ~/.kres/prompts/, else
-    // the compiled-in copy. `--markdown` picks the markdown variant at
-    // each hop (bug-summary-markdown.md, BUG_SUMMARY_MARKDOWN_TEMPLATE).
-    // Each hop logs its source so operators can tell which template
-    // shaped the report.
+    // then the on-disk operator override under
+    // ~/.kres/system-prompts/, else the compiled-in copy from
+    // kres_agents::embedded_prompts. `--markdown` picks the markdown
+    // variant at each hop. Each hop logs its source so operators can
+    // tell which template shaped the report.
     let (disk_default, fallback_text, fallback_label): (
         Option<PathBuf>,
         &'static str,
@@ -175,13 +196,13 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     ) = if inputs.markdown {
         (
             default_markdown_template_path(),
-            BUG_SUMMARY_MARKDOWN_TEMPLATE,
+            bug_summary_markdown_template(),
             "<compiled-in markdown fallback>",
         )
     } else {
         (
             default_template_path(),
-            BUG_SUMMARY_TEMPLATE,
+            bug_summary_template(),
             "<compiled-in fallback>",
         )
     };

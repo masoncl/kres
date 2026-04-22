@@ -92,6 +92,22 @@ impl AgentConfig {
         // Resolve and read `system_file` if present. It supersedes
         // any inline `system` — callers that want to override
         // should just drop the `system_file` field.
+        //
+        // Resolution order, in descending priority:
+        //   1. Disk file at the resolved path. An operator who
+        //      wants to customize a prompt drops a file at the
+        //      referenced path (typically `~/.kres/prompts/X.md`)
+        //      and kres reads it.
+        //   2. Embedded prompt keyed by the file's basename. This
+        //      is the normal path for stock installs — the
+        //      `.system.md` files are compiled into the binary
+        //      via `include_str!` (see `embedded_prompts` module),
+        //      so a fresh install with no `~/.kres/prompts/` copy
+        //      still runs. This replaces the previous "setup.sh
+        //      must copy every prompt" workflow — operators no
+        //      longer need `setup.sh --overwrite` when the repo's
+        //      prompts change; rebuilding kres refreshes them.
+        //   3. Both missing → error, same as before.
         if let Some(ref sf) = cfg.system_file {
             let expanded = expand_tilde(sf);
             let resolved = if expanded.is_absolute() {
@@ -103,10 +119,28 @@ impl AgentConfig {
                     .unwrap_or_else(|| Path::new("."))
                     .join(expanded)
             };
-            let body = std::fs::read_to_string(&resolved).map_err(|e| {
-                AgentError::Other(format!("system_file {}: {e}", resolved.display()))
-            })?;
-            cfg.system = Some(body);
+            let disk_read = std::fs::read_to_string(&resolved);
+            match disk_read {
+                Ok(body) => {
+                    cfg.system = Some(body);
+                }
+                Err(disk_err) => {
+                    let basename = resolved
+                        .file_name()
+                        .and_then(|o| o.to_str())
+                        .unwrap_or("");
+                    if let Some(embedded) =
+                        crate::embedded_prompts::lookup(basename)
+                    {
+                        cfg.system = Some(embedded.to_string());
+                    } else {
+                        return Err(AgentError::Other(format!(
+                            "system_file {}: {disk_err} (no embedded fallback for basename '{basename}')",
+                            resolved.display()
+                        )));
+                    }
+                }
+            }
         }
         Ok(cfg)
     }
@@ -250,11 +284,85 @@ mod tests {
     }
 
     #[test]
-    fn missing_system_file_errors() {
-        let p = write_tmp(r#"{"key": "sk-x", "system_file": "/tmp/does-not-exist-kres-test.md"}"#);
+    fn missing_system_file_without_embedded_match_errors() {
+        // The basename doesn't correspond to any embedded prompt
+        // (the `.system.md` table is agent-role specific) and the
+        // disk path is absent → both fallbacks fail and the caller
+        // gets a clear error.
+        let p = write_tmp(
+            r#"{"key": "sk-x", "system_file": "/tmp/does-not-exist-kres-test.md"}"#,
+        );
         let e = AgentConfig::load(&p).unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("system_file"), "got: {msg}");
+        assert!(
+            msg.contains("no embedded fallback"),
+            "error should mention the embedded-fallback attempt, got: {msg}"
+        );
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn missing_system_file_falls_back_to_embedded_prompt() {
+        // When the disk path is absent but the basename matches a
+        // known embedded prompt (the typical "stock install, no
+        // ~/.kres/prompts/" case), kres uses the compiled-in copy
+        // instead of erroring. This test targets `main-agent.system.md`
+        // because that name is guaranteed present in the embedded
+        // table.
+        let dir = std::env::temp_dir().join(format!(
+            "kres-sysfile-embedded-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pointing at a nonexistent sibling file whose basename
+        // matches an embedded key.
+        let cfg_path = dir.join("agent.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"key": "sk-x", "system_file": "prompts/main-agent.system.md"}"#,
+        )
+        .unwrap();
+        let c = AgentConfig::load(&cfg_path).unwrap();
+        let body = c.system.expect("embedded fallback should populate system");
+        assert!(!body.trim().is_empty(), "embedded prompt came back empty");
+        // Sanity check — the main-agent system prompt mentions
+        // the action-type vocabulary.
+        assert!(
+            body.contains("action") || body.contains("grep"),
+            "body doesn't look like the main-agent prompt: {}",
+            &body[..body.len().min(200)]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn existing_disk_file_wins_over_embedded() {
+        // An operator's custom copy at the referenced path must
+        // take precedence over the embedded one — this is the
+        // override path.
+        let dir = std::env::temp_dir().join(format!(
+            "kres-sysfile-override-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Shadow the embedded main-agent prompt with a tiny
+        // operator-supplied one. Same basename, different body.
+        let prompts = dir.join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("main-agent.system.md"),
+            "OPERATOR-OVERRIDE BODY",
+        )
+        .unwrap();
+        let cfg_path = dir.join("agent.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"key": "sk-x", "system_file": "prompts/main-agent.system.md"}"#,
+        )
+        .unwrap();
+        let c = AgentConfig::load(&cfg_path).unwrap();
+        assert_eq!(c.system.as_deref(), Some("OPERATOR-OVERRIDE BODY"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

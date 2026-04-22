@@ -213,15 +213,42 @@ say "slow model:   ${SLOW_MODEL}"
 say "model:        ${MODEL}"
 
 echo "system prompts and agent configs:"
-# All markdown under configs/prompts/ is shipped — agent system
-# prompts, bug-summary.md, and any `*-template.md` prompt templates
-# invoked via `--prompt word: extra`. Install every .md
-# the source tree ships so adding a new prompt doesn't require a
-# setup.sh edit.
+# LLM system prompts are compiled into the kres binary via
+# kres-agents::embedded_prompts and are deliberately NOT installed
+# on disk. This covers the agent `*.system.md` prompts AND the
+# `bug-summary{,-markdown}.md` templates used by `/summary` —
+# both classes drive an LLM `system` field, just in different
+# pipelines. Rebuilding kres refreshes the lot.
+#
+# An operator who wants to override any of those prompts drops a
+# file at ~/.kres/system-prompts/<basename> and the loader
+# (AgentConfig::load for agent prompts, summary.rs for the bug-
+# summary templates) reads it ahead of the embedded copy.
+#
+# The override directory is system-prompts/, not prompts/, on
+# purpose: older installs populated ~/.kres/prompts/ directly
+# (both *.system.md and bug-summary{,-markdown}.md), and those
+# leftover files would otherwise shadow the embedded defaults
+# and produce stale behaviour after an upgrade. The new
+# directory name means a fresh kres reads only the embedded
+# prompts until the operator deliberately drops one.
+#
+# `<word>-template.md` files (review-template.md and any
+# `<word>-template.md` the operator added) DO install to
+# ~/.kres/prompts/ — those are prompt-TEMPLATE content that the
+# operator invokes via `--prompt "word: extra"`, not system
+# prompts for an LLM call.
 mkdir -p "${DEST}/prompts"
 shopt -s nullglob
 for src in "${CONFIGS_SRC}/prompts"/*.md; do
-  install_file "$src" "${DEST}/prompts/$(basename "$src")"
+  case "$(basename "$src")" in
+    *.system.md | bug-summary.md | bug-summary-markdown.md)
+      # Embedded in the binary; skip.
+      ;;
+    *)
+      install_file "$src" "${DEST}/prompts/$(basename "$src")"
+      ;;
+  esac
 done
 shopt -u nullglob
 

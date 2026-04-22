@@ -170,8 +170,10 @@ struct ReplArgs {
 
     /// Override the bug-summary template path for --summary. Accepted by
     /// `/summary` too. When omitted, kres reads
-    /// ~/.kres/prompts/bug-summary.md (installed by setup.sh) and falls
-    /// back to the compiled-in copy if that's missing.
+    /// ~/.kres/system-prompts/bug-summary.md (the operator-override
+    /// path — empty by default) and falls back to the compiled-in
+    /// copy bundled in the binary (see
+    /// `kres-agents/src/embedded_prompts.rs`).
     #[arg(long, value_name = "FILE")]
     template: Option<PathBuf>,
 

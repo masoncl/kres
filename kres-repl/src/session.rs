@@ -48,8 +48,8 @@ pub struct ReplConfig {
     pub results_dir: Option<PathBuf>,
     /// Explicit `--template FILE` from the CLI. Passed through to
     /// SummaryInputs.template_path when /summary fires. When None
-    /// the summariser falls back to ~/.kres/prompts/bug-summary.md, then
-    /// to the compiled-in default (see kres_repl::summary).
+    /// the summariser falls back to ~/.kres/system-prompts/bug-summary.md,
+    /// then to the compiled-in default (see kres_repl::summary).
     pub template_path: Option<PathBuf>,
     /// When true, skip the persistent status line (no DECSTBM scroll
     /// region). Useful for dumb terminals / pipes / finicky muxers.
@@ -2216,9 +2216,10 @@ impl Session {
             // The REPL's /summary path keeps the plain-text default;
             // `--markdown` is a --summary-time flag, not a per-turn
             // one.  An operator who wants markdown inside the REPL
-            // can point `/summary --template ~/.kres/prompts/bug-
-            // summary-markdown.md` at it, or use `kres --summary
-            // --markdown` post-hoc.
+            // can point `/summary --template
+            // ~/.kres/system-prompts/bug-summary-markdown.md` at it
+            // (after dropping the file there), or use `kres
+            // --summary --markdown` post-hoc.
             markdown: false,
             original_prompt,
             client: orc.fast_client.clone(),
@@ -2647,59 +2648,45 @@ fn build_recent_context_preamble(entries: &[AccumulatedEntry], cap: usize) -> St
     out
 }
 
-/// Compile-time fallback for the coding-mode slow-agent system prompt.
-/// Used when `~/.kres/prompts/slow-code-agent-coding.system.md` is
-/// absent (fresh install pre-setup.sh). Keeps coding tasks functional
-/// without requiring a rebuild of the binary.
-pub const SLOW_CODING_SYSTEM: &str =
-    include_str!("../../configs/prompts/slow-code-agent-coding.system.md");
-
-/// Compile-time fallback for the generic-mode slow-agent system
-/// prompt. The generic prompt is less opinionated than the
-/// review/analysis prompt — it tells the slow agent to answer the
-/// operator's question directly and use the full followup tool
-/// surface (including bash) instead of forcing an "audit some code"
-/// stance on every single-call task.
-pub const SLOW_GENERIC_SYSTEM: &str =
-    include_str!("../../configs/prompts/slow-code-agent-generic.system.md");
-
-/// Load the coding-mode system prompt: prefer the operator-editable
-/// copy in `~/.kres/prompts/`, fall back to the compiled-in version.
-/// Returns `None` only when $HOME is unset AND the file isn't readable
-/// — the caller then leaves `slow_coding_system` as None and coding
-/// tasks fall back to the analysis prompt with a warning (see
-/// `pipeline::run_once_with_ctx`).
-fn load_slow_coding_system() -> Option<String> {
+/// Load a `.system.md` prompt from disk-then-embedded, matching the
+/// same two-step resolution `AgentConfig::load` uses for
+/// `system_file`: an operator's `~/.kres/system-prompts/<basename>`
+/// copy wins, otherwise the compiled-in entry from
+/// `kres_agents::embedded_prompts` is used. Returns None only when
+/// no embedded entry is bundled under this basename (in which case
+/// the caller should surface a warning and fall back to its own
+/// default — for coding/generic mode this means "use the analysis
+/// prompt"; see `pipeline::run_once_with_ctx`).
+///
+/// The override directory name is `system-prompts/` (not
+/// `prompts/`) on purpose: before agent prompts were embedded in
+/// the binary, setup.sh populated `~/.kres/prompts/*.system.md`
+/// directly, and those leftover files would otherwise be read
+/// ahead of the embedded defaults, producing stale behaviour
+/// after an upgrade. Moving the override to a new directory name
+/// means a fresh kres reads only the embedded prompts until the
+/// operator deliberately drops a file under the new path.
+fn load_prompt_disk_then_embedded(basename: &str) -> Option<String> {
     if let Some(home) = dirs::home_dir() {
         let p = home
             .join(".kres")
-            .join("prompts")
-            .join("slow-code-agent-coding.system.md");
+            .join("system-prompts")
+            .join(basename);
         if let Ok(s) = std::fs::read_to_string(&p) {
             if !s.trim().is_empty() {
                 return Some(s);
             }
         }
     }
-    Some(SLOW_CODING_SYSTEM.to_string())
+    kres_agents::embedded_prompts::lookup(basename).map(|s| s.to_string())
 }
 
-/// Load the generic-mode system prompt. Same resolution order as
-/// `load_slow_coding_system`: `~/.kres/prompts/` wins when present,
-/// otherwise the compiled-in SLOW_GENERIC_SYSTEM.
+fn load_slow_coding_system() -> Option<String> {
+    load_prompt_disk_then_embedded("slow-code-agent-coding.system.md")
+}
+
 fn load_slow_generic_system() -> Option<String> {
-    if let Some(home) = dirs::home_dir() {
-        let p = home
-            .join(".kres")
-            .join("prompts")
-            .join("slow-code-agent-generic.system.md");
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            if !s.trim().is_empty() {
-                return Some(s);
-            }
-        }
-    }
-    Some(SLOW_GENERIC_SYSTEM.to_string())
+    load_prompt_disk_then_embedded("slow-code-agent-generic.system.md")
 }
 
 /// Convenience: build an Orchestrator from paths to agent configs and

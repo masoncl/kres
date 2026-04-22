@@ -3,5 +3,5 @@
   "max_tokens": 128000,
   "max_input_tokens": 900000,
   "rate_limit": 800000,
-  "system_file": "prompts/slow-code-agent.system.md"
+  "system_file": "system-prompts/slow-code-agent.system.md"
 }

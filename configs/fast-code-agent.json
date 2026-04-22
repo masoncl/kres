@@ -3,5 +3,5 @@
   "max_tokens": 64000,
   "max_input_tokens": 800000,
   "rate_limit": 800000,
-  "system_file": "prompts/fast-code-agent.system.md"
+  "system_file": "system-prompts/fast-code-agent.system.md"
 }

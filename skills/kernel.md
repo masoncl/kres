@@ -27,5 +27,7 @@ context files from `@REVIEW_PROMPTS@/kernel/`:
 1.  Always read `technical-patterns.md` before loading subsystem specific files
 
 2. Read `@REVIEW_PROMPTS@/kernel/subsystem/subsystem.md` and load matching subsystem
-   guides and critical patterns
+   guides and critical patterns.  IMPORTANT.  Files referenced in subsystem.md
+   are under @REVIEW_PROMPTS@/kernel/subsystem, you'll need to adjust the paths
+   as you read them.
 

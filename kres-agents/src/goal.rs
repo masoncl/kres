@@ -665,5 +665,4 @@ mod tests {
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].id, "step-1");
     }
-
 }

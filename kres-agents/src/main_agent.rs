@@ -453,8 +453,7 @@ async fn dispatch_non_mcp(
 ) -> (String, Option<Value>) {
     let ty = action.get("type").and_then(|v| v.as_str()).unwrap_or("?");
     if ty != "?" && !allowed_actions.contains(ty) {
-        let allowed_list: Vec<&str> =
-            allowed_actions.iter().map(|s| s.as_str()).collect();
+        let allowed_list: Vec<&str> = allowed_actions.iter().map(|s| s.as_str()).collect();
         let list_display = if allowed_list.is_empty() {
             "none — every non-MCP action is denied this session".to_string()
         } else {
@@ -666,10 +665,7 @@ async fn dispatch_non_mcp(
                 .get("timeout_secs")
                 .or_else(|| action.get("timeout"))
                 .and_then(|v| v.as_u64());
-            let cwd = action
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let cwd = action.get("cwd").and_then(|v| v.as_str()).map(String::from);
             let args = BashArgs {
                 command,
                 timeout_secs,
@@ -856,10 +852,7 @@ mod tests {
         // Regression: the dispatcher used to read only `name`, so a
         // model-emitted {"type":"find","pattern":"report.md"} ran
         // find(1) with no -name filter and dumped the workspace tree.
-        let tmp = std::env::temp_dir().join(format!(
-            "kres-find-pattern-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kres-find-pattern-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("report.md"), b"").unwrap();
         std::fs::write(tmp.join("other.md"), b"").unwrap();
@@ -867,10 +860,7 @@ mod tests {
         let allow: std::collections::BTreeSet<String> =
             ["find"].iter().map(|s| s.to_string()).collect();
         let (out, _) = dispatch_non_mcp(&tmp, &action, &allow).await;
-        assert!(
-            out.contains("report.md"),
-            "output missing report.md: {out}"
-        );
+        assert!(out.contains("report.md"), "output missing report.md: {out}");
         assert!(
             !out.contains("other.md"),
             "filter not applied, got other.md: {out}"
@@ -886,17 +876,11 @@ mod tests {
         // content in the turn-log text — the bytes were going into
         // the symbol pool only. Model gave up and used `bash sed`.
         // The turn-log text must carry the content inline.
-        let tmp = std::env::temp_dir().join(format!(
-            "kres-read-text-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kres-read-text-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let body = (1..=10)
-            .map(|n| format!("line {n}\n"))
-            .collect::<String>();
+        let body = (1..=10).map(|n| format!("line {n}\n")).collect::<String>();
         std::fs::write(tmp.join("f.txt"), body).unwrap();
-        let action =
-            json!({"type":"read","file":"f.txt","line":3,"end_line":5});
+        let action = json!({"type":"read","file":"f.txt","line":3,"end_line":5});
         let allow: std::collections::BTreeSet<String> =
             ["read"].iter().map(|s| s.to_string()).collect();
         let (text, _sym) = dispatch_non_mcp(&tmp, &action, &allow).await;
@@ -911,17 +895,11 @@ mod tests {
     async fn read_accepts_end_line_snake_case() {
         // The main-agent prompt advertises `end_line` as the canonical
         // arg name, but the dispatcher used to only look up `endLine`.
-        let tmp = std::env::temp_dir().join(format!(
-            "kres-read-snake-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kres-read-snake-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let body = (1..=10)
-            .map(|n| format!("line {n}\n"))
-            .collect::<String>();
+        let body = (1..=10).map(|n| format!("line {n}\n")).collect::<String>();
         std::fs::write(tmp.join("f.txt"), body).unwrap();
-        let action =
-            json!({"type":"read","file":"f.txt","line":3,"end_line":5});
+        let action = json!({"type":"read","file":"f.txt","line":3,"end_line":5});
         let allow: std::collections::BTreeSet<String> =
             ["read"].iter().map(|s| s.to_string()).collect();
         let (out, sym) = dispatch_non_mcp(&tmp, &action, &allow).await;
@@ -947,13 +925,9 @@ mod tests {
         // With a non-empty allowlist that excludes "bash", a bash
         // action must bounce with an error that names the allowed
         // set and points at --allow / settings.json.
-        let tmp = std::env::temp_dir().join(format!(
-            "kres-gate-bash-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kres-gate-bash-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let action =
-            json!({"type":"bash","command":"echo should not run > /tmp/gated"});
+        let action = json!({"type":"bash","command":"echo should not run > /tmp/gated"});
         let mut allow = std::collections::BTreeSet::new();
         allow.insert("read".to_string());
         allow.insert("grep".to_string());
@@ -964,8 +938,14 @@ mod tests {
             out.contains("'bash' is not in the allowed-action list"),
             "error missing action name: {out}"
         );
-        assert!(out.contains("--allow bash"), "error missing fix hint: {out}");
-        assert!(out.contains("settings.json"), "error missing settings hint: {out}");
+        assert!(
+            out.contains("--allow bash"),
+            "error missing fix hint: {out}"
+        );
+        assert!(
+            out.contains("settings.json"),
+            "error missing settings hint: {out}"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -976,10 +956,7 @@ mod tests {
         // settings.json semantic. Previously the dispatcher
         // short-circuited on is_empty() and allowed everything,
         // which silently neutered an operator's lockdown.
-        let tmp = std::env::temp_dir().join(format!(
-            "kres-gate-empty-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kres-gate-empty-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("f.txt"), "hello\n").unwrap();
         let action = json!({"type":"read","file":"f.txt"});
@@ -997,10 +974,7 @@ mod tests {
         );
         // The file we wrote should remain unread (the dispatcher
         // bailed before touching it).
-        assert!(
-            !out.contains("hello"),
-            "read tool ran despite deny: {out}"
-        );
+        assert!(!out.contains("hello"), "read tool ran despite deny: {out}");
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1009,10 +983,7 @@ mod tests {
         // An action with no `type` field should hit the existing
         // "unknown action type" error, NOT the allowlist-gate error.
         // A malformed action is not a gated action.
-        let tmp = std::env::temp_dir().join(format!(
-            "kres-malformed-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("kres-malformed-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let action = json!({"command": "nope"}); // no `type` field
         let allow: std::collections::BTreeSet<String> =

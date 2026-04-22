@@ -963,10 +963,8 @@ mod tests {
     #[tokio::test]
     async fn empty_analysis_does_not_increment_turn_counter() {
         let mgr = TaskManager::new();
-        mgr.spawn("t-empty", None, |_h| async {
-            Ok(TaskOutcome::default())
-        })
-        .await;
+        mgr.spawn("t-empty", None, |_h| async { Ok(TaskOutcome::default()) })
+            .await;
         loop {
             let s = mgr.snapshot().await;
             if s.iter().all(|t| t.state.is_terminal()) {

@@ -27,8 +27,7 @@ use crate::{
     followup::Followup,
     pipeline::{DataFetcher, FetchResult},
     tools::{
-        bash_run, find, git, grep, read_file_range, BashArgs, FindArgs, GitArgs, GrepArgs,
-        ReadArgs,
+        bash_run, find, git, grep, read_file_range, BashArgs, FindArgs, GitArgs, GrepArgs, ReadArgs,
     },
 };
 

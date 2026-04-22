@@ -218,8 +218,7 @@ fn value_to_plan(v: Value) -> Option<kres_core::PlanRewrite> {
             // the LLM stuffs in (prompt, goal, mode, created_at)
             // are ignored. An empty-steps rewrite is indistinguish-
             // able from "no rewrite", so drop it.
-            let rewrite: kres_core::PlanRewrite =
-                serde_json::from_value(other).ok()?;
+            let rewrite: kres_core::PlanRewrite = serde_json::from_value(other).ok()?;
             if rewrite.steps.is_empty() {
                 None
             } else {

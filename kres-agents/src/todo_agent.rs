@@ -790,9 +790,7 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
 /// carried a parseable `todo` field; returns `None` when the
 /// envelope itself couldn't be parsed (callers fall back to the
 /// todo-only parser, which tries harder on malformed replies).
-fn parse_todo_update_full(
-    text: &str,
-) -> Option<(Vec<TodoItem>, Option<kres_core::PlanRewrite>)> {
+fn parse_todo_update_full(text: &str) -> Option<(Vec<TodoItem>, Option<kres_core::PlanRewrite>)> {
     if let Ok(r) = serde_json::from_str::<TodoUpdateResponse>(text) {
         if let Some(items) = todo_list_from_value(r.todo) {
             return Some((items, r.plan));
@@ -814,9 +812,7 @@ fn parse_todo_update_full(
                 depth -= 1;
                 if depth == 0 {
                     if let Some(s) = start.take() {
-                        if let Ok(r) =
-                            serde_json::from_str::<TodoUpdateResponse>(&text[s..=i])
-                        {
+                        if let Ok(r) = serde_json::from_str::<TodoUpdateResponse>(&text[s..=i]) {
                             if let Some(items) = todo_list_from_value(r.todo) {
                                 return Some((items, r.plan));
                             }

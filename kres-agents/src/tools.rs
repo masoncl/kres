@@ -298,8 +298,7 @@ pub async fn bash_run(workspace: &Path, args: &BashArgs) -> Result<String, Agent
     let timeout = Duration::from_secs(
         args.timeout_secs
             .unwrap_or(BASH_DEFAULT_TIMEOUT_SECS)
-            .min(BASH_MAX_TIMEOUT_SECS)
-            .max(1),
+            .clamp(1, BASH_MAX_TIMEOUT_SECS),
     );
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c").arg(&args.command);
@@ -400,9 +399,9 @@ pub async fn edit_file(workspace: &Path, args: &EditArgs) -> Result<String, Agen
         ));
     }
     let abs = resolve_workspace(workspace, &args.file_path)?;
-    let original = tokio::fs::read_to_string(&abs).await.map_err(|e| {
-        AgentError::Other(format!("edit: read {}: {e}", abs.display()))
-    })?;
+    let original = tokio::fs::read_to_string(&abs)
+        .await
+        .map_err(|e| AgentError::Other(format!("edit: read {}: {e}", abs.display())))?;
     let count = count_occurrences(&original, &args.old_string);
     if count == 0 {
         return Err(AgentError::Other(format!(
@@ -431,15 +430,15 @@ pub async fn edit_file(workspace: &Path, args: &EditArgs) -> Result<String, Agen
     ));
     {
         use tokio::io::AsyncWriteExt as _;
-        let mut f = tokio::fs::File::create(&tmp).await.map_err(|e| {
-            AgentError::Other(format!("edit: create {}: {e}", tmp.display()))
-        })?;
-        f.write_all(updated.as_bytes()).await.map_err(|e| {
-            AgentError::Other(format!("edit: write {}: {e}", tmp.display()))
-        })?;
-        f.sync_all().await.map_err(|e| {
-            AgentError::Other(format!("edit: fsync {}: {e}", tmp.display()))
-        })?;
+        let mut f = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(|e| AgentError::Other(format!("edit: create {}: {e}", tmp.display())))?;
+        f.write_all(updated.as_bytes())
+            .await
+            .map_err(|e| AgentError::Other(format!("edit: write {}: {e}", tmp.display())))?;
+        f.sync_all()
+            .await
+            .map_err(|e| AgentError::Other(format!("edit: fsync {}: {e}", tmp.display())))?;
     }
     tokio::fs::rename(&tmp, &abs).await.map_err(|e| {
         AgentError::Other(format!(
@@ -870,14 +869,14 @@ mod tests {
             new_string: "x".into(),
             replace_all: false,
         };
-        assert!(matches!(edit_file(&dir, &empty_old).await, Err(_)));
+        assert!(edit_file(&dir, &empty_old).await.is_err());
         let identity = EditArgs {
             file_path: "foo.c".into(),
             old_string: "some body".into(),
             new_string: "some body".into(),
             replace_all: false,
         };
-        assert!(matches!(edit_file(&dir, &identity).await, Err(_)));
+        assert!(edit_file(&dir, &identity).await.is_err());
         // File untouched.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "some body\n");
         std::fs::remove_dir_all(&dir).ok();
@@ -1100,8 +1099,8 @@ mod tests {
             count: None,
             end_line: None,
         };
-        let got = read_file_range(&workspace, &args)
-            .expect("read should succeed via consent grant");
+        let got =
+            read_file_range(&workspace, &args).expect("read should succeed via consent grant");
         assert_eq!(got, "contents");
         // Cleanup: revert the grant so a follow-on test starts
         // clean. Removing just our entry is enough — `clear()`
@@ -1117,10 +1116,7 @@ mod tests {
         // tokio spawn. Whatever the spawn returns (it may well
         // error because /tmp isn't a git repo), it must NOT be
         // the "not in allowlist" or "rejected" strings.
-        for cmd in [
-            "add README.md",
-            "commit -s -m \"msg\"",
-        ] {
+        for cmd in ["add README.md", "commit -s -m \"msg\""] {
             let v = serde_json::json!({"command": cmd});
             let args: GitArgs = serde_json::from_value(v).unwrap();
             let res = git(std::path::Path::new("/tmp"), &args).await;

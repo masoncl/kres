@@ -168,12 +168,13 @@ struct ReplArgs {
     #[arg(long, default_value_t = false)]
     summary: bool,
 
-    /// Override the bug-summary template path for --summary. Accepted by
-    /// `/summary` too. When omitted, kres reads
-    /// ~/.kres/system-prompts/bug-summary.md (the operator-override
-    /// path — empty by default) and falls back to the compiled-in
-    /// copy bundled in the binary (see
-    /// `kres-agents/src/embedded_prompts.rs`).
+    /// Override the bug-summary template path for --summary. Accepted
+    /// by `/summary` too. When omitted, kres reads
+    /// ~/.kres/commands/summary.md (the operator-override path —
+    /// empty by default) and falls back to the compiled-in copy
+    /// bundled in the binary (see
+    /// `kres-agents/src/user_commands.rs`). `--markdown` selects
+    /// `summary-markdown.md` at each hop instead.
     #[arg(long, value_name = "FILE")]
     template: Option<PathBuf>,
 
@@ -328,27 +329,24 @@ fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
         None
     };
     if let Some((head, rest)) = named {
+        // Preferred: ~/.kres/commands/<word>.md via user_commands
+        // (disk-first + embedded fallback + name-validation). The
+        // validation inside compose covers the same character set
+        // we'd enforce here, so there's no need to pre-filter.
+        if let Some((src, composed)) =
+            kres_agents::user_commands::compose(head, rest)
+        {
+            return Ok((src, composed));
+        }
+        // Legacy: ~/.kres/prompts/<word>-template.md. Kept for
+        // operators whose custom templates predate the slash-
+        // command refactor. New templates should go under
+        // ~/.kres/commands/<word>.md.
         let is_word = !head.is_empty()
             && head
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if is_word {
-            // Preferred: ~/.kres/commands/<word>.md via
-            // user_commands::lookup (disk-first + embedded
-            // fallback).
-            if let Some(body) = kres_agents::user_commands::lookup(head) {
-                let composed = if rest.is_empty() {
-                    body
-                } else {
-                    format!("{rest}\n\n{body}")
-                };
-                let src = format!("/{head} (user_commands)");
-                return Ok((src, composed));
-            }
-            // Legacy: ~/.kres/prompts/<word>-template.md. Kept for
-            // operators whose custom templates predate the slash-
-            // command refactor. New templates should go under
-            // ~/.kres/commands/<word>.md.
             if let Some(dir) = kres_dir() {
                 let tmpl = dir
                     .join("prompts")
@@ -1127,6 +1125,58 @@ mod tests {
     fn allow_flag_defaults_to_empty() {
         let c = Cli::try_parse_from(["kres"]).unwrap();
         assert!(c.repl.allow.is_empty());
+    }
+
+    #[test]
+    fn resolve_prompt_arg_word_colon_form_hits_user_commands() {
+        // --prompt "review: target" resolves via user_commands to the
+        // embedded review template with the target prepended.
+        let (src, body) = resolve_prompt_arg("review: fs/btrfs/ctree.c")
+            .expect("review: form should resolve");
+        assert!(src.contains("review"), "source label: {src}");
+        assert!(
+            body.starts_with("fs/btrfs/ctree.c\n\n"),
+            "target must lead body: {body:?}"
+        );
+        assert!(body.contains("[investigate]"), "review body missing");
+    }
+
+    #[test]
+    fn resolve_prompt_arg_slash_form_equivalent_to_colon_form() {
+        // The whole point of the CLI slash-form: --prompt "/review X"
+        // must produce the same composed prompt as --prompt "review: X".
+        let (_, colon_body) =
+            resolve_prompt_arg("review: fs/btrfs/ctree.c").unwrap();
+        let (_, slash_body) =
+            resolve_prompt_arg("/review fs/btrfs/ctree.c").unwrap();
+        assert_eq!(
+            colon_body, slash_body,
+            "slash form and colon form must compose identically"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_arg_slash_unknown_command_falls_to_inline() {
+        // A slash prefix with no matching command and no legacy
+        // template on disk must pass through as verbatim prompt
+        // text — NOT error, NOT be silently dropped.
+        let (src, body) =
+            resolve_prompt_arg("/no-such-cmd hello world").unwrap();
+        assert_eq!(src, "<inline>");
+        assert_eq!(body, "/no-such-cmd hello world");
+    }
+
+    #[test]
+    fn resolve_prompt_arg_inline_colon_not_misparsed() {
+        // A free-form question that happens to contain a colon but
+        // doesn't start with a command word must stay inline — this
+        // is the "question like 'when did btrfs: land?' shouldn't
+        // look up a btrfs template" case.
+        let (src, body) =
+            resolve_prompt_arg("why does func() return: unusual values?")
+                .unwrap();
+        assert_eq!(src, "<inline>");
+        assert!(body.contains("unusual values"));
     }
 
     #[test]

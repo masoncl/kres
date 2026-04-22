@@ -33,6 +33,17 @@ pub enum Command {
     /// to bug-report.txt, placed in the results directory when one
     /// was configured (else the current working directory).
     Summary { filename: Option<String> },
+    /// `/summary-markdown [filename]` — same as /summary but
+    /// selects the `summary-markdown` slash-command template for
+    /// the system prompt and defaults the filename to
+    /// `bug-report.md`.
+    SummaryMarkdown { filename: Option<String> },
+    /// `/review <target>` — submit a prompt equivalent to
+    /// `--prompt "review: <target>"`. Composes the `review`
+    /// slash-command template (disk override at
+    /// ~/.kres/commands/review.md wins over the embedded copy)
+    /// with the trailing target text and queues it as a new task.
+    Review { target: String },
     /// `/extract [--dir DIR] [--report F] [--todo F] [--findings F]`
     /// — copy session artifacts to operator-chosen destinations.
     Extract {
@@ -93,6 +104,19 @@ pub fn parse_command(line: &str) -> Command {
             "summary" => Command::Summary {
                 filename: rest.split_whitespace().next().map(|s| s.to_string()),
             },
+            "summary-markdown" => Command::SummaryMarkdown {
+                filename: rest.split_whitespace().next().map(|s| s.to_string()),
+            },
+            "review" => {
+                let target = rest.trim().to_string();
+                if target.is_empty() {
+                    Command::Unknown(
+                        "review (expected: /review <target>, e.g. /review fs/btrfs/ctree.c)".into(),
+                    )
+                } else {
+                    Command::Review { target }
+                }
+            }
             "extract" => Command::Extract {
                 dir: flag_value(rest, "--dir").map(|s| s.to_string()),
                 report: flag_value(rest, "--report").map(|s| s.to_string()),
@@ -197,6 +221,40 @@ mod tests {
     fn parses_followup_and_deferred() {
         assert_eq!(parse_command("/followup"), Command::Followup);
         assert_eq!(parse_command("/deferred"), Command::Followup);
+    }
+
+    #[test]
+    fn parses_summary_markdown() {
+        assert_eq!(
+            parse_command("/summary-markdown"),
+            Command::SummaryMarkdown { filename: None }
+        );
+        assert_eq!(
+            parse_command("/summary-markdown report.md"),
+            Command::SummaryMarkdown {
+                filename: Some("report.md".into())
+            }
+        );
+    }
+
+    #[test]
+    fn parses_review_with_target() {
+        match parse_command("/review fs/btrfs/ctree.c") {
+            Command::Review { target } => {
+                assert_eq!(target, "fs/btrfs/ctree.c");
+            }
+            other => panic!("expected Review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_without_target_is_unknown() {
+        match parse_command("/review") {
+            Command::Unknown(s) => {
+                assert!(s.starts_with("review"), "got {s}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
     }
 
     #[test]

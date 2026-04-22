@@ -111,9 +111,13 @@ to `~/.kres/prompts/<word>-template.md` when no matching
 the embedded commands — operators with custom `<word>-template.md`
 files from before the refactor keep working.
 
-Note: the template is invoked because the prompt starts with
-`review:` (or `/review`). A bare `review` or `review ` without
-the separator is submitted verbatim.
+Note: the template is invoked only when `review` appears as the
+colon-terminated leading word (`"review:..."`) or as the
+slash-prefixed leading word followed by whitespace
+(`"/review ..."`). Free-form text that happens to contain those
+character sequences elsewhere (e.g. `"what caused the review: ..."`)
+is submitted verbatim — the split is anchored to the start of
+the prompt.
 
 ### Parallel lenses inside `review-template.md`
 
@@ -622,13 +626,22 @@ commands there since setup.sh never writes those names to
 slash-command templates. Each has an `.md` body bundled in the
 kres binary via `kres_agents::user_commands`, and an operator
 can override or add commands by dropping a file at
-`~/.kres/commands/<name>.md`. Invocation paths:
+`~/.kres/commands/<name>.md`.
 
-| Where | How to invoke `review` on `fs/btrfs/ctree.c` |
-|-------|---------------------------------------------|
-| CLI   | `kres --prompt 'review: fs/btrfs/ctree.c'` |
-| CLI   | `kres --prompt '/review fs/btrfs/ctree.c'` (equivalent) |
-| REPL  | `/summary` — synthesises the accumulated run into `bug-report.txt` |
+Invocation paths (all three commands available in both places,
+plus arbitrary operator commands dropped under
+`~/.kres/commands/<name>.md` are invocable the same way):
+
+| Command            | CLI                                                | REPL                           |
+|--------------------|----------------------------------------------------|--------------------------------|
+| `review`           | `kres --prompt 'review: fs/btrfs/ctree.c'` or `kres --prompt '/review fs/btrfs/ctree.c'` | `/review fs/btrfs/ctree.c`     |
+| `summary`          | `kres --summary --results DIR`                     | `/summary [filename]`          |
+| `summary-markdown` | `kres --summary --markdown --results DIR`          | `/summary-markdown [filename]` |
+
+The `review:` and `/review` CLI forms compose the template body
+with the trailing target; the `/review` REPL form does the same
+composition through `user_commands::compose` and submits the
+result as a new task.
 
 The shipped three:
 
@@ -725,6 +738,6 @@ kres [--fast-agent ...] [--slow TAG | --slow-agent ...] [--main-agent ...]
 ```
 
 Interactive REPL commands: `/help`, `/tasks`, `/findings`, `/stop`,
-`/clear`, `/cost`, `/todo`, `/summary [FILE]`, `/report <path>`,
-`/load <path>`, `/edit`, `/reply <text>`, `/next`, `/continue`,
-`/quit`.
+`/clear`, `/cost`, `/todo`, `/summary [FILE]`, `/summary-markdown [FILE]`,
+`/review <target>`, `/report <path>`, `/load <path>`, `/edit`,
+`/reply <text>`, `/next`, `/continue`, `/quit`.

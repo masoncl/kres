@@ -48,8 +48,10 @@ pub struct ReplConfig {
     pub results_dir: Option<PathBuf>,
     /// Explicit `--template FILE` from the CLI. Passed through to
     /// SummaryInputs.template_path when /summary fires. When None
-    /// the summariser falls back to ~/.kres/system-prompts/bug-summary.md,
-    /// then to the compiled-in default (see kres_repl::summary).
+    /// the summariser falls back to ~/.kres/commands/summary.md (or
+    /// summary-markdown.md with `/summary-markdown`), then to the
+    /// compiled-in default (see kres_repl::summary and
+    /// kres_agents::user_commands).
     pub template_path: Option<PathBuf>,
     /// When true, skip the persistent status line (no DECSTBM scroll
     /// region). Useful for dumb terminals / pipes / finicky muxers.
@@ -1383,7 +1385,11 @@ impl Session {
                     }
                 }
                 Command::Followup => self.cmd_followup().await,
-                Command::Summary { filename } => self.cmd_summary(filename).await,
+                Command::Summary { filename } => self.cmd_summary(filename, false).await,
+                Command::SummaryMarkdown { filename } => {
+                    self.cmd_summary(filename, true).await
+                }
+                Command::Review { target } => self.cmd_review(target).await,
                 Command::Extract {
                     dir,
                     report,
@@ -1482,7 +1488,7 @@ impl Session {
                 );
             } else {
                 kres_core::async_eprintln!("--turns: rendering bug-report.txt before exit");
-                self.cmd_summary(None).await;
+                self.cmd_summary(None, false).await;
             }
         }
 
@@ -2157,8 +2163,11 @@ impl Session {
     /// The calls the main agent to generate a smart
     /// synthesis; kres currently produces a deterministic concatenation
     /// (TODO: add an LLM synthesiser once the summariser agent config
-    /// is defined). Matches the shape of `/summary` at.
-    async fn cmd_summary(&self, filename: Option<String>) {
+    /// is defined). Matches the shape of `/summary`; pass
+    /// `markdown=true` (via the `/summary-markdown` slash command) to
+    /// select the markdown-variant template and default the output
+    /// filename to `bug-report.md` instead of `bug-report.txt`.
+    async fn cmd_summary(&self, filename: Option<String>, markdown: bool) {
         let Some(orc) = self.orchestrator.as_ref() else {
             async_println(
                 "/summary: orchestrator not configured (need --fast-agent and --slow-agent)",
@@ -2187,8 +2196,18 @@ impl Session {
             .results_dir
             .clone()
             .or_else(|| report_path.parent().map(std::path::Path::to_path_buf));
+        // /summary-markdown defaults the filename to bug-report.md
+        // instead of bug-report.txt so the operator's explicit
+        // filename wins (--summary --markdown behaves the same at
+        // the CLI).
+        let default_name: Option<&str> = match filename.as_deref() {
+            Some(_) => None,
+            None if markdown => Some("bug-report.md"),
+            None => None,
+        };
+        let effective_name = filename.as_deref().or(default_name);
         let output_path =
-            crate::summary::default_output_path(output_dir.as_deref(), filename.as_deref());
+            crate::summary::default_output_path(output_dir.as_deref(), effective_name);
         let findings_path = self.cfg.findings_base.clone();
         // Original prompt resolution: in-memory initial_prompt wins
         // (it's the literal --prompt FILE or first submission). If
@@ -2213,27 +2232,55 @@ impl Session {
             findings_path,
             output_path: output_path.clone(),
             template_path: self.cfg.template_path.clone(),
-            // The REPL's /summary path keeps the plain-text default;
-            // `--markdown` is a --summary-time flag, not a per-turn
-            // one.  An operator who wants markdown inside the REPL
-            // can point `/summary --template
-            // ~/.kres/system-prompts/bug-summary-markdown.md` at it
-            // (after dropping the file there), or use `kres
-            // --summary --markdown` post-hoc.
-            markdown: false,
+            // `/summary` uses the plain-text template,
+            // `/summary-markdown` flips this flag so the summariser
+            // reads `summary-markdown` from the user_commands table
+            // (with the operator's
+            // ~/.kres/commands/summary-markdown.md as an override).
+            markdown,
             original_prompt,
             client: orc.fast_client.clone(),
             model: orc.fast_model.clone(),
             max_tokens: orc.fast_max_tokens,
             max_input_tokens: orc.fast_max_input_tokens,
         };
+        let label = if markdown { "/summary-markdown" } else { "/summary" };
         async_println(format!(
-            "/summary: rendering bug report to {}",
+            "{label}: rendering bug report to {}",
             output_path.display()
         ));
         if let Err(e) = crate::summary::run_summary(inputs).await {
-            async_println(format!("/summary: {e}"));
+            async_println(format!("{label}: {e}"));
         }
+    }
+
+    /// `/review <target>` — compose the embedded `review`
+    /// slash-command template with the operator's target string
+    /// and submit the result as a new prompt. Uses the same
+    /// user_commands::compose path as `--prompt "review: ..."` so
+    /// the CLI and REPL share exactly one code path for the
+    /// review flow.
+    async fn cmd_review(&self, target: String) {
+        let target = target.trim();
+        if target.is_empty() {
+            async_println(
+                "/review: expected a target, e.g. /review fs/btrfs/ctree.c",
+            );
+            return;
+        }
+        let Some((src, body)) =
+            kres_agents::user_commands::compose("review", target)
+        else {
+            async_println(
+                "/review: `review` template missing from the embedded table — this is a build bug",
+            );
+            return;
+        };
+        async_println(format!(
+            "/review: composed prompt from {src} ({} chars)",
+            body.len()
+        ));
+        self.submit_prompt(body).await;
     }
 
     /// `/extract [--dir D] [--report F] [--todo F] [--findings F]` —
@@ -3199,27 +3246,33 @@ fn print_banner() {
 
 fn print_help() {
     println!("commands:");
-    println!("  /help, /?        show this help");
-    println!("  /tasks, /task    list running tasks");
-    println!("  /findings        summarise findings");
-    println!("  /stop            cancel running tasks");
-    println!("  /clear           stop tasks, reset findings + todo + accumulated context");
-    println!("  /compact         summarise accumulated context into one short entry");
-    println!("  /cost            show API token usage");
-    println!("  /todo            show the todo list");
-    println!("  /report <path>   write findings report (markdown)");
-    println!("  /load <path>     submit a file's contents as the next prompt");
-    println!("  /edit            open $EDITOR on a scratch file, submit on save");
-    println!("  /followup        list items deferred by goal/--turns");
-    println!("  /summary [FILE]  render report.md+findings.json into a plain-text bug report (default bug-report.txt)");
-    println!("  /extract ...     copy artifacts (--dir, --report, --todo, --findings)");
-    println!("  /done N          remove the N'th pending todo");
-    println!("  /todo --clear    drop every todo item");
-    println!("  /reply <text>    prepend last analysis to new text, submit");
-    println!("  /next            dispatch the next pending todo item as a prompt");
-    println!("  /continue        dispatch every unblocked pending todo");
-    println!("  /quit, /exit     leave the REPL");
-    println!("  <anything else>  submit as a prompt");
+    println!("  /help, /?              show this help");
+    println!("  /tasks, /task          list running tasks");
+    println!("  /findings              summarise findings");
+    println!("  /stop                  cancel running tasks");
+    println!("  /clear                 stop tasks, reset findings + todo + accumulated context");
+    println!("  /compact               summarise accumulated context into one short entry");
+    println!("  /cost                  show API token usage");
+    println!("  /todo                  show the todo list");
+    println!("  /report <path>         write findings report (markdown)");
+    println!("  /load <path>           submit a file's contents as the next prompt");
+    println!("  /edit                  open $EDITOR on a scratch file, submit on save");
+    println!("  /followup              list items deferred by goal/--turns");
+    println!("  /review <target>       compose the embedded `review` template with <target> and submit");
+    println!("  /summary [FILE]        render report.md+findings.json into a plain-text bug report (default bug-report.txt)");
+    println!("  /summary-markdown [FILE]  render the markdown variant (default bug-report.md)");
+    println!("  /extract ...           copy artifacts (--dir, --report, --todo, --findings)");
+    println!("  /done N                remove the N'th pending todo");
+    println!("  /todo --clear          drop every todo item");
+    println!("  /reply <text>          prepend last analysis to new text, submit");
+    println!("  /next                  dispatch the next pending todo item as a prompt");
+    println!("  /continue              dispatch every unblocked pending todo");
+    println!("  /quit, /exit           leave the REPL");
+    println!("  <anything else>        submit as a prompt");
+    println!();
+    println!(
+        "override slash-command templates by dropping a file at ~/.kres/commands/<name>.md"
+    );
 }
 
 fn truncate(s: &str, n: usize) -> String {

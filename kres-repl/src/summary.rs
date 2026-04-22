@@ -27,25 +27,6 @@ use kres_agents::AgentConfig;
 use kres_core::findings::FindingsFile;
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
-/// Resolve the plain-text bug-report template via the slash-command
-/// lookup. Goes through `~/.kres/commands/summary.md` first (if the
-/// operator wrote one) and falls back to the embedded default.
-/// Panics only if the embedded table is missing the key — which
-/// the module's own unit test
-/// (`all_expected_commands_are_present`) prevents.
-pub fn bug_summary_template() -> String {
-    kres_agents::user_commands::lookup("summary")
-        .expect("`summary` missing from user_commands table")
-}
-
-/// Resolve the markdown variant of the bug-report template. Same
-/// two-step lookup (`~/.kres/commands/summary-markdown.md` →
-/// embedded).
-pub fn bug_summary_markdown_template() -> String {
-    kres_agents::user_commands::lookup("summary-markdown")
-        .expect("`summary-markdown` missing from user_commands table")
-}
-
 /// Default on-disk override location for the plain-text template.
 /// Empty by default; an operator who wants to shadow the embedded
 /// prompt drops a file at `~/.kres/commands/summary.md`. Returns
@@ -73,10 +54,10 @@ pub struct SummaryInputs {
     pub output_path: PathBuf,
     /// Explicit override for the system prompt template. When Some,
     /// run_summary reads the file and errors if it cannot. When None,
-    /// `~/.kres/system-prompts/bug-summary.md` wins if it exists;
-    /// else the compiled-in fallback is used. When `markdown` is
-    /// true the markdown variant of each resolution step is tried
-    /// instead.
+    /// `~/.kres/commands/summary.md` wins if it exists; else the
+    /// compiled-in `summary` body from `kres_agents::user_commands`
+    /// is used. When `markdown` is true the `summary-markdown`
+    /// variant is selected at each hop instead.
     pub template_path: Option<PathBuf>,
     /// Select the markdown variant of the template + the `.md` output
     /// filename default. Ignored when `template_path` is set (the
@@ -123,6 +104,47 @@ pub fn load_fast_for_summary(
     let client = Arc::new(Client::new(fast_cfg.key.clone())?);
     let max_tokens = fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens);
     Ok((client, fast_model, max_tokens, fast_cfg.max_input_tokens))
+}
+
+/// Resolve the summariser's system-prompt template to a
+/// (source-label, body) pair. Each disk path is read at most once;
+/// the embedded fallback skips disk entirely. Precedence:
+///   1. `inputs.template_path` (explicit `--template FILE`).
+///   2. `~/.kres/commands/<name>.md` when the file exists (the
+///      operator override path; `<name>` is `summary` or
+///      `summary-markdown` depending on `inputs.markdown`).
+///   3. The compiled-in body from `kres_agents::user_commands`.
+fn resolve_template(inputs: &SummaryInputs) -> Result<(String, String)> {
+    if let Some(ref p) = inputs.template_path {
+        let text = std::fs::read_to_string(p)
+            .with_context(|| format!("reading template {}", p.display()))?;
+        return Ok((p.display().to_string(), text));
+    }
+    let (disk_default, fallback_label, fallback_name) = if inputs.markdown {
+        (
+            default_markdown_template_path(),
+            "<compiled-in markdown fallback>",
+            "summary-markdown",
+        )
+    } else {
+        (
+            default_template_path(),
+            "<compiled-in fallback>",
+            "summary",
+        )
+    };
+    if let Some(p) = disk_default.filter(|p| p.exists()) {
+        let text = std::fs::read_to_string(&p)
+            .with_context(|| format!("reading template {}", p.display()))?;
+        return Ok((p.display().to_string(), text));
+    }
+    let body = kres_agents::user_commands::lookup(fallback_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "embedded `{fallback_name}` template missing from user_commands — build bug"
+            )
+        })?;
+    Ok((fallback_label.to_string(), body))
 }
 
 /// Run the summary pipeline. Reads report.md (required) and
@@ -182,41 +204,12 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     }))?;
 
     // Resolve the system prompt template: explicit --template wins,
-    // then the on-disk operator override under ~/.kres/commands/
-    // (handled inside bug_summary_template / bug_summary_markdown_template
-    // via user_commands::lookup), else the compiled-in default.
-    // `--markdown` picks the markdown variant at each hop. Each hop
-    // logs its source so operators can tell which template shaped
-    // the report.
-    let (disk_default, fallback_text, fallback_label): (
-        Option<PathBuf>,
-        String,
-        &'static str,
-    ) = if inputs.markdown {
-        (
-            default_markdown_template_path(),
-            bug_summary_markdown_template(),
-            "<compiled-in markdown fallback>",
-        )
-    } else {
-        (
-            default_template_path(),
-            bug_summary_template(),
-            "<compiled-in fallback>",
-        )
-    };
-    let (template_src, template_text): (String, String) = if let Some(ref p) = inputs.template_path
-    {
-        let text = std::fs::read_to_string(p)
-            .with_context(|| format!("reading template {}", p.display()))?;
-        (p.display().to_string(), text)
-    } else if let Some(p) = disk_default.filter(|p| p.exists()) {
-        let text = std::fs::read_to_string(&p)
-            .with_context(|| format!("reading template {}", p.display()))?;
-        (p.display().to_string(), text)
-    } else {
-        (fallback_label.to_string(), fallback_text)
-    };
+    // else the on-disk operator override under ~/.kres/commands/,
+    // else the compiled-in default. `--markdown` picks the markdown
+    // variant at each hop. We read each file at most once — the
+    // per-hop log line names the source so operators can tell which
+    // template actually shaped the report.
+    let (template_src, template_text) = resolve_template(&inputs)?;
     eprintln!("summary: template = {}", template_src);
 
     let mut cfg = CallConfig::defaults_for(inputs.model.clone())

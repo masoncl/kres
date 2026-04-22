@@ -87,7 +87,9 @@ Rate limiters are shared across agents that use the same API key string.
 | `/todo` | Show pending items (ready/blocked) + completed count |
 | `/todo --clear` | Clear all todo items |
 | `/cost` | Token usage by agent role and model |
-| `/summary` | Main agent synthesizes accumulated findings |
+| `/summary [FILE]` | Fast agent renders the run's report.md + findings.json into a bug report via the embedded `summary` slash-command template. Output defaults to `bug-report.txt` in the results dir |
+| `/summary-markdown [FILE]` | Same as `/summary` but uses the `summary-markdown` template and defaults the filename to `bug-report.md` |
+| `/review <target>` | Compose the embedded `review` slash-command template with `<target>` and submit as a new task — CLI equivalent of `--prompt 'review: <target>'` |
 | `/report <file>` | Write all findings to markdown file |
 | `/followup` | Show deferred items (identified but skipped when goal met) |
 | `/next` | Run next todo item |

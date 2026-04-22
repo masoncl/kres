@@ -285,10 +285,21 @@ fn main() -> Result<()> {
 /// files, the skills directory, findings base, and mcp.json.
 /// Resolve the --prompt CLI argument into (source-description, body).
 ///
+/// Recognised forms:
 ///   1. Path to an existing file → `(path.display(), file-contents)`.
-///   2. `"word: extra"` where `~/.kres/prompts/<word>-template.md`
-///      exists → `(template-path, extra + "\n\n" + template-body)`.
-///   3. Anything else → `("<inline>", raw)`.
+///   2. `"word: extra"` or `"/word extra"` naming a slash-command
+///      template (embedded default plus optional override at
+///      `~/.kres/commands/<word>.md`) → `(source-label, extra +
+///      "\n\n" + command-body)`. Both forms are equivalent:
+///      `--prompt "review: fs/btrfs/ctree.c"` and
+///      `--prompt "/review fs/btrfs/ctree.c"` produce the same
+///      composed prompt.
+///   3. Legacy `~/.kres/prompts/<word>-template.md` lookup — kept
+///      as a back-compat fallback so operators with custom
+///      `<word>-template.md` files from before the slash-command
+///      refactor keep working without edits. The new location
+///      `~/.kres/commands/<word>.md` is preferred.
+///   4. Anything else → `("<inline>", raw)`.
 fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
     // Form 1: existing file path wins outright, including when the
     // name happens to contain a colon.
@@ -298,35 +309,64 @@ fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
             .with_context(|| format!("reading prompt file {}", as_path.display()))?;
         return Ok((as_path.display().to_string(), body));
     }
-    // Form 2: "word: extra". The prefix must be a single bare word
-    // (alphanumerics, dash, underscore) so free-form questions that
-    // happen to contain colons don't false-match.
-    if let Some((head, rest)) = raw.split_once(':') {
-        let head_trim = head.trim();
-        let is_word = !head_trim.is_empty()
-            && head_trim
+
+    // Form 2: try to extract a command name and the trailing extra
+    // text from either "word: extra" or "/word extra". In both
+    // cases the name must be a single bare word (alphanumerics,
+    // dash, underscore) so free-form questions that happen to
+    // contain colons or start with a slash don't false-match.
+    let named: Option<(&str, &str)> = if let Some(after_slash) = raw.strip_prefix('/') {
+        // `/word extra` — split on the first whitespace run.
+        let (head, rest) = match after_slash.split_once(char::is_whitespace) {
+            Some((h, r)) => (h, r.trim()),
+            None => (after_slash, ""),
+        };
+        Some((head, rest))
+    } else if let Some((head, rest)) = raw.split_once(':') {
+        Some((head.trim(), rest.trim()))
+    } else {
+        None
+    };
+    if let Some((head, rest)) = named {
+        let is_word = !head.is_empty()
+            && head
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
         if is_word {
+            // Preferred: ~/.kres/commands/<word>.md via
+            // user_commands::lookup (disk-first + embedded
+            // fallback).
+            if let Some(body) = kres_agents::user_commands::lookup(head) {
+                let composed = if rest.is_empty() {
+                    body
+                } else {
+                    format!("{rest}\n\n{body}")
+                };
+                let src = format!("/{head} (user_commands)");
+                return Ok((src, composed));
+            }
+            // Legacy: ~/.kres/prompts/<word>-template.md. Kept for
+            // operators whose custom templates predate the slash-
+            // command refactor. New templates should go under
+            // ~/.kres/commands/<word>.md.
             if let Some(dir) = kres_dir() {
                 let tmpl = dir
                     .join("prompts")
-                    .join(format!("{}-template.md", head_trim));
+                    .join(format!("{}-template.md", head));
                 if tmpl.exists() {
                     let body = std::fs::read_to_string(&tmpl)
                         .with_context(|| format!("reading template {}", tmpl.display()))?;
-                    let extra = rest.trim();
-                    let composed = if extra.is_empty() {
+                    let composed = if rest.is_empty() {
                         body
                     } else {
-                        format!("{extra}\n\n{body}")
+                        format!("{rest}\n\n{body}")
                     };
                     return Ok((tmpl.display().to_string(), composed));
                 }
             }
         }
     }
-    // Form 3: inline prompt text.
+    // Form 4: inline prompt text.
     Ok(("<inline>".to_string(), raw.to_string()))
 }
 

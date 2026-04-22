@@ -1,24 +1,25 @@
-//! LLM system prompts compiled into the kres binary.
+//! Agent `*.system.md` prompts compiled into the kres binary.
 //!
-//! Markdown files under `configs/prompts/` that carry system-prompt
-//! text for an LLM call (agent `*.system.md` prompts plus the
-//! `bug-summary` templates for the `/summary` pipeline) are
-//! included via `include_str!` at build time. A freshly-rebuilt
-//! kres already knows the current prompts — no `setup.sh
-//! --overwrite` dance is needed every time the repo's prompts
-//! change.
+//! The agent-role system prompts (fast-code-agent, main-agent,
+//! slow-code-agent, slow-code-agent-coding, slow-code-agent-generic,
+//! todo-agent) are included via `include_str!` at build time. A
+//! freshly-rebuilt kres already knows the current prompts — no
+//! `setup.sh --overwrite` dance is needed every time the repo's
+//! prompts change.
 //!
-//! Disk still wins: an operator who wants to customize a prompt
-//! drops a file at `~/.kres/system-prompts/<basename>` and kres
-//! reads it ahead of the embedded copy. The embedded entry is the
-//! fallback when the disk path is absent (the normal case — the
-//! `system-prompts/` directory is empty by default).
+//! Disk still wins: an operator who wants to customize an agent
+//! prompt drops a file at `~/.kres/system-prompts/<basename>` and
+//! kres reads it ahead of the embedded copy. The embedded entry is
+//! the fallback when the disk path is absent (the normal case —
+//! the `system-prompts/` directory is empty by default).
 //!
-//! Excluded on purpose: the prompt TEMPLATES the operator wires
-//! via `--prompt "word: extra"` (`review-template.md`,
-//! `<word>-template.md`). Those are user-authored content, not
-//! LLM system prompts, and they continue to live on disk under
-//! `~/.kres/prompts/`.
+//! Not covered here: slash-command templates invoked via
+//! `--prompt "word: extra"`, `--prompt "/word extra"`, or REPL
+//! commands like `/review` / `/summary` / `/summary-markdown`.
+//! Those live in the separate `kres_agents::user_commands` module
+//! with their own override directory (`~/.kres/commands/`). The
+//! split exists so agent-role prompts and operator-authored
+//! prompt content keep distinct override surfaces.
 
 /// Basename → verbatim prompt body. Keep the list aligned with
 /// `configs/prompts/*.system.md` in the repo; a missing entry falls
@@ -48,14 +49,6 @@ const TABLE: &[(&str, &str)] = &[
     (
         "todo-agent.system.md",
         include_str!("../../configs/prompts/todo-agent.system.md"),
-    ),
-    (
-        "bug-summary.md",
-        include_str!("../../configs/prompts/bug-summary.md"),
-    ),
-    (
-        "bug-summary-markdown.md",
-        include_str!("../../configs/prompts/bug-summary-markdown.md"),
     ),
 ];
 
@@ -122,13 +115,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn bug_summary_templates_are_present() {
-        // bug-summary{,-markdown}.md back /summary and kres
-        // --summary; they are LLM system prompts for the
-        // summariser call, so they ride the same embed/override
-        // pipeline as the agent prompts.
-        assert!(lookup("bug-summary.md").is_some());
-        assert!(lookup("bug-summary-markdown.md").is_some());
-    }
 }

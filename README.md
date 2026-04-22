@@ -6,12 +6,21 @@ is the primary target).
 
 # NEWS
 
-April 22: Agent system prompts are now embedded in the kres binary
-— rebuilding kres refreshes them. `setup.sh` no longer copies
-`*.system.md` anywhere. The override directory for a custom prompt
-is `~/.kres/system-prompts/` (NOT `~/.kres/prompts/`); any stale
-`.system.md` files left in `~/.kres/prompts/` from prior installs
-are ignored. See "System prompts" below.
+April 22: Agent system prompts and slash-command templates are
+now embedded in the kres binary — rebuilding kres refreshes
+them. `setup.sh` no longer copies `*.system.md`, `bug-summary*.md`,
+or `review-template.md` anywhere. Two new override directories:
+
+- `~/.kres/system-prompts/<name>.system.md` — operator override
+  for an agent system prompt.
+- `~/.kres/commands/<name>.md` — operator override for a slash-
+  command template (`/review`, `/summary`, `/summary-markdown`),
+  and the same lookup that backs `--prompt "word: extra"` and
+  the new `--prompt "/word extra"` form.
+
+Stale files left under `~/.kres/prompts/` from earlier installs
+are ignored and safe to delete. See "System prompts" and
+"Slash-command templates" below.
 
 April 21: There's new support for writing patches, more details below.
 
@@ -73,17 +82,38 @@ April 21: There's new support for writing patches, more details below.
    kres --results review --prompt 'review: fs/btrfs/ctree.c' --turns 2
    ```
 
-The `--prompt 'review: fs/btrfs/ctree.c'` form is a two-part prompt:
-the token `review` names a template at
-`~/.kres/prompts/review-template.md`, and the rest of the string is
-the specific target. kres splices the target onto the front of the
-template to produce a full prompt covering object lifetime, memory
-safety, bounds checks, races, and general bugs in the named code.
-Drop a new `<word>-template.md` in `~/.kres/prompts/` to add your
-own prompt templates.
+The `--prompt 'review: fs/btrfs/ctree.c'` form is a two-part
+prompt: the token `review` names the slash-command template
+embedded in the kres binary (source:
+`configs/prompts/review-template.md`), and the rest of the
+string is the specific target. kres splices the target onto the
+front of the template body to produce a full prompt covering
+object lifetime, memory safety, bounds checks, races, and
+general bugs in the named code.
 
-Note: the template is invoked because the prompt has 'review:'.  If you just
-wrote 'review', the template would not be loaded.
+Two equivalent forms — pick whichever reads better:
+
+```
+kres --prompt 'review: fs/btrfs/ctree.c'
+kres --prompt '/review fs/btrfs/ctree.c'
+```
+
+Both resolve via `kres_agents::user_commands::lookup("review")`,
+which prefers `~/.kres/commands/review.md` on disk (the operator
+override path) and falls back to the embedded copy. Drop a file
+at `~/.kres/commands/<name>.md` to add a new command; use the
+same `--prompt "name: extra"` or `--prompt "/name extra"` form
+to invoke it.
+
+Legacy compatibility: `--prompt "word: extra"` still falls back
+to `~/.kres/prompts/<word>-template.md` when no matching
+`~/.kres/commands/<word>.md` exists and the name isn't one of
+the embedded commands — operators with custom `<word>-template.md`
+files from before the refactor keep working.
+
+Note: the template is invoked because the prompt starts with
+`review:` (or `/review`). A bare `review` or `review ` without
+the separator is submitted verbatim.
 
 ### Parallel lenses inside `review-template.md`
 
@@ -118,9 +148,12 @@ lens bullet fold into its `reason` field and become extra guidance
 the slow agent sees on that specific lens (see the sub-bullets
 under `object lifetime` and `memory allocations` in the template).
 
-To add or remove angles for your own reviews, edit the bullets in
-`~/.kres/prompts/review-template.md`, or drop a whole new
-`<word>-template.md` with its own lens set.
+To add or remove angles for your own reviews, drop a customised
+copy of the review template at `~/.kres/commands/review.md` — it
+takes precedence over the embedded copy at load time. Dropping a
+new `<word>.md` alongside it (e.g. `~/.kres/commands/audit.md`)
+adds a `/audit` slash-command you can invoke via
+`--prompt "audit: target"` or `--prompt "/audit target"`.
 
 `--results review` tells kres where to keep the run's artifacts:
 `findings.json` (plus `findings-N.json` history snapshots), the
@@ -256,10 +289,10 @@ At the end of a run you get a plain-text bug report via `/summary`
 - Picks up `<results>/prompt.md` (saved on the first submit so
   subsequent `/summary` or `--summary` invocations know the original
   question), `<results>/report.md`, and `<results>/findings.json`.
-- Uses the fast agent with the `bug-summary.md` prompt template
+- Uses the fast agent with the `summary` slash-command template
   (embedded in the kres binary; overridable at
-  `~/.kres/system-prompts/bug-summary.md`) as a dedicated system
-  prompt.
+  `~/.kres/commands/summary.md`) as a dedicated system prompt.
+  `--markdown` selects the `summary-markdown` variant instead.
 - Orders the resulting sections by `bug-severity` — `high` →
   `medium` → `low` → `latent` → `unknown` — with one section per
   bug, each led by `Subject:`, `bug-severity:`, and `bug-impact:`
@@ -541,56 +574,96 @@ settings.json for that agent only.
 
 ## System prompts
 
-Markdown files under `configs/prompts/` that carry LLM
-system-prompt text are compiled into the kres binary via
-`include_str!` (see `kres-agents/src/embedded_prompts.rs`).
-`setup.sh` does NOT install them anywhere on disk. Rebuilding
-kres is enough to pick up prompt changes; there is no
-`--overwrite` dance to run after every repo pull.
+Agent `*.system.md` prompts (fast / slow / slow-coding /
+slow-generic / main / todo) are compiled into the kres binary
+via `include_str!` (see `kres-agents/src/embedded_prompts.rs`).
+`setup.sh` does NOT install them on disk. Rebuilding kres
+refreshes them.
 
-Covered prompts:
+The shipped agent configs under `configs/*.json` reference
+`system_file: "system-prompts/<name>.system.md"`; the path is
+resolved relative to the config file's directory, so at runtime
+it becomes `~/.kres/system-prompts/<name>.system.md`.
 
-- `*.system.md` — one per agent role (fast / slow /
-  slow-coding / slow-generic / main / todo). Referenced by the
-  shipped agent configs via `system_file:
-  "system-prompts/<name>.system.md"`.
-- `bug-summary.md` / `bug-summary-markdown.md` — the system
-  prompt for the `/summary` and `kres --summary` call. The
-  second variant is selected by `--markdown`.
+Load order used by `AgentConfig::load`:
 
-Load order used by `AgentConfig::load` (for agent prompts) and
-`summary.rs::run_summary` (for the bug-summary templates):
-
-1. **Explicit path** (summary only): `--template PATH` wins
-   when set.
-2. **Disk override**: `~/.kres/system-prompts/<basename>`. If
+1. **Disk override**: `~/.kres/system-prompts/<basename>`. If
    this file exists and is non-empty it is used verbatim.
-3. **Embedded**: the compiled-in copy keyed by basename.
-4. **Error** (agent configs only — summary silently falls
-   back to embedded): neither disk nor embedded → config load
-   fails with a message that names both paths.
+2. **Embedded**: the compiled-in copy keyed by basename.
+3. **Error**: neither present → config load fails with a
+   message that names both paths.
 
-To customize a prompt for your own install, drop the edited file
-at `~/.kres/system-prompts/<basename>`. The default install has
-no files there; the embedded copies do all the work.
+To customize an agent prompt for your own install, drop the
+edited file at `~/.kres/system-prompts/<basename>`. The default
+install has no files there; the embedded copies do all the work.
 
-Why `system-prompts/` and not `prompts/`? Older installs
-populated `~/.kres/prompts/` directly from setup.sh (both
-`*.system.md` and `bug-summary*.md`). Keeping the override in
-the same directory would mean those leftover files shadow the
-embedded defaults and produce stale behaviour after an upgrade.
-A new directory name sidesteps that — a fresh kres reads only
-the embedded prompts until the operator deliberately drops one
-under the new path. Stale files under `~/.kres/prompts/` are
-safe to delete (they are never consulted).
+Slash-command templates (`/review`, `/summary`,
+`/summary-markdown`) live in a separate module
+(`kres-agents/src/user_commands.rs`) with their own override
+directory at `~/.kres/commands/` — see the next section.
 
-Files that ARE still copied to disk by `setup.sh` (their job is
-per-install prompt-template content, not an LLM system prompt)
-continue to live in `~/.kres/prompts/`:
+Why distinct directories? Older installs populated
+`~/.kres/prompts/` directly from setup.sh (both `*.system.md`
+and `bug-summary*.md`). Keeping the override in the same
+directory would mean those leftover files shadow the embedded
+defaults and produce stale behaviour after an upgrade. Two
+fresh directory names sidestep that — a fresh kres reads only
+the embedded defaults until the operator deliberately drops a
+file under the new paths. Stale files under `~/.kres/prompts/`
+are safe to delete (the slash-command loader still reads
+`<word>-template.md` from there as a back-compat fallback, but
+will never find a filename matching one of the shipped embedded
+commands there since setup.sh never writes those names to
+`prompts/`).
 
-- `review-template.md` and any `<word>-template.md` — backs
-  `--prompt "word: extra details"`. Parsed into lenses via
-  `parse_prompt_file`.
+## Slash-command templates
+
+`review` / `summary` / `summary-markdown` are embedded
+slash-command templates. Each has an `.md` body bundled in the
+kres binary via `kres_agents::user_commands`, and an operator
+can override or add commands by dropping a file at
+`~/.kres/commands/<name>.md`. Invocation paths:
+
+| Where | How to invoke `review` on `fs/btrfs/ctree.c` |
+|-------|---------------------------------------------|
+| CLI   | `kres --prompt 'review: fs/btrfs/ctree.c'` |
+| CLI   | `kres --prompt '/review fs/btrfs/ctree.c'` (equivalent) |
+| REPL  | `/summary` — synthesises the accumulated run into `bug-report.txt` |
+
+The shipped three:
+
+- `review` — the parallel-lens review template (see the
+  "Parallel lenses" section above). Invocation prepends the
+  operator's target to the template body.
+- `summary` — the plain-text bug-report system prompt that
+  `/summary` and `kres --summary` pass to the fast agent.
+- `summary-markdown` — the markdown-output variant selected by
+  `--markdown`.
+
+Adding your own: drop `~/.kres/commands/audit.md` and run
+`kres --prompt 'audit: net/...'` or `kres --prompt '/audit
+net/...'`. No rebuild needed — the disk override path is
+consulted on every invocation.
+
+Load order (identical for every command):
+
+1. `~/.kres/commands/<name>.md` on disk (operator override).
+2. Embedded body in `kres_agents::user_commands` (for the three
+   shipped commands).
+3. Fallback to the legacy `~/.kres/prompts/<name>-template.md`
+   lookup when neither of the above hit — preserves existing
+   custom templates from before this refactor.
+4. Nothing matched → treat `"name: extra"` as a verbatim prompt.
+
+Files that setup.sh still copies to `~/.kres/prompts/`: any
+operator-authored `<word>-template.md` the user drops into
+`configs/prompts/` that isn't shadowed by an embedded command
+of the same root name. The shipped `review-template.md`,
+`bug-summary.md`, and `bug-summary-markdown.md` are NOT copied
+(they're embedded); `configs/prompts/<word>-template.md` for
+any other `<word>` is copied verbatim so custom templates from
+before the refactor keep working via the legacy
+`~/.kres/prompts/<word>-template.md` fallback path.
 
 ## Workspace layout
 

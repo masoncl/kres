@@ -23,6 +23,7 @@ pub mod skills;
 pub mod symbol;
 pub mod todo_agent;
 pub mod tools;
+pub mod user_commands;
 
 pub use config::{AgentConfig, AgentKind};
 pub use consolidate::{consolidate_lenses, ConsolidatedTask, LensOutput};

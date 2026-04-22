@@ -213,36 +213,41 @@ say "slow model:   ${SLOW_MODEL}"
 say "model:        ${MODEL}"
 
 echo "system prompts and agent configs:"
-# LLM system prompts are compiled into the kres binary via
-# kres-agents::embedded_prompts and are deliberately NOT installed
-# on disk. This covers the agent `*.system.md` prompts AND the
-# `bug-summary{,-markdown}.md` templates used by `/summary` —
-# both classes drive an LLM `system` field, just in different
-# pipelines. Rebuilding kres refreshes the lot.
+# Every prompt/template the shipped kres binary uses is embedded
+# via include_str!: agent `*.system.md` prompts go through
+# kres-agents::embedded_prompts, slash-command templates
+# (/review, /summary, /summary-markdown) go through
+# kres-agents::user_commands. None of these files are installed
+# on disk by default — rebuilding kres refreshes the lot.
 #
-# An operator who wants to override any of those prompts drops a
-# file at ~/.kres/system-prompts/<basename> and the loader
-# (AgentConfig::load for agent prompts, summary.rs for the bug-
-# summary templates) reads it ahead of the embedded copy.
+# Override directories (both empty on a fresh install, both
+# honoured by the respective loaders when populated):
 #
-# The override directory is system-prompts/, not prompts/, on
-# purpose: older installs populated ~/.kres/prompts/ directly
-# (both *.system.md and bug-summary{,-markdown}.md), and those
-# leftover files would otherwise shadow the embedded defaults
-# and produce stale behaviour after an upgrade. The new
-# directory name means a fresh kres reads only the embedded
-# prompts until the operator deliberately drops one.
+#   ~/.kres/system-prompts/<agent>.system.md
+#     → override an agent system prompt. AgentConfig::load reads
+#       this ahead of the embedded copy.
 #
-# `<word>-template.md` files (review-template.md and any
-# `<word>-template.md` the operator added) DO install to
-# ~/.kres/prompts/ — those are prompt-TEMPLATE content that the
-# operator invokes via `--prompt "word: extra"`, not system
-# prompts for an LLM call.
+#   ~/.kres/commands/<name>.md
+#     → override (or add) a slash-command template. Consulted by
+#       user_commands::lookup, which drives --prompt "word: extra",
+#       --prompt "/word extra", and the /review / /summary /
+#       /summary-markdown REPL paths.
+#
+# Both override directories are new; older installs populated
+# ~/.kres/prompts/ directly. The rename prevents stale files
+# from an earlier install shadowing embedded defaults after an
+# upgrade — leftover files under ~/.kres/prompts/ are safe to
+# delete.
+#
+# The only files that still install to ~/.kres/prompts/ are
+# operator-authored `<word>-template.md` templates used by the
+# legacy --prompt "word: extra" lookup. Those are user content,
+# not kres-shipped content.
 mkdir -p "${DEST}/prompts"
 shopt -s nullglob
 for src in "${CONFIGS_SRC}/prompts"/*.md; do
   case "$(basename "$src")" in
-    *.system.md | bug-summary.md | bug-summary-markdown.md)
+    *.system.md | bug-summary.md | bug-summary-markdown.md | review-template.md)
       # Embedded in the binary; skip.
       ;;
     *)

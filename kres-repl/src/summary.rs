@@ -1,20 +1,21 @@
 //! /summary and `kres --summary` — render a plain-text bug report from
 //! a research run's report.md + findings.json.
 //!
-//! The communication rules live in `bug-summary.md`. The binary
-//! carries a compile-time copy via `kres_agents::embedded_prompts`,
-//! and callers can (but normally don't need to) point at an on-disk
-//! template so operators can tune the prompt without rebuilding.
-//! Resolution order in `run_summary`:
+//! The summariser is backed by the `/summary` (or
+//! `/summary-markdown`) slash-command template. The binary carries
+//! the embedded default via `kres_agents::user_commands`, and an
+//! operator can shadow it by dropping a file under
+//! `~/.kres/commands/`. Resolution order inside `run_summary`:
 //!   1. `inputs.template_path` (explicit `--template FILE`),
-//!   2. `~/.kres/system-prompts/bug-summary.md` (operator override
-//!      — empty by default; kres never installs this file),
-//!   3. the compiled-in prompt from `embedded_prompts::lookup`.
+//!   2. `user_commands::lookup("summary")` /
+//!      `user_commands::lookup("summary-markdown")` — which
+//!      itself prefers `~/.kres/commands/<name>.md` on disk and
+//!      falls back to the compiled-in default.
 //!
-//! The override directory is `system-prompts/`, matching the agent
-//! system-prompt override path. Old installs populated
-//! `~/.kres/prompts/bug-summary.md` directly; those stale files
-//! are ignored.
+//! Stale files under `~/.kres/prompts/` or
+//! `~/.kres/system-prompts/` are never consulted from this
+//! module — `~/.kres/commands/` is the canonical override path
+//! for slash-command templates.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,35 +27,32 @@ use kres_agents::AgentConfig;
 use kres_core::findings::FindingsFile;
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
-/// Compile-time fallback copy of the plain-text bug-report template,
-/// sourced from `kres_agents::embedded_prompts`. Kept as a module-
-/// level `fn()` rather than a `const` so the lookup stays in one
-/// place and the table owns the source of truth. Panics only if the
-/// embedded table is missing the key — which the table's own unit
-/// test (`bug_summary_templates_are_present`) prevents.
-pub fn bug_summary_template() -> &'static str {
-    kres_agents::embedded_prompts::lookup("bug-summary.md")
-        .expect("bug-summary.md missing from embedded_prompts table")
+/// Resolve the plain-text bug-report template via the slash-command
+/// lookup. Goes through `~/.kres/commands/summary.md` first (if the
+/// operator wrote one) and falls back to the embedded default.
+/// Panics only if the embedded table is missing the key — which
+/// the module's own unit test
+/// (`all_expected_commands_are_present`) prevents.
+pub fn bug_summary_template() -> String {
+    kres_agents::user_commands::lookup("summary")
+        .expect("`summary` missing from user_commands table")
 }
 
-/// Compile-time fallback for the markdown variant, selected by
-/// `--markdown`. Same content guidance, different output format
-/// (markdown with fenced code blocks instead of plain text).
-pub fn bug_summary_markdown_template() -> &'static str {
-    kres_agents::embedded_prompts::lookup("bug-summary-markdown.md")
-        .expect("bug-summary-markdown.md missing from embedded_prompts table")
+/// Resolve the markdown variant of the bug-report template. Same
+/// two-step lookup (`~/.kres/commands/summary-markdown.md` →
+/// embedded).
+pub fn bug_summary_markdown_template() -> String {
+    kres_agents::user_commands::lookup("summary-markdown")
+        .expect("`summary-markdown` missing from user_commands table")
 }
 
 /// Default on-disk override location for the plain-text template.
 /// Empty by default; an operator who wants to shadow the embedded
-/// prompt drops a file at `~/.kres/system-prompts/bug-summary.md`.
-/// Returns None when $HOME is unset.
+/// prompt drops a file at `~/.kres/commands/summary.md`. Returns
+/// None when $HOME is unset.
 pub fn default_template_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join(".kres")
-            .join("system-prompts")
-            .join("bug-summary.md")
-    })
+    dirs::home_dir()
+        .map(|h| h.join(".kres").join("commands").join("summary.md"))
 }
 
 /// Default on-disk override location for the markdown variant.
@@ -62,8 +60,8 @@ pub fn default_template_path() -> Option<PathBuf> {
 pub fn default_markdown_template_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| {
         h.join(".kres")
-            .join("system-prompts")
-            .join("bug-summary-markdown.md")
+            .join("commands")
+            .join("summary-markdown.md")
     })
 }
 
@@ -184,14 +182,15 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     }))?;
 
     // Resolve the system prompt template: explicit --template wins,
-    // then the on-disk operator override under
-    // ~/.kres/system-prompts/, else the compiled-in copy from
-    // kres_agents::embedded_prompts. `--markdown` picks the markdown
-    // variant at each hop. Each hop logs its source so operators can
-    // tell which template shaped the report.
+    // then the on-disk operator override under ~/.kres/commands/
+    // (handled inside bug_summary_template / bug_summary_markdown_template
+    // via user_commands::lookup), else the compiled-in default.
+    // `--markdown` picks the markdown variant at each hop. Each hop
+    // logs its source so operators can tell which template shaped
+    // the report.
     let (disk_default, fallback_text, fallback_label): (
         Option<PathBuf>,
-        &'static str,
+        String,
         &'static str,
     ) = if inputs.markdown {
         (
@@ -216,7 +215,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
             .with_context(|| format!("reading template {}", p.display()))?;
         (p.display().to_string(), text)
     } else {
-        (fallback_label.to_string(), fallback_text.to_string())
+        (fallback_label.to_string(), fallback_text)
     };
     eprintln!("summary: template = {}", template_src);
 

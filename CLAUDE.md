@@ -74,7 +74,7 @@ this repo's `configs/` tree:
 | `mcp.json` | MCP server definitions (installed only when semcode-mcp is available) |
 | `settings.json` | Per-user defaults (today: per-role model ids). CLI flags `--fast-model`, `--slow-model`, `--main-model`, `--todo-model` override the matching role; a known `--slow <tag>` (sonnet/opus) also overrides the slow model id unless `--slow-model` is given |
 | `system-prompts/*.system.md` | Optional operator overrides for agent system prompts. Default prompts are embedded in the kres binary (`kres-agents/src/embedded_prompts.rs`); a file at `~/.kres/system-prompts/<basename>` shadows the embedded copy. Empty by default |
-| `prompts/bug-summary.md` | Bug-report template for `/summary` and `kres --summary` |
+| `commands/<name>.md` | Optional operator overrides (or additions) for slash-command templates. Shipped commands `review`, `summary`, `summary-markdown` are embedded in the kres binary (`kres-agents/src/user_commands.rs`). A file at `~/.kres/commands/<name>.md` shadows the embedded copy; adding a new `<name>.md` creates a `/name` command invocable via `--prompt "name: extra"` or `--prompt "/name extra"`. Empty by default |
 | `skills/*.md` | Domain knowledge files |
 
 Rate limiters are shared across agents that use the same API key string.

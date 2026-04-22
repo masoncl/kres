@@ -182,6 +182,19 @@ struct ReplArgs {
     /// an explicit template wins over the variant picker.
     #[arg(long, default_value_t = false)]
     markdown: bool,
+
+    /// Allow one additional non-MCP action type for this session.
+    /// Repeatable (`--allow bash --allow git`) or comma-separated
+    /// (`--allow bash,git`). Adds to whatever `actions.allowed`
+    /// resolved to from settings.json. The default allowlist is
+    /// grep/find/read/git/edit — `bash` is OFF by default because
+    /// operators report it becoming an escape hatch for things the
+    /// typed tools already cover. Example: `--allow bash` enables
+    /// the bash tool for compile+run in coding flows. The special
+    /// value `--allow all` enables every action type the dispatcher
+    /// knows (including bash).
+    #[arg(long, value_name = "ACTION", value_delimiter = ',')]
+    allow: Vec<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -409,7 +422,8 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // When --slow is passed as a known tag (sonnet/opus) we also map
     // it to a model id, so `--slow sonnet` actually switches the
     // slow model. Explicit --slow-model still beats the tag mapping.
-    let mut settings = kres_repl::Settings::load_default();
+    let mut settings =
+        kres_repl::Settings::load_merged(&args.workspace);
     // Only map the --slow tag to a model id when the operator
     // actually passed --slow. Without this gate the clap default
     // "sonnet" would unconditionally overwrite settings.models.slow
@@ -634,6 +648,48 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         session = session.with_logger(lg.clone());
     }
     let usage = Some(session.usage_tracker());
+    // Compute the session's non-MCP action allowlist from settings
+    // layered with CLI --allow flags. Shared Arc so every MainAgent
+    // instance (currently one per kres) reads the same resolved set.
+    // Emit typo warnings up-front so an operator who wrote
+    // `--allow bsah` sees their mistake instead of silently keeping
+    // bash disabled.
+    let _ = settings.warn_unknown_action_tokens(&args.allow);
+    let allowed_actions: Arc<std::collections::BTreeSet<String>> =
+        Arc::new(settings.effective_allowed_actions(&args.allow));
+    // Print the allowlist banner only when a main agent is going
+    // to consult it. In --summary mode and any other shape where
+    // there's no main agent, the allowlist is dead data and
+    // printing it is just noise.
+    if main_agent.is_some() {
+        // The banner differentiates "bash off because default"
+        // from "bash off because the operator explicitly wrote a
+        // list that excludes it" — in the latter case pointing at
+        // `--allow bash` still works (CLI is additive) but the
+        // hint is worded to respect the deliberate choice rather
+        // than nudge them to undo it.
+        let bash_in_explicit_list = settings
+            .actions
+            .allowed
+            .as_ref()
+            .map(|l| l.iter().any(|s| s == "bash"))
+            .unwrap_or(false);
+        let bash_status = if allowed_actions.contains("bash") {
+            "ENABLED".to_string()
+        } else if settings.actions.allowed.is_some() && !bash_in_explicit_list {
+            "disabled by explicit allowlist in settings.json".to_string()
+        } else {
+            "disabled by default (add to settings.json or pass --allow bash to enable)".to_string()
+        };
+        kres_core::async_eprintln!(
+            "actions: allowlist = [{}] (bash {bash_status})",
+            allowed_actions
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if let (Some(fc), Some(sc)) = (fast_agent.as_ref(), slow_agent.as_ref()) {
         let workspace =
             std::fs::canonicalize(&args.workspace).unwrap_or_else(|_| args.workspace.clone());
@@ -740,6 +796,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         mcp_servers: spawned_mcp.clone(),
                         logger: logger.clone(),
                         usage: usage.clone(),
+                        allowed_actions: allowed_actions.clone(),
                     };
                     kres_core::async_eprintln!(
                         "main-agent: LLM-driven ({}), {} MCP server(s) routed",
@@ -1006,6 +1063,30 @@ mod tests {
     fn slow_tag_passes_through_when_set() {
         let c = Cli::try_parse_from(["kres", "--slow", "opus"]).unwrap();
         assert_eq!(c.repl.slow.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn allow_flag_accepts_comma_separated() {
+        // value_delimiter = ',' on the --allow arg means both
+        // `--allow bash --allow git` and `--allow bash,git` parse
+        // into ["bash", "git"]. Repeatable-plus-delimited is what
+        // clap's conventional pattern expects, and this pins it so
+        // a future refactor can't silently drop the delimiter.
+        let c = Cli::try_parse_from([
+            "kres",
+            "--allow",
+            "bash,git",
+            "--allow",
+            "edit",
+        ])
+        .unwrap();
+        assert_eq!(c.repl.allow, vec!["bash", "git", "edit"]);
+    }
+
+    #[test]
+    fn allow_flag_defaults_to_empty() {
+        let c = Cli::try_parse_from(["kres"]).unwrap();
+        assert!(c.repl.allow.is_empty());
     }
 
     #[test]

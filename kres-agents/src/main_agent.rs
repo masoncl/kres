@@ -73,6 +73,14 @@ pub struct MainAgent {
     pub mcp_servers: HashMap<String, Arc<Mutex<McpClient>>>,
     pub logger: Option<Arc<TurnLogger>>,
     pub usage: Option<Arc<UsageTracker>>,
+    /// Allowlist of non-MCP action types the main agent is permitted
+    /// to dispatch this session. An emitted action whose `type` is
+    /// not in the set is rejected with an error string that names
+    /// the alternatives and points at `--allow`/`settings.json`.
+    /// Empty = allow all (for tests and callers that don't care).
+    /// Resolved from settings.json layered with `--allow` CLI flags
+    /// by `kres-repl::Settings::effective_allowed_actions`.
+    pub allowed_actions: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl MainAgent {
@@ -371,8 +379,9 @@ impl MainAgent {
         let mut non_mcp_futures = Vec::with_capacity(non_mcp.len());
         for (idx, action) in non_mcp {
             let ws = self.workspace.clone();
+            let allowed = self.allowed_actions.clone();
             non_mcp_futures.push(async move {
-                let out = dispatch_non_mcp(&ws, &action).await;
+                let out = dispatch_non_mcp(&ws, &action, &allowed).await;
                 (idx, action, out)
             });
         }
@@ -413,8 +422,37 @@ impl MainAgent {
 /// Dispatch a single non-MCP action. Returns (text_output, optional
 /// symbol). Actions with unknown types land in context with an error
 /// message so they don't silently vanish.
-async fn dispatch_non_mcp(workspace: &std::path::Path, action: &Value) -> (String, Option<Value>) {
+///
+/// `allowed_actions` is the session allowlist (resolved from
+/// settings.json + CLI `--allow`). Every action's `type` must be
+/// present in the set; an empty set means "deny all non-MCP
+/// actions" (the explicit `"allowed": []` in settings.json
+/// semantic). Malformed actions (missing `type` field) bypass the
+/// gate so they hit the existing unknown-type error below — a
+/// malformed action is not a gated action and deserves a clearer
+/// error. MCP actions are gated separately (by server registration)
+/// and don't enter this function.
+async fn dispatch_non_mcp(
+    workspace: &std::path::Path,
+    action: &Value,
+    allowed_actions: &std::collections::BTreeSet<String>,
+) -> (String, Option<Value>) {
     let ty = action.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+    if ty != "?" && !allowed_actions.contains(ty) {
+        let allowed_list: Vec<&str> =
+            allowed_actions.iter().map(|s| s.as_str()).collect();
+        let list_display = if allowed_list.is_empty() {
+            "none — every non-MCP action is denied this session".to_string()
+        } else {
+            allowed_list.join(", ")
+        };
+        return (
+            format!(
+                "[error] action type '{ty}' is not in the allowed-action list for this session ({list_display}). To enable it, add `{ty}` to `actions.allowed` in ~/.kres/settings.json (or <cwd>/.kres/settings.json) or re-run kres with `--allow {ty}`."
+            ),
+            None,
+        );
+    }
     match ty {
         "grep" => {
             let args = GrepArgs {
@@ -793,6 +831,7 @@ mod tests {
             mcp_servers: HashMap::new(),
             logger: None,
             usage: None,
+            allowed_actions: Arc::new(std::collections::BTreeSet::new()),
         };
         let s = a.mcp_tool_descriptions().await;
         assert!(s.is_empty());
@@ -811,7 +850,9 @@ mod tests {
         std::fs::write(tmp.join("report.md"), b"").unwrap();
         std::fs::write(tmp.join("other.md"), b"").unwrap();
         let action = json!({"type":"find","pattern":"report.md"});
-        let (out, _) = dispatch_non_mcp(&tmp, &action).await;
+        let allow: std::collections::BTreeSet<String> =
+            ["find"].iter().map(|s| s.to_string()).collect();
+        let (out, _) = dispatch_non_mcp(&tmp, &action, &allow).await;
         assert!(
             out.contains("report.md"),
             "output missing report.md: {out}"
@@ -842,7 +883,9 @@ mod tests {
         std::fs::write(tmp.join("f.txt"), body).unwrap();
         let action =
             json!({"type":"read","file":"f.txt","line":3,"end_line":5});
-        let (text, _sym) = dispatch_non_mcp(&tmp, &action).await;
+        let allow: std::collections::BTreeSet<String> =
+            ["read"].iter().map(|s| s.to_string()).collect();
+        let (text, _sym) = dispatch_non_mcp(&tmp, &action, &allow).await;
         assert!(text.contains("line 3\n"), "no body in text: {text:?}");
         assert!(text.contains("line 5\n"), "no body in text: {text:?}");
         // Header still present for at-a-glance scanning.
@@ -865,7 +908,9 @@ mod tests {
         std::fs::write(tmp.join("f.txt"), body).unwrap();
         let action =
             json!({"type":"read","file":"f.txt","line":3,"end_line":5});
-        let (out, sym) = dispatch_non_mcp(&tmp, &action).await;
+        let allow: std::collections::BTreeSet<String> =
+            ["read"].iter().map(|s| s.to_string()).collect();
+        let (out, sym) = dispatch_non_mcp(&tmp, &action, &allow).await;
         // dispatch returns a short summary string; the actual body
         // lands on `sym.definition`.
         assert!(!out.starts_with("[error]"), "unexpected error: {out}");
@@ -879,6 +924,93 @@ mod tests {
         assert!(
             !def.contains("line 6\n"),
             "def leaked line 6 past end_line: {def:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_action_not_in_allowlist() {
+        // With a non-empty allowlist that excludes "bash", a bash
+        // action must bounce with an error that names the allowed
+        // set and points at --allow / settings.json.
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-gate-bash-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let action =
+            json!({"type":"bash","command":"echo should not run > /tmp/gated"});
+        let mut allow = std::collections::BTreeSet::new();
+        allow.insert("read".to_string());
+        allow.insert("grep".to_string());
+        let (out, sym) = dispatch_non_mcp(&tmp, &action, &allow).await;
+        assert!(sym.is_none(), "gated action shouldn't emit a symbol");
+        assert!(out.contains("[error]"), "got {out}");
+        assert!(
+            out.contains("'bash' is not in the allowed-action list"),
+            "error missing action name: {out}"
+        );
+        assert!(out.contains("--allow bash"), "error missing fix hint: {out}");
+        assert!(out.contains("settings.json"), "error missing settings hint: {out}");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_denies_all_actions() {
+        // Contract: an empty allowlist means "deny every non-MCP
+        // action" — it is the explicit `"allowed": []` in
+        // settings.json semantic. Previously the dispatcher
+        // short-circuited on is_empty() and allowed everything,
+        // which silently neutered an operator's lockdown.
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-gate-empty-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("f.txt"), "hello\n").unwrap();
+        let action = json!({"type":"read","file":"f.txt"});
+        let allow = std::collections::BTreeSet::new();
+        let (out, sym) = dispatch_non_mcp(&tmp, &action, &allow).await;
+        assert!(sym.is_none(), "denied action shouldn't emit a symbol");
+        assert!(out.contains("[error]"), "expected error, got {out}");
+        assert!(
+            out.contains("'read' is not in the allowed-action list"),
+            "expected deny message, got {out}"
+        );
+        assert!(
+            out.contains("none — every non-MCP action is denied"),
+            "expected empty-list message, got {out}"
+        );
+        // The file we wrote should remain unread (the dispatcher
+        // bailed before touching it).
+        assert!(
+            !out.contains("hello"),
+            "read tool ran despite deny: {out}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn malformed_action_reports_unknown_not_gated() {
+        // An action with no `type` field should hit the existing
+        // "unknown action type" error, NOT the allowlist-gate error.
+        // A malformed action is not a gated action.
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-malformed-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let action = json!({"command": "nope"}); // no `type` field
+        let allow: std::collections::BTreeSet<String> =
+            ["read", "grep"].iter().map(|s| s.to_string()).collect();
+        let (out, _) = dispatch_non_mcp(&tmp, &action, &allow).await;
+        assert!(
+            out.contains("unknown action type"),
+            "expected unknown-type error, got {out}"
+        );
+        assert!(
+            !out.contains("not in the allowed-action list"),
+            "unexpected allowlist error for malformed action: {out}"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

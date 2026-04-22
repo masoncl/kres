@@ -65,10 +65,13 @@ User prompt → Task created → Task thread starts
   `completed_run_count` + last prompt. Written atomically (tmp +
   fsync + rename) from the reaper tick and the various drain
   paths.
-- Resume: `kres --results <dir>` on an existing dir loads the
-  snapshot, flips every `InProgress` todo/plan step back to
-  `Pending` (its prior executor is gone), and seeds the manager +
-  deferred list before the REPL starts.
+- Resume: `kres --results <dir> --resume` loads the snapshot,
+  flips every `InProgress` todo/plan step back to `Pending` (its
+  prior executor is gone), and seeds the manager + deferred list
+  before the REPL starts. Without `--resume`, any existing
+  session.json is left untouched on disk and the REPL starts
+  clean; a note in the startup banner points at the file so the
+  operator knows the state is recoverable.
 - InProgress drains: ctrl-c, the `--turns N` cap, goal-met, and
   `--turns 0` follow-stagnation all call
   `TaskManager::reset_in_progress_to_pending()` before moving items
@@ -111,6 +114,7 @@ Rate limiters are shared across agents that use the same API key string.
 | `/tasks` `/task` | Show active tasks and states |
 | `/todo` | Show pending items (ready/blocked) + completed count |
 | `/plan` | Show the current plan + per-step status (produced by `define_plan`) |
+| `/resume [PATH]` | Load a persisted `session.json` (defaults to `<results>/session.json.prev` → live file). Overwrites in-memory state |
 | `/todo --clear` | Clear all todo items |
 | `/cost` | Token usage by agent role and model |
 | `/summary [FILE]` | Fast agent renders the run's report.md + findings.json into a bug report via the embedded `summary` slash-command template. Output defaults to `bug-report.txt` in the results dir |

@@ -101,6 +101,17 @@ struct ReplArgs {
     /// cap still wins there.
     #[arg(long, default_value_t = false)]
     follow: bool,
+    /// Resume from a prior `session.json` in the results dir.
+    /// When false (default), kres ignores any existing session.json
+    /// and starts clean — even when `--results DIR` points at a
+    /// directory that has one. Pass `--resume` to explicitly load
+    /// the persisted plan + todo + deferred + counter state. This
+    /// is off by default because an accidentally-shared results
+    /// dir between runs would otherwise bleed prior state into a
+    /// new session. When a session.json exists but `--resume` is
+    /// absent, kres prints a hint pointing at the file.
+    #[arg(long, default_value_t = false)]
+    resume: bool,
     /// Directory for all three artifact files (findings.json,
     /// report.md, todo.md). Defaults to ~/.kres/sessions/<session-id>/.
     /// Per-file flags (--findings/--report/--todo) still override.
@@ -674,25 +685,83 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         persist_path,
     };
     let mut session = Session::new(mgr, cfg);
-    // Resume from a prior session.json when the operator pointed at
-    // an existing results dir. `resume_state` is a no-op when the
-    // file isn't there, so a fresh session starts empty.
-    match session.resume_state().await {
-        Ok(Some(state)) => {
+    // Resume from a prior session.json ONLY when `--resume` was
+    // passed. Without the flag, any existing session.json is left
+    // untouched on disk and the REPL starts clean — this avoids
+    // silently inheriting a prior session's plan/todo/deferred
+    // state when the operator re-uses a results dir by accident.
+    // When the flag is absent but a session.json is present, log a
+    // hint so the operator knows the state is available.
+    if args.resume {
+        // Prefer the live session.json; fall back to
+        // session.json.prev when the live file is missing. The
+        // backup is what a prior run-without-`--resume` moved
+        // aside, so `--resume` on the next launch should pick it
+        // up rather than telling the operator there is nothing
+        // to load.
+        let live = results_dir.join("session.json");
+        let backup = results_dir.join("session.json.prev");
+        let chosen: Option<std::path::PathBuf> = if live.exists() {
+            Some(live)
+        } else if backup.exists() {
             kres_core::async_eprintln!(
-                "resume: {} todo item(s), {} deferred, turns done={}",
-                state.todo.len(),
-                state.deferred.len(),
-                state.completed_run_count
+                "resume: session.json missing; loading {} instead",
+                backup.display()
             );
-            if let Some(ref prompt) = state.last_prompt {
-                let short: String = prompt.chars().take(80).collect();
-                kres_core::async_eprintln!("resume: last prompt: {}", short);
+            Some(backup)
+        } else {
+            None
+        };
+        let load_result = match chosen.as_deref() {
+            Some(p) => session.resume_state_from(Some(p)).await,
+            None => Ok(None),
+        };
+        match load_result {
+            Ok(Some(state)) => {
+                kres_core::async_eprintln!(
+                    "resume: {} todo item(s), {} deferred, turns done={}",
+                    state.todo.len(),
+                    state.deferred.len(),
+                    state.completed_run_count
+                );
+                if let Some(ref prompt) = state.last_prompt {
+                    let short: String = prompt.chars().take(80).collect();
+                    kres_core::async_eprintln!("resume: last prompt: {}", short);
+                }
+            }
+            Ok(None) => {
+                kres_core::async_eprintln!(
+                    "resume: no session.json or session.json.prev in {} — starting clean",
+                    results_dir.display()
+                );
+            }
+            Err(e) => {
+                kres_core::async_eprintln!("resume: {e}");
             }
         }
-        Ok(None) => {}
-        Err(e) => {
-            kres_core::async_eprintln!("resume: {e}");
+    } else {
+        let session_json = results_dir.join("session.json");
+        if session_json.exists() {
+            // Move the prior snapshot to session.json.prev so the
+            // first reaper tick that writes this session's fresh
+            // state does not destroy it. `/resume` inside the REPL
+            // reads this backup when the live session.json matches
+            // the current in-memory state.
+            let backup = results_dir.join("session.json.prev");
+            match std::fs::rename(&session_json, &backup) {
+                Ok(()) => kres_core::async_eprintln!(
+                    "note: prior session snapshot moved to {}; \
+                     starting clean. Type /resume (or restart with \
+                     --resume) to load it back.",
+                    backup.display()
+                ),
+                Err(e) => kres_core::async_eprintln!(
+                    "note: {} exists but could not be moved aside ({e}); \
+                     the first reaper tick will overwrite it. Pass \
+                     --resume next time to load prior state.",
+                    session_json.display()
+                ),
+            }
         }
     }
 

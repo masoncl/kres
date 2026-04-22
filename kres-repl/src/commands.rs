@@ -41,14 +41,13 @@ pub enum Command {
     /// `/followup` — list items deferred by goal-met or --turns cap.
     Followup,
     /// `/summary [filename]` — render the run's report.md +
-    /// findings.json into a plain-text bug report. Filename defaults
-    /// to bug-report.txt, placed in the results directory when one
-    /// was configured (else the current working directory).
+    /// findings.json into a plain-text summary. Filename defaults to
+    /// `summary.txt`, placed in the results directory when one was
+    /// configured (else the current working directory).
     Summary { filename: Option<String> },
     /// `/summary-markdown [filename]` — same as /summary but
     /// selects the `summary-markdown` slash-command template for
-    /// the system prompt and defaults the filename to
-    /// `bug-report.md`.
+    /// the system prompt and defaults the filename to `summary.md`.
     SummaryMarkdown { filename: Option<String> },
     /// `/review <target>` — submit a prompt equivalent to
     /// `--prompt "review: <target>"`. Composes the `review`

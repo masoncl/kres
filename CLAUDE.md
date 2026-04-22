@@ -117,8 +117,8 @@ Rate limiters are shared across agents that use the same API key string.
 | `/resume [PATH]` | Load a persisted `session.json` (defaults to `<results>/session.json.prev` → live file). Overwrites in-memory state |
 | `/todo --clear` | Clear all todo items |
 | `/cost` | Token usage by agent role and model |
-| `/summary [FILE]` | Fast agent renders the run's report.md + findings.json into a bug report via the embedded `summary` slash-command template. Output defaults to `bug-report.txt` in the results dir |
-| `/summary-markdown [FILE]` | Same as `/summary` but uses the `summary-markdown` template and defaults the filename to `bug-report.md` |
+| `/summary [FILE]` | Fast agent renders the run's report.md + findings.json into a summary via the embedded `summary` slash-command template. Output defaults to `summary.txt` in the results dir. Auto-chunks findings when the prompt exceeds the fast agent's `max_input_tokens` and runs a combine pass to merge the partials |
+| `/summary-markdown [FILE]` | Same as `/summary` but uses the `summary-markdown` template and defaults the filename to `summary.md` |
 | `/review <target>` | Compose the embedded `review` slash-command template with `<target>` and submit as a new task — CLI equivalent of `--prompt 'review: <target>'` |
 | `/report <file>` | Write all findings to markdown file |
 | `/followup` | Show deferred items (identified but skipped when goal met) |
@@ -183,7 +183,7 @@ Rate limiters are shared across agents that use the same API key string.
     findings.json             # Cumulative findings (history in findings-N.json)
     report.md                 # Append-only narrative
     session.json              # Plan + todo + deferred + counters (resume state)
-    bug-report.txt            # Output of /summary or kres --summary
+    summary.txt               # Output of /summary or kres --summary (summary.md with --summary-markdown)
 
 .kres/logs/<session-uuid>/    # Next to cwd, one dir per REPL run
   code.jsonl                  # All fast + slow agent turns

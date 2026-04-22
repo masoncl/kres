@@ -25,8 +25,8 @@ fast → main → slow and produced non-empty analysis or code output
 
 On any `--turns` exit — run-count cap, goal-met drain, or
 stagnation — kres cancels in-flight work, auto-runs `/summary`
-(`bug-report.txt`, or `bug-report.md` with `--markdown`) in the
-results dir (cwd when `--results` was absent), and exits.
+(`summary.txt`; use `--summary-markdown` to get `summary.md`) in
+the results dir (cwd when `--results` was absent), and exits.
 Remaining pending / blocked todos move to the deferred list;
 `/followup` lists them and `/continue` dispatches them if you
 re-enter the REPL.

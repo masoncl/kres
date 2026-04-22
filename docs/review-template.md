@@ -53,6 +53,6 @@ adds a `/<word>` slash-command invocable via
 `--prompt "<word>: target"` or `--prompt "/<word> target"`.
 
 `--results <dir>` keeps the run's artifacts (`findings.json`
-plus `findings-N.json` history, `report.md`, `bug-report.txt`)
+plus `findings-N.json` history, `report.md`, `summary.txt`)
 in `<dir>/`; without it kres picks
 `~/.kres/sessions/<timestamp>/`.

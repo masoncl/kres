@@ -70,7 +70,7 @@ impl TaskMode {
     }
 
     /// True for modes that feed the findings pipeline (findings merger
-    /// runs, /summary bug-report is meaningful). Coding tasks produce
+    /// runs, /summary output is meaningful). Coding tasks produce
     /// files instead of findings, so they return false.
     pub fn produces_findings(self) -> bool {
         matches!(self, Self::Analysis | Self::Generic)

@@ -10,7 +10,7 @@ override or add commands by dropping a file at
 |--------------------|------------------------------------------------------------------------------------------|--------------------------------|
 | `review`           | `kres --prompt 'review: fs/btrfs/ctree.c'` or `kres --prompt '/review fs/btrfs/ctree.c'` | `/review fs/btrfs/ctree.c`     |
 | `summary`          | `kres --summary --results DIR`                                                           | `/summary [filename]`          |
-| `summary-markdown` | `kres --summary --markdown --results DIR`                                                | `/summary-markdown [filename]` |
+| `summary-markdown` | `kres --summary-markdown --results DIR`                                                  | `/summary-markdown [filename]` |
 
 The three shipped templates play two different roles:
 
@@ -20,10 +20,14 @@ The three shipped templates play two different roles:
   (see [review-template.md](review-template.md)).
 - `summary` — a system prompt. `/summary` and `kres --summary`
   feed the template body to the fast agent alongside the run's
-  `report.md` + `findings.json` to render `bug-report.txt`
-  (`kres-repl/src/summary.rs`). No target composition.
-- `summary-markdown` — identical path; selected by `--markdown`
-  and writes `bug-report.md`.
+  `report.md` + `findings.json` to render `summary.txt`
+  (`kres-repl/src/summary.rs`). When the assembled prompt
+  exceeds the fast agent's `max_input_tokens`, findings are
+  split across partial summaries that a final combine call
+  merges. No target composition.
+- `summary-markdown` — identical path; selected by
+  `--summary-markdown` (or `/summary-markdown`) and writes
+  `summary.md`.
 
 Adding your own: drop `~/.kres/commands/audit.md` and run
 `kres --prompt 'audit: net/...'` or `/audit net/...`. No rebuild

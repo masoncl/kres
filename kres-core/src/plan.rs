@@ -278,17 +278,17 @@ impl Plan {
                 }
             }
             for tid in &step.todo_ids {
-                if let Some(n) = todo.iter().position(|i| {
-                    (!i.id.is_empty() && i.id == *tid) || i.name == *tid
-                }) {
+                if let Some(n) = todo
+                    .iter()
+                    .position(|i| (!i.id.is_empty() && i.id == *tid) || i.name == *tid)
+                {
                     linked_idx.insert(n);
                 }
             }
             if linked_idx.is_empty() {
                 continue;
             }
-            let linked: Vec<&crate::TodoItem> =
-                linked_idx.iter().map(|n| &todo[*n]).collect();
+            let linked: Vec<&crate::TodoItem> = linked_idx.iter().map(|n| &todo[*n]).collect();
             let all_terminal = linked.iter().all(|i| {
                 matches!(
                     i.status,
@@ -442,10 +442,7 @@ mod tests {
 
     #[test]
     fn normalize_steps_filters_empty_titles() {
-        let out = normalize_steps(vec![
-            step("keep-id", ""),
-            step("", "Kept title"),
-        ]);
+        let out = normalize_steps(vec![step("keep-id", ""), step("", "Kept title")]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "kept-title");
     }

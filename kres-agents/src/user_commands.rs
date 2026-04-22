@@ -51,7 +51,10 @@ const TABLE: &[(&str, &str)] = &[
 /// guard here means a future caller that forgets to sanitize
 /// still can't escape the directory.
 pub fn lookup(name: &str) -> Option<String> {
-    lookup_with_root(dirs::home_dir().map(|h| h.join(".kres").join("commands")), name)
+    lookup_with_root(
+        dirs::home_dir().map(|h| h.join(".kres").join("commands")),
+        name,
+    )
 }
 
 /// Testable core of `lookup`. `commands_dir` is the directory to
@@ -59,10 +62,7 @@ pub fn lookup(name: &str) -> Option<String> {
 /// entirely — useful in tests that want to pin the embedded
 /// fallback). `name` is validated against the same character set
 /// as the public `lookup`.
-pub fn lookup_with_root(
-    commands_dir: Option<std::path::PathBuf>,
-    name: &str,
-) -> Option<String> {
+pub fn lookup_with_root(commands_dir: Option<std::path::PathBuf>, name: &str) -> Option<String> {
     if !is_valid_name(name) {
         return None;
     }
@@ -122,10 +122,7 @@ mod tests {
     fn every_embedded_body_is_non_empty() {
         for name in embedded_names() {
             let body = lookup(name).unwrap_or_default();
-            assert!(
-                !body.trim().is_empty(),
-                "command {name} body is empty"
-            );
+            assert!(!body.trim().is_empty(), "command {name} body is empty");
         }
     }
 
@@ -163,15 +160,10 @@ mod tests {
         // Drop a file at <tmp>/commands/review.md and assert
         // lookup_with_root returns its contents, not the embedded
         // review template.
-        let dir = std::env::temp_dir().join(format!(
-            "kres-cmd-override-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("kres-cmd-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("review.md"), "OPERATOR REVIEW OVERRIDE")
-            .unwrap();
-        let got = lookup_with_root(Some(dir.clone()), "review")
-            .expect("override should resolve");
+        std::fs::write(dir.join("review.md"), "OPERATOR REVIEW OVERRIDE").unwrap();
+        let got = lookup_with_root(Some(dir.clone()), "review").expect("override should resolve");
         assert_eq!(got, "OPERATOR REVIEW OVERRIDE");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -182,14 +174,12 @@ mod tests {
         // embedded copy (consistent with the agent-prompt loader's
         // behaviour) — returning empty prompt text would brick the
         // command silently.
-        let dir = std::env::temp_dir().join(format!(
-            "kres-cmd-empty-override-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kres-cmd-empty-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("review.md"), "   \n\t\n").unwrap();
-        let got = lookup_with_root(Some(dir.clone()), "review")
-            .expect("should fall through to embedded");
+        let got =
+            lookup_with_root(Some(dir.clone()), "review").expect("should fall through to embedded");
         assert!(got.contains("[investigate]"), "got {got:?}");
         std::fs::remove_dir_all(&dir).ok();
     }

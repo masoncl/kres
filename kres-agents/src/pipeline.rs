@@ -461,8 +461,7 @@ impl Orchestrator {
             // for it — looping would just re-ask the same question.
             // Break out to the slow agent, which can surface the
             // question to the operator via its own followups.
-            if !parsed.followups.is_empty()
-                && parsed.followups.iter().all(|f| f.kind == "question")
+            if !parsed.followups.is_empty() && parsed.followups.iter().all(|f| f.kind == "question")
             {
                 kres_core::async_eprintln!(
                     "[fast round {}] only type:question followups — breaking to slow",
@@ -729,11 +728,9 @@ impl Orchestrator {
             kres_core::TaskMode::Analysis | kres_core::TaskMode::Generic => {
                 (slow_parsed.findings, Vec::new(), Vec::new())
             }
-            kres_core::TaskMode::Coding => (
-                Vec::new(),
-                slow_parsed.code_output,
-                slow_parsed.code_edits,
-            ),
+            kres_core::TaskMode::Coding => {
+                (Vec::new(), slow_parsed.code_output, slow_parsed.code_edits)
+            }
         };
         // Only surface a slow-agent plan rewrite when this task is
         // the first slow call for the top-level prompt. Later
@@ -1161,8 +1158,7 @@ impl Orchestrator {
             // for any of them — spinning another main-agent round
             // just burns tokens while the fast agent re-asks. Break
             // and let the slow/lens path surface the questions.
-            if !parsed.followups.is_empty()
-                && parsed.followups.iter().all(|f| f.kind == "question")
+            if !parsed.followups.is_empty() && parsed.followups.iter().all(|f| f.kind == "question")
             {
                 kres_core::async_eprintln!(
                     "[fast gather round {}] only type:question followups — breaking",
@@ -1412,10 +1408,8 @@ mod tests {
     /// the lens slow agents that read `live_skills`) see it.
     #[test]
     fn apply_skill_reads_inserts_file_into_first_skill() {
-        let dir = std::env::temp_dir().join(format!(
-            "kres-apply-skill-reads-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kres-apply-skill-reads-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("skill.md");
         std::fs::write(&p, "hello skill body").unwrap();

@@ -23,9 +23,10 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskMode {
+    #[default]
     Analysis,
     Generic,
     Coding,
@@ -57,12 +58,6 @@ pub struct CodeEdit {
     pub new_string: String,
     #[serde(default)]
     pub replace_all: bool,
-}
-
-impl Default for TaskMode {
-    fn default() -> Self {
-        Self::Analysis
-    }
 }
 
 impl TaskMode {

@@ -55,8 +55,7 @@ use kres_llm::Model;
 /// (`bash sed` for range reads, `bash find` for file locates).
 /// Coding flows that genuinely need `cc && ./repro` can opt in via
 /// `--allow bash` or via settings.actions.allowed.
-pub const DEFAULT_ALLOWED_ACTIONS: &[&str] =
-    &["grep", "find", "read", "git", "edit"];
+pub const DEFAULT_ALLOWED_ACTIONS: &[&str] = &["grep", "find", "read", "git", "edit"];
 
 /// Every action type the main agent might emit. Used for typo
 /// detection when an operator writes `--allow bsah` or sticks
@@ -67,8 +66,7 @@ pub const DEFAULT_ALLOWED_ACTIONS: &[&str] =
 /// gate in dispatch_non_mcp never consults the `"mcp"` entry (MCP
 /// actions are gated by mcp.json server registration, not this
 /// list), so including it here is effectively documentation.
-pub const KNOWN_ACTION_TYPES: &[&str] =
-    &["grep", "find", "read", "git", "edit", "bash", "mcp"];
+pub const KNOWN_ACTION_TYPES: &[&str] = &["grep", "find", "read", "git", "edit", "bash", "mcp"];
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {
@@ -151,6 +149,7 @@ impl Settings {
     ///     project's None leaves the global value in place.
     ///   - `actions.allowed`: project's Some REPLACES global's Some
     ///     (allowlists don't union — the more specific config wins).
+    ///
     /// A missing project settings file is not an error.
     pub fn load_merged(project_root: &Path) -> Self {
         let proj_path = project_root.join(".kres").join("settings.json");
@@ -162,10 +161,7 @@ impl Settings {
     /// `project` is the path to the per-project overrides. Public
     /// so the test suite can exercise the merge without having to
     /// mock the operator's real home directory.
-    pub fn load_merged_with_paths(
-        global: Option<&Path>,
-        project: &Path,
-    ) -> Self {
+    pub fn load_merged_with_paths(global: Option<&Path>, project: &Path) -> Self {
         let mut s = match global {
             Some(p) => Self::load_from(p),
             None => Self::default(),
@@ -257,10 +253,7 @@ impl Settings {
     /// - `"all"` expands to the full built-in set plus `bash`
     ///   (every action the dispatcher knows). Useful for one-off
     ///   runs where the operator wants a total escape hatch.
-    pub fn effective_allowed_actions(
-        &self,
-        cli_extras: &[String],
-    ) -> BTreeSet<String> {
+    pub fn effective_allowed_actions(&self, cli_extras: &[String]) -> BTreeSet<String> {
         let known: BTreeSet<&str> = KNOWN_ACTION_TYPES.iter().copied().collect();
         let mut out: BTreeSet<String> = match &self.actions.allowed {
             Some(list) => list
@@ -345,9 +338,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         cur[0] = i;
         for j in 1..=m {
             let cost = if av[i - 1] == bv[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1)
-                .min(cur[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -489,10 +480,8 @@ mod tests {
         // produce exactly that set — no defaults leaking through.
         // Uses load_from directly rather than load_merged to avoid
         // touching the operator's real ~/.kres/settings.json.
-        let dir = std::env::temp_dir().join(format!(
-            "kres-settings-proj-only-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kres-settings-proj-only-{}", std::process::id()));
         let proj = dir.join(".kres");
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(
@@ -516,10 +505,8 @@ mod tests {
         // main=sonnet. Result: allowlist={read} (project wins),
         // slow=opus (project didn't touch), main=sonnet (project
         // wins).
-        let dir = std::env::temp_dir().join(format!(
-            "kres-settings-merge-real-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kres-settings-merge-real-{}", std::process::id()));
         let global_dir = dir.join("global");
         let proj_dir = dir.join("project").join(".kres");
         std::fs::create_dir_all(&global_dir).unwrap();
@@ -536,8 +523,7 @@ mod tests {
             r#"{"models":{"main":"claude-sonnet-4-6"},"actions":{"allowed":["read"]}}"#,
         )
         .unwrap();
-        let s =
-            Settings::load_merged_with_paths(Some(&global_path), &proj_path);
+        let s = Settings::load_merged_with_paths(Some(&global_path), &proj_path);
         assert_eq!(s.models.slow.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(s.models.main.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(
@@ -560,15 +546,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let global = dir.join("global.json");
-        std::fs::write(&global, r#"{"actions":{"allowed":["read","grep"]}}"#)
-            .unwrap();
+        std::fs::write(&global, r#"{"actions":{"allowed":["read","grep"]}}"#).unwrap();
         let missing_project = dir.join("nope/.kres/settings.json");
-        let s = Settings::load_merged_with_paths(
-            Some(&global),
-            &missing_project,
-        );
-        let a: Vec<String> =
-            s.effective_allowed_actions(&[]).iter().cloned().collect();
+        let s = Settings::load_merged_with_paths(Some(&global), &missing_project);
+        let a: Vec<String> = s.effective_allowed_actions(&[]).iter().cloned().collect();
         assert_eq!(a, vec!["grep".to_string(), "read".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }

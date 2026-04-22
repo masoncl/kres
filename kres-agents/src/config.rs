@@ -125,13 +125,8 @@ impl AgentConfig {
                     cfg.system = Some(body);
                 }
                 Err(disk_err) => {
-                    let basename = resolved
-                        .file_name()
-                        .and_then(|o| o.to_str())
-                        .unwrap_or("");
-                    if let Some(embedded) =
-                        crate::embedded_prompts::lookup(basename)
-                    {
+                    let basename = resolved.file_name().and_then(|o| o.to_str()).unwrap_or("");
+                    if let Some(embedded) = crate::embedded_prompts::lookup(basename) {
                         cfg.system = Some(embedded.to_string());
                     } else {
                         return Err(AgentError::Other(format!(
@@ -289,9 +284,7 @@ mod tests {
         // (the `.system.md` table is agent-role specific) and the
         // disk path is absent → both fallbacks fail and the caller
         // gets a clear error.
-        let p = write_tmp(
-            r#"{"key": "sk-x", "system_file": "/tmp/does-not-exist-kres-test.md"}"#,
-        );
+        let p = write_tmp(r#"{"key": "sk-x", "system_file": "/tmp/does-not-exist-kres-test.md"}"#);
         let e = AgentConfig::load(&p).unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("system_file"), "got: {msg}");
@@ -310,10 +303,8 @@ mod tests {
         // instead of erroring. This test targets `main-agent.system.md`
         // because that name is guaranteed present in the embedded
         // table.
-        let dir = std::env::temp_dir().join(format!(
-            "kres-sysfile-embedded-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kres-sysfile-embedded-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Pointing at a nonexistent sibling file whose basename
         // matches an embedded key.
@@ -341,10 +332,8 @@ mod tests {
         // An operator's custom copy at the referenced path must
         // take precedence over the embedded one — this is the
         // override path.
-        let dir = std::env::temp_dir().join(format!(
-            "kres-sysfile-override-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("kres-sysfile-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Shadow the embedded main-agent prompt with a tiny
         // operator-supplied one. Same basename, different body.

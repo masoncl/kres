@@ -153,20 +153,8 @@ pub fn grant_paths_from_text(store: &ConsentStore, cwd: &Path, text: &str) -> Ve
 fn is_suspicious_grant(dir: &Path) -> bool {
     // Bare-tree exact matches.
     let suspicious_exact: &[&str] = &[
-        "/usr",
-        "/etc",
-        "/var",
-        "/opt",
-        "/lib",
-        "/lib64",
-        "/bin",
-        "/sbin",
-        "/boot",
-        "/srv",
-        "/sys",
-        "/proc",
-        "/root",
-        "/home",
+        "/usr", "/etc", "/var", "/opt", "/lib", "/lib64", "/bin", "/sbin", "/boot", "/srv", "/sys",
+        "/proc", "/root", "/home",
     ];
     if let Some(s) = dir.to_str() {
         if suspicious_exact.contains(&s) {
@@ -191,26 +179,10 @@ fn strip_token_punctuation(s: &str) -> &str {
     // dots of `./foo` and `../foo`, turning a relative path into an
     // absolute one that doesn't exist — so left-trim is limited to
     // chars that can never legitimately start a path.
-    let left_trimmed = s.trim_start_matches(|c: char| {
-        matches!(c, '`' | '(' | '[' | '{' | '\'' | '"' | '<')
-    });
-    left_trimmed.trim_end_matches(|c: char| {
-        matches!(
-            c,
-            ',' | '.'
-                | ':'
-                | ';'
-                | '!'
-                | '?'
-                | '`'
-                | ')'
-                | ']'
-                | '}'
-                | '\''
-                | '"'
-                | '>'
-        )
-    })
+    let left_trimmed = s.trim_start_matches(['`', '(', '[', '{', '\'', '"', '<']);
+    left_trimmed.trim_end_matches([
+        ',', '.', ':', ';', '!', '?', '`', ')', ']', '}', '\'', '"', '>',
+    ])
 }
 
 fn looks_like_path(s: &str) -> bool {
@@ -408,7 +380,9 @@ mod tests {
     #[test]
     fn looks_like_path_skips_url_schemes() {
         assert!(!looks_like_path("http://example.com/foo"));
-        assert!(!looks_like_path("https://github.com/masoncl/review-prompts"));
+        assert!(!looks_like_path(
+            "https://github.com/masoncl/review-prompts"
+        ));
         assert!(!looks_like_path("s3://bucket/key"));
         assert!(!looks_like_path("ftp://host/p"));
         // But a path with a colon in a non-scheme position still

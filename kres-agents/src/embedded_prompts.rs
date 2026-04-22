@@ -58,10 +58,7 @@ const TABLE: &[(&str, &str)] = &[
 /// `"main-agent.system.md"` for a config field
 /// `"prompts/main-agent.system.md"`).
 pub fn lookup(basename: &str) -> Option<&'static str> {
-    TABLE
-        .iter()
-        .find(|(k, _)| *k == basename)
-        .map(|(_, v)| *v)
+    TABLE.iter().find(|(k, _)| *k == basename).map(|(_, v)| *v)
 }
 
 /// Every basename that has an embedded copy. Useful for logging /
@@ -78,10 +75,7 @@ mod tests {
     fn every_embedded_prompt_is_non_empty() {
         for name in embedded_names() {
             let body = lookup(name).expect("lookup must succeed for listed name");
-            assert!(
-                !body.trim().is_empty(),
-                "embedded prompt {name} is empty"
-            );
+            assert!(!body.trim().is_empty(), "embedded prompt {name} is empty");
         }
     }
 
@@ -114,5 +108,4 @@ mod tests {
             );
         }
     }
-
 }

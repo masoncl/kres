@@ -52,9 +52,33 @@ pub struct TodoClient {
 struct TodoUpdateResponse {
     #[serde(default)]
     todo: Value,
+    /// Optional rewritten plan the agent wants to substitute. Agents
+    /// may emit this when the existing plan no longer matches the
+    /// work actually being done (e.g. a step is complete and the
+    /// sweep needs a new axis). Absent / null leaves the manager's
+    /// current plan in place.
+    ///
+    /// Wire shape is `{steps: [...]}` (only the steps are mutable);
+    /// the caller merges with the existing plan's metadata via
+    /// `kres_core::PlanRewrite::apply_to` at the apply site. Parsing
+    /// just the steps means a forgotten metadata field cannot
+    /// silently drop the rewrite.
+    #[serde(default)]
+    plan: Option<kres_core::PlanRewrite>,
 }
 
-/// Run the todo agent. Returns an updated list. Matches
+/// Combined return value of `update_todo_via_agent*`: the reconciled
+/// todo list plus an optional rewritten plan. `plan` is a rewrite
+/// (steps-only); the caller applies it against the existing plan.
+#[derive(Debug, Clone, Default)]
+pub struct TodoUpdate {
+    pub todo: Vec<TodoItem>,
+    pub plan: Option<kres_core::PlanRewrite>,
+}
+
+/// Run the todo agent. Returns an updated todo list plus an
+/// optionally-rewritten plan. Matches
+#[allow(clippy::too_many_arguments)]
 pub async fn update_todo_via_agent(
     tc: &TodoClient,
     completed_query: &str,
@@ -62,7 +86,8 @@ pub async fn update_todo_via_agent(
     new_followups: &[Value],
     current_todo: &[TodoItem],
     lenses: &[LensSpec],
-) -> Result<Vec<TodoItem>, AgentError> {
+    plan: Option<&kres_core::Plan>,
+) -> Result<TodoUpdate, AgentError> {
     update_todo_via_agent_with_logger(
         tc,
         completed_query,
@@ -70,6 +95,7 @@ pub async fn update_todo_via_agent(
         new_followups,
         current_todo,
         lenses,
+        plan,
         None,
     )
     .await
@@ -85,8 +111,9 @@ pub async fn update_todo_via_agent_with_logger(
     new_followups: &[Value],
     current_todo: &[TodoItem],
     lenses: &[LensSpec],
+    plan: Option<&kres_core::Plan>,
     logger: Option<Arc<TurnLogger>>,
-) -> Result<Vec<TodoItem>, AgentError> {
+) -> Result<TodoUpdate, AgentError> {
     // --- Prepare inputs ------------------------------------------------
     let mut todo_list = current_todo.to_vec();
     assign_ids(&mut todo_list);
@@ -117,9 +144,22 @@ pub async fn update_todo_via_agent_with_logger(
     if !lens_payload.is_empty() {
         request.insert("lenses".into(), json!(lens_payload));
     }
+    // Ship the current plan (if any) so the agent can attach
+    // `step_id` to each emitted todo; `build_instructions` flips
+    // its plan-linking paragraph on when has_plan is true.
+    let has_plan = if let Some(p) = plan {
+        if let Ok(v) = serde_json::to_value(p) {
+            request.insert("plan".into(), v);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     request.insert(
         "instructions".into(),
-        json!(build_instructions(!lens_payload.is_empty())),
+        json!(build_instructions(!lens_payload.is_empty(), has_plan)),
     );
     let request_text = serde_json::to_string_pretty(&Value::Object(request))?;
 
@@ -148,7 +188,10 @@ pub async fn update_todo_via_agent_with_logger(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "kres_agents", "todo agent call failed: {e}; falling back");
-            return Ok(fallback_dedup(&todo_list, new_followups));
+            return Ok(TodoUpdate {
+                todo: fallback_dedup(&todo_list, new_followups),
+                plan: None,
+            });
         }
     };
     let text = extract_text(&resp);
@@ -167,12 +210,24 @@ pub async fn update_todo_via_agent_with_logger(
     }
 
     // --- Parse response ------------------------------------------------
-    let parsed: Vec<TodoItem> = match parse_todo_response(&text) {
-        Some(v) => v,
-        None => {
-            tracing::warn!(target: "kres_agents", "todo agent returned no parseable list; falling back");
-            return Ok(fallback_dedup(&todo_list, new_followups));
-        }
+    // Try the combined (todo + plan) envelope first so the agent's
+    // optional plan rewrite survives; fall back to the todo-only
+    // parser for responses that only carry the todo array.
+    let (parsed, returned_plan) = match parse_todo_update_full(&text) {
+        Some((todo, plan)) => (todo, plan),
+        None => match parse_todo_response(&text) {
+            Some(v) => (v, None),
+            None => {
+                tracing::warn!(
+                    target: "kres_agents",
+                    "todo agent returned no parseable list; falling back"
+                );
+                return Ok(TodoUpdate {
+                    todo: fallback_dedup(&todo_list, new_followups),
+                    plan: None,
+                });
+            }
+        },
     };
 
     // --- Reconcile with existing done items ---------------------------
@@ -268,7 +323,10 @@ pub async fn update_todo_via_agent_with_logger(
     result.extend(done_final);
     result.extend(preserved);
     result.extend(filtered_pending);
-    Ok(result)
+    Ok(TodoUpdate {
+        todo: result,
+        plan: returned_plan,
+    })
 }
 
 fn todo_to_payload(t: &TodoItem) -> Value {
@@ -290,6 +348,9 @@ fn todo_to_payload(t: &TodoItem) -> Value {
     obj.insert("depends_on".into(), json!(t.depends_on));
     if !t.coverage.is_empty() {
         obj.insert("coverage".into(), json!(t.coverage));
+    }
+    if !t.step_id.is_empty() {
+        obj.insert("step_id".into(), json!(t.step_id));
     }
     Value::Object(obj)
 }
@@ -572,6 +633,11 @@ fn followup_to_todo(fu: &Value) -> Result<TodoItem, serde_json::Error> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let step_id = fu
+        .get("step_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     Ok(TodoItem {
         name,
         kind,
@@ -580,15 +646,68 @@ fn followup_to_todo(fu: &Value) -> Result<TodoItem, serde_json::Error> {
         depends_on: Vec::new(),
         coverage: String::new(),
         id: String::new(),
+        step_id,
     })
 }
 
-fn build_instructions(has_lenses: bool) -> String {
+fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
     let mut s = String::from(
         "Update the todo list. Return JSON only:\n\
          {\"todo\": [{\"id\":\"ID\",\"type\":\"T\",\"name\":\"N\",\"reason\":\"R\",\
-         \"status\":\"pending|done\",\"coverage\":\"C\",\"depends_on\":[\"ID1\",\"ID2\"]}]}\n\n",
+         \"status\":\"pending|done\",\"coverage\":\"C\",\"depends_on\":[\"ID1\",\"ID2\"],\
+         \"step_id\":\"PLAN_STEP_ID_OR_EMPTY\"}]}\n\n",
     );
+    if has_plan {
+        s.push_str(
+            "PLAN LINKAGE — a `plan` field is present with `steps:[{id,\
+             title,description}]`. For EVERY todo item you emit in the \
+             output (done or pending), set `step_id` to the id of the \
+             plan step whose title/description best matches the todo's \
+             target. Match on file, symbol, subsystem, or investigation \
+             angle — not just keyword overlap. If NO step is a clear \
+             fit, set `step_id` to the empty string. Do not invent step \
+             ids; only use ids listed under `plan.steps`. Keep any \
+             step_id already set on a current_todo item unless the new \
+             analysis proves the item was actually executing a \
+             different step.\n\n",
+        );
+        s.push_str(
+            "PLAN REEVALUATION — you MAY also return a top-level \
+             `plan` field alongside `todo` to rewrite the plan. Do \
+             this ONLY when the analysis shows the current plan is \
+             materially wrong: a step is too vague to track, a step \
+             duplicates the pipeline's automatic lens fan-out and \
+             produces no new signal, a new concrete step is needed \
+             (e.g. a specific subsystem the prompt's sweep clearly \
+             requires but the planner missed), or a step's work is \
+             fully subsumed by another. Keep the plan STABLE when it \
+             is still serviceable — churning step ids breaks the \
+             step_id links on existing todos and wastes tokens.\n\
+             Wire shape: `\"plan\": {\"steps\": [...]}`. Emit ONLY \
+             the `steps` array. The pipeline keeps the existing \
+             plan's `prompt`, `goal`, `mode`, and `created_at` \
+             verbatim — you cannot and need not set them.\n\
+             When you do rewrite:\n\
+             - Prefer KEEPING existing step ids when the step's \
+               intent survives (even if title/description change) so \
+               the linked todos do not orphan.\n\
+             - When a step's MEANING changes, assign a NEW id \
+               instead of overloading the old one. The step_id → \
+               semantics contract is how this module's todo-linker \
+               stays honest; overloading it poisons the link.\n\
+             - New ids MUST be kebab-case slugs that describe the \
+               work (e.g. `audit-ring-buffer-init`). Never use \
+               positional tags like `s1`/`s2`; they get accidentally \
+               reassigned when steps reorder.\n\
+             - Every step you emit MUST have id, title, and status. \
+               Description and todo_ids are optional.\n\
+             - After rewriting, set step_id on every emitted todo to \
+               an id from the NEW plan — do not reference ids you \
+               just removed.\n\
+             Omit the `plan` field entirely when no rewrite is \
+             warranted — that is the common case.\n\n",
+        );
+    }
     s.push_str(
         "REPRIORITIZE — every call, not just when new items arrive:\n\
          - Sort all pending items so the one MOST LIKELY to surface a \
@@ -662,6 +781,54 @@ fn build_instructions(has_lenses: bool) -> String {
          depends_on when an item truly requires another's results first.",
     );
     s
+}
+
+/// Extract both the `todo` array and an optional rewritten `plan`
+/// from the todo-agent response. Mirrors `parse_todo_response`'s
+/// parse-then-brace-match discipline but preserves the full
+/// envelope. Returns `Some((todo, Option<Plan>))` when the response
+/// carried a parseable `todo` field; returns `None` when the
+/// envelope itself couldn't be parsed (callers fall back to the
+/// todo-only parser, which tries harder on malformed replies).
+fn parse_todo_update_full(
+    text: &str,
+) -> Option<(Vec<TodoItem>, Option<kres_core::PlanRewrite>)> {
+    if let Ok(r) = serde_json::from_str::<TodoUpdateResponse>(text) {
+        if let Some(items) = todo_list_from_value(r.todo) {
+            return Some((items, r.plan));
+        }
+    }
+    let bytes = text.as_bytes();
+    let mut start: Option<usize> = None;
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start.take() {
+                        if let Ok(r) =
+                            serde_json::from_str::<TodoUpdateResponse>(&text[s..=i])
+                        {
+                            if let Some(items) = todo_list_from_value(r.todo) {
+                                return Some((items, r.plan));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Extract the `todo` array from the agent's response text. Tries
@@ -828,6 +995,7 @@ mod tests {
             depends_on: Vec::new(),
             coverage: String::new(),
             id: String::new(),
+            step_id: String::new(),
         }];
         let new_fu = vec![json!({
             "type": "investigate",

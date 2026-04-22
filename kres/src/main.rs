@@ -650,6 +650,12 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     let _ = (&report_path, &todo_path);
 
     let mgr = TaskManager::new();
+    // session.json lives beside findings.json / report.md so an
+    // interrupted run can be resumed via `--results <same dir>`.
+    // Always set — even for defaulted session dirs, so crash recovery
+    // works out-of-the-box; operators who don't point at the dir
+    // again will simply never read it.
+    let persist_path = Some(results_dir.join("session.json"));
     let cfg = ReplConfig {
         stop_grace: std::time::Duration::from_millis(args.stop_grace_ms),
         findings_base,
@@ -663,8 +669,30 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         template_path: args.template.clone(),
         stdio: args.stdio,
         workspace: args.workspace.clone(),
+        persist_path,
     };
     let mut session = Session::new(mgr, cfg);
+    // Resume from a prior session.json when the operator pointed at
+    // an existing results dir. `resume_state` is a no-op when the
+    // file isn't there, so a fresh session starts empty.
+    match session.resume_state().await {
+        Ok(Some(state)) => {
+            kres_core::async_eprintln!(
+                "resume: {} todo item(s), {} deferred, turns done={}",
+                state.todo.len(),
+                state.deferred.len(),
+                state.completed_run_count
+            );
+            if let Some(ref prompt) = state.last_prompt {
+                let short: String = prompt.chars().take(80).collect();
+                kres_core::async_eprintln!("resume: last prompt: {}", short);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            kres_core::async_eprintln!("resume: {e}");
+        }
+    }
 
     // Turn logger: always on (see todo.md §2). Rooted at cwd so
     // `.kres/logs/<uuid>/` lands next to the session artifacts.

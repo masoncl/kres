@@ -124,6 +124,10 @@ struct Inner {
     /// Counter against `--turns N`. Incremented ONLY on successful
     /// task completion (no error AND produced analysis).
     completed_run_count: u32,
+    /// Optional plan (produced once per top-level prompt). When set,
+    /// the session persistence layer saves it alongside the todo
+    /// list so a resumed session sees the same decomposition.
+    plan: Option<crate::plan::Plan>,
 }
 
 struct Caches {
@@ -146,6 +150,7 @@ impl TaskManager {
                 todo: Vec::new(),
                 findings: Vec::new(),
                 completed_run_count: 0,
+                plan: None,
             }),
             caches: Mutex::new(Caches {
                 symbol_cache: LruCache::new(symbol_cap),
@@ -182,6 +187,7 @@ impl TaskManager {
                     todo: Vec::new(),
                     findings: Vec::new(),
                     completed_run_count: 0,
+                    plan: None,
                 }),
                 caches: Mutex::new(Caches {
                     symbol_cache: LruCache::new(2000),
@@ -521,6 +527,69 @@ impl TaskManager {
         }
     }
 
+    /// Flip every `InProgress` todo back to `Pending`. Called on
+    /// exit paths that drain the todo list (ctrl-c, --turns cap,
+    /// goal-met stop) so items are persisted/deferred instead of
+    /// orphaned in a non-terminal status that no process owns any
+    /// more.
+    pub async fn reset_in_progress_to_pending(&self) -> usize {
+        let mut g = self.inner.write().await;
+        let mut n = 0usize;
+        for i in g.todo.iter_mut() {
+            if i.status == TodoStatus::InProgress {
+                i.status = TodoStatus::Pending;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    // -- plan ----------------------------------------------------------
+
+    pub async fn plan_snapshot(&self) -> Option<crate::plan::Plan> {
+        self.inner.read().await.plan.clone()
+    }
+
+    /// Install a plan (or clear it when `None`). When the new plan
+    /// is `Some` and its step ids differ from the prior plan, walks
+    /// the current todo list and clears `step_id` on any todo whose
+    /// prior step id is not in the new plan — otherwise those
+    /// orphans would drag the next `sync_plan_from_todo` pass over
+    /// the plan's linkage directions and never roll up into any
+    /// step. When the new plan is `None` (or carries no steps),
+    /// strips `step_id` from every todo.
+    pub async fn set_plan(&self, plan: Option<crate::plan::Plan>) {
+        let new_step_ids: std::collections::BTreeSet<String> = match plan.as_ref() {
+            Some(p) => p.steps.iter().map(|s| s.id.clone()).collect(),
+            None => std::collections::BTreeSet::new(),
+        };
+        let mut g = self.inner.write().await;
+        g.plan = plan;
+        for t in g.todo.iter_mut() {
+            if !t.step_id.is_empty() && !new_step_ids.contains(&t.step_id) {
+                t.step_id = String::new();
+            }
+        }
+    }
+
+    /// Recompute plan step statuses from the current todo list.
+    /// No-op when no plan is set. Call after any todo mutation that
+    /// could flip a linked item's status.
+    pub async fn sync_plan_from_todo(&self) {
+        let mut g = self.inner.write().await;
+        let todo = g.todo.clone();
+        if let Some(plan) = g.plan.as_mut() {
+            plan.sync_from_todo(&todo);
+        }
+    }
+
+    /// Overwrite `completed_run_count`. Only used by the session
+    /// loader to restore a persisted count on resume — the normal
+    /// path is the `finish_ok` auto-increment.
+    pub async fn set_completed_run_count(&self, n: u32) {
+        self.inner.write().await.completed_run_count = n;
+    }
+
     // -- findings ------------------------------------------------------
 
     pub async fn findings_snapshot(&self) -> Vec<Finding> {
@@ -678,6 +747,99 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reset_in_progress_flips_only_inprogress() {
+        let mgr = TaskManager::new();
+        let mut a = TodoItem::new("a", "investigate");
+        a.status = TodoStatus::InProgress;
+        let mut b = TodoItem::new("b", "investigate");
+        b.status = TodoStatus::Pending;
+        let mut c = TodoItem::new("c", "investigate");
+        c.status = TodoStatus::Done;
+        let mut d = TodoItem::new("d", "investigate");
+        d.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![a, b, c, d]).await;
+        let flipped = mgr.reset_in_progress_to_pending().await;
+        assert_eq!(flipped, 2);
+        let snap = mgr.todo_snapshot().await;
+        assert_eq!(snap[0].status, TodoStatus::Pending);
+        assert_eq!(snap[1].status, TodoStatus::Pending);
+        assert_eq!(snap[2].status, TodoStatus::Done);
+        assert_eq!(snap[3].status, TodoStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn set_and_sync_plan_marks_step_done_when_todos_terminal() {
+        use crate::plan::{Plan, PlanStep, PlanStepStatus};
+        let mgr = TaskManager::new();
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        let mut step = PlanStep::new("s1", "t");
+        step.todo_ids = vec!["a".into(), "b".into()];
+        plan.steps.push(step);
+        mgr.set_plan(Some(plan)).await;
+        let mut a = TodoItem::new("a", "investigate");
+        a.status = TodoStatus::Done;
+        let mut b = TodoItem::new("b", "investigate");
+        b.status = TodoStatus::Skipped;
+        mgr.replace_todo(vec![a, b]).await;
+        mgr.sync_plan_from_todo().await;
+        let out = mgr.plan_snapshot().await.unwrap();
+        assert_eq!(out.steps[0].status, PlanStepStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn set_completed_run_count_overrides_counter() {
+        let mgr = TaskManager::new();
+        mgr.set_completed_run_count(42).await;
+        assert_eq!(mgr.completed_run_count().await, 42);
+    }
+
+    #[tokio::test]
+    async fn set_plan_strips_orphan_step_ids_from_todos() {
+        // When the slow or todo agent rewrites the plan and drops
+        // a step id the new plan no longer owns, existing todos
+        // pointing at the dead id must be cleared so they are not
+        // stranded. The todo's step_id goes back to empty and the
+        // todo-agent's next turn re-links it against the new plan.
+        use crate::plan::{Plan, PlanStep};
+        let mgr = TaskManager::new();
+        let mut old_plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        old_plan.steps.push(PlanStep::new("s1", "old-one"));
+        old_plan.steps.push(PlanStep::new("s2", "old-two"));
+        mgr.set_plan(Some(old_plan)).await;
+        let mut a = TodoItem::new("a", "investigate");
+        a.step_id = "s1".into();
+        let mut b = TodoItem::new("b", "investigate");
+        b.step_id = "s2".into();
+        let c = TodoItem::new("c", "investigate"); // empty step_id
+        mgr.replace_todo(vec![a, b, c]).await;
+
+        // New plan drops s2, keeps s1, adds s3.
+        let mut new_plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        new_plan.steps.push(PlanStep::new("s1", "new-one"));
+        new_plan.steps.push(PlanStep::new("s3", "new-three"));
+        mgr.set_plan(Some(new_plan)).await;
+
+        let snap = mgr.todo_snapshot().await;
+        assert_eq!(snap[0].step_id, "s1"); // still valid, preserved
+        assert_eq!(snap[1].step_id, ""); // s2 dead, cleared
+        assert_eq!(snap[2].step_id, ""); // was empty, unchanged
+    }
+
+    #[tokio::test]
+    async fn set_plan_none_clears_every_step_id() {
+        use crate::plan::{Plan, PlanStep};
+        let mgr = TaskManager::new();
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        plan.steps.push(PlanStep::new("s1", "x"));
+        mgr.set_plan(Some(plan)).await;
+        let mut a = TodoItem::new("a", "investigate");
+        a.step_id = "s1".into();
+        mgr.replace_todo(vec![a]).await;
+        mgr.set_plan(None).await;
+        assert_eq!(mgr.todo_snapshot().await[0].step_id, "");
+    }
 
     #[tokio::test]
     async fn spawn_and_reap_ok() {

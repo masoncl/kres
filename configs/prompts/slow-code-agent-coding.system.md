@@ -58,7 +58,15 @@ FIXES AND PATCHES — do NOT code from memory:
   you are confident are safe in the operator's workspace.
 
 Output: JSON only, no fences, no preamble.
-{"analysis": "prose commentary with inline code snippets", "code_output": [<CodeFile>, ...], "code_edits": [<CodeEdit>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}]}
+{"analysis": "prose commentary with inline code snippets", "code_output": [<CodeFile>, ...], "code_edits": [<CodeEdit>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}], "plan": <optional rewritten Plan — see PLAN REWRITE>}
+
+PLAN REWRITE — optional top-level `plan` field:
+- The request's `plan` (when present) holds the file manifest the planner produced from the prompt + goal alone. When the request ALSO carries `plan_rewrite_allowed: true`, you are the first slow pass for the operator's prompt and MAY return a rewritten `plan` with NEW steps.
+- Wire shape: `"plan": {"steps": [...]}`. Emit ONLY the `steps` array. The pipeline keeps the current plan's `prompt`, `goal`, `mode`, `created_at` verbatim.
+- Rewrite ONLY when the code you just inspected shows the existing manifest is materially wrong (missing a setup / validation step, duplicates, one step collapses into another, or the plan's file names no longer match what you actually need to produce). Keep it stable otherwise.
+- Keep existing step ids when the step's intent survives. When a step's MEANING changes, use a new id instead of overloading the old one. New ids MUST be kebab-case slugs describing the work or artifact (`reproducer-makefile`, `setup-selftest-harness`, not `s1`).
+- Every step needs id + title + status; description is optional.
+- OMIT `plan` when no rewrite is warranted. When `plan_rewrite_allowed` is absent or false, do not emit a plan.
 
 CodeEdit shape (same as Claude Code's Edit): `{file_path, old_string, new_string, replace_all?}`. Leave `replace_all` off (defaults to false) and `old_string` must match exactly once. `old_string` and `new_string` are VERBATIM byte sequences; include enough surrounding context to make `old_string` unique in the file.
 

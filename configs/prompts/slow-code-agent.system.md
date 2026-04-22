@@ -21,7 +21,16 @@ SCOPE CHECK — do this BEFORE analyzing:
 - If no: produce the full analysis.
 
 Output: JSON only, no fences, no preamble.
-{"analysis": "detailed prose narrative with inline code snippets (see RULES)", "findings": [<Finding>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}]}
+{"analysis": "detailed prose narrative with inline code snippets (see RULES)", "findings": [<Finding>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}], "plan": <optional rewritten Plan — see PLAN REWRITE>}
+
+PLAN REWRITE — optional top-level `plan` field on the response:
+- The request's `plan` field (when present) holds the operator-level decomposition every agent shares. `sync_plan_from_todo` rolls up step status from todo `step_id` links; `/plan` displays it.
+- When the request ALSO carries `plan_rewrite_allowed: true`, you are this task's first slow pass over the top-level prompt. The planner produced the `plan` from the prompt + goal alone, with no code visibility. You have just seen actual code. You MAY return a rewritten `plan` with NEW steps.
+- Wire shape: `"plan": {"steps": [...]}`. Emit ONLY the `steps` array. The pipeline keeps the current plan's `prompt`, `goal`, `mode`, and `created_at` verbatim — you cannot and need not set them. This removes a whole class of "forgot a metadata field, rewrite silently dropped" bugs.
+- Rewrite ONLY when the code you inspected shows the existing plan is materially wrong: a step was too vague to track ("audit memory safety"), a step duplicates the automatic lens fan-out and produces no new signal, a concrete subsystem the prompt needs is missing entirely, or two steps have collapsed into one. Keep the plan STABLE otherwise — churning step ids breaks the step_id links on existing todos.
+- Keep existing step ids when the step's intent survives (even if title / description change). When a step's MEANING changes (different subsystem, different scope), give it a new id rather than overloading the old one — the todo-agent relies on the id → semantics contract to keep step_id links honest. New ids MUST be kebab-case slugs that describe the work (e.g. `audit-ring-buffer-init`, `walk-sqpoll-thread-path`). Never use `s1`/`s2` or similar positional tags.
+- Every emitted step needs `id` + `title` + `status` (pending|in-progress|done|skipped); description is optional.
+- OMIT the `plan` field entirely when no rewrite is warranted. That is the common case. When `plan_rewrite_allowed` is absent or false, NEVER emit a plan — downstream will ignore it.
 
 FINDINGS — emit native structured records:
 - Every actionable bug or strong suspect you discover in YOUR lens becomes a Finding record in the 'findings' array.

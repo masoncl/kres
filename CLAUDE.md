@@ -54,6 +54,31 @@ User prompt → Task created → Task thread starts
 - Auto-progress checks goal after each completed task for early exit
 - Deferred items (identified but not started when goal met) saved via `/followup`
 
+### Plan + Session Persistence
+- `kres_core::Plan` holds the planner's decomposition: `prompt`, `goal`,
+  `mode`, and `steps` (each with `id`, `title`, `status`, `todo_ids`
+  linking to `TodoItem` rows). Lives on `TaskManager` as
+  `Option<Plan>`; `sync_plan_from_todo` rolls up step status from
+  linked todo statuses.
+- `kres_core::SessionState` (`<results>/session.json`) is the
+  resumable snapshot: plan + todo list + deferred list +
+  `completed_run_count` + last prompt. Written atomically (tmp +
+  fsync + rename) from the reaper tick and the various drain
+  paths.
+- Resume: `kres --results <dir>` on an existing dir loads the
+  snapshot, flips every `InProgress` todo/plan step back to
+  `Pending` (its prior executor is gone), and seeds the manager +
+  deferred list before the REPL starts.
+- InProgress drains: ctrl-c, the `--turns N` cap, goal-met, and
+  `--turns 0` follow-stagnation all call
+  `TaskManager::reset_in_progress_to_pending()` before moving items
+  to the deferred list, so a task that was mid-run when the drain
+  fired still ends up on `/followup` instead of being orphaned.
+  `/stop` is separate: it moves `Pending|Blocked|InProgress` items
+  to deferred directly via its own `matches!` pattern
+  (kres-repl/src/session.rs), so a resumed REPL picks them up via
+  `/continue`.
+
 ### Skills
 - Loaded from `~/.kres/skills/*.md` at startup
 - Skill files scanned for absolute paths in backticks — referenced files pre-loaded
@@ -85,6 +110,7 @@ Rate limiters are shared across agents that use the same API key string.
 |---------|--------|
 | `/tasks` `/task` | Show active tasks and states |
 | `/todo` | Show pending items (ready/blocked) + completed count |
+| `/plan` | Show the current plan + per-step status (produced by `define_plan`) |
 | `/todo --clear` | Clear all todo items |
 | `/cost` | Token usage by agent role and model |
 | `/summary [FILE]` | Fast agent renders the run's report.md + findings.json into a bug report via the embedded `summary` slash-command template. Output defaults to `bug-report.txt` in the results dir |
@@ -152,6 +178,7 @@ Rate limiters are shared across agents that use the same API key string.
   sessions/<ts>/              # Per-run artifacts when --results not set
     findings.json             # Cumulative findings (history in findings-N.json)
     report.md                 # Append-only narrative
+    session.json              # Plan + todo + deferred + counters (resume state)
     bug-report.txt            # Output of /summary or kres --summary
 
 .kres/logs/<session-uuid>/    # Next to cwd, one dir per REPL run

@@ -31,7 +31,8 @@ pub use error::AgentError;
 pub use fetcher::{parse_read_spec, WorkspaceFetcher};
 pub use followup::Followup;
 pub use goal::{
-    check_goal, define_goal, GoalCheck, GoalClient, GoalDefinition, GOAL_INSTRUCTIONS,
+    check_goal, define_goal, define_plan, GoalCheck, GoalClient, GoalDefinition,
+    GOAL_INSTRUCTIONS,
 };
 pub use kres_core::TaskMode;
 pub use main_agent::{parse_actions, MainAgent, DEFAULT_MAX_MAIN_TURNS};
@@ -50,5 +51,5 @@ pub use symbol::{
 };
 pub use todo_agent::{
     dedup_tokens, extract_citations, parse_todo_response, update_todo_via_agent,
-    update_todo_via_agent_with_logger, TodoClient,
+    update_todo_via_agent_with_logger, TodoClient, TodoUpdate,
 };

@@ -44,6 +44,15 @@ pub struct TodoItem {
     /// references that cite the old id.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
+    /// Optional pointer to the plan step this todo is executing.
+    /// Written by the todo-agent when a plan is in play (the agent
+    /// sees the plan in its user JSON and picks the best-matching
+    /// step id); consumed by `crate::plan::Plan::sync_from_todo` to
+    /// roll up step status. Empty string means "not yet linked" —
+    /// most common for todos created before a plan existed, or for
+    /// followups the agent couldn't confidently attribute.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub step_id: String,
 }
 
 fn default_pending() -> TodoStatus {
@@ -60,6 +69,7 @@ impl TodoItem {
             depends_on: Vec::new(),
             coverage: String::new(),
             id: String::new(),
+            step_id: String::new(),
         }
     }
 }

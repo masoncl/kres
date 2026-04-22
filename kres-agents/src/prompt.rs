@@ -33,6 +33,23 @@ pub struct CodePrompt<'a> {
     pub parallel_lenses: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<&'a Value>,
+    /// Plan produced by `define_plan` for the top-level prompt.
+    /// Forwarded to every fast and slow agent turn as a top-level
+    /// `plan` field so the agents see the operator-level
+    /// decomposition alongside their narrow per-task brief. The
+    /// plan is a stable-across-a-task payload, so callers place it
+    /// in the cached prefix half of `to_cached_split_json` for
+    /// free cache hits on round 2+.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<&'a kres_core::Plan>,
+    /// When `Some(true)`, invites the slow agent to return a
+    /// top-level `plan` object in its response replacing the
+    /// current plan. Set on the first slow call per top-level
+    /// prompt (see `RunContext.allow_plan_rewrite`); left out
+    /// otherwise. Serialised as a top-level boolean so the
+    /// agent can trivially test for it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_rewrite_allowed: Option<bool>,
 }
 
 impl<'a> CodePrompt<'a> {
@@ -45,7 +62,19 @@ impl<'a> CodePrompt<'a> {
             previous_findings: None,
             parallel_lenses: None,
             skills: None,
+            plan: None,
+            plan_rewrite_allowed: None,
         }
+    }
+
+    pub fn with_plan(mut self, plan: &'a kres_core::Plan) -> Self {
+        self.plan = Some(plan);
+        self
+    }
+
+    pub fn with_plan_rewrite_allowed(mut self, allowed: bool) -> Self {
+        self.plan_rewrite_allowed = Some(allowed);
+        self
     }
 
     pub fn with_symbols(mut self, symbols: &'a [Value]) -> Self {

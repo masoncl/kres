@@ -47,7 +47,11 @@ impl WorkspaceFetcher {
 
 #[async_trait]
 impl DataFetcher for WorkspaceFetcher {
-    async fn fetch(&self, followups: &[Followup]) -> Result<FetchResult, AgentError> {
+    async fn fetch(
+        &self,
+        followups: &[Followup],
+        _plan: Option<&kres_core::Plan>,
+    ) -> Result<FetchResult, AgentError> {
         let mut out = FetchResult::default();
         for fu in followups {
             match fu.kind.as_str() {
@@ -214,12 +218,15 @@ mod tests {
         f.write_all(b"1\n2\n3\n4\n5\n").unwrap();
         let f = WorkspaceFetcher::new(&dir);
         let r = f
-            .fetch(&[Followup {
-                kind: "read".into(),
-                name: "a.c:2+2".into(),
-                reason: String::new(),
-                path: None,
-            }])
+            .fetch(
+                &[Followup {
+                    kind: "read".into(),
+                    name: "a.c:2+2".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(r.context.len(), 1);
@@ -233,12 +240,15 @@ mod tests {
         let dir = tmpdir("unk");
         let f = WorkspaceFetcher::new(&dir);
         let r = f
-            .fetch(&[Followup {
-                kind: "source".into(),
-                name: "some_func".into(),
-                reason: String::new(),
-                path: None,
-            }])
+            .fetch(
+                &[Followup {
+                    kind: "source".into(),
+                    name: "some_func".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(r.context.len(), 1);

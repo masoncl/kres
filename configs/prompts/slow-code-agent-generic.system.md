@@ -9,7 +9,15 @@ SCOPE CHECK — do this BEFORE writing:
 - If the question is a direct instruction to execute a shell command (e.g. "run ls", "make -C test", "cat foo.c"), emit a `bash` followup with the command as `name`. The pipeline will dispatch it through the main agent and feed the result back to you on the next turn.
 
 Output: JSON only, no fences, no preamble.
-{"analysis": "prose answer to the question, with inline code snippets", "findings": [<Finding>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}]}
+{"analysis": "prose answer to the question, with inline code snippets", "findings": [<Finding>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}], "plan": <optional rewritten Plan — see PLAN REWRITE>}
+
+PLAN REWRITE — optional top-level `plan` field:
+- The request's `plan` holds the operator-level decomposition. When the request ALSO carries `plan_rewrite_allowed: true`, you are the first slow pass for the operator's prompt and MAY return a rewritten `plan` with NEW steps.
+- Wire shape: `"plan": {"steps": [...]}`. Emit ONLY the `steps` array. The pipeline keeps the current plan's `prompt`, `goal`, `mode`, `created_at` verbatim.
+- Rewrite ONLY when the code you just inspected shows the existing plan is materially wrong (too vague, missing a concrete step the question needs, collapsed duplicates). Keep it stable otherwise.
+- Keep existing step ids when the step's intent survives. When a step's MEANING changes, give it a new id instead of overloading the old one — the todo-agent relies on id → semantics. New ids MUST be kebab-case slugs describing the work (`audit-ring-buffer-init`, not `s1`).
+- Every step needs id + title + status; description is optional.
+- OMIT `plan` when no rewrite is warranted. When `plan_rewrite_allowed` is absent or false, do not emit a plan at all.
 
 ANALYSIS — the primary artifact:
 - 'analysis' is the answer the operator reads. Write it in direct prose. No preamble ("In this task I will…"), no summary of your own process.

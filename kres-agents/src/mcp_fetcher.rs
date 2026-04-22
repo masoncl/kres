@@ -80,7 +80,11 @@ impl McpFetcher {
 
 #[async_trait]
 impl DataFetcher for McpFetcher {
-    async fn fetch(&self, followups: &[Followup]) -> Result<FetchResult, AgentError> {
+    async fn fetch(
+        &self,
+        followups: &[Followup],
+        plan: Option<&kres_core::Plan>,
+    ) -> Result<FetchResult, AgentError> {
         let mut out = FetchResult::default();
         let mut passthrough: Vec<Followup> = Vec::new();
 
@@ -148,7 +152,7 @@ impl DataFetcher for McpFetcher {
         }
 
         if !passthrough.is_empty() {
-            let inner_out = self.inner.fetch(&passthrough).await?;
+            let inner_out = self.inner.fetch(&passthrough, plan).await?;
             out.symbols.extend(inner_out.symbols);
             out.context.extend(inner_out.context);
         }

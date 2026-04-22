@@ -48,6 +48,18 @@ pub struct CodeResponse {
     /// primitive: `{file_path, old_string, new_string, replace_all}`.
     /// The reaper applies each entry via `tools::edit_file`.
     pub code_edits: Vec<kres_core::CodeEdit>,
+    /// Optional rewritten plan. The slow agent is permitted to
+    /// emit a top-level `plan` field when (a) it's the first slow
+    /// call for the operator's top-level prompt and (b) the code
+    /// it just inspected shows the existing plan is materially
+    /// wrong. The wire shape is `{steps: [...]}` (only the steps
+    /// are mutable — prompt/goal/mode/created_at inherit from the
+    /// existing plan via `PlanRewrite::apply_to` at the apply
+    /// site); parsing just the steps means a forgotten metadata
+    /// field in the LLM reply does NOT silently drop the rewrite.
+    /// `None` means "keep the existing plan", which is the common
+    /// case.
+    pub plan: Option<kres_core::PlanRewrite>,
     /// Which parse strategy won — used for diagnostics.
     pub strategy: ParseStrategy,
 }
@@ -84,6 +96,8 @@ struct RawResponse {
     code_output: Value,
     #[serde(default)]
     code_edits: Value,
+    #[serde(default)]
+    plan: Value,
 }
 
 pub fn parse_code_response(text: &str) -> CodeResponse {
@@ -145,6 +159,7 @@ pub fn parse_code_response(text: &str) -> CodeResponse {
         ready_for_slow: false,
         code_output: vec![],
         code_edits: vec![],
+        plan: None,
         strategy: ParseStrategy::RawText,
     }
 }
@@ -190,7 +205,27 @@ fn into_code_response(r: RawResponse, _original: &str, strategy: ParseStrategy) 
         ready_for_slow: matches!(r.ready_for_slow, Value::Bool(true)),
         code_output: value_to_code_output(r.code_output),
         code_edits: value_to_code_edits(r.code_edits),
+        plan: value_to_plan(r.plan),
         strategy,
+    }
+}
+
+fn value_to_plan(v: Value) -> Option<kres_core::PlanRewrite> {
+    match v {
+        Value::Null => None,
+        other => {
+            // Only the `steps` field is consumed; any other fields
+            // the LLM stuffs in (prompt, goal, mode, created_at)
+            // are ignored. An empty-steps rewrite is indistinguish-
+            // able from "no rewrite", so drop it.
+            let rewrite: kres_core::PlanRewrite =
+                serde_json::from_value(other).ok()?;
+            if rewrite.steps.is_empty() {
+                None
+            } else {
+                Some(rewrite)
+            }
+        }
     }
 }
 

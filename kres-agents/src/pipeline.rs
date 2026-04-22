@@ -49,8 +49,27 @@ use crate::{
 /// `cache_read=8403` (full prefix hit) but round 2 with
 /// `cache_read=0, cache_create=33275` (miss) — the miss was driven
 /// by previously_fetched growing.
-const CACHED_PREFIX_FIELDS: &[&str] =
-    &["question", "skills", "parallel_lenses", "previous_findings"];
+// Keep the plan OUT of the cached prefix. The plan is the most
+// mutation-prone static field in this envelope: define_plan on
+// first submit, a slow-agent rewrite on the first turn, and the
+// todo-agent can reshape it every turn. If the plan sat in the
+// prefix, every rewrite would bust the prompt cache for the
+// following fast + slow calls — wiping out the tens-of-kB
+// question + skills + lenses prefix alongside it. Routing the
+// plan through the volatile suffix keeps the big cache intact;
+// the plan bytes (usually a handful of KB) get re-sent every
+// round but nothing the prefix carried needs to be.
+//
+// `plan_rewrite_allowed` changes at most once per top-level
+// prompt (submit_prompt_inner turns it on for the first task
+// and off for follow-ups), so it stays in the prefix.
+const CACHED_PREFIX_FIELDS: &[&str] = &[
+    "question",
+    "skills",
+    "parallel_lenses",
+    "previous_findings",
+    "plan_rewrite_allowed",
+];
 
 /// Abstraction over the main-agent's data-fetch capability.
 /// Implementations route followups to MCP tools, grep, read, git.
@@ -58,7 +77,17 @@ const CACHED_PREFIX_FIELDS: &[&str] =
 pub trait DataFetcher: Send + Sync {
     /// Fetch the requested data. Returns (symbols, context) as opaque
     /// JSON chunks to feed to the fast agent's next round.
-    async fn fetch(&self, followups: &[Followup]) -> Result<FetchResult, AgentError>;
+    ///
+    /// `plan` is the operator's current plan (or None when no plan
+    /// is in play). Callers pass it per-call so a concurrent task
+    /// with a different plan does not clobber the value via a
+    /// shared-slot write in between. Implementations forward the
+    /// plan into the main-agent user JSON; NullFetcher ignores it.
+    async fn fetch(
+        &self,
+        followups: &[Followup],
+        plan: Option<&kres_core::Plan>,
+    ) -> Result<FetchResult, AgentError>;
 }
 
 #[derive(Debug, Default, Clone)]
@@ -74,7 +103,11 @@ pub struct NullFetcher;
 
 #[async_trait]
 impl DataFetcher for NullFetcher {
-    async fn fetch(&self, _followups: &[Followup]) -> Result<FetchResult, AgentError> {
+    async fn fetch(
+        &self,
+        _followups: &[Followup],
+        _plan: Option<&kres_core::Plan>,
+    ) -> Result<FetchResult, AgentError> {
         Ok(FetchResult::default())
     }
 }
@@ -153,6 +186,19 @@ pub struct RunContext {
     /// TaskSummary with `code_output` populated and `findings`
     /// empty. The session sets this from `define_goal`'s classifier.
     pub mode: kres_core::TaskMode,
+    /// Plan produced by [`crate::define_plan`] for the operator's
+    /// top-level prompt, or None when no planner was configured or
+    /// it failed. Forwarded to every agent turn (fast + slow via
+    /// `CodePrompt`, main via `DataFetcher::set_plan_context`, goal
+    /// via `check_goal`) so every LLM call sees the same plan
+    /// alongside the derived goal.
+    pub plan: Option<kres_core::Plan>,
+    /// True on the first task spawned from a given top-level
+    /// prompt — the task that immediately follows `define_plan`.
+    /// Controls whether the slow agent is told it may rewrite the
+    /// plan in its response; subsequent pipeline-driven tasks keep
+    /// this false so plan churn stays bounded.
+    pub allow_plan_rewrite: bool,
 }
 
 fn record_usage(
@@ -217,6 +263,14 @@ pub struct TaskSummary {
     /// String-replacement edits emitted by a Coding-mode task.
     /// The reaper applies each entry via tools::edit_file.
     pub code_edits: Vec<kres_core::CodeEdit>,
+    /// Optional rewritten plan proposed by the slow agent. Wire
+    /// shape is `{steps: [...]}` via [`kres_core::PlanRewrite`] —
+    /// the caller merges it with the existing plan's metadata via
+    /// `apply_to` before handing it to `mgr.set_plan`. Populated
+    /// only when the slow agent emitted a `plan` field; only the
+    /// first slow call per top-level prompt is expected to set
+    /// this (see `RunContext.allow_plan_rewrite`).
+    pub plan: Option<kres_core::PlanRewrite>,
 }
 
 impl Orchestrator {
@@ -289,10 +343,13 @@ impl Orchestrator {
             if let Some(sk) = &live_skills {
                 cp = cp.with_skills(sk);
             }
+            if let Some(ref p) = ctx.plan {
+                cp = cp.with_plan(p);
+            }
             // §cache: split the envelope into a stable prefix
-            // (question + skills + previous_findings + parallel_lenses)
-            // and a per-round volatile tail (symbols + context +
-            // previously_fetched). The prefix cache-hits across
+            // (question + skills + previous_findings + parallel_lenses
+            // + plan) and a per-round volatile tail (symbols + context
+            // + previously_fetched). The prefix cache-hits across
             // rounds; the tail does not.
             let (prefix, suffix) = cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
             prev_n_syms = symbols.len();
@@ -440,7 +497,7 @@ impl Orchestrator {
                 _ = shutdown.cancelled() => {
                     return Err(AgentError::Other("cancelled during fetch".into()));
                 }
-                f = self.fetcher.fetch(&parsed.followups) => f?,
+                f = self.fetcher.fetch(&parsed.followups, ctx.plan.as_ref()) => f?,
             };
             let got_syms = fetched.symbols.len();
             let got_ctx = fetched.context.len();
@@ -492,6 +549,12 @@ impl Orchestrator {
         // hand the slow agent a stale, smaller skill payload.
         if let Some(sk) = &live_skills {
             slow_cp = slow_cp.with_skills(sk);
+        }
+        if let Some(ref p) = ctx.plan {
+            slow_cp = slow_cp.with_plan(p);
+        }
+        if ctx.allow_plan_rewrite {
+            slow_cp = slow_cp.with_plan_rewrite_allowed(true);
         }
         let (slow_prefix, slow_suffix) = slow_cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
         let slow_logged = format!("{slow_prefix}{slow_suffix}");
@@ -644,6 +707,18 @@ impl Orchestrator {
                 slow_parsed.code_edits,
             ),
         };
+        // Only surface a slow-agent plan rewrite when this task is
+        // the first slow call for the top-level prompt. Later
+        // pipeline-driven tasks going through run_once_with_ctx
+        // (follow-ups) are NOT permitted to reshape the plan — the
+        // todo agent's per-turn reevaluation handles incremental
+        // updates, and letting every slow call rewrite would churn
+        // step ids mid-sweep and break the step_id→step linkage.
+        let slow_plan = if ctx.allow_plan_rewrite {
+            slow_parsed.plan
+        } else {
+            None
+        };
         Ok(TaskSummary {
             analysis: slow_parsed.analysis,
             findings: findings_out,
@@ -653,6 +728,7 @@ impl Orchestrator {
             mode: ctx.mode,
             code_output,
             code_edits,
+            plan: slow_plan,
         })
     }
 }
@@ -681,7 +757,7 @@ impl Orchestrator {
         // Gather once via fast+main (same loop as run_once, up to the
         // point where we'd call the slow agent).
         let (symbols, context, fast_rounds, live_skills) =
-            self.gather(prompt, shutdown).await?;
+            self.gather(prompt, ctx.plan.as_ref(), shutdown).await?;
 
         // Fan out N slow-agent calls in parallel.
         let mut futures = Vec::with_capacity(lenses.len());
@@ -722,6 +798,9 @@ impl Orchestrator {
             // agents too.
             if let Some(sk) = &live_skills {
                 lens_cp = lens_cp.with_skills(sk);
+            }
+            if let Some(ref p) = ctx.plan {
+                lens_cp = lens_cp.with_plan(p);
             }
             let (lens_prefix, lens_suffix) = lens_cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
             let client = self.slow_client.clone();
@@ -826,6 +905,13 @@ impl Orchestrator {
             mode: kres_core::TaskMode::Analysis,
             code_output: Vec::new(),
             code_edits: Vec::new(),
+            // Lens fan-out runs N parallel slow calls; merging N
+            // plan rewrites would churn step ids. Analysis-mode
+            // plan rewrites flow through the todo-agent's per-turn
+            // reevaluation path (a97bff2) instead. Single-slow
+            // analysis tasks (lens count 0) still get plan rewrite
+            // via run_once_with_ctx above.
+            plan: None,
         })
     }
 
@@ -835,6 +921,7 @@ impl Orchestrator {
     pub async fn gather(
         &self,
         prompt: &str,
+        plan: Option<&kres_core::Plan>,
         shutdown: &Shutdown,
     ) -> Result<(Vec<Value>, Vec<Value>, u8, Option<Value>), AgentError> {
         let mut symbols: Vec<Value> = Vec::new();
@@ -880,6 +967,9 @@ impl Orchestrator {
             }
             if let Some(sk) = &live_skills {
                 cp = cp.with_skills(sk);
+            }
+            if let Some(p) = plan {
+                cp = cp.with_plan(p);
             }
             let (gp_prefix, gp_suffix) = cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
             prev_n_syms = symbols.len();
@@ -956,7 +1046,7 @@ impl Orchestrator {
             }
             let fetched = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fetch".into())),
-                f = self.fetcher.fetch(&parsed.followups) => f?,
+                f = self.fetcher.fetch(&parsed.followups, plan) => f?,
             };
             symbols.extend(fetched.symbols);
             context.extend(fetched.context);
@@ -1104,12 +1194,15 @@ mod tests {
     async fn null_fetcher_returns_empty() {
         let f = NullFetcher;
         let r = f
-            .fetch(&[Followup {
-                kind: "source".into(),
-                name: "x".into(),
-                reason: String::new(),
-                path: None,
-            }])
+            .fetch(
+                &[Followup {
+                    kind: "source".into(),
+                    name: "x".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
             .await
             .unwrap();
         assert!(r.symbols.is_empty());

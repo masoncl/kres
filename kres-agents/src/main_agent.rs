@@ -158,7 +158,11 @@ impl MainAgent {
 
 #[async_trait]
 impl DataFetcher for MainAgent {
-    async fn fetch(&self, followups: &[Followup]) -> Result<FetchResult, AgentError> {
+    async fn fetch(
+        &self,
+        followups: &[Followup],
+        plan: Option<&kres_core::Plan>,
+    ) -> Result<FetchResult, AgentError> {
         let mut symbols: Vec<Value> = Vec::new();
         let mut context: Vec<Value> = Vec::new();
 
@@ -168,6 +172,16 @@ impl DataFetcher for MainAgent {
         }
         if !self.task_brief.is_empty() && self.task_brief != self.user_query {
             main_payload.insert("task_brief".into(), json!(self.task_brief));
+        }
+        // Include the plan the caller handed in so the main-agent
+        // LLM sees the same decomposition the fast + slow agents
+        // see. Per-call delivery (vs a shared slot) means two
+        // concurrent tasks with different plans cannot clobber each
+        // other's snapshot between the push and the LLM call.
+        if let Some(plan) = plan {
+            if let Ok(v) = serde_json::to_value(plan) {
+                main_payload.insert("plan".into(), v);
+            }
         }
         main_payload.insert("code_agent_followups".into(), json!(followups));
         let opening = serde_json::to_string_pretty(&Value::Object(main_payload))?;

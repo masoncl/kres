@@ -26,6 +26,10 @@ pub enum Command {
     Cost,
     /// `/todo [--clear]` — show or clear the current todo list.
     Todo { clear: bool },
+    /// `/plan` — show the current plan (step id, status, title)
+    /// if one was produced by `define_plan` when the prompt was
+    /// submitted. Prints a reminder when no plan exists.
+    Plan,
     /// `/followup` — list items deferred by goal-met or --turns cap.
     Followup,
     /// `/summary [filename]` — render the run's report.md +
@@ -100,6 +104,7 @@ pub fn parse_command(line: &str) -> Command {
             "todo" => Command::Todo {
                 clear: rest.split_whitespace().any(|tok| tok == "--clear"),
             },
+            "plan" => Command::Plan,
             "followup" | "followups" | "deferred" => Command::Followup,
             "summary" => Command::Summary {
                 filename: rest.split_whitespace().next().map(|s| s.to_string()),
@@ -215,6 +220,11 @@ mod tests {
             parse_command("/todo --clear"),
             Command::Todo { clear: true }
         );
+    }
+
+    #[test]
+    fn parses_plan() {
+        assert_eq!(parse_command("/plan"), Command::Plan);
     }
 
     #[test]

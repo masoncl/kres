@@ -1,4 +1,7 @@
-We're doing a deep security and bug analysis of the target below.
+The block above this paragraph is the review target — a file path,
+function name, commit ref (e.g. `HEAD`), diff, or code snippet
+supplied by the operator. We're doing a deep security and bug
+analysis of that target.
 
 Focus on just the target itself and the supporting code it calls,
 without expanding out into the rest of the kernel. Pay special

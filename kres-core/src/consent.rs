@@ -184,7 +184,17 @@ fn is_suspicious_grant(dir: &Path) -> bool {
 }
 
 fn strip_token_punctuation(s: &str) -> &str {
-    let trimmed = s.trim_matches(|c: char| {
+    // Trim asymmetrically. Operator prose wraps paths with leading
+    // quote-like chars (`` `/etc/hosts` ``, `"./foo"`, `(../bar)`)
+    // and trails them with sentence punctuation (`foo.c,` `foo.c.`
+    // `see foo:`). Stripping `.` from the LEFT would eat the leading
+    // dots of `./foo` and `../foo`, turning a relative path into an
+    // absolute one that doesn't exist — so left-trim is limited to
+    // chars that can never legitimately start a path.
+    let left_trimmed = s.trim_start_matches(|c: char| {
+        matches!(c, '`' | '(' | '[' | '{' | '\'' | '"' | '<')
+    });
+    left_trimmed.trim_end_matches(|c: char| {
         matches!(
             c,
             ',' | '.'
@@ -193,19 +203,14 @@ fn strip_token_punctuation(s: &str) -> &str {
                 | '!'
                 | '?'
                 | '`'
-                | '('
                 | ')'
-                | '['
                 | ']'
-                | '{'
                 | '}'
                 | '\''
                 | '"'
-                | '<'
                 | '>'
         )
-    });
-    trimmed
+    })
 }
 
 fn looks_like_path(s: &str) -> bool {
@@ -329,6 +334,40 @@ mod tests {
         let canon = d.canonicalize().unwrap();
         assert!(added.iter().any(|g| g.dir == canon), "added={added:?}");
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn text_scanner_preserves_leading_dot_dot() {
+        // Regression: a prompt like "read ../sibling/report.md," used
+        // to get both leading dots stripped by the symmetric
+        // trim_matches, turning it into "/sibling/report.md" which
+        // doesn't exist — so consent was silently never granted.
+        let tmp = std::env::temp_dir();
+        let base = tmp.join(format!("kres-scan-dotdot-{}", std::process::id()));
+        let sibling = base.join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let file = sibling.join("report.md");
+        std::fs::write(&file, b"x").unwrap();
+        let cwd = base.join("here");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let s = ConsentStore::new();
+        let msg = "read ../sibling/report.md, write a fix";
+        let added = grant_paths_from_text(&s, &cwd, msg);
+        let canon_parent = sibling.canonicalize().unwrap();
+        assert!(
+            added.iter().any(|g| g.dir == canon_parent),
+            "added={added:?}"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn strip_token_punctuation_keeps_leading_relative_prefixes() {
+        assert_eq!(strip_token_punctuation("./foo,"), "./foo");
+        assert_eq!(strip_token_punctuation("../foo."), "../foo");
+        assert_eq!(strip_token_punctuation("`../foo`"), "../foo");
+        assert_eq!(strip_token_punctuation("(./bar)"), "./bar");
+        assert_eq!(strip_token_punctuation("\"../baz\""), "../baz");
     }
 
     #[test]

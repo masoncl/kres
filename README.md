@@ -9,14 +9,7 @@ is the primary target).
 April 22: Agent system prompts and slash-command templates are
 now embedded in the kres binary — rebuilding kres refreshes
 them. `setup.sh` no longer copies `*.system.md`, `bug-summary*.md`,
-or `review-template.md` anywhere. Two new override directories:
-
-- `~/.kres/system-prompts/<name>.system.md` — operator override
-  for an agent system prompt.
-- `~/.kres/commands/<name>.md` — operator override for a slash-
-  command template (`/review`, `/summary`, `/summary-markdown`),
-  and the same lookup that backs `--prompt "word: extra"` and
-  the new `--prompt "/word extra"` form.
+or `review-template.md` anywhere.
 
 Stale files left under `~/.kres/prompts/` from earlier installs
 are ignored and safe to delete. See "System prompts" and

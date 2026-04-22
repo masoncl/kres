@@ -536,13 +536,24 @@ impl Session {
         .await;
     }
 
-    /// Load a prior session from `cfg.persist_path` and seed the
-    /// manager + deferred list. Called once at REPL startup. Returns
-    /// `Ok(Some(state))` on a successful resume, `Ok(None)` when
-    /// there's nothing to resume (no persist_path or file absent),
-    /// and `Err` on parse / I/O failure.
+    /// Load a prior session from `cfg.persist_path` (or an
+    /// explicit override) and seed the manager + deferred list.
+    /// Called once at REPL startup when `--resume` was passed, and
+    /// by the `/resume` command. Returns `Ok(Some(state))` on a
+    /// successful resume, `Ok(None)` when there's nothing to
+    /// resume (no persist path or file absent), and `Err` on parse
+    /// / I/O failure.
     pub async fn resume_state(&self) -> Result<Option<kres_core::SessionState>> {
-        let Some(path) = self.cfg.persist_path.as_ref() else {
+        self.resume_state_from(self.cfg.persist_path.as_deref()).await
+    }
+
+    /// `resume_state` with an explicit source path override. `None`
+    /// falls back to `cfg.persist_path`.
+    pub async fn resume_state_from(
+        &self,
+        override_path: Option<&Path>,
+    ) -> Result<Option<kres_core::SessionState>> {
+        let Some(path) = override_path.or(self.cfg.persist_path.as_deref()) else {
             return Ok(None);
         };
         let state = match kres_core::SessionState::load(path) {
@@ -1623,6 +1634,7 @@ impl Session {
                     }
                 }
                 Command::Plan => self.cmd_plan().await,
+                Command::Resume { path } => self.cmd_resume(path).await,
                 Command::Followup => self.cmd_followup().await,
                 Command::Summary { filename } => self.cmd_summary(filename, false).await,
                 Command::SummaryMarkdown { filename } => {
@@ -2428,6 +2440,76 @@ impl Session {
         match crate::report::write_findings_to_file(&findings, std::path::Path::new(&path)) {
             Ok(()) => println!("/report: wrote {} finding(s) to {}", findings.len(), path),
             Err(e) => println!("/report: {}: {e}", path),
+        }
+    }
+
+    /// `/resume [PATH]` — load a persisted snapshot from disk.
+    /// Selection order:
+    ///   1. Explicit `PATH` argument when given.
+    ///   2. `<results>/session.json.prev` — the backup kres moves
+    ///      aside on startup when `--resume` was not passed.
+    ///   3. `<results>/session.json` — the live file. Useful only
+    ///      before any state-mutating command in this session,
+    ///      since after that point it reflects the current run.
+    ///
+    /// Overwrites the current in-memory plan / todo / deferred /
+    /// counter. Operators who have already submitted prompts in
+    /// this session should expect to lose that work; no merge.
+    async fn cmd_resume(&self, path: Option<String>) {
+        let chosen: std::path::PathBuf = match path.as_deref() {
+            Some(p) => std::path::PathBuf::from(p),
+            None => {
+                // Derive the backup + live paths from cfg.persist_path.
+                let Some(live) = self.cfg.persist_path.as_ref() else {
+                    println!(
+                        "/resume: no persist path configured (kres was started \
+                         without a results dir)"
+                    );
+                    return;
+                };
+                // Same-dir, same-stem, extra ".prev" extension.
+                let mut prev = live.clone();
+                let prev_name = match live.file_name() {
+                    Some(n) => format!("{}.prev", n.to_string_lossy()),
+                    None => {
+                        println!("/resume: persist path has no filename");
+                        return;
+                    }
+                };
+                prev.set_file_name(prev_name);
+                if prev.exists() {
+                    prev
+                } else if live.exists() {
+                    live.clone()
+                } else {
+                    println!(
+                        "/resume: neither {} nor {} exists — nothing to load",
+                        prev.display(),
+                        live.display()
+                    );
+                    return;
+                }
+            }
+        };
+        match self.resume_state_from(Some(&chosen)).await {
+            Ok(Some(state)) => {
+                println!(
+                    "/resume: loaded {} ({} todo, {} deferred, turns done={})",
+                    chosen.display(),
+                    state.todo.len(),
+                    state.deferred.len(),
+                    state.completed_run_count,
+                );
+                if let Some(ref p) = state.last_prompt {
+                    println!("/resume: last prompt: {}", truncate(p, 80));
+                }
+            }
+            Ok(None) => {
+                println!("/resume: {} is missing or empty", chosen.display());
+            }
+            Err(e) => {
+                println!("/resume: {e}");
+            }
         }
     }
 
@@ -3635,6 +3717,7 @@ fn print_help() {
     println!("  /cost                  show API token usage");
     println!("  /todo                  show the todo list");
     println!("  /plan                  show the current plan (produced by define_plan)");
+    println!("  /resume [PATH]         load a persisted session.json (backup, live, or PATH)");
     println!("  /report <path>         write findings report (markdown)");
     println!("  /load <path>           submit a file's contents as the next prompt");
     println!("  /edit                  open $EDITOR on a scratch file, submit on save");

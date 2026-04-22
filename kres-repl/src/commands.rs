@@ -30,6 +30,14 @@ pub enum Command {
     /// if one was produced by `define_plan` when the prompt was
     /// submitted. Prints a reminder when no plan exists.
     Plan,
+    /// `/resume [PATH]` — load plan + todo + deferred + turn
+    /// counter from a persisted `session.json`. When PATH is
+    /// omitted, reads `<results>/session.json.prev` if present
+    /// (the backup kres writes at startup when you did not pass
+    /// `--resume`) then falls back to `<results>/session.json`.
+    /// Overwrites the current in-memory state, so run it before
+    /// submitting prompts.
+    Resume { path: Option<String> },
     /// `/followup` — list items deferred by goal-met or --turns cap.
     Followup,
     /// `/summary [filename]` — render the run's report.md +
@@ -105,6 +113,16 @@ pub fn parse_command(line: &str) -> Command {
                 clear: rest.split_whitespace().any(|tok| tok == "--clear"),
             },
             "plan" => Command::Plan,
+            "resume" => Command::Resume {
+                path: {
+                    let t = rest.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    }
+                },
+            },
             "followup" | "followups" | "deferred" => Command::Followup,
             "summary" => Command::Summary {
                 filename: rest.split_whitespace().next().map(|s| s.to_string()),
@@ -225,6 +243,21 @@ mod tests {
     #[test]
     fn parses_plan() {
         assert_eq!(parse_command("/plan"), Command::Plan);
+    }
+
+    #[test]
+    fn parses_resume_without_path() {
+        assert_eq!(parse_command("/resume"), Command::Resume { path: None });
+    }
+
+    #[test]
+    fn parses_resume_with_path() {
+        assert_eq!(
+            parse_command("/resume /tmp/foo.json"),
+            Command::Resume {
+                path: Some("/tmp/foo.json".into())
+            }
+        );
     }
 
     #[test]

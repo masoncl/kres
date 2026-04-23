@@ -27,7 +27,7 @@ You handle three tasks, selected by the request's top-level
                   "design review", or any non-defect assessment is
                   NOT audit — route those to "generic".
 
-                - "generic" — the one-shot analysis flow. The
+                - "generic" — the one-shot investigation flow. The
                   operator wants the main/fast/slow/goal loop to
                   answer a specific free-form question. No lens
                   fan-out, just one slow-agent call per task with

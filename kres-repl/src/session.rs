@@ -1068,6 +1068,44 @@ impl Session {
                             }
                         }
                     }
+                    // Provenance stamp written into findings'
+                    // first_seen_task / last_updated_task. Shape:
+                    //   "<uuid-simple>/<todo-tag>"   when a todo
+                    //   dispatched this task (cmd_next /
+                    //   cmd_continue paths), else just the uuid.
+                    //   We avoid the prior `r.name` convention —
+                    //   for an operator-typed `/review …` task
+                    //   `r.name` is the full prompt body, which
+                    //   got duplicated across every finding.
+                    let stamp = match r.todo_name.as_deref() {
+                        Some(tag) => format!("{}/{}", r.uuid.as_simple(), tag),
+                        None => r.uuid.as_simple().to_string(),
+                    };
+                    // Persist the task's effective_analysis at the
+                    // file level for `/summary`'s benefit, regardless
+                    // of whether a finding delta landed. Captures the
+                    // broader-than-finding narrative (overview,
+                    // summary tables, cross-cutting conclusions,
+                    // multi-step proofs) that no single
+                    // `Finding.details[].analysis` claims ownership
+                    // of — observed missing from session
+                    // `kres-findings2`, where 21 `###` headings in
+                    // report.md had no counterpart in any finding's
+                    // JSON body. NEVER forwarded to an agent:
+                    // `task_prose` sits on `FindingsFile`, and agents
+                    // only see `&[Finding]` via
+                    // `redact_findings_for_agent`.
+                    if !effective_analysis.is_empty() {
+                        if let Some(ref s) = store_for_reaper {
+                            if let Err(e) =
+                                s.append_task_prose(&stamp, &effective_analysis).await
+                            {
+                                kres_core::async_eprintln!(
+                                    "task_prose append: {e}"
+                                );
+                            }
+                        }
+                    }
                     let had_delta = r.mode.produces_findings() && !working_delta.is_empty();
                     let mut apply_changed = false;
                     let mut apply_added: u32 = 0;
@@ -1076,19 +1114,6 @@ impl Session {
                     let mut apply_reactivated: u32 = 0;
                     if had_delta {
                         let delta = working_delta.clone();
-                        // Provenance stamp written into findings'
-                        // first_seen_task / last_updated_task. Shape:
-                        //   "<uuid-simple>/<todo-tag>"   when a todo
-                        //   dispatched this task (cmd_next /
-                        //   cmd_continue paths), else just the uuid.
-                        //   We avoid the prior `r.name` convention —
-                        //   for an operator-typed `/review …` task
-                        //   `r.name` is the full prompt body, which
-                        //   got duplicated across every finding.
-                        let stamp = match r.todo_name.as_deref() {
-                            Some(tag) => format!("{}/{}", r.uuid.as_simple(), tag),
-                            None => r.uuid.as_simple().to_string(),
-                        };
                         // effective_analysis is the prose we want on
                         // every finding this task touched, stored
                         // under `details` for /summary to consume

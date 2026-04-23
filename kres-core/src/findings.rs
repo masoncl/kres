@@ -168,6 +168,36 @@ pub fn redact_findings_for_agent(findings: &[Finding]) -> Vec<Finding> {
     findings.iter().map(Finding::redacted_for_agent).collect()
 }
 
+/// Per-task narrative captured at the file level, independent of
+/// whether the task produced any findings. Storage site for the
+/// broader investigation prose a slow-agent run emits alongside
+/// its delta — overview paragraphs, summary tables, per-function
+/// walk-throughs, "Question 1/2" multi-step proofs, conclusions —
+/// content that isn't attributable to a single finding body.
+///
+/// Observed gap: session `kres-findings2` on 2026-04-23 had 21
+/// `### <heading>` sections in report.md (Summary table,
+/// Conclusion, Step 1-4, per-function walk-throughs) that were not
+/// recoverable from any `Finding.details[].analysis` or
+/// `mechanism_detail`. This entry exists so those bodies get a
+/// canonical home without needing `/summary` to re-read report.md.
+///
+/// NEVER forwarded to another LLM. Agents see findings via
+/// [`redact_findings_for_agent`] on `&[Finding]`, which never
+/// touches the file-level `task_prose` list. Keep it that way.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskProse {
+    /// Provenance stamp. Same format used by
+    /// [`FindingDetail::task`] / `last_updated_task` —
+    /// `"<uuid-simple>/<todo-tag>"` or bare uuid.
+    pub task: String,
+    /// Wall-clock timestamp of the append. Useful for ordering in
+    /// `/summary` rendering when multiple tasks land out of order.
+    pub created_at: DateTime<Utc>,
+    /// The broader-than-finding investigation narrative verbatim.
+    pub prose: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FindingsFile {
     #[serde(default)]
@@ -183,6 +213,11 @@ pub struct FindingsFile {
     /// for operators eyeballing how much churn a session produced.
     #[serde(default)]
     pub turn_n: Option<u32>,
+    /// Per-task broader-than-finding narrative (see [`TaskProse`]).
+    /// Append-only for `/summary`'s benefit; NEVER serialised into
+    /// an agent prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_prose: Vec<TaskProse>,
 }
 
 impl SchemaV0 for FindingsFile {
@@ -286,6 +321,32 @@ impl FindingsStore {
         })
     }
 
+    /// Append a per-task broader-narrative entry to
+    /// [`FindingsFile::task_prose`]. Provenance-keyed — callers pass
+    /// the same task id string they pass to
+    /// [`Self::apply_delta`]. Multiple appends for the same task
+    /// stack in call order; callers decide whether to dedupe.
+    ///
+    /// NEVER forwarded to another LLM. Agents see findings via
+    /// [`redact_findings_for_agent`] on `&[Finding]`; the
+    /// file-level `task_prose` list never enters an agent payload.
+    pub async fn append_task_prose(
+        &self,
+        task: &str,
+        prose: &str,
+    ) -> Result<(), FindingsError> {
+        if prose.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.db.write().await;
+        guard.task_prose.push(TaskProse {
+            task: task.to_string(),
+            created_at: Utc::now(),
+            prose: prose.to_string(),
+        });
+        guard.updated_at = Some(Utc::now());
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -758,6 +819,54 @@ mod tests {
         assert_eq!(b.details.len(), 1);
         assert_eq!(b.details[0].task, "t4");
         assert_eq!(b.details[0].analysis, "legit");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn task_prose_appends_and_skips_empty() {
+        let dir = tmp_dir("prose");
+        let base = dir.join("findings.json");
+        let store = FindingsStore::new(&base).await.unwrap();
+        store
+            .append_task_prose("task-a", "### Summary table\n| x | y |\n|---|---|")
+            .await
+            .unwrap();
+        store
+            .append_task_prose("task-b", "### Conclusion\nThe UAF path is gated.")
+            .await
+            .unwrap();
+        // Empty prose is a no-op — don't pollute the list.
+        store.append_task_prose("task-c", "").await.unwrap();
+
+        let file = store.file_snapshot().await;
+        assert_eq!(file.task_prose.len(), 2, "empty-prose call was skipped");
+        assert_eq!(file.task_prose[0].task, "task-a");
+        assert!(file.task_prose[0].prose.contains("Summary table"));
+        assert_eq!(file.task_prose[1].task, "task-b");
+
+        // The agent-facing redaction path operates on `&[Finding]`
+        // and has no visibility into file-level `task_prose`. This
+        // asserts the schema wall: the per-finding redaction is
+        // unchanged, and nothing on the Finding side carries prose.
+        let snap = store.snapshot().await;
+        let redacted = redact_findings_for_agent(&snap);
+        for f in &redacted {
+            assert!(f.details.is_empty());
+        }
+
+        // Round-trip through JSON: task_prose must serialize and
+        // survive a reload (persistence check for `/summary`).
+        let raw = std::fs::read_to_string(&base).unwrap();
+        let reloaded: FindingsFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reloaded.task_prose.len(), 2);
+        assert_eq!(reloaded.task_prose[0].prose, file.task_prose[0].prose);
+
+        // Assert the JSON on disk has `task_prose` as a top-level
+        // array, i.e. operators / `/summary` can load it without
+        // needing deeper traversal into each Finding.
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(root.get("task_prose").and_then(|v| v.as_array()).is_some());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

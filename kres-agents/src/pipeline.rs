@@ -36,40 +36,40 @@ use crate::{
 
 /// CodePrompt fields that go into the cached-prefix block.
 ///
-/// Only fields that are BYTE-IDENTICAL across rounds of the same
-/// task belong here. `question`, `skills`, `parallel_lenses`, and
-/// `previous_findings` satisfy that. `previously_fetched` does NOT
-/// — it accumulates each round (round 1 has none, round 2 carries
-/// round 1's manifest, round 3 carries rounds 1+2). If it were in
-/// the prefix, round 2's prefix would diverge from round 1's and
-/// the cache wouldn't hit. Keep it in the volatile tail alongside
-/// `symbols` / `context`.
+/// Scope the prefix to fields that are BYTE-IDENTICAL ACROSS TASKS
+/// within a session, not just across rounds within a task. The
+/// Anthropic prompt cache is keyed on the exact prefix bytes, so
+/// anything task-specific in here (the `question`, the
+/// `previous_findings` list that grows as the session progresses,
+/// the per-task `parallel_lenses`) forces every task to write a
+/// fresh prefix cache that nothing else will ever read. Session
+/// `0204e154…` (fs/btrfs/inode.c review) burned 14.5M tokens of
+/// cache_creation on code.jsonl for only 2.25M tokens of
+/// cache_read because `question` + `previous_findings` sat in the
+/// prefix and mutated per task.
 ///
-/// Evidence this matters: session `0392fbb5…` landed round 1 with
-/// `cache_read=8403` (full prefix hit) but round 2 with
-/// `cache_read=0, cache_create=33275` (miss) — the miss was driven
-/// by previously_fetched growing.
-// Keep the plan OUT of the cached prefix. The plan is the most
-// mutation-prone static field in this envelope: define_plan on
-// first submit, a slow-agent rewrite on the first turn, and the
-// todo-agent can reshape it every turn. If the plan sat in the
-// prefix, every rewrite would bust the prompt cache for the
-// following fast + slow calls — wiping out the tens-of-kB
-// question + skills + lenses prefix alongside it. Routing the
-// plan through the volatile suffix keeps the big cache intact;
-// the plan bytes (usually a handful of KB) get re-sent every
-// round but nothing the prefix carried needs to be.
-//
-// `plan_rewrite_allowed` changes at most once per top-level
-// prompt (submit_prompt_inner turns it on for the first task
-// and off for follow-ups), so it stays in the prefix.
-const CACHED_PREFIX_FIELDS: &[&str] = &[
-    "question",
-    "skills",
-    "parallel_lenses",
-    "previous_findings",
-    "plan_rewrite_allowed",
-];
+/// `skills` is the only fat field that actually stays byte-stable
+/// across tasks (typically 20-80k chars of skill bodies). Keeping
+/// only it here lets task 2+ hit the skills cache written by task
+/// 1 for the full ~5min TTL.
+///
+/// Everything other than `skills` goes in the volatile tail —
+/// including `plan_rewrite_allowed`, which is `Option<bool>` with
+/// `skip_serializing_if=None`. Having it in the prefix meant the
+/// prefix JSON key set varied (slow-first-call had it, fast calls
+/// didn't). `to_cached_split_json` round-trips through
+/// `serde_json::Value` whose Map sorts keys alphabetically, so
+/// `plan_rewrite_allowed` sorted before `skills` — two prefix
+/// shapes on the wire that shared only 5 bytes. Session
+/// `c5843f10-…` confirmed: i=2 (fast) and i=4 (slow) had a common
+/// prefix of 5 chars, cache_read=0.
+///
+/// For fast-agent gather rounds the tail still cache-hits on
+/// round 2+ via the `Message::cache` flag; for one-shot
+/// slow/lens/consolidate/merge calls the caller drops
+/// `Message::cache` entirely so we don't pay the +25% write tax
+/// on a tail nothing will read.
+const CACHED_PREFIX_FIELDS: &[&str] = &["skills"];
 
 /// Abstraction over the main-agent's data-fetch capability.
 /// Implementations route followups to MCP tools, grep, read, git.
@@ -557,10 +557,14 @@ impl Orchestrator {
         }
         let (slow_prefix, slow_suffix) = slow_cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
         let slow_logged = format!("{slow_prefix}{slow_suffix}");
+        // Slow agent is one-shot per task — no round 2 will ever
+        // read the tail cache. Drop `cache` to avoid the +25% write
+        // tax on the volatile suffix. `cached_prefix` still carries
+        // a cache_control block so cross-task skills reads hit.
         let messages = vec![Message {
             role: "user".into(),
             content: slow_suffix.clone(),
-            cache: true,
+            cache: false,
             cached_prefix: if slow_prefix.is_empty() {
                 None
             } else {
@@ -936,10 +940,13 @@ impl Orchestrator {
             let logger = self.logger.clone();
             let lens_label = format!("lens {}", lens.name);
             futures.push(async move {
+                // Each lens fan-out is a one-shot slow call. Same
+                // reasoning as the single slow path above: skip the
+                // tail cache tax, keep the prefix cache for skills.
                 let messages = vec![Message {
                     role: "user".into(),
                     content: lens_suffix,
-                    cache: true,
+                    cache: false,
                     cached_prefix: if lens_prefix.is_empty() {
                         None
                     } else {

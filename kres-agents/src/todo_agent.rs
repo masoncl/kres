@@ -173,10 +173,12 @@ pub async fn update_todo_via_agent_with_logger(
     if let Some(n) = tc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
     }
+    // Each todo-update call is one-shot (one inference per reap);
+    // the tail cache would never be read. Skip the +25% write tax.
     let messages = vec![Message {
         role: "user".into(),
         content: request_text.clone(),
-        cache: true,
+        cache: false,
         cached_prefix: None,
     }];
     if let Some(lg) = &logger {

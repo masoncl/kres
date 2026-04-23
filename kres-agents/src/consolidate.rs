@@ -116,10 +116,12 @@ pub async fn consolidate_lenses_with_logger(
         cfg = cfg.with_max_input_tokens(n);
     }
 
+    // Consolidator is one-shot per task; tail cache would never be
+    // read. Skip the +25% write tax.
     let messages = vec![Message {
         role: "user".into(),
         content: request_text,
-        cache: true,
+        cache: false,
         cached_prefix: None,
     }];
     if let Some(lg) = &logger {

@@ -1832,9 +1832,16 @@ impl Session {
         // with multiple concurrent prompts the previous single
         // session-wide goal overwrote earlier ones and the reaper
         // checked task-A's analysis against task-B's goal.
+        //
+        // Pass the manager's current plan so the per-task goal can
+        // anchor itself to a named step. Pipeline follow-ups run
+        // through this same path, so without the plan they'd produce
+        // goals with no step attribution and the todo_update path
+        // downstream can't flip the parent step to `done`.
+        let existing_plan = self.mgr.plan_snapshot().await;
         let (defined_goal, task_mode): (Option<String>, kres_agents::TaskMode) =
             if let Some(gc) = &self.goal_client {
-                match kres_agents::define_goal(gc, &text).await {
+                match kres_agents::define_goal(gc, &text, existing_plan.as_ref()).await {
                     Some(def) => {
                         kres_core::async_eprintln!(
                             "goal ({}): {}",

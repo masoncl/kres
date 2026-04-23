@@ -52,13 +52,37 @@ const TABLE: &[(&str, &str)] = &[
     ),
 ];
 
+/// Translate legacy prompt-file basenames to their post-rename
+/// equivalents. Operator configs installed from an older repo keep
+/// the old `system_file` path; applying this shim on lookup lets
+/// those configs resolve against the new embedded table without
+/// the operator having to re-run setup.sh.
+///
+/// Add new entries here each time a `configs/prompts/*.system.md`
+/// file gets renamed; remove them when the old basename has had
+/// enough deprecation time. Each entry is a deliberate one-way
+/// translation — the key is what operators might still emit, the
+/// value is what the embedded TABLE keys on now.
+fn translate_legacy_basename(basename: &str) -> &str {
+    match basename {
+        // b01c1ae (Analysis → Audit): defect-review system prompt
+        // file renamed from slow-code-agent.system.md to
+        // slow-code-agent-audit.system.md.
+        "slow-code-agent.system.md" => "slow-code-agent-audit.system.md",
+        other => other,
+    }
+}
+
 /// Return the embedded prompt body for a filename's basename, if
 /// one is bundled in this build. `basename` is the final path
 /// component with any directory prefix stripped (e.g.
 /// `"main-agent.system.md"` for a config field
-/// `"prompts/main-agent.system.md"`).
+/// `"prompts/main-agent.system.md"`). Legacy basenames from
+/// pre-rename installs are translated to the current key via
+/// [`translate_legacy_basename`] before the table lookup.
 pub fn lookup(basename: &str) -> Option<&'static str> {
-    TABLE.iter().find(|(k, _)| *k == basename).map(|(_, v)| *v)
+    let key = translate_legacy_basename(basename);
+    TABLE.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
 }
 
 /// Every basename that has an embedded copy. Useful for logging /
@@ -90,6 +114,29 @@ mod tests {
         // directory prefix does not match.
         assert!(lookup("prompts/main-agent.system.md").is_none());
         assert!(lookup("main-agent.system.md").is_some());
+    }
+
+    #[test]
+    fn legacy_slow_code_agent_basename_translates_to_audit() {
+        // Operator configs installed before b01c1ae point at
+        // `slow-code-agent.system.md`; the embedded table now keys
+        // on `slow-code-agent-audit.system.md`. The translation
+        // shim must resolve the old basename to the new prompt
+        // body WITHOUT the operator needing to edit their config
+        // or re-run setup.sh.
+        let legacy = lookup("slow-code-agent.system.md")
+            .expect("legacy basename must resolve via translation");
+        let new = lookup("slow-code-agent-audit.system.md")
+            .expect("new basename must resolve directly");
+        assert_eq!(legacy, new, "translation must return identical body");
+    }
+
+    #[test]
+    fn translate_legacy_passes_through_unknown_basenames() {
+        // Non-legacy basenames must not be rewritten — the shim is
+        // opt-in per entry.
+        assert_eq!(translate_legacy_basename("todo-agent.system.md"), "todo-agent.system.md");
+        assert_eq!(translate_legacy_basename("does-not-exist.md"), "does-not-exist.md");
     }
 
     #[test]

@@ -102,8 +102,20 @@ struct PlanResponse {
 /// the agent fails to produce a well-shaped response — callers
 /// should treat "no goal" as "run until --turns or the todo list
 /// drains" and NOT invoke `check_goal` ( behaviour).
-pub async fn define_goal(gc: &GoalClient, prompt: &str) -> Option<GoalDefinition> {
-    let request = json!({
+///
+/// `plan` is the manager's current plan, when one exists. Forwarded
+/// to the agent so per-task goals derived from pipeline-driven
+/// follow-up prompts can be framed in terms of which plan step the
+/// task is serving. Without it, `define_goal` sees only the bare
+/// follow-up query and produces goals that read like isolated
+/// sub-questions — the downstream check_goal / todo_update path
+/// then has no handle to attribute the completed work back to its
+/// parent step, so step status stays `pending` even after
+/// substantial exploration (observed on the RCU overnight run:
+/// ~1.1k `tasks.h`/`rcu_tasks` mentions in code.jsonl, yet the
+/// `audit-rcu-tasks` step stayed pending in session.json).
+fn build_define_goal_request(prompt: &str, plan: Option<&kres_core::Plan>) -> serde_json::Value {
+    let mut request = json!({
         "task": "define_goal",
         "query": prompt.chars().take(2000).collect::<String>(),
         "instructions": "Define a clear, specific goal for this query \
@@ -129,10 +141,37 @@ pub async fn define_goal(gc: &GoalClient, prompt: &str) -> Option<GoalDefinition
                          Default to \"generic\" when the prompt is \
                          ambiguous — it's the cheapest analytical \
                          path.\n\
+                         When a `plan` field is present, use it as \
+                         scoping context only. If the query genuinely \
+                         overlaps one of the plan's steps, phrase the \
+                         goal in terms of that step (and include its \
+                         step id in the goal prose) so satisfying the \
+                         goal advances a named step. If the query is a \
+                         new topic with no clear plan-step overlap, \
+                         ignore the plan and frame the goal on the \
+                         query's own terms — do not force-fit an \
+                         unrelated prompt into an existing step.\n\
                          Return JSON only:\n\
                          {\"goal\": \"specific completion criteria\", \
                           \"mode\": \"analysis\" | \"generic\" | \"coding\"}"
     });
+    if let Some(p) = plan {
+        if let Ok(v) = serde_json::to_value(p) {
+            request
+                .as_object_mut()
+                .expect("request is an object literal")
+                .insert("plan".into(), v);
+        }
+    }
+    request
+}
+
+pub async fn define_goal(
+    gc: &GoalClient,
+    prompt: &str,
+    plan: Option<&kres_core::Plan>,
+) -> Option<GoalDefinition> {
+    let request = build_define_goal_request(prompt, plan);
     let body = serde_json::to_string_pretty(&request).ok()?;
     let mut cfg = CallConfig::defaults_for(gc.model.clone())
         .with_max_tokens(gc.max_tokens)
@@ -526,6 +565,50 @@ mod tests {
         let c = assume_met();
         assert!(c.met);
         assert!(c.missing.is_empty());
+    }
+
+    fn sample_plan() -> kres_core::Plan {
+        // Build via JSON round-trip so this module doesn't need a
+        // chrono dev-dependency just for the created_at field.
+        serde_json::from_value(json!({
+            "prompt": "review rcu",
+            "goal": "enumerate rcu bugs",
+            "mode": "analysis",
+            "steps": [{"id": "audit-rcu-tree-core", "title": "tree.c"}],
+            "created_at": "2026-04-23T12:00:00Z",
+        }))
+        .expect("sample_plan JSON is well-formed")
+    }
+
+    #[test]
+    fn define_goal_request_embeds_plan_when_some() {
+        let plan = sample_plan();
+        let r = build_define_goal_request("tree.c CPU hotplug", Some(&plan));
+        let obj = r.as_object().unwrap();
+        assert_eq!(obj.get("task").and_then(|v| v.as_str()), Some("define_goal"));
+        let plan_v = obj.get("plan").expect("plan should be embedded");
+        assert_eq!(
+            plan_v.get("prompt").and_then(|v| v.as_str()),
+            Some("review rcu"),
+        );
+        let step0 = plan_v
+            .get("steps")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .unwrap();
+        assert_eq!(
+            step0.get("id").and_then(|v| v.as_str()),
+            Some("audit-rcu-tree-core"),
+        );
+    }
+
+    #[test]
+    fn define_goal_request_omits_plan_when_none() {
+        let r = build_define_goal_request("first prompt, no plan yet", None);
+        assert!(
+            r.as_object().unwrap().get("plan").is_none(),
+            "plan key should be absent when caller passes None",
+        );
     }
 
     #[test]

@@ -30,8 +30,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskMode {
-    #[default]
     Audit,
+    /// The fallback mode. Matches the goal-agent classifier's stated
+    /// "Default to 'generic' when the prompt is ambiguous" rule —
+    /// when the classifier misbehaves (empty mode, unparseable mode,
+    /// network failure), the Rust code falls back here instead of
+    /// silently routing to the defect-review pipeline.
+    #[default]
     Generic,
     Coding,
 }

@@ -113,10 +113,12 @@ pub async fn merge_findings_with_logger(
 
     // bugs.md#M2: one retry on transient flake before falling back to
     // the deterministic union. Each attempt is a full API call.
+    // Common case is a single successful call, so the tail cache
+    // almost never gets a second reader — skip the +25% write tax.
     let messages = vec![Message {
         role: "user".into(),
         content: request_text,
-        cache: true,
+        cache: false,
         cached_prefix: None,
     }];
     for attempt in 0..2 {

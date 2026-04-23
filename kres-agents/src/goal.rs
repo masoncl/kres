@@ -143,10 +143,12 @@ pub async fn define_goal(gc: &GoalClient, prompt: &str) -> Option<GoalDefinition
     if let Some(n) = gc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
     }
+    // define_goal is one-shot per prompt — tail cache would never
+    // be read. Skip the +25% write tax.
     let messages = vec![Message {
         role: "user".into(),
         content: body.clone(),
-        cache: true,
+        cache: false,
         cached_prefix: None,
     }];
     if let Some(lg) = &gc.logger {
@@ -241,10 +243,12 @@ pub async fn check_goal(
     if let Some(n) = gc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
     }
+    // check_goal is one-shot per completed task — no reader for a
+    // tail cache. Skip the +25% write tax.
     let messages = vec![Message {
         role: "user".into(),
         content: body.clone(),
-        cache: true,
+        cache: false,
         cached_prefix: None,
     }];
     if let Some(lg) = &gc.logger {
@@ -365,10 +369,12 @@ pub async fn define_plan(
     if let Some(n) = gc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
     }
+    // define_plan is one-shot per top-level prompt — tail cache
+    // would never be read. Skip the +25% write tax.
     let messages = vec![Message {
         role: "user".into(),
         content: body.clone(),
-        cache: true,
+        cache: false,
         cached_prefix: None,
     }];
     if let Some(lg) = &gc.logger {

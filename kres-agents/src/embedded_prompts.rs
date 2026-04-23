@@ -35,8 +35,8 @@ const TABLE: &[(&str, &str)] = &[
         include_str!("../../configs/prompts/main-agent.system.md"),
     ),
     (
-        "slow-code-agent.system.md",
-        include_str!("../../configs/prompts/slow-code-agent.system.md"),
+        "slow-code-agent-audit.system.md",
+        include_str!("../../configs/prompts/slow-code-agent-audit.system.md"),
     ),
     (
         "slow-code-agent-coding.system.md",
@@ -97,7 +97,7 @@ mod tests {
         for expected in [
             "fast-code-agent.system.md",
             "main-agent.system.md",
-            "slow-code-agent.system.md",
+            "slow-code-agent-audit.system.md",
             "slow-code-agent-coding.system.md",
             "slow-code-agent-generic.system.md",
             "todo-agent.system.md",

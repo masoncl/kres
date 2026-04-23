@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn plan_serde_roundtrip() {
-        let mut p = Plan::new("review foo", "every fn audited", TaskMode::Analysis);
+        let mut p = Plan::new("review foo", "every fn audited", TaskMode::Audit);
         p.steps.push(PlanStep::new("s1", "audit foo()"));
         p.steps[0].todo_ids.push("t1".into());
         let s = serde_json::to_string(&p).unwrap();
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn sync_from_todo_marks_done_when_all_linked_terminal() {
-        let mut p = Plan::new("p", "g", TaskMode::Analysis);
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
         let mut step = PlanStep::new("s1", "one");
         step.todo_ids = vec!["a".into(), "b".into()];
         p.steps.push(step);
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn sync_from_todo_inprogress_when_any_running() {
-        let mut p = Plan::new("p", "g", TaskMode::Analysis);
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
         let mut step = PlanStep::new("s1", "one");
         step.todo_ids = vec!["a".into(), "b".into()];
         p.steps.push(step);
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn sync_from_todo_leaves_pending_alone() {
-        let mut p = Plan::new("p", "g", TaskMode::Analysis);
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
         let mut step = PlanStep::new("s1", "one");
         step.todo_ids = vec!["a".into()];
         p.steps.push(step);
@@ -380,7 +380,7 @@ mod tests {
         // linked todos back to Pending, a step that was InProgress
         // must also regress — otherwise the live plan lies about
         // what is still running.
-        let mut p = Plan::new("p", "g", TaskMode::Analysis);
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
         let mut step = PlanStep::new("s1", "one");
         step.status = PlanStepStatus::InProgress;
         step.todo_ids = vec!["a".into()];
@@ -395,7 +395,7 @@ mod tests {
         // New linkage direction: todo.step_id points up at the plan
         // step. sync_from_todo must find the linked todo without any
         // entry in step.todo_ids.
-        let mut p = Plan::new("p", "g", TaskMode::Analysis);
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
         p.steps.push(PlanStep::new("s1", "audit foo"));
         let mut t = TodoItem::new("audit-foo", "investigate");
         t.step_id = "s1".into();
@@ -409,7 +409,7 @@ mod tests {
         // Both linkage directions must contribute. Step.todo_ids
         // claims todo "a"; todo "b" points back via step_id. Step
         // is Done only when BOTH reach terminal status.
-        let mut p = Plan::new("p", "g", TaskMode::Analysis);
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
         let mut step = PlanStep::new("s1", "audit");
         step.todo_ids = vec!["a".into()];
         p.steps.push(step);
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn apply_to_inherits_prior_metadata_and_normalises_steps() {
-        let prior = Plan::new("review fs", "find bugs", TaskMode::Analysis);
+        let prior = Plan::new("review fs", "find bugs", TaskMode::Audit);
         // The rewrite forgot the id on one step and left a title
         // blank on another — without normalisation, apply_to would
         // land a broken plan.
@@ -495,7 +495,7 @@ mod tests {
         let built = rewrite.apply_to(Some(&prior));
         assert_eq!(built.prompt, "review fs");
         assert_eq!(built.goal, "find bugs");
-        assert_eq!(built.mode, TaskMode::Analysis);
+        assert_eq!(built.mode, TaskMode::Audit);
         assert_eq!(built.steps.len(), 1);
         assert_eq!(built.steps[0].id, "audit-foo");
     }
@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn sync_from_todo_skips_terminal_steps() {
-        let mut p = Plan::new("p", "g", TaskMode::Analysis);
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
         let mut step = PlanStep::new("s1", "one");
         step.status = PlanStepStatus::Skipped;
         step.todo_ids = vec!["a".into()];

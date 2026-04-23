@@ -2,24 +2,28 @@
 //!
 //! Three flows:
 //!
-//! `Analysis` — the review flow.  The fast+main loop gathers context,
-//! the slow agent fans out across session-wide lenses (from the
-//! review-template), and the consolidator + cross-task merger fold
-//! per-lens findings into the cumulative list.  Degrades to a single
-//! slow call when no lenses are configured.
+//! `Audit` — the defect-review flow. The fast+main loop gathers
+//! context, the slow agent fans out across session-wide lenses
+//! (from the review-template), and the consolidator + cross-task
+//! merger fold per-lens findings into the cumulative list. Picked
+//! when the operator asked to "review", "audit", or "find bugs
+//! in" a target. Degrades to a single slow call when no lenses
+//! are configured.
 //!
 //! `Generic` — just the main/fast/slow/goal loop, no lens fan-out.
 //! One slow call per task, findings still merge into the cumulative
 //! list.  Good for free-form questions ("explain X", "what does this
-//! do", "trace the call path from Y to Z") where the review-template
-//! multi-angle spread would be overkill.
+//! do", "trace the call path from Y to Z", efficiency reviews) where
+//! the multi-angle defect spread would be overkill.
 //!
 //! `Coding` swaps the slow-agent system prompt for one that writes
-//! source code (reproducers, PoCs, selftests). The pipeline skips the
-//! lens fan-out, the consolidator, and the cross-task merger entirely
-//! — a coding task produces files and prose notes, not findings. The
-//! goal agent still judges completion and is what drives follow-on
-//! coding turns when needed.
+//! files (source code for reproducers/PoCs/selftests, OR prose
+//! documents like markdown reports to an operator-named path). The
+//! pipeline skips the lens fan-out, the consolidator, and the
+//! findings pipeline entirely — a coding task produces files and
+//! prose notes, not findings. The goal agent still judges
+//! completion and is what drives follow-on coding turns when
+//! needed.
 
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +31,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum TaskMode {
     #[default]
-    Analysis,
+    Audit,
     Generic,
     Coding,
 }
@@ -63,7 +67,7 @@ pub struct CodeEdit {
 impl TaskMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Analysis => "analysis",
+            Self::Audit => "audit",
             Self::Generic => "generic",
             Self::Coding => "coding",
         }
@@ -73,6 +77,6 @@ impl TaskMode {
     /// runs, /summary output is meaningful). Coding tasks produce
     /// files instead of findings, so they return false.
     pub fn produces_findings(self) -> bool {
-        matches!(self, Self::Analysis | Self::Generic)
+        matches!(self, Self::Audit | Self::Generic)
     }
 }

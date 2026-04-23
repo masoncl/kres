@@ -708,7 +708,7 @@ pub struct TaskOutcome {
     /// pipeline, Coding tasks write files and skip the merger.
     pub mode: crate::TaskMode,
     /// Code files produced by a Coding-mode task. Empty for
-    /// Analysis-mode tasks. The reaper writes each entry under
+    /// Audit-mode tasks. The reaper writes each entry under
     /// `<results>/code/<path>`.
     pub code_output: Vec<crate::CodeFile>,
     /// Surgical edits produced by a Coding-mode task. The reaper
@@ -840,7 +840,7 @@ mod tests {
         // fully-terminal linkage, and the step flips to Done.
         use crate::plan::{Plan, PlanStep, PlanStepStatus};
         let mgr = TaskManager::new();
-        let mut plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Audit);
         plan.steps.push(PlanStep::new("s1", "audit"));
         mgr.set_plan(Some(plan)).await;
         let mut a = TodoItem::new("a", "investigate");
@@ -862,7 +862,7 @@ mod tests {
     async fn set_and_sync_plan_marks_step_done_when_todos_terminal() {
         use crate::plan::{Plan, PlanStep, PlanStepStatus};
         let mgr = TaskManager::new();
-        let mut plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Audit);
         let mut step = PlanStep::new("s1", "t");
         step.todo_ids = vec!["a".into(), "b".into()];
         plan.steps.push(step);
@@ -893,7 +893,7 @@ mod tests {
         // todo-agent's next turn re-links it against the new plan.
         use crate::plan::{Plan, PlanStep};
         let mgr = TaskManager::new();
-        let mut old_plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        let mut old_plan = Plan::new("p", "g", crate::TaskMode::Audit);
         old_plan.steps.push(PlanStep::new("s1", "old-one"));
         old_plan.steps.push(PlanStep::new("s2", "old-two"));
         mgr.set_plan(Some(old_plan)).await;
@@ -905,7 +905,7 @@ mod tests {
         mgr.replace_todo(vec![a, b, c]).await;
 
         // New plan drops s2, keeps s1, adds s3.
-        let mut new_plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        let mut new_plan = Plan::new("p", "g", crate::TaskMode::Audit);
         new_plan.steps.push(PlanStep::new("s1", "new-one"));
         new_plan.steps.push(PlanStep::new("s3", "new-three"));
         mgr.set_plan(Some(new_plan)).await;
@@ -920,7 +920,7 @@ mod tests {
     async fn set_plan_none_clears_every_step_id() {
         use crate::plan::{Plan, PlanStep};
         let mgr = TaskManager::new();
-        let mut plan = Plan::new("p", "g", crate::TaskMode::Analysis);
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Audit);
         plan.steps.push(PlanStep::new("s1", "x"));
         mgr.set_plan(Some(plan)).await;
         let mut a = TodoItem::new("a", "investigate");

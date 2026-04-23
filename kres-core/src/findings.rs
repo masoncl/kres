@@ -138,7 +138,7 @@ pub struct Finding {
     /// matching-id existing record is `Status::Invalidated`, the
     /// existing record flips back to `Status::Active`. Intended for
     /// slow-agent turns that discover new evidence reversing a
-    /// prior invalidation (see slow-code-agent.system.md). Never
+    /// prior invalidation (see slow-code-agent-audit.system.md). Never
     /// serialized on stored records — `merge_into` consumes the
     /// signal and doesn't propagate it; on a new-id apply the flag
     /// is stripped before the entry enters the list.

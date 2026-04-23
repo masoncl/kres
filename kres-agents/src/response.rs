@@ -37,7 +37,7 @@ pub struct CodeResponse {
     pub findings: Vec<Finding>,
     pub ready_for_slow: bool,
     /// Source files emitted by a Coding-mode slow-agent turn. Empty
-    /// for Analysis-mode responses. The coding-mode system prompt
+    /// for Audit-mode responses. The coding-mode system prompt
     /// instructs the slow agent to return
     /// `{"analysis": "...", "code_output": [{path, content, purpose}], "followups": [...]}`
     /// and this field is populated from that `code_output` array.

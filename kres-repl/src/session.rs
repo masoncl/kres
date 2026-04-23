@@ -2108,7 +2108,7 @@ impl Session {
                             .run_once_with_ctx(&text, &ctx, &handle.shutdown)
                             .await
                     }
-                    kres_agents::TaskMode::Analysis => {
+                    kres_agents::TaskMode::Audit => {
                         if lenses.is_empty() {
                             orc_task
                                 .run_once_with_ctx(&text, &ctx, &handle.shutdown)

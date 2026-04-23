@@ -54,8 +54,8 @@ pub struct GoalCheck {
 }
 
 /// Result of a `define_goal` call: the completion criterion + the
-/// classified work mode ("analysis" for reading code / surfacing
-/// bugs, "coding" for writing code / reproducers / PoCs).
+/// classified work mode ("audit" for defect review, "generic" for
+/// free-form questions, "coding" for writing files).
 #[derive(Debug, Clone)]
 pub struct GoalDefinition {
     pub goal: String,
@@ -124,20 +124,33 @@ fn build_define_goal_request(prompt: &str, plan: Option<&kres_core::Plan>) -> se
                          concrete: name specific things that must be \
                          found, verified, written, or answered. The \
                          `mode` field selects the pipeline:\n\
-                         - \"analysis\" — the REVIEW flow: multi-angle \
-                           audit, lens fan-out, consolidator + merger. \
-                           Pick when the operator asked to \"review\", \
-                           \"audit\", or \"find bugs in\" a target.\n\
+                         - \"audit\" — the DEFECT-REVIEW flow: \
+                           multi-angle audit, lens fan-out, \
+                           consolidator + findings pipeline. Pick \
+                           ONLY when the operator asked to find or \
+                           review bugs / defects / correctness \
+                           issues in a target. An \"efficiency \
+                           review\", a \"design review\", or any \
+                           non-defect assessment does NOT belong \
+                           here.\n\
                          - \"generic\" — one slow-agent call per task \
-                           over the fast/main/slow/goal loop, with \
-                           findings merger but NO lens fan-out. Pick \
-                           for free-form questions (\"explain\", \"what \
-                           does X do\", \"trace path from A to B\", \
-                           narrow investigative prompts).\n\
-                         - \"coding\" — write source code (reproducer, \
-                           PoC, selftest, trigger, harness). Pick only \
-                           when the REQUESTED OUTPUT is code the \
-                           operator will run.\n\
+                           over the fast/main/slow/goal loop, no lens \
+                           fan-out. Pick for free-form questions \
+                           (\"explain\", \"what does X do\", \"trace \
+                           path from A to B\"), efficiency / \
+                           performance reviews, design-intent \
+                           investigations, and any narrow prompt \
+                           whose output is prose rather than files \
+                           or defect findings.\n\
+                         - \"coding\" — write files (source code for \
+                           reproducers / PoCs / selftests / triggers \
+                           / harnesses, OR prose documents such as \
+                           markdown reports to an operator-named \
+                           path). Pick when the REQUESTED OUTPUT is \
+                           a file on disk — source the operator will \
+                           run, or a document like \
+                           `./suggestions.md` they asked to be \
+                           written.\n\
                          Default to \"generic\" when the prompt is \
                          ambiguous — it's the cheapest analytical \
                          path.\n\
@@ -153,7 +166,7 @@ fn build_define_goal_request(prompt: &str, plan: Option<&kres_core::Plan>) -> se
                          unrelated prompt into an existing step.\n\
                          Return JSON only:\n\
                          {\"goal\": \"specific completion criteria\", \
-                          \"mode\": \"analysis\" | \"generic\" | \"coding\"}"
+                          \"mode\": \"audit\" | \"generic\" | \"coding\"}"
     });
     if let Some(p) = plan {
         if let Ok(v) = serde_json::to_value(p) {
@@ -361,7 +374,7 @@ pub async fn define_plan(
                          into 3-12 ordered concrete steps. Every \
                          title names a specific file, symbol, \
                          subsystem, code path, or artifact. In \
-                         analysis mode, decompose by file / symbol / \
+                         audit mode, decompose by file / symbol / \
                          subsystem — NOT by lens (object lifetime, \
                          memory, bounds, races, general correctness). \
                          Those lenses already run on every slow call; \
@@ -573,7 +586,7 @@ mod tests {
         serde_json::from_value(json!({
             "prompt": "review rcu",
             "goal": "enumerate rcu bugs",
-            "mode": "analysis",
+            "mode": "audit",
             "steps": [{"id": "audit-rcu-tree-core", "title": "tree.c"}],
             "created_at": "2026-04-23T12:00:00Z",
         }))
@@ -631,7 +644,7 @@ mod tests {
         // A goal.txt-shaped reply does NOT contain "steps"; brace
         // matcher returns None so the caller falls back to "no plan".
         let r: Option<PlanResponse> =
-            extract_json_with_key(r#"{"goal": "x", "mode": "analysis"}"#, "steps");
+            extract_json_with_key(r#"{"goal": "x", "mode": "audit"}"#, "steps");
         assert!(r.is_none());
     }
 
@@ -649,7 +662,7 @@ mod tests {
             vec![step_raw("s1", "one"), step_raw("s2", "two")],
             "prompt",
             "goal",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.steps[0].id, "s1");
@@ -665,7 +678,7 @@ mod tests {
             ],
             "prompt",
             "goal",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         assert_eq!(plan.steps.len(), 2);
         // Semantic slugs — survive reorder because they name the
@@ -684,7 +697,7 @@ mod tests {
             ],
             "prompt",
             "goal",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         // The first keeps its id; the later two get slugs derived
         // from their own titles rather than being forced onto the
@@ -708,7 +721,7 @@ mod tests {
             ],
             "prompt",
             "goal",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.steps[0].id, "audit-same");
@@ -723,7 +736,7 @@ mod tests {
             vec![step_raw("audit-kept", ""), step_raw("", "Audit kept")],
             "prompt",
             "goal",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].id, "audit-kept");
@@ -736,7 +749,7 @@ mod tests {
             vec![step_raw("anything", ""), step_raw("", "")],
             "prompt",
             "goal",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         assert!(plan.steps.is_empty());
     }
@@ -749,7 +762,7 @@ mod tests {
             vec![step_raw("", "!!!")],
             "prompt",
             "goal",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].id, "step-1");

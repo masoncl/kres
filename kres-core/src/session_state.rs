@@ -216,7 +216,7 @@ mod tests {
     fn inprogress_plan_steps_flip_to_pending_on_load() {
         let dir = tempfile::tempdir().unwrap();
         let p = SessionState::path_in(dir.path());
-        let mut plan = Plan::new("prompt", "goal", TaskMode::Analysis);
+        let mut plan = Plan::new("prompt", "goal", TaskMode::Audit);
         let mut step = PlanStep::new("s1", "t");
         step.status = PlanStepStatus::InProgress;
         plan.steps.push(step);
@@ -293,7 +293,7 @@ mod tests {
         let mut plan = Plan::new(
             "review fs/btrfs for memory bugs",
             "identify every UAF / leak / double-free in fs/btrfs",
-            TaskMode::Analysis,
+            TaskMode::Audit,
         );
         let mut s1 = PlanStep::new("s1", "audit accessors.c");
         s1.description = "walk each btrfs_set_*/btrfs_get_* helper".into();
@@ -322,7 +322,7 @@ mod tests {
         );
         assert_eq!(lp.steps[1].id, "s2");
         assert_eq!(lp.steps[1].status, PlanStepStatus::Pending);
-        assert_eq!(lp.mode, TaskMode::Analysis);
+        assert_eq!(lp.mode, TaskMode::Audit);
         assert_eq!(
             loaded.last_prompt.as_deref(),
             Some("review fs/btrfs for memory bugs")

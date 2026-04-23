@@ -138,12 +138,12 @@ pub struct Orchestrator {
     /// Slow-agent system prompt used when a task runs in
     /// `TaskMode::Generic`. Loaded from
     /// `configs/prompts/slow-code-agent-generic.system.md`. Unlike
-    /// the analysis prompt it doesn't force the "you are a deep code
-    /// analysis agent, emit findings" stance — generic tasks
-    /// answer the operator's question directly and can emit
+    /// the audit prompt it doesn't force the "you are a deep
+    /// defect-analysis agent, emit findings" stance — generic
+    /// tasks answer the operator's question directly and can emit
     /// `bash` followups for execution-style prompts. When `None`,
     /// generic tasks fall back to `slow_system` (the operator gets
-    /// review-flavoured behaviour, which is usually fine but not
+    /// audit-flavoured behaviour, which is usually fine but not
     /// ideal for free-form questions).
     pub slow_generic_system: Option<String>,
 
@@ -258,7 +258,7 @@ pub struct TaskSummary {
     /// instead and the merger/consolidator should be skipped.
     pub mode: kres_core::TaskMode,
     /// Source files emitted by a Coding-mode task. Empty for
-    /// Analysis-mode tasks.
+    /// Audit-mode tasks.
     pub code_output: Vec<kres_core::CodeFile>,
     /// String-replacement edits emitted by a Coding-mode task.
     /// The reaper applies each entry via tools::edit_file.
@@ -578,7 +578,7 @@ impl Orchestrator {
         let mut cfg = CallConfig::defaults_for(self.slow_model.clone())
             .with_max_tokens(self.slow_max_tokens)
             .with_stream_label(match ctx.mode {
-                kres_core::TaskMode::Analysis => "slow",
+                kres_core::TaskMode::Audit => "slow",
                 kres_core::TaskMode::Generic => "slow (generic)",
                 kres_core::TaskMode::Coding => "slow (coding)",
             });
@@ -586,8 +586,8 @@ impl Orchestrator {
         // tells the slow agent to emit `code_output` rather than
         // findings. Fall back to slow_system if the coding prompt
         // wasn't loaded (fresh install pre-setup.sh), noisily — the
-        // analysis prompt will still produce something, just not a
-        // useful code artifact.  Analysis and Generic share
+        // audit prompt will still produce something, just not a
+        // useful code artifact. Audit and Generic share
         // slow_system; the difference between them is handled at the
         // dispatch level (lens fan-out vs single call), not in the
         // per-call system prompt.
@@ -597,7 +597,7 @@ impl Orchestrator {
                     self.slow_coding_system.as_ref()
                 } else {
                     kres_core::async_eprintln!(
-                        "[slow] coding-mode task but no slow_coding_system loaded — falling back to analysis prompt"
+                        "[slow] coding-mode task but no slow_coding_system loaded — falling back to audit prompt"
                     );
                     self.slow_system.as_ref()
                 }
@@ -606,14 +606,14 @@ impl Orchestrator {
                 if self.slow_generic_system.is_some() {
                     self.slow_generic_system.as_ref()
                 } else {
-                    // Fall back quietly — analysis prompt still
+                    // Fall back quietly — audit prompt still
                     // produces reasonable output for most free-form
-                    // questions, it just trends toward "audit"
+                    // questions, it just trends toward defect
                     // phrasing.
                     self.slow_system.as_ref()
                 }
             }
-            kres_core::TaskMode::Analysis => self.slow_system.as_ref(),
+            kres_core::TaskMode::Audit => self.slow_system.as_ref(),
         };
         if let Some(s) = slow_system_for_call {
             cfg = cfg.with_system(s.clone());
@@ -670,7 +670,7 @@ impl Orchestrator {
         // Rescue path: when the slow agent returned pure prose, any
         // bug claims in that prose would otherwise be lost (findings
         // stays empty, the merger has nothing to promote — see
-        // slow-code-agent.system.md:37 "a bug that exists only in
+        // slow-code-agent-audit.system.md:37 "a bug that exists only in
         // prose will be LOST"). Ask the fast agent to translate the
         // prose into the expected envelope. If the translation also
         // fails to produce parseable JSON, keep the original
@@ -733,7 +733,7 @@ impl Orchestrator {
         // shape (findings go through the merger) and do not emit
         // in-place edits — edits only flow from coding mode.
         let (findings_out, code_output, code_edits) = match ctx.mode {
-            kres_core::TaskMode::Analysis | kres_core::TaskMode::Generic => {
+            kres_core::TaskMode::Audit | kres_core::TaskMode::Generic => {
                 (slow_parsed.findings, Vec::new(), Vec::new())
             }
             kres_core::TaskMode::Coding => {
@@ -1039,11 +1039,11 @@ impl Orchestrator {
             followups: all_followups,
             fast_rounds,
             strategy: ParseStrategy::WholeBody,
-            mode: kres_core::TaskMode::Analysis,
+            mode: kres_core::TaskMode::Audit,
             code_output: Vec::new(),
             code_edits: Vec::new(),
             // Lens fan-out runs N parallel slow calls; merging N
-            // plan rewrites would churn step ids. Analysis-mode
+            // plan rewrites would churn step ids. Audit-mode
             // plan rewrites flow through the todo-agent's per-turn
             // reevaluation path (a97bff2) instead. Single-slow
             // analysis tasks (lens count 0) still get plan rewrite

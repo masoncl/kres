@@ -2090,10 +2090,10 @@ impl Session {
                 // Dispatch by mode:
                 //   Coding  → single slow call with slow_coding_system;
                 //             reaper persists code_output, skips merge.
-                //   Analysis → REVIEW flow. Lens fan-out + consolidator
-                //             when lenses are installed; otherwise
-                //             degrades to a single call (the old no-
-                //             lens analysis path).
+                //   Audit   → DEFECT-REVIEW flow. Lens fan-out +
+                //             consolidator when lenses are installed;
+                //             otherwise degrades to a single call (the
+                //             old no-lens audit path).
                 //   Generic → one-shot main/fast/slow/goal loop. Single
                 //             slow call with slow_system, findings
                 //             merger still runs in the reaper. Lens

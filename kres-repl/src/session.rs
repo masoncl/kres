@@ -2737,12 +2737,17 @@ impl Session {
         }
     }
 
-    /// `/summary` — render the run's report.md + findings.json into
-    /// a plain-text summary via the fast agent using the `summary`
+    /// `/summary` — render the run's findings.json into a plain-text
+    /// bug report via the fast agent using the `summary`
     /// slash-command template. Pass `markdown=true` (via
     /// `/summary-markdown`) to select the markdown-variant template
     /// and default the output filename to `summary.md` instead of
     /// `summary.txt`.
+    ///
+    /// report.md is NOT consulted. The summariser reads findings.json
+    /// via jsondb, runs a per-task condense pass, then renders the
+    /// result through the bug-summary template in batches that fit
+    /// the fast agent's context window.
     async fn cmd_summary(&self, filename: Option<String>, markdown: bool) {
         let Some(orc) = self.orchestrator.as_ref() else {
             async_println(
@@ -2750,28 +2755,28 @@ impl Session {
             );
             return;
         };
-        let Some(report_path) = self.cfg.report_path.clone() else {
-            async_println("/summary: no report path configured");
+        let Some(findings_path) = self.cfg.findings_base.clone() else {
+            async_println("/summary: no findings path configured");
             return;
         };
-        if !report_path.exists() {
+        if !findings_path.exists() {
             async_println(format!(
                 "/summary: {} does not exist yet — run at least one task",
-                report_path.display()
+                findings_path.display()
             ));
             return;
         }
         // Output goes to the explicit --results dir when the operator
-        // set one (so prompt.md, findings.json, report.md, and
-        // summary.txt all live together). Without --results, fall
-        // back to the report.md's parent — that's still inside the
-        // defaulted ~/.kres/sessions/<ts>/ tree, just not flagged as
-        // operator-chosen.
+        // set one (so prompt.md, findings.json, and summary.txt all
+        // live together). Without --results, fall back to the
+        // findings.json's parent — that's still inside the defaulted
+        // ~/.kres/sessions/<ts>/ tree, just not flagged as operator-
+        // chosen.
         let output_dir = self
             .cfg
             .results_dir
             .clone()
-            .or_else(|| report_path.parent().map(std::path::Path::to_path_buf));
+            .or_else(|| findings_path.parent().map(std::path::Path::to_path_buf));
         // /summary-markdown defaults the filename to summary.md
         // instead of summary.txt; --summary-markdown at the CLI
         // behaves the same way.
@@ -2783,7 +2788,6 @@ impl Session {
         let effective_name = filename.as_deref().or(default_name);
         let output_path =
             crate::summary::default_output_path(output_dir.as_deref(), effective_name);
-        let findings_path = self.cfg.findings_base.clone();
         // Original prompt resolution: in-memory initial_prompt wins
         // (it's the literal --prompt FILE or first submission). If
         // that's empty, look for prompt.md in the results dir; the
@@ -2803,7 +2807,6 @@ impl Session {
             }),
         };
         let inputs = crate::summary::SummaryInputs {
-            report_path,
             findings_path,
             output_path: output_path.clone(),
             template_path: self.cfg.template_path.clone(),

@@ -50,6 +50,10 @@ const TABLE: &[(&str, &str)] = &[
         "todo-agent.system.md",
         include_str!("../../configs/prompts/todo-agent.system.md"),
     ),
+    (
+        "condense-task.system.md",
+        include_str!("../../configs/prompts/condense-task.system.md"),
+    ),
 ];
 
 /// Translate legacy prompt-file basenames to their post-rename
@@ -148,6 +152,7 @@ mod tests {
             "slow-code-agent-coding.system.md",
             "slow-code-agent-generic.system.md",
             "todo-agent.system.md",
+            "condense-task.system.md",
         ] {
             assert!(
                 lookup(expected).is_some(),

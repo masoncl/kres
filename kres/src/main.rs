@@ -538,23 +538,20 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 ));
             }
         };
-        if !report_path.exists() {
-            return Err(anyhow::anyhow!(
-                "--summary: report {} does not exist",
-                report_path.display()
-            ));
-        }
-        let findings_opt = findings_base.as_ref().and_then(|p| {
-            if p.exists() {
-                Some(p.clone())
-            } else {
-                eprintln!(
-                    "--summary: warning: findings file {} does not exist — continuing with report.md only",
+        let findings_path = match findings_base.as_ref() {
+            Some(p) if p.exists() => p.clone(),
+            Some(p) => {
+                return Err(anyhow::anyhow!(
+                    "--summary: findings file {} does not exist",
                     p.display()
-                );
-                None
+                ));
             }
-        });
+            None => {
+                return Err(anyhow::anyhow!(
+                    "--summary: no findings path configured (pass --findings or --results)"
+                ));
+            }
+        };
         let (fast_client, fast_model, fast_max_tokens, fast_max_input) =
             kres_repl::summary::load_fast_for_summary(&fast_cfg_path, &settings)?;
         // `results_dir` is already cwd when --results was absent (see
@@ -572,25 +569,21 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             let p = d.join("prompt.md");
             match std::fs::read_to_string(&p) {
                 Ok(s) if !s.trim().is_empty() => {
-                    eprintln!("--summary: prompt  = {}", p.display());
+                    eprintln!("--summary: prompt   = {}", p.display());
                     Some(s)
                 }
                 _ => None,
             }
         });
-        eprintln!("--summary: report  = {}", report_path.display());
-        if let Some(ref p) = findings_opt {
-            eprintln!("--summary: findings= {}", p.display());
-        }
-        eprintln!("--summary: output  = {}", output_path.display());
+        eprintln!("--summary: findings = {}", findings_path.display());
+        eprintln!("--summary: output   = {}", output_path.display());
         // Race the summary call against SIGINT so ctrl-c actually
         // aborts the HTTP request instead of hanging until the
         // streaming response completes. Without this branch the REPL
         // path installs its own ctrl-c handler but --summary has
         // none, so SIGINT just sits in the tokio signal queue.
         let summary_fut = kres_repl::summary::run_summary(kres_repl::summary::SummaryInputs {
-            report_path,
-            findings_path: findings_opt,
+            findings_path,
             output_path,
             template_path: args.template.clone(),
             markdown,

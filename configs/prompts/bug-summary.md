@@ -15,10 +15,14 @@ LINE ACROSS TWO LINES.
 Produce a bug report about existing code based on this template.
 
 The inputs describe a research run: an optional original_prompt (the
-top-level question that drove the run), a report.md narrative, a
-findings.json with structured bug entries, and any extra context the run
-accumulated.  Your job is to turn those inputs into a single, plain-text
-bug report covering every bug that was found.
+top-level question that drove the run), a findings list sorted by
+severity (most severe first), and a task_observations string — a
+condensed, already-merged block of observations drawn from every
+analysis task that contributed to a finding.  Your job is to turn
+those inputs into a single, plain-text bug report covering every
+bug that was found.  Treat the task_observations text as supporting
+detail to fold into the relevant bug's section — quote from it when
+it sharpens the question, do not attribute observations to tasks.
 
 - If original_prompt is non-empty, open the report with one or two
 sentences of plain-text context that restates what the run was looking
@@ -84,9 +88,9 @@ material into the prose without repeating it verbatim.
 - If multiple findings describe the same underlying bug, merge them into
 one section and cite every affected code site.
 
-- Do not invent facts.  If the findings.json and report.md do not support
-a claim, do not make it.  If a finding lacks the detail you want to cite,
-drop that detail rather than guess.
+- Do not invent facts.  If the findings list and task_observations
+do not support a claim, do not make it.  If a finding lacks the
+detail you want to cite, drop that detail rather than guess.
 
 ## Ensure clear, concise paragraphs
 

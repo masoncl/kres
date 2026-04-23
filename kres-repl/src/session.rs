@@ -17,8 +17,8 @@ use crate::commands::{parse_command, Command};
 #[derive(Debug, Clone)]
 pub struct ReplConfig {
     pub stop_grace: Duration,
-    /// Path to `findings.json` base (per-turn files written as
-    /// `findings-N.json`). When None, nothing is written to disk.
+    /// Path to the canonical `findings.json` (jsondb-backed). When
+    /// None, nothing is written to disk and findings stay in memory.
     pub findings_base: Option<PathBuf>,
     /// Stop the REPL after N completed task runs (0 = unlimited).
     /// Matches semantics.
@@ -240,6 +240,16 @@ pub struct Session {
     /// was still sitting in the todo list — which is NOT what an
     /// operator who just hit Ctrl-C's moral equivalent wants.
     stop_latched: Arc<std::sync::atomic::AtomicBool>,
+    /// Woken by `cmd_stop` alongside the `stop_latched` atomic so
+    /// an in-flight reaper-side inference call (the promoter today;
+    /// the consolidator / todo-agent / merger in principle) can
+    /// `tokio::select!` on `notified()` and abandon its API
+    /// round-trip instead of running to completion while the
+    /// operator waits for /stop to take effect. Notify is edge-
+    /// triggered — notifications with no waiter are discarded,
+    /// which matches the reaper's behaviour: the latched atomic
+    /// catches the next iteration when no call is mid-flight.
+    stop_notify: Arc<tokio::sync::Notify>,
     /// Pauses the 200ms status-row repainter while a child process
     /// (vim launched by /edit, for instance) has the terminal.
     /// Without this, the repainter absolute-positions to row H-1
@@ -348,11 +358,11 @@ pub struct AccumulatedEntry {
 }
 
 impl Session {
-    pub fn new(mgr: Arc<TaskManager>, cfg: ReplConfig) -> Self {
-        // Eagerly create the parent of the findings base so
-        // FindingsStore::new can preflight its probe without the
-        // user having to `mkdir -p` themselves. Matches what
-        // did implicitly by the --results DIR convention.
+    pub async fn new(mgr: Arc<TaskManager>, cfg: ReplConfig) -> Self {
+        // Eagerly create the parent of the findings base so the
+        // jsondb-backed store can open without the user having to
+        // `mkdir -p` themselves. Matches what the pre-jsondb store
+        // did implicitly.
         if let Some(ref p) = cfg.findings_base {
             if let Some(parent) = p.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
@@ -363,77 +373,64 @@ impl Session {
                 }
             }
         }
-        let findings_store =
-            cfg.findings_base
-                .as_ref()
-                .and_then(|p| match FindingsStore::new(p.clone()) {
-                    Ok(fs) => Some(Arc::new(fs)),
-                    Err(e) => {
-                        kres_core::async_eprintln!(
-                            "findings: store init failed for {}: {e}",
-                            p.display()
-                        );
-                        None
-                    }
-                });
-        if let Some(ref fs) = findings_store {
-            match fs.bootstrap() {
-                Ok(init) => {
-                    let turn_n = init.turn_n;
-                    let count = init.findings.len();
-                    let findings = init.findings;
-                    // Seed the manager synchronously via
-                    // blocking_lock-free futures::executor: the
-                    // ergonomic fix is to hand the findings to
-                    // `run()` which will replace them on the
-                    // first reap tick, BEFORE submit_prompt can
-                    // observe a stale snapshot. To preserve the
-                    // previous behaviour without introducing a
-                    // handle-back API, we store the bootstrap in
-                    // the Session itself.
-                    //
-                    // See `Self::pending_bootstrap` below, consumed
-                    // at the top of `run()`.
+        let mut findings_store: Option<Arc<FindingsStore>> = None;
+        if let Some(ref p) = cfg.findings_base {
+            match FindingsStore::new(p.clone()).await {
+                Ok(fs) => findings_store = Some(Arc::new(fs)),
+                Err(e) => {
                     kres_core::async_eprintln!(
-                        "findings: initialised at turn {} ({} existing)",
-                        turn_n,
-                        count
+                        "findings: store init failed for {}: {e}",
+                        p.display()
                     );
-                    return Self {
-                        mgr,
-                        cfg,
-                        orchestrator: None,
-                        consolidator: None,
-                        todo_client: None,
-                        goal_client: None,
-                        findings_store,
-                        usage: Arc::new(UsageTracker::new()),
-                        lenses: Vec::new(),
-                        initial_prompt: None,
-                        last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
-                        pending_bootstrap: findings,
-                        logger: None,
-                        task_goals: Arc::new(tokio::sync::Mutex::new(
-                            std::collections::HashMap::new(),
-                        )),
-                        task_prompts: Arc::new(tokio::sync::Mutex::new(
-                            std::collections::HashMap::new(),
-                        )),
-                        accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                        deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                        interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
-                        last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
-                        persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                        turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        input_ack_tx: tokio::sync::Mutex::new(None),
-                        mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                    };
                 }
-                Err(e) => kres_core::async_eprintln!("findings bootstrap: {e}"),
             }
+        }
+        if let Some(ref fs) = findings_store {
+            let turn_n = fs.last_turn().await;
+            let findings = fs.snapshot().await;
+            let count = findings.len();
+            // Seed the manager via `pending_bootstrap`, consumed at
+            // the top of `run()`. This preserves the prior behaviour
+            // where the first reap tick establishes the in-memory
+            // list BEFORE submit_prompt observes a stale snapshot.
+            kres_core::async_eprintln!(
+                "findings: initialised at turn {} ({} existing)",
+                turn_n,
+                count
+            );
+            return Self {
+                mgr,
+                cfg,
+                orchestrator: None,
+                consolidator: None,
+                todo_client: None,
+                goal_client: None,
+                findings_store,
+                usage: Arc::new(UsageTracker::new()),
+                lenses: Vec::new(),
+                initial_prompt: None,
+                last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
+                pending_bootstrap: findings,
+                logger: None,
+                task_goals: Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                task_prompts: Arc::new(tokio::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
+                last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
+                persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                stop_notify: Arc::new(tokio::sync::Notify::new()),
+                status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                input_ack_tx: tokio::sync::Mutex::new(None),
+                mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            };
         }
         Self {
             mgr,
@@ -459,6 +456,7 @@ impl Session {
             turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
             status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             input_ack_tx: tokio::sync::Mutex::new(None),
             mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -777,8 +775,8 @@ impl Session {
         let persist_path_for_reaper = self.cfg.persist_path.clone();
         let last_prompt_for_reaper = self.last_prompt.clone();
         let persist_sig_for_reaper = self.persist_sig.clone();
-        let merger_for_reaper = self.consolidator.clone();
         let store_for_reaper = self.findings_store.clone();
+        let promoter_for_reaper = self.consolidator.clone();
         let interrupted_for_reaper = self.interrupted_prompt.clone();
         let report_path_for_reaper = self.cfg.report_path.clone();
         // Destination for coding-mode file output. Coding tasks emit
@@ -790,6 +788,7 @@ impl Session {
         let code_output_root_for_reaper: PathBuf = self.cfg.workspace.clone();
         let turns_exhausted_for_reaper = self.turns_exhausted.clone();
         let stop_latched_for_reaper = self.stop_latched.clone();
+        let stop_notify_for_reaper = self.stop_notify.clone();
         let turns_limit = self.cfg.turns_limit;
         let follow_followups = self.cfg.follow_followups;
         // §16: findings-signature watchdog. Every successful merge
@@ -953,95 +952,238 @@ impl Session {
                     if stop_latched_now {
                         continue;
                     }
-                    // Findings merger runs for both Analysis (review)
-                    // and Generic tasks — both feed the findings
-                    // pipeline. Coding tasks skip it: their output is
-                    // source files, not findings.
-                    let had_delta = r.mode.produces_findings() && !r.findings_delta.is_empty();
-                    if had_delta {
-                        // §16: when a consolidator client is available
-                        // we reuse it as the findings merger too.
-                        // `merge_findings_with_logger` takes a snapshot
-                        // of the current list + the task's delta and
-                        // asks the fast agent for a merged output. The
-                        // with_findings_extract_lock() call serialises
-                        // every merge — 's
-                        // does the same to stop concurrent merges from
-                        // racing.
-                        if let Some(ref merger) = merger_for_reaper {
-                            let current = mgr_for_reaper.findings_snapshot().await;
-                            let delta = r.findings_delta.clone();
-                            let brief = r.name.clone();
-                            let merger_c = merger.clone();
-                            let logger_c = logger_for_reaper.clone();
-                            let merged = mgr_for_reaper
-                                .with_findings_extract_lock(|| async move {
-                                    kres_agents::merge::merge_findings_with_logger(
-                                        merger_c.client.clone(),
-                                        merger_c.model.clone(),
-                                        // Use the dedicated merger
-                                        // system prompt so the model
-                                        // doesn't drift into
-                                        // fast-code-agent mode
-                                        // (returning {"goal":…} or
-                                        // <action> tags) when the
-                                        // embedded MERGER_INSTRUCTIONS
-                                        // in the user message gets
-                                        // under-weighted.
-                                        Some(kres_agents::MERGER_SYSTEM),
-                                        merger_c.max_tokens,
-                                        merger_c.max_input_tokens,
-                                        &brief,
-                                        &delta,
-                                        &current,
-                                        logger_c,
-                                    )
-                                    .await
-                                })
-                                .await;
-                            match merged {
-                                Ok(new_list) => {
-                                    mgr_for_reaper.replace_findings(new_list).await;
+                    // Findings delta application runs for Analysis
+                    // (review) and Generic tasks — both feed the
+                    // findings pipeline. Coding tasks skip it: their
+                    // output is source files, not findings.
+                    //
+                    // The LLM-based merger has been retired. The slow
+                    // agent's prompt already tells it to reuse an
+                    // existing finding's id when extending it; the
+                    // store applies deterministic merge rules in Rust
+                    // (kres_core::findings::apply_delta_to_list) — no
+                    // token round-trip per turn.
+                    //
+                    // Promotion pass: the slow agent + consolidator
+                    // PROMOTION RULE is instructional only. When they
+                    // describe a bug in prose but don't emit the
+                    // matching Finding (or when the response
+                    // RawText-downgrades and the findings array is
+                    // empty), the bug reaches report.md and is lost
+                    // to findings.json. A one-shot fast-agent audit
+                    // pass here reads effective_analysis against the
+                    // current findings_delta and returns any net-new
+                    // bugs it spots; we append those to the delta
+                    // before apply_delta runs. Non-fatal: on any
+                    // failure we skip and carry on with whatever the
+                    // slow agent did emit.
+                    let mut working_delta = r.findings_delta.clone();
+                    // Ids the promoter contributed on top of
+                    // r.findings_delta. Populated when the audit
+                    // pass returns extras; consumed below to append
+                    // a cross-reference trailer to report.md so a
+                    // human reader of the narrative can find the
+                    // new Findings by id.
+                    let mut promoted_ids: Vec<String> = Vec::new();
+                    if r.mode.produces_findings() && !effective_analysis.is_empty() {
+                        if let Some(ref promoter) = promoter_for_reaper {
+                            // Assemble the full universe of known
+                            // ids (store snapshot ∪ this task's
+                            // delta). `apply_delta_to_list` matches
+                            // by id against the store, so we need
+                            // the whole universe for the Rust-side
+                            // dedup filter to catch collisions.
+                            let mut all_known = mgr_for_reaper.findings_snapshot().await;
+                            for d in &working_delta {
+                                if !all_known.iter().any(|e| e.id == d.id) {
+                                    all_known.push(d.clone());
                                 }
+                            }
+                            // Narrow the LLM-bound subset to findings
+                            // actually mentioned (by id, filename, or
+                            // symbol name) in the prose. A 500-entry
+                            // store with full source bodies blows up
+                            // the prompt; a typical prose chunk only
+                            // touches a handful of those. False
+                            // negatives in this scan are handled
+                            // downstream: filter_net_new sees the
+                            // full `all_known` and RENAMES colliding
+                            // ids rather than dropping them.
+                            let prose_relevant = kres_core::relevant_subset(
+                                &effective_analysis,
+                                &all_known,
+                            );
+                            // Both slices go to the promoter's
+                            // prompt path — redact Finding.details
+                            // so the per-task narrative captured for
+                            // /summary never round-trips through
+                            // another LLM call. dedup_against only
+                            // touches ids, but redact uniformly for
+                            // discipline.
+                            let prose_relevant =
+                                kres_core::redact_findings_for_agent(&prose_relevant);
+                            let all_known_for_dedup =
+                                kres_core::redact_findings_for_agent(&all_known);
+                            kres_core::async_eprintln!(
+                                "[promote] sending {} of {} existing finding(s) to auditor",
+                                prose_relevant.len(),
+                                all_known.len(),
+                            );
+                            match kres_agents::promote::promote_prose_bugs_with_logger(
+                                promoter.client.clone(),
+                                promoter.model.clone(),
+                                // Use the dedicated promoter system
+                                // prompt, NOT the consolidator's
+                                // inherited fast-code-agent system.
+                                // Same drift-avoidance reason the
+                                // retired merger_system.txt existed.
+                                Some(kres_agents::promote::PROMOTE_SYSTEM),
+                                promoter.max_tokens,
+                                promoter.max_input_tokens,
+                                &r.name,
+                                &effective_analysis,
+                                &prose_relevant,
+                                &all_known_for_dedup,
+                                Some(stop_notify_for_reaper.clone()),
+                                logger_for_reaper.clone(),
+                            )
+                            .await
+                            {
+                                Ok(extras) if !extras.is_empty() => {
+                                    kres_core::async_eprintln!(
+                                        "[promote] {} prose-only bug(s) promoted to findings",
+                                        extras.len()
+                                    );
+                                    promoted_ids
+                                        .extend(extras.iter().map(|f| f.id.clone()));
+                                    working_delta.extend(extras);
+                                }
+                                Ok(_) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         target: "kres_repl",
-                                        "merge_findings failed: {e}; applying naive union"
+                                        "promote pass failed: {e}"
                                     );
-                                    let mut all = mgr_for_reaper.findings_snapshot().await;
-                                    let existing: std::collections::BTreeSet<String> =
-                                        all.iter().map(|f| f.id.clone()).collect();
-                                    for f in r.findings_delta {
-                                        if !existing.contains(&f.id) {
-                                            all.push(f);
-                                        }
-                                    }
-                                    mgr_for_reaper.replace_findings(all).await;
+                                }
+                            }
+                        }
+                    }
+                    let had_delta = r.mode.produces_findings() && !working_delta.is_empty();
+                    let mut apply_changed = false;
+                    let mut apply_added: u32 = 0;
+                    let mut apply_updated: u32 = 0;
+                    let mut apply_invalidated: u32 = 0;
+                    let mut apply_reactivated: u32 = 0;
+                    if had_delta {
+                        let delta = working_delta.clone();
+                        // Provenance stamp written into findings'
+                        // first_seen_task / last_updated_task. Shape:
+                        //   "<uuid-simple>/<todo-tag>"   when a todo
+                        //   dispatched this task (cmd_next /
+                        //   cmd_continue paths), else just the uuid.
+                        //   We avoid the prior `r.name` convention —
+                        //   for an operator-typed `/review …` task
+                        //   `r.name` is the full prompt body, which
+                        //   got duplicated across every finding.
+                        let stamp = match r.todo_name.as_deref() {
+                            Some(tag) => format!("{}/{}", r.uuid.as_simple(), tag),
+                            None => r.uuid.as_simple().to_string(),
+                        };
+                        // effective_analysis is the prose we want on
+                        // every finding this task touched, stored
+                        // under `details` for /summary to consume
+                        // later. Feed it to apply_delta alongside
+                        // the stamp so the record_detail pass can
+                        // attach one entry per finding per task.
+                        let prose_for_details = effective_analysis.clone();
+                        if let Some(ref s) = store_for_reaper {
+                            let s_c = s.clone();
+                            let stamp_c = stamp.clone();
+                            let prose_c = prose_for_details.clone();
+                            let report = mgr_for_reaper
+                                .with_findings_extract_lock(|| async move {
+                                    s_c.apply_delta(&delta, Some(&stamp_c), Some(&prose_c)).await
+                                })
+                                .await;
+                            match report {
+                                Ok(rep) => {
+                                    apply_changed = rep.changed;
+                                    apply_added = rep.added;
+                                    apply_updated = rep.updated;
+                                    apply_invalidated = rep.invalidated;
+                                    apply_reactivated = rep.reactivated;
+                                    mgr_for_reaper.replace_findings(rep.merged).await;
+                                }
+                                Err(e) => {
+                                    kres_core::async_eprintln!("findings apply: {e}");
                                 }
                             }
                         } else {
-                            let mut all = mgr_for_reaper.findings_snapshot().await;
-                            let existing: std::collections::BTreeSet<String> =
-                                all.iter().map(|f| f.id.clone()).collect();
-                            for f in r.findings_delta {
-                                if !existing.contains(&f.id) {
-                                    all.push(f);
-                                }
-                            }
-                            mgr_for_reaper.replace_findings(all).await;
+                            // No persistent store (no --results set):
+                            // apply the same rules to the in-memory
+                            // list so the pipeline still benefits
+                            // from deterministic dedup.
+                            let mut current = mgr_for_reaper.findings_snapshot().await;
+                            let counts = kres_core::apply_delta_to_list(
+                                &mut current,
+                                &delta,
+                                Some(&stamp),
+                                Some(&prose_for_details),
+                            );
+                            apply_changed = counts.changed;
+                            apply_added = counts.added;
+                            apply_updated = counts.updated;
+                            apply_invalidated = counts.invalidated;
+                            apply_reactivated = counts.reactivated;
+                            mgr_for_reaper.replace_findings(current).await;
                         }
                     }
-                    // Persist the CUMULATIVE findings list to disk
-                    // once per reaped task. findings-N.json is the
-                    // complete list of findings still considered
-                    // relevant after this task's delta has been merged
-                    // in — operators reading findings-84.json see the
-                    // full state at turn 84, not just what changed.
-                    // `changed` drives tasks_since_change inside the
-                    // store; quiescent tracking mirrors that signal.
+                    // Promoted-findings cross-reference trailer on
+                    // report.md. `effective_analysis` was appended
+                    // earlier (before the /stop latch + promoter +
+                    // apply_delta) — that ordering is load-bearing
+                    // for the /stop-latched case, which otherwise
+                    // would lose its prose. Appending a SECOND small
+                    // section here now that we know which ids the
+                    // promoter added lets a human reader of the
+                    // narrative jump to the new Findings without
+                    // re-reading the whole JSON store. Only append
+                    // when apply_delta actually landed those ids —
+                    // an apply_delta error above leaves promoted_ids
+                    // unrecorded in findings.json, so a stray
+                    // cross-reference would be misleading.
+                    if !promoted_ids.is_empty() && apply_changed {
+                        if let Some(ref rp) = report_path_for_reaper {
+                            let joined = promoted_ids
+                                .iter()
+                                .map(|id| format!("`{id}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let trailer = format!(
+                                "_promoted-from-prose: {}_ ({})",
+                                joined,
+                                promoted_ids.len()
+                            );
+                            if let Err(e) =
+                                crate::report::append_task_section(rp, &r.name, &trailer)
+                            {
+                                tracing::warn!(
+                                    target: "kres_repl",
+                                    "report promoted-ids trailer append to {}: {e}",
+                                    rp.display()
+                                );
+                            }
+                        }
+                    }
                     let final_list = mgr_for_reaper.findings_snapshot().await;
                     let new_sig = findings_signature(&final_list);
-                    let changed = new_sig != last_sig;
+                    // Also treat apply_changed as a change signal even
+                    // when the signature happens to match (e.g. the
+                    // signature hash doesn't fold in relevant_symbols
+                    // updates). `last_sig != new_sig` catches list
+                    // membership shifts; apply_changed catches field
+                    // updates on an existing id.
+                    let changed = apply_changed || new_sig != last_sig;
                     last_sig = new_sig;
                     if changed {
                         quiescent = 0;
@@ -1054,11 +1196,11 @@ impl Session {
                         }
                     }
                     // §turns0: only count tasks that actually produced
-                    // analysis (mirrors the completed_run_count rule in
-                    // task.rs). A strict growth in the merged findings
+                    // analysis. A strict growth in the merged findings
                     // list resets the streak; anything else — whether
-                    // the delta was empty, or the merger folded it into
-                    // existing findings — counts as "no new findings".
+                    // the delta was empty, or apply_delta folded it
+                    // into existing findings — counts as "no new
+                    // findings".
                     if !r.analysis.is_empty() {
                         let grew = final_list.len() > pre_size;
                         if grew {
@@ -1069,23 +1211,15 @@ impl Session {
                     }
                     if had_delta {
                         kres_core::async_eprintln!(
-                            "[merge] {} finding(s) after merge (delta={} changed={} quiescent={})",
+                            "[findings] {} total (added={} updated={} invalidated={} reactivated={} changed={} quiescent={})",
                             final_list.len(),
-                            final_list.len() as i64 - pre_size as i64,
+                            apply_added,
+                            apply_updated,
+                            apply_invalidated,
+                            apply_reactivated,
                             changed,
                             quiescent,
                         );
-                    }
-                    if let Some(ref s) = store_for_reaper {
-                        let to_write = final_list.clone();
-                        let s_c = s.clone();
-                        mgr_for_reaper
-                            .with_findings_extract_lock(|| async move {
-                                if let Err(e) = s_c.write_turn(to_write, changed).await {
-                                    kres_core::async_eprintln!("findings write: {e}");
-                                }
-                            })
-                            .await;
                     }
                     // Update todo list via todo-agent when one is
                     // configured. Non-fatal on any failure — the todo
@@ -1728,7 +1862,7 @@ impl Session {
     /// Prepends the accumulated-analysis ledger as "Recent context"
     /// so a follow-up operator prompt doesn't start cold.
     async fn submit_prompt(&self, text: String) {
-        self.submit_prompt_inner(text, true).await
+        self.submit_prompt_inner(text, true, None).await
     }
 
     /// Pipeline-driven submission (cmd_next / cmd_continue's
@@ -1739,11 +1873,20 @@ impl Session {
     /// would double-count (see review of 04ea466): it would widen
     /// narrow fetch tasks, bust the fast-agent's cached prefix, and
     /// pay 8k chars per turn on every follow-up.
-    async fn submit_from_pipeline(&self, text: String) {
-        self.submit_prompt_inner(text, false).await
+    ///
+    /// `todo_tag` is the dispatching TodoItem's id (or name when id
+    /// is empty) — fed into findings provenance via apply_delta so a
+    /// stored finding records which todo produced it.
+    async fn submit_from_pipeline(&self, text: String, todo_tag: Option<String>) {
+        self.submit_prompt_inner(text, false, todo_tag).await
     }
 
-    async fn submit_prompt_inner(&self, text: String, include_recent_context: bool) {
+    async fn submit_prompt_inner(
+        &self,
+        text: String,
+        include_recent_context: bool,
+        todo_tag: Option<String>,
+    ) {
         let Some(orc) = self.orchestrator.clone() else {
             println!("(no orchestrator configured — prompt dropped)");
             println!("hint: rerun `kres repl` with agent configs to enable prompt handling");
@@ -1935,7 +2078,7 @@ impl Session {
         let allow_plan_rewrite = include_recent_context;
         let task_id = self
             .mgr
-            .spawn(task_brief, None, move |handle| async move {
+            .spawn(task_brief, todo_tag, move |handle| async move {
                 let ctx = RunContext {
                     previous_findings,
                     task_brief: task_brief_clone,
@@ -2004,12 +2147,10 @@ impl Session {
                                 mgr.set_plan(Some(new_plan)).await;
                             }
                         }
-                        // findings-N.json is written by the reaper
-                        // with the CUMULATIVE merged list (see the
-                        // `findings_store` write site in run()). The
-                        // per-task delta here is carried to the reaper
-                        // via TaskOutcome.findings and fed to the
-                        // merger; the file on disk is the union.
+                        // findings.json is maintained by the reaper
+                        // through `FindingsStore::apply_delta` (see
+                        // session.rs run()). The per-task delta here
+                        // rides in TaskOutcome.findings.
                         Ok(kres_core::task::TaskOutcome {
                             analysis: summary.analysis,
                             findings: summary.findings,
@@ -2103,6 +2244,11 @@ impl Session {
         // resumes with /continue or submits a new prompt.
         self.stop_latched
             .store(true, std::sync::atomic::Ordering::Release);
+        // Wake any reaper-side inference call that's select!'ing on
+        // stop_notify so it can abandon mid-flight. No-op when no
+        // call is in progress — the latched atomic above catches
+        // the next iteration either way.
+        self.stop_notify.notify_waiters();
         // Move pending / blocked / in-progress todo items to the
         // deferred list. Done/Skipped items stay on the active
         // queue so the plan step rollup in sync_plan_from_todo can
@@ -2199,7 +2345,12 @@ impl Session {
             self.mgr
                 .mark_todo_status(&item.name, TodoStatus::InProgress)
                 .await;
-            self.submit_from_pipeline(prompt).await;
+            let tag = if !item.id.is_empty() {
+                item.id.clone()
+            } else {
+                item.name.clone()
+            };
+            self.submit_from_pipeline(prompt, Some(tag)).await;
             dispatched += 1;
         }
         let mut msg = format!("/continue: dispatched {dispatched} item(s)");
@@ -2252,7 +2403,12 @@ impl Session {
             .mark_todo_status(&item.name, TodoStatus::InProgress)
             .await;
         println!("/next: dispatching {}", truncate(&item.name, 80));
-        self.submit_from_pipeline(prompt).await;
+        let tag = if !item.id.is_empty() {
+            item.id.clone()
+        } else {
+            item.name.clone()
+        };
+        self.submit_from_pipeline(prompt, Some(tag)).await;
     }
 
     async fn cmd_edit(&self) {
@@ -3853,7 +4009,7 @@ mod tests {
     #[tokio::test]
     async fn session_without_orchestrator_drops_prompt() {
         let mgr = TaskManager::new();
-        let s = Session::new(mgr, ReplConfig::default());
+        let s = Session::new(mgr, ReplConfig::default()).await;
         // We can't easily exercise submit_prompt from a unit test
         // without stdin plumbing, but we can assert construction
         // leaves `orchestrator` unset.

@@ -176,6 +176,8 @@ mod tests {
             first_seen_task: None,
             last_updated_task: None,
             related_finding_ids: vec!["other".into()],
+            reactivate: false,
+            details: vec![],
         }
     }
 

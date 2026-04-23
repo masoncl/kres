@@ -237,6 +237,8 @@ mod tests {
             first_seen_task: None,
             last_updated_task: None,
             related_finding_ids: vec![],
+            reactivate: false,
+            details: vec![],
         }
     }
 

@@ -1,9 +1,13 @@
-//! Agent roles: fast, slow, main, todo, consolidator, merger.
+//! Agent roles: fast, slow, main, todo, consolidator.
 //!
 //! Phase 4 landed: agent configs, response parsing (prose-then-JSON
 //! fallback, fenced-block extraction, brace-match), followup types,
 //! prompt builders. The actual fast/slow pipeline runner is a follow-
 //! on phase.
+//!
+//! The cross-task findings merger (LLM-based whole-list rewrite)
+//! was retired in favour of deterministic delta application in
+//! `kres_core::findings::apply_delta_to_list`.
 
 pub mod config;
 pub mod consolidate;
@@ -14,8 +18,8 @@ pub mod followup;
 pub mod goal;
 pub mod main_agent;
 pub mod mcp_fetcher;
-pub mod merge;
 pub mod pipeline;
+pub mod promote;
 pub mod prompt;
 pub mod prompt_file;
 pub mod response;
@@ -36,7 +40,6 @@ pub use goal::{
 pub use kres_core::TaskMode;
 pub use main_agent::{parse_actions, MainAgent, DEFAULT_MAX_MAIN_TURNS};
 pub use mcp_fetcher::{McpFetcher, McpMethodMap};
-pub use merge::{merge_findings, MERGER_SYSTEM};
 pub use pipeline::{
     ConsolidatorClient, DataFetcher, FetchResult, NullFetcher, Orchestrator, RunContext,
     TaskSummary,

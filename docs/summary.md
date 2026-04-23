@@ -1,9 +1,10 @@
 # Summary output — `/summary`, `--summary`, `summary.txt`/`summary.md`
 
 After each task, kres appends the slow agent's narrative to
-`<results>/report.md` and rewrites `<results>/findings.json` with
-the cumulative merged list (the previous canonical file is copied
-to `findings-N.json` first, preserving history).
+`<results>/report.md` and applies the task's findings delta to the
+jsondb-backed `<results>/findings.json`. The canonical file is
+rewritten atomically in place (tmp + fsync + rename); there are no
+per-turn history snapshots.
 
 A plain-text summary is produced by `/summary` (or automatically
 on `--turns` exit, or standalone via

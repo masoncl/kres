@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 use crate::findings::Finding;
 use crate::shutdown::Shutdown;
@@ -52,7 +53,17 @@ impl TaskState {
 
 pub struct Task {
     pub id: TaskId,
+    /// Random v4 uuid generated at spawn time. Distinct from `id`
+    /// (a process-local monotonic u64): the uuid is stable across
+    /// restarts only in the sense of never colliding, so it's safe
+    /// to stamp into `findings.json` for provenance across sessions.
+    pub uuid: Uuid,
     pub name: String,
+    /// Short tag for the todo that dispatched this task (TodoItem.id
+    /// when non-empty, otherwise TodoItem.name). None for operator-
+    /// typed prompts that don't come from the todo list. Fed into
+    /// `FindingsStore::apply_delta` as part of the stamp so a
+    /// finding's provenance records which todo produced it.
     pub todo_name: Option<String>,
     pub shutdown: Shutdown,
     /// State is behind a single RwLock on the manager; a Task itself
@@ -228,6 +239,7 @@ impl TaskManager {
         let shutdown = self.root_shutdown.child();
         let task = Task {
             id,
+            uuid: Uuid::new_v4(),
             name: name.into(),
             todo_name,
             shutdown: shutdown.clone(),
@@ -286,6 +298,7 @@ impl TaskManager {
             g.tasks.push(TaskEntry {
                 task: Task {
                     id,
+                    uuid: task.uuid,
                     name: task.name.clone(),
                     todo_name: task.todo_name.clone(),
                     shutdown: shutdown.clone(),
@@ -442,6 +455,7 @@ impl TaskManager {
             if entry.state.is_terminal() {
                 reaped.push(ReapedTask {
                     id: entry.task.id,
+                    uuid: entry.task.uuid,
                     name: entry.task.name,
                     todo_name: entry.task.todo_name,
                     state: entry.state,
@@ -468,6 +482,7 @@ impl TaskManager {
             .iter()
             .map(|e| TaskSnapshot {
                 id: e.task.id,
+                uuid: e.task.uuid,
                 name: e.task.name.clone(),
                 state: e.state,
                 todo_name: e.task.todo_name.clone(),
@@ -652,6 +667,7 @@ pub struct StopAllOutcome {
 #[derive(Debug)]
 pub struct TaskSnapshot {
     pub id: TaskId,
+    pub uuid: Uuid,
     pub name: String,
     pub state: TaskState,
     pub todo_name: Option<String>,
@@ -660,6 +676,7 @@ pub struct TaskSnapshot {
 #[derive(Debug)]
 pub struct ReapedTask {
     pub id: TaskId,
+    pub uuid: Uuid,
     pub name: String,
     pub todo_name: Option<String>,
     pub state: TaskState,

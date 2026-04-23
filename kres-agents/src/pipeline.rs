@@ -518,11 +518,15 @@ impl Orchestrator {
         }
 
         // Slow agent call.
+        // Redact `details` before ANY budget / shipping step — the
+        // per-task narrative stored on Finding.details is for
+        // /summary only and must never reach an agent prompt.
         // bugs.md#L5: budget previous_findings to ~1M chars before
         // shipping. Symbols and context are also trimmed — a single
         // fetcher response can blow the per-slot budget even with a
         // short gather loop (e.g. a multi-MB type definition).
-        let trimmed_prev = shrink_findings_to_budget(&ctx.previous_findings, 1_000_000);
+        let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
+        let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
         let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
         let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
         // §cache: same split policy on the slow-agent user message.
@@ -910,7 +914,10 @@ impl Orchestrator {
             }
             let lens_prompt = format!("{prompt}\n\n{lens_extra}");
             // bugs.md#L5: same trim applies in the lens path.
-            let trimmed_prev = shrink_findings_to_budget(&ctx.previous_findings, 1_000_000);
+            // Redact `details` first — per-task narrative is
+            // /summary-only and never reaches a lens agent.
+            let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
+            let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
             let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
             let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
             let mut lens_cp = CodePrompt::new(&lens_prompt)

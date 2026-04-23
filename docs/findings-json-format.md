@@ -96,6 +96,7 @@ Rationale:
 | `mechanism_detail` | string | Specifics that pin down HOW the bug becomes exploitable: which struct-field type/offset gets clobbered, which invariant-establishing ordering contract in adjacent code is violated, what the actual kernel object behind an OOB target is (e.g. `tx_ring[8]` lands on a `tx_int` function pointer). These are the facts a reproducer or patch author would otherwise re-derive. |
 | `fix_sketch` | string | 1-3 sentences describing a concrete patch the analysis identified (e.g. "cache the static-key result in a local bool at bnxt_xdp.c:353 and use it for both lock and unlock"). Omit entirely if no fix was analyzed — never fabricate. |
 | `open_questions` | array[string] | Unresolved items that would settle or refine the finding: `[UNVERIFIED]` claims, call sites not yet confirmed, type-query followups, locking-order assumptions, etc. One sentence each. These accumulate across turns; the merger unions them. |
+| `details` | array[object] | Per-task narrative captured at apply_delta time. Each entry `{task, analysis}` pairs a provenance stamp with the task's effective_analysis prose verbatim. **Store-local only** — every site that hands findings to an agent must run them through `kres_core::redact_findings_for_agent` first. Consumed by `/summary` so the plain-text summary can reach the richer exposition that would otherwise only live in report.md. Never emitted by agents; the store populates this field. |
 
 ## Sizing guidance for embedded bodies
 
@@ -126,13 +127,15 @@ should be JUST enough to prove the bug. Rules of thumb:
 ## Relationship to other files
 
 - `todo.md` (via `--todo`): the plan, what's next.
-- `findings-N.json` (via `--findings`): the results, what's been
-  proven. One numbered file per task turn; the highest N is current.
+- `findings.json` (via `--findings`): the results, what's been
+  proven. Maintained in-place by a jsondb-backed store; each task
+  reap applies its delta deterministically (no per-turn snapshot
+  history).
 - `code.jsonl` / `main.jsonl`: raw inference transcripts.
 - Report markdown (via `--report`): human narrative, appended per task.
 
 The four are complementary and independent — writing
-`findings-N.json` doesn't touch the others.
+`findings.json` doesn't touch the others.
 
 ## Agent interaction
 
@@ -157,14 +160,18 @@ Three points where findings flow:
    emitted as a Finding by any lens) to new Findings, and returns
    `(unified_analysis, unified_findings)` for the task.
 
-3. **After each task is reaped, a second fast-agent pass merges the
-   task's unified findings into the running `current_findings` list**:
-   handles cross-task dedup, chain-linking via
-   `related_finding_ids`, status transitions, subset-supersession,
-   and preservation of `mechanism_detail` / `fix_sketch` /
-   `open_questions` across merges. This is the pass that writes the
-   next `findings-N.json` (monotonically incremented; prior turn's
-   snapshot stays on disk).
+3. **After each task is reaped, the task's unified findings are
+   applied to the running list as a delta by
+   `kres_core::findings::FindingsStore::apply_delta`**: incoming
+   records with a matching `id` update the existing finding in
+   place (union relevant_symbols / relevant_file_sections /
+   related_finding_ids / open_questions, prefer incoming non-empty
+   prose, max severity, stamp `last_updated_task`); a matching id
+   with `status: invalidated` flips the existing entry to
+   invalidated; a new id is appended with `first_seen_task` stamped.
+   The store is backed by jsondb and rewrites the canonical
+   `findings.json` atomically on every apply. There is no per-turn
+   snapshot history and no LLM round-trip during apply.
 
 4. **Before each slow-agent call**, the slow-agent request includes a
    `previous_findings` field carrying the current list. The slow

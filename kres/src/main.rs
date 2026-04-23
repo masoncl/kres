@@ -680,7 +680,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         workspace: args.workspace.clone(),
         persist_path,
     };
-    let mut session = Session::new(mgr, cfg);
+    let mut session = Session::new(mgr, cfg).await;
     // Resume from a prior session.json ONLY when `--resume` was
     // passed. Without the flag, any existing session.json is left
     // untouched on disk and the REPL starts clean — this avoids

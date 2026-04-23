@@ -180,7 +180,7 @@ Rate limiters are shared across agents that use the same API key string.
   prompts/                    # System prompts + bug-summary.md
   skills/                     # Skill files (kernel.md, …)
   sessions/<ts>/              # Per-run artifacts when --results not set
-    findings.json             # Cumulative findings (history in findings-N.json)
+    findings.json             # jsondb-backed canonical findings (delta-applied, no history)
     report.md                 # Append-only narrative
     session.json              # Plan + todo + deferred + counters (resume state)
     summary.txt               # Output of /summary or kres --summary (summary.md with --summary-markdown)

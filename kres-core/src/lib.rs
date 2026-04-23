@@ -6,11 +6,11 @@
 //! - C2: every Task owns a CancellationToken; /stop / /clear / goal-met
 //!   / --turns propagate cancel before dropping references.
 //! - C3: abandoning a Task waits for its handle, never strands it.
-//! - H1: the merge critical section is split — the extract lock holds
-//!   only during disk write, not across API calls.
-//! - H2/H3: findings_write_count is incremented under the same mutex
-//!   that allocates N and writes the file — one atomic unit.
-//! - H6: findings-N.json is written via tmp-file + fsync + rename.
+//! - H1: no LLM call runs inside the findings-extract critical
+//!   section; `FindingsStore::apply_delta` does a pure Rust merge
+//!   and the jsondb-owned RwLock serialises disk writes.
+//! - H6: the canonical findings.json is written via jsondb's
+//!   tmp-file + fsync + rename pipeline (no history snapshots).
 //! - L1: no parallel "completed_ids" vector — done tasks are queried
 //!   directly off the ordered task list.
 
@@ -30,7 +30,10 @@ pub mod todo;
 
 pub use consent::ConsentStore;
 pub use cost::{UsageEntry, UsageKey, UsageTracker};
-pub use findings::{Finding, FindingsFile, FindingsStore, Severity};
+pub use findings::{
+    apply_delta_to_list, redact_findings_for_agent, relevant_subset, ApplyReport, DeltaCounts,
+    Finding, FindingDetail, FindingsFile, FindingsStore, Severity, Status,
+};
 pub use lens::LensSpec;
 pub use log::{LoggedUsage, TurnLogger};
 pub use mode::{CodeEdit, CodeFile, TaskMode};

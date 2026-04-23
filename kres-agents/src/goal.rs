@@ -574,6 +574,40 @@ mod tests {
     }
 
     #[test]
+    fn missing_mode_field_defaults_to_generic_via_unwrap_or_default() {
+        // Parse a classifier reply that omits the `mode` field.
+        // DefineResponse::mode is Option<TaskMode> with serde default
+        // = None, and define_goal's caller unwraps via
+        // parsed.mode.unwrap_or_default(). That must resolve to
+        // Generic — matches goal.txt's "Default to 'generic' when
+        // ambiguous" policy.
+        let r: DefineResponse =
+            extract_json_with_key(r#"{"goal": "audit btrfs for efficiency"}"#, "goal").unwrap();
+        assert!(r.mode.is_none(), "mode field absent in reply");
+        assert_eq!(r.mode.unwrap_or_default(), kres_core::TaskMode::Generic);
+    }
+
+    #[test]
+    fn unparseable_mode_string_drops_whole_reply_outer_fallback_handles() {
+        // Classifier hallucinates a mode that doesn't match the
+        // three-variant enum. serde rename_all=lowercase rejects
+        // the string, which fails the whole DefineResponse parse
+        // (not just the one field). extract_json_with_key returns
+        // None, and the caller in session.rs handles that via
+        // `None => (None, TaskMode::default())`. With the
+        // default=Generic pinned test above, the outer observable
+        // behaviour is still "fall back to Generic". Documented
+        // here so a future change to the deserialize policy
+        // (e.g. tolerating unknown modes) doesn't silently break
+        // the outer fallback.
+        let r: Option<DefineResponse> = extract_json_with_key(
+            r#"{"goal": "check x", "mode": "investigation"}"#,
+            "goal",
+        );
+        assert!(r.is_none(), "unparseable mode collapses entire reply");
+    }
+
+    #[test]
     fn assume_met_default_is_truthy() {
         let c = assume_met();
         assert!(c.met);

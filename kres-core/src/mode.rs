@@ -85,3 +85,35 @@ impl TaskMode {
         matches!(self, Self::Audit | Self::Generic)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_generic() {
+        // Pinned: the Rust fallback must match goal.txt's classifier
+        // policy ("Default to 'generic' when the prompt is
+        // ambiguous"). Changing this back to Audit would silently
+        // route every misclassified prompt to defect-review.
+        assert_eq!(TaskMode::default(), TaskMode::Generic);
+    }
+
+    #[test]
+    fn as_str_matches_wire_encoding() {
+        // as_str and the serde rename_all="lowercase" must agree —
+        // otherwise logs say one thing and the wire says another.
+        for m in [TaskMode::Audit, TaskMode::Generic, TaskMode::Coding] {
+            let wire = serde_json::to_string(&m).unwrap();
+            let unquoted = wire.trim_matches('"');
+            assert_eq!(unquoted, m.as_str(), "{:?}", m);
+        }
+    }
+
+    #[test]
+    fn produces_findings_excludes_coding_only() {
+        assert!(TaskMode::Audit.produces_findings());
+        assert!(TaskMode::Generic.produces_findings());
+        assert!(!TaskMode::Coding.produces_findings());
+    }
+}

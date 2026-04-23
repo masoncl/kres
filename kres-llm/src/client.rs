@@ -146,8 +146,13 @@ impl Client {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt < MAX_RETRIES && is_transport_retryable(&e) {
-                        backoff_sleep(attempt).await;
+                        let wait = backoff_duration(attempt);
+                        log_transport_retry("messages", attempt, MAX_RETRIES, &e, wait);
+                        tokio::time::sleep(wait).await;
                         continue;
+                    }
+                    if is_transport_retryable(&e) {
+                        log_transport_giveup("messages", MAX_RETRIES, &e);
                     }
                     return Err(LlmError::Http(e));
                 }
@@ -276,9 +281,14 @@ impl Client {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt < max_retries && is_transport_retryable(&e) {
-                        backoff_sleep(attempt).await;
+                        let wait = backoff_duration(attempt);
+                        log_transport_retry("stream", attempt, max_retries, &e, wait);
+                        tokio::time::sleep(wait).await;
                         last_err = Some(LlmError::Http(e));
                         continue;
+                    }
+                    if is_transport_retryable(&e) {
+                        log_transport_giveup("stream", max_retries, &e);
                     }
                     return Err(LlmError::Http(e));
                 }
@@ -387,8 +397,19 @@ impl Client {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt < MAX_RETRIES && is_transport_retryable(&e) {
-                        backoff_sleep(attempt).await;
+                        let wait = backoff_duration(attempt);
+                        log_transport_retry(
+                            "messages_streaming",
+                            attempt,
+                            MAX_RETRIES,
+                            &e,
+                            wait,
+                        );
+                        tokio::time::sleep(wait).await;
                         continue;
+                    }
+                    if is_transport_retryable(&e) {
+                        log_transport_giveup("messages_streaming", MAX_RETRIES, &e);
                     }
                     return Err(LlmError::Http(e));
                 }
@@ -669,6 +690,44 @@ fn is_transport_retryable(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
 }
 
+/// Short tag describing the transport failure category, for log output.
+fn transport_error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect-failed"
+    } else if e.is_request() {
+        "request-failed"
+    } else {
+        "transport"
+    }
+}
+
+/// User-visible notice that we hit a transport error and are retrying.
+/// Without this, an offline / DNS-broken host looks like kres just hanging.
+fn log_transport_retry(label: &str, attempt: u32, max: u32, e: &reqwest::Error, wait: Duration) {
+    kres_core::async_eprintln!(
+        "[network] {} attempt={}/{} kind={} error={} — retrying in {:?} (check connectivity to api.anthropic.com)",
+        label,
+        attempt + 1,
+        max + 1,
+        transport_error_kind(e),
+        e,
+        wait,
+    );
+}
+
+/// User-visible notice that we exhausted retries on transport errors.
+fn log_transport_giveup(label: &str, max: u32, e: &reqwest::Error) {
+    kres_core::async_eprintln!(
+        "[network] {} giving up after {} attempts: kind={} error={} — API unreachable, check network / proxy / DNS",
+        label,
+        max + 1,
+        transport_error_kind(e),
+        e,
+    );
+}
+
 /// Parse the `retry-after` header. Returns `None` when absent or
 /// unparseable. Accepts both integer-seconds and HTTP-date forms
 /// (RFC 7231 §7.1.3). The HTTP-date parser is a tiny local impl —
@@ -773,10 +832,6 @@ fn apply_jitter(base: Duration, attempt: u32) -> Duration {
     let factor = 0.75 + (h as f64 / 512.0);
     let scaled = base.as_secs_f64() * factor;
     Duration::from_secs_f64(scaled)
-}
-
-async fn backoff_sleep(attempt: u32) {
-    tokio::time::sleep(backoff_duration(attempt)).await;
 }
 
 /// Boxed stream of parsed SSE events; `Err(LlmError)` ends the stream.

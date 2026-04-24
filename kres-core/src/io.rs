@@ -15,26 +15,54 @@
 //! handler is installed (non-REPL contexts like `kres turn` or
 //! setup-phase logging), messages fall through to `eprintln!`.
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 /// The sink receives each line as a String. The REPL wraps an
 /// `ExternalPrinter` behind this. Non-REPL callers never install a
 /// handler and their messages go to stderr via the fallback.
 pub type PrinterFn = Box<dyn Fn(String) + Send + Sync + 'static>;
 
-static PRINTER: OnceLock<PrinterFn> = OnceLock::new();
+/// The printer slot is an `RwLock<Option<…>>` rather than a plain
+/// `OnceLock` so startup code can install a cheap fallback (e.g.
+/// a stdout writer) early and replace it with a fancier sink once
+/// the REPL finishes booting (rustyline's ExternalPrinter, the TUI
+/// scrollback). Without replacement, messages emitted *during*
+/// bring-up — banner, initial-prompt notice, lens list — either
+/// race the install or fall through to `eprintln!` and miss the
+/// real sink entirely.
+fn slot() -> &'static RwLock<Option<PrinterFn>> {
+    static SLOT: OnceLock<RwLock<Option<PrinterFn>>> = OnceLock::new();
+    SLOT.get_or_init(|| RwLock::new(None))
+}
 
-/// Install the global printer sink. Idempotent — subsequent calls
-/// after the first are ignored (returns `Err` with the rejected
-/// handler). Typically invoked once from the REPL startup.
+/// Install the global printer sink. Install-if-absent semantics:
+/// succeeds when the slot is empty, returns `Err(f)` if another
+/// printer is already installed. Preserves the original
+/// call-once contract for tests and non-REPL entry points that
+/// shouldn't stomp on an in-place handler.
 pub fn install_printer(f: PrinterFn) -> Result<(), PrinterFn> {
-    PRINTER.set(f)
+    let mut g = slot().write().unwrap();
+    if g.is_some() {
+        return Err(f);
+    }
+    *g = Some(f);
+    Ok(())
+}
+
+/// Replace the installed printer unconditionally, returning any
+/// previously-installed handler. Used by startup sequences that
+/// need to swap a bootstrap printer (stdout fallback) for the
+/// real one (ExternalPrinter / TUI scrollback) once the real sink
+/// is ready.
+pub fn replace_printer(f: PrinterFn) -> Option<PrinterFn> {
+    let mut g = slot().write().unwrap();
+    g.replace(f)
 }
 
 /// Has a printer been installed? Useful for call sites that want to
 /// skip work when there's no REPL listening.
 pub fn has_printer() -> bool {
-    PRINTER.get().is_some()
+    slot().read().unwrap().is_some()
 }
 
 /// Route a single line through the installed printer, falling back
@@ -42,7 +70,8 @@ pub fn has_printer() -> bool {
 /// newline — the sink appends one.
 pub fn async_println(line: impl Into<String>) {
     let s = line.into();
-    match PRINTER.get() {
+    let g = slot().read().unwrap();
+    match g.as_ref() {
         Some(f) => f(s),
         None => eprintln!("{s}"),
     }

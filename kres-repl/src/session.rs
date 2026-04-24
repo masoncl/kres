@@ -57,6 +57,12 @@ pub struct ReplConfig {
     /// When true, skip the persistent status line (no DECSTBM scroll
     /// region). Useful for dumb terminals / pipes / finicky muxers.
     pub stdio: bool,
+    /// Opt into the ratatui TUI (stage 1 of the prompt-line
+    /// migration). When set, [`Session::run`] owns the terminal via
+    /// crossterm instead of rustyline. `stdio` takes precedence —
+    /// `--stdio --tui` still uses the plain path so output
+    /// redirection keeps working.
+    pub tui: bool,
     /// Root for coding-mode file output. Coding tasks emit a
     /// `code_output` array whose paths are relative; the reaper
     /// writes them under this directory (`<workspace>/<path>` —
@@ -84,6 +90,7 @@ impl Default for ReplConfig {
             results_dir: None,
             template_path: None,
             stdio: false,
+            tui: false,
             workspace: PathBuf::from("."),
             persist_path: None,
         }
@@ -412,12 +419,8 @@ impl Session {
                 last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
                 pending_bootstrap: findings,
                 logger: None,
-                task_goals: Arc::new(tokio::sync::Mutex::new(
-                    std::collections::HashMap::new(),
-                )),
-                task_prompts: Arc::new(tokio::sync::Mutex::new(
-                    std::collections::HashMap::new(),
-                )),
+                task_goals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                task_prompts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
@@ -618,17 +621,85 @@ impl Session {
         // the reader waits for the ack before calling readline again.
         // That keeps rustyline from painting "> " on top of a child
         // process (vim) that cmd_edit is running, and keeps it from
-        // racing the main loop in general.
+        // racing the main loop in general. In TUI mode the prompt is
+        // a persistent widget (no readline repaint race), so the ack
+        // is plumbed through but currently unused — kept so the
+        // rustyline and TUI paths share the same signature.
         let (ack_tx, ack_rx) = mpsc::unbounded_channel::<()>();
         *self.input_ack_tx.lock().await = Some(ack_tx);
-        tokio::task::spawn_blocking(move || read_stdin(tx, ack_rx));
+        // --stdio always wins, even if --tui was also passed — so a
+        // redirected-to-file run stays line-buffered and doesn't
+        // enter the alt screen / raw mode.
+        let use_tui = self.cfg.tui && !self.cfg.stdio;
+        if use_tui {
+            let scrollback = crate::tui::Scrollback::new();
+            crate::tui::install_tui_printer(scrollback.clone());
+            // Shared task-snapshot cell. A tokio task refreshes it
+            // every 200 ms; the TUI status closure reads it
+            // synchronously with no block_on / no Handle dance (the
+            // TUI runs under spawn_blocking, off the tokio scheduler,
+            // so calling block_on from there would deadlock or
+            // panic).
+            let snap_cell: Arc<std::sync::Mutex<Vec<kres_core::task::TaskSnapshot>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mgr_for_refresh = self.mgr.clone();
+            let snap_cell_for_refresh = snap_cell.clone();
+            let shutdown_for_refresh = self.mgr.root_shutdown().clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(200));
+                loop {
+                    tokio::select! {
+                        _ = shutdown_for_refresh.cancelled() => break,
+                        _ = ticker.tick() => {
+                            let snap = mgr_for_refresh.snapshot().await;
+                            *snap_cell_for_refresh.lock().unwrap() = snap;
+                        }
+                    }
+                }
+            });
+            let snap_cell_for_status = snap_cell.clone();
+            let status_fn: crate::tui::StatusFn = Box::new(move |cols| {
+                // Render inside the lock — TaskSnapshot isn't Clone,
+                // and render_status_line only reads the slice so
+                // there's no reentrancy risk.
+                let guard = snap_cell_for_status.lock().unwrap();
+                render_status_line(&guard, cols)
+            });
+            // History file — matches the rustyline path at
+            // session.rs:3660. Sharing the same file means Up/Down
+            // recall works across interactive / TUI / --stdio
+            // invocations without per-mode silos.
+            let history_path = dirs::home_dir().map(|h| h.join(".kres").join("history"));
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = crate::tui::run_tui(tx, ack_rx, scrollback, status_fn, history_path)
+                {
+                    eprintln!("tui: {e}");
+                }
+            });
+        } else {
+            // Non-TUI paths (rustyline and --stdio fallback) install
+            // a stdout bootstrap printer BEFORE read_stdin runs so
+            // every migrated `kres_core::async_eprintln!` call site
+            // reaches a real sink from the first line. The rustyline
+            // branch inside read_stdin later `replace_printer`s this
+            // with its ExternalPrinter once the editor finishes
+            // booting, which is what makes the prompt-aware printing
+            // kick in. --stdio keeps the stdout printer for the
+            // whole session so redirected output (`kres --stdio …
+            // > out.txt`) captures everything.
+            crate::tui::install_stdout_printer();
+            tokio::task::spawn_blocking(move || read_stdin(tx, ack_rx));
+        }
 
         // Reserve the bottom two rows for a status bar + prompt.
         // Scrolling output stays above; status shows what each task
         // is currently doing. install() returns geometry only when
         // stderr is a tty and terminal is tall enough (≥3 rows).
         // --stdio forces the plain path even when stdout is a tty.
-        let status_geom = if self.cfg.stdio {
+        // --tui owns the terminal via crossterm, so the DECSTBM
+        // scroll region is suppressed too; the TUI paints its own
+        // status row.
+        let status_geom = if self.cfg.stdio || use_tui {
             None
         } else {
             crate::status::install()
@@ -1009,10 +1080,8 @@ impl Session {
                             // downstream: filter_net_new sees the
                             // full `all_known` and RENAMES colliding
                             // ids rather than dropping them.
-                            let prose_relevant = kres_core::relevant_subset(
-                                &effective_analysis,
-                                &all_known,
-                            );
+                            let prose_relevant =
+                                kres_core::relevant_subset(&effective_analysis, &all_known);
                             // Both slices go to the promoter's
                             // prompt path — redact Finding.details
                             // so the per-task narrative captured for
@@ -1054,8 +1123,7 @@ impl Session {
                                         "[promote] {} prose-only bug(s) promoted to findings",
                                         extras.len()
                                     );
-                                    promoted_ids
-                                        .extend(extras.iter().map(|f| f.id.clone()));
+                                    promoted_ids.extend(extras.iter().map(|f| f.id.clone()));
                                     working_delta.extend(extras);
                                 }
                                 Ok(_) => {}
@@ -1097,12 +1165,8 @@ impl Session {
                     // `redact_findings_for_agent`.
                     if !effective_analysis.is_empty() {
                         if let Some(ref s) = store_for_reaper {
-                            if let Err(e) =
-                                s.append_task_prose(&stamp, &effective_analysis).await
-                            {
-                                kres_core::async_eprintln!(
-                                    "task_prose append: {e}"
-                                );
+                            if let Err(e) = s.append_task_prose(&stamp, &effective_analysis).await {
+                                kres_core::async_eprintln!("task_prose append: {e}");
                             }
                         }
                     }
@@ -1127,7 +1191,8 @@ impl Session {
                             let prose_c = prose_for_details.clone();
                             let report = mgr_for_reaper
                                 .with_findings_extract_lock(|| async move {
-                                    s_c.apply_delta(&delta, Some(&stamp_c), Some(&prose_c)).await
+                                    s_c.apply_delta(&delta, Some(&stamp_c), Some(&prose_c))
+                                        .await
                                 })
                                 .await;
                             match report {
@@ -1660,16 +1725,16 @@ impl Session {
         let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
         print_banner();
         if !self.lenses.is_empty() {
-            println!(
+            kres_core::async_eprintln!(
                 "installed {} session-wide slow-agent lens(es):",
                 self.lenses.len()
             );
             for l in &self.lenses {
-                println!("  [{}] {}", l.kind, l.name);
+                kres_core::async_eprintln!("  [{}] {}", l.kind, l.name);
             }
         }
         if let Some(ref p) = self.initial_prompt {
-            println!("submitting initial prompt from --prompt");
+            kres_core::async_eprintln!("submitting initial prompt from --prompt");
             self.submit_prompt(p.clone()).await;
         }
         let root_shutdown = self.mgr.root_shutdown().clone();
@@ -1758,7 +1823,7 @@ impl Session {
                 Command::Next => self.cmd_next().await,
                 Command::Continue => self.cmd_continue().await,
                 Command::Quit => {
-                    println!("bye");
+                    kres_core::async_eprintln!("bye");
                     // Fast-path teardown. Cancel root so every reaper /
                     // orchestrator / task future awaiting cancellation
                     // wakes up now (instead of waiting for stop_all to
@@ -1773,9 +1838,11 @@ impl Session {
                         .stop_all(std::time::Duration::from_millis(500))
                         .await;
                     if out.requested > 0 {
-                        println!(
+                        kres_core::async_eprintln!(
                             "teardown: {}/{} stopped, {} grace-expired",
-                            out.stopped, out.requested, out.grace_expired
+                            out.stopped,
+                            out.requested,
+                            out.grace_expired
                         );
                     }
                     ctrlc_handle.abort();
@@ -1790,7 +1857,7 @@ impl Session {
                     return Ok(());
                 }
                 Command::Unknown(name) => {
-                    println!("unknown command: /{name} (try /help)");
+                    kres_core::async_eprintln!("unknown command: /{name} (try /help)");
                 }
                 Command::Prompt(text) => {
                     // submit_prompt awaits define_goal inline before
@@ -1848,9 +1915,11 @@ impl Session {
 
         let out = self.mgr.stop_all(self.cfg.stop_grace).await;
         if out.requested > 0 {
-            println!(
+            kres_core::async_eprintln!(
                 "teardown: {}/{} stopped, {} grace-expired",
-                out.stopped, out.requested, out.grace_expired
+                out.stopped,
+                out.requested,
+                out.grace_expired
             );
         }
         ctrlc_handle.abort();
@@ -1913,8 +1982,10 @@ impl Session {
         todo_tag: Option<String>,
     ) {
         let Some(orc) = self.orchestrator.clone() else {
-            println!("(no orchestrator configured — prompt dropped)");
-            println!("hint: rerun `kres repl` with agent configs to enable prompt handling");
+            kres_core::async_eprintln!("(no orchestrator configured — prompt dropped)");
+            kres_core::async_eprintln!(
+                "hint: rerun `kres repl` with agent configs to enable prompt handling"
+            );
             return;
         };
         // Operator engaged — clear the /stop latch so auto-continue
@@ -2210,12 +2281,13 @@ impl Session {
 
     async fn print_tasks(&self) {
         let snap = self.mgr.snapshot().await;
-        if snap.is_empty() {
-            println!("(no tasks)");
-            return;
-        }
-        println!("{} task(s):", snap.len());
-        for t in snap {
+        // Always emit a header so /tasks is visibly acknowledged
+        // even on an empty list. Previously the empty case printed
+        // a bare "(no tasks)" which was easy to miss in a busy
+        // scrollback; the /tasks: prefix makes it obvious this is
+        // the command's response.
+        kres_core::async_eprintln!("/tasks: {} active", snap.len());
+        for t in &snap {
             let badge = match t.state {
                 TaskState::Pending => "pending",
                 TaskState::Running => "running",
@@ -2223,14 +2295,14 @@ impl Session {
                 TaskState::Done => "done",
                 TaskState::Errored => "errored",
             };
-            println!("  [{:>10}] #{}  {}", badge, t.id, t.name);
+            kres_core::async_eprintln!("  [{:>10}] #{}  {}", badge, t.id, t.name);
         }
     }
 
     async fn print_findings(&self) {
         let findings = self.mgr.findings_snapshot().await;
         if findings.is_empty() {
-            println!("(no findings yet)");
+            kres_core::async_eprintln!("(no findings yet)");
             return;
         }
         let (hi, med, lo) = findings.iter().fold((0, 0, 0), |(h, m, l), f| {
@@ -2241,7 +2313,7 @@ impl Session {
                 Low => (h, m, l + 1),
             }
         });
-        println!(
+        kres_core::async_eprintln!(
             "{} findings: {} high, {} medium, {} low",
             findings.len(),
             hi,
@@ -2249,7 +2321,7 @@ impl Session {
             lo
         );
         for f in findings.iter().take(20) {
-            println!(
+            kres_core::async_eprintln!(
                 "  [{:>8?}] {} — {}",
                 f.severity,
                 f.id,
@@ -2257,7 +2329,7 @@ impl Session {
             );
         }
         if findings.len() > 20 {
-            println!("  … {} more", findings.len() - 20);
+            kres_core::async_eprintln!("  … {} more", findings.len() - 20);
         }
     }
 
@@ -2288,7 +2360,7 @@ impl Session {
         let mut deferred = self.deferred.lock().await;
         deferred.extend(drained);
         drop(deferred);
-        println!(
+        kres_core::async_eprintln!(
             "/stop: requested={} stopped={} grace_expired={} (auto-continue paused; {} pending item(s) moved to /followup; /continue or a new prompt resumes)",
             out.requested, out.stopped, out.grace_expired, carry
         );
@@ -2304,7 +2376,7 @@ impl Session {
         // gets their work back before new items start.
         let stashed = self.interrupted_prompt.lock().await.take();
         if let Some(prompt) = stashed {
-            println!(
+            kres_core::async_eprintln!(
                 "/continue: resuming interrupted prompt: {}",
                 truncate(&prompt, 80)
             );
@@ -2331,7 +2403,9 @@ impl Session {
                     items.push(d);
                 }
                 self.mgr.replace_todo(items).await;
-                println!("/continue: pulled {carry} deferred item(s) into todo list");
+                kres_core::async_eprintln!(
+                    "/continue: pulled {carry} deferred item(s) into todo list"
+                );
             }
         }
         // §15: cap the batch at 10 items per `/continue` to match
@@ -2385,7 +2459,7 @@ impl Session {
                 ", {remaining} left — /continue again to process next batch"
             ));
         }
-        println!("{msg}");
+        kres_core::async_eprintln!("{msg}");
     }
 
     async fn cmd_next(&self) {
@@ -2406,9 +2480,9 @@ impl Session {
                 .filter(|i| i.status == TodoStatus::Pending)
                 .count();
             if pending == 0 {
-                println!("/next: nothing pending");
+                kres_core::async_eprintln!("/next: nothing pending");
             } else {
-                println!(
+                kres_core::async_eprintln!(
                     "/next: {} pending item(s) but all are blocked on unfinished deps",
                     pending
                 );
@@ -2425,7 +2499,7 @@ impl Session {
         self.mgr
             .mark_todo_status(&item.name, TodoStatus::InProgress)
             .await;
-        println!("/next: dispatching {}", truncate(&item.name, 80));
+        kres_core::async_eprintln!("/next: dispatching {}", truncate(&item.name, 80));
         let tag = if !item.id.is_empty() {
             item.id.clone()
         } else {
@@ -2442,7 +2516,7 @@ impl Session {
             chrono::Utc::now().timestamp_millis()
         ));
         if let Err(e) = std::fs::write(&tmp, "") {
-            println!("/edit: create tempfile: {e}");
+            kres_core::async_eprintln!("/edit: create tempfile: {e}");
             return;
         }
         // Tear down kres's DECSTBM scroll region (status.rs:50) and
@@ -2486,11 +2560,11 @@ impl Session {
         let content = match status {
             Ok(Ok(_)) => std::fs::read_to_string(&tmp).ok(),
             Ok(Err(e)) => {
-                println!("/edit: editor spawn failed: {e}");
+                kres_core::async_eprintln!("/edit: editor spawn failed: {e}");
                 None
             }
             Err(e) => {
-                println!("/edit: join error: {e}");
+                kres_core::async_eprintln!("/edit: join error: {e}");
                 None
             }
         };
@@ -2500,7 +2574,7 @@ impl Session {
         let Some(text) = content else { return };
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            println!("/edit: empty, nothing submitted");
+            kres_core::async_eprintln!("/edit: empty, nothing submitted");
             return;
         }
         self.submit_prompt(trimmed.to_string()).await;
@@ -2515,11 +2589,13 @@ impl Session {
             (Some(p), false) => format!("{}\n\n{}", p, text),
             (Some(p), true) => p,
             (None, false) => {
-                println!("/reply: no prior analysis — submitting plain text");
+                kres_core::async_eprintln!("/reply: no prior analysis — submitting plain text");
                 text
             }
             (None, true) => {
-                println!("/reply: no prior analysis and no new text — nothing to do");
+                kres_core::async_eprintln!(
+                    "/reply: no prior analysis and no new text — nothing to do"
+                );
                 return;
             }
         };
@@ -2528,32 +2604,40 @@ impl Session {
 
     async fn cmd_load(&self, path: String) {
         if path.is_empty() {
-            println!("usage: /load <path>");
+            kres_core::async_eprintln!("usage: /load <path>");
             return;
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
-                    println!("/load: {} is empty", path);
+                    kres_core::async_eprintln!("/load: {} is empty", path);
                     return;
                 }
-                println!("/load: submitting {} chars from {}", trimmed.len(), path);
+                kres_core::async_eprintln!(
+                    "/load: submitting {} chars from {}",
+                    trimmed.len(),
+                    path
+                );
                 self.submit_prompt(trimmed.to_string()).await;
             }
-            Err(e) => println!("/load: {}: {e}", path),
+            Err(e) => kres_core::async_eprintln!("/load: {}: {e}", path),
         }
     }
 
     async fn cmd_report(&self, path: String) {
         if path.is_empty() {
-            println!("usage: /report <path>.md");
+            kres_core::async_eprintln!("usage: /report <path>.md");
             return;
         }
         let findings = self.mgr.findings_snapshot().await;
         match crate::report::write_findings_to_file(&findings, std::path::Path::new(&path)) {
-            Ok(()) => println!("/report: wrote {} finding(s) to {}", findings.len(), path),
-            Err(e) => println!("/report: {}: {e}", path),
+            Ok(()) => kres_core::async_eprintln!(
+                "/report: wrote {} finding(s) to {}",
+                findings.len(),
+                path
+            ),
+            Err(e) => kres_core::async_eprintln!("/report: {}: {e}", path),
         }
     }
 
@@ -2575,7 +2659,7 @@ impl Session {
             None => {
                 // Derive the backup + live paths from cfg.persist_path.
                 let Some(live) = self.cfg.persist_path.as_ref() else {
-                    println!(
+                    kres_core::async_eprintln!(
                         "/resume: no persist path configured (kres was started \
                          without a results dir)"
                     );
@@ -2586,7 +2670,7 @@ impl Session {
                 let prev_name = match live.file_name() {
                     Some(n) => format!("{}.prev", n.to_string_lossy()),
                     None => {
-                        println!("/resume: persist path has no filename");
+                        kres_core::async_eprintln!("/resume: persist path has no filename");
                         return;
                     }
                 };
@@ -2596,7 +2680,7 @@ impl Session {
                 } else if live.exists() {
                     live.clone()
                 } else {
-                    println!(
+                    kres_core::async_eprintln!(
                         "/resume: neither {} nor {} exists — nothing to load",
                         prev.display(),
                         live.display()
@@ -2607,7 +2691,7 @@ impl Session {
         };
         match self.resume_state_from(Some(&chosen)).await {
             Ok(Some(state)) => {
-                println!(
+                kres_core::async_eprintln!(
                     "/resume: loaded {} ({} todo, {} deferred, turns done={})",
                     chosen.display(),
                     state.todo.len(),
@@ -2615,14 +2699,14 @@ impl Session {
                     state.completed_run_count,
                 );
                 if let Some(ref p) = state.last_prompt {
-                    println!("/resume: last prompt: {}", truncate(p, 80));
+                    kres_core::async_eprintln!("/resume: last prompt: {}", truncate(p, 80));
                 }
             }
             Ok(None) => {
-                println!("/resume: {} is missing or empty", chosen.display());
+                kres_core::async_eprintln!("/resume: {} is missing or empty", chosen.display());
             }
             Err(e) => {
-                println!("/resume: {e}");
+                kres_core::async_eprintln!("/resume: {e}");
             }
         }
     }
@@ -2638,7 +2722,7 @@ impl Session {
         // statuses right now, not whatever the planner last wrote.
         self.mgr.sync_plan_from_todo().await;
         let Some(plan) = self.mgr.plan_snapshot().await else {
-            println!(
+            kres_core::async_eprintln!(
                 "(no plan — either no goal agent configured or define_plan failed on the last prompt)"
             );
             return;
@@ -2650,12 +2734,12 @@ impl Session {
         // the step-side list is often empty while todos actually
         // point at the step via their own step_id field.
         let todo = self.mgr.todo_snapshot().await;
-        println!(
+        kres_core::async_eprintln!(
             "plan — mode={}, {} step(s)",
             plan.mode.as_str(),
             plan.steps.len()
         );
-        println!("goal: {}", truncate(&plan.goal, 120));
+        kres_core::async_eprintln!("goal: {}", truncate(&plan.goal, 120));
         for s in &plan.steps {
             let status = match s.status {
                 kres_core::PlanStepStatus::Pending => "pending",
@@ -2663,9 +2747,9 @@ impl Session {
                 kres_core::PlanStepStatus::Done => "done",
                 kres_core::PlanStepStatus::Skipped => "skipped",
             };
-            println!("  [{}] {:<11}  {}", s.id, status, truncate(&s.title, 80));
+            kres_core::async_eprintln!("  [{}] {:<11}  {}", s.id, status, truncate(&s.title, 80));
             if !s.description.is_empty() {
-                println!("         — {}", truncate(&s.description, 120));
+                kres_core::async_eprintln!("         — {}", truncate(&s.description, 120));
             }
             // Union of step.todo_ids (down-link) and todos whose
             // step_id matches s.id (up-link). Dedup by the todo's
@@ -2701,7 +2785,7 @@ impl Session {
                         }
                     })
                     .collect();
-                println!("         linked: {}", labels.join(", "));
+                kres_core::async_eprintln!("         linked: {}", labels.join(", "));
             }
         }
     }
@@ -2710,13 +2794,15 @@ impl Session {
     /// cap. Matches command.
     async fn cmd_followup(&self) {
         let def = self.deferred.lock().await;
+        // Always emit the banner so /followup is visibly acknowledged
+        // even on an empty list — operators otherwise can't tell
+        // whether the command ran or the main loop was busy.
+        kres_core::async_eprintln!("/followup: {} deferred item(s)", def.len());
         if def.is_empty() {
-            println!("(no deferred items)");
             return;
         }
-        println!("deferred ({}):", def.len());
         for (i, item) in def.iter().enumerate() {
-            println!(
+            kres_core::async_eprintln!(
                 "  {:3}. [{}] {}  ({})",
                 i + 1,
                 item.kind,
@@ -2730,7 +2816,7 @@ impl Session {
                 }
             );
             if !item.reason.is_empty() {
-                println!("       — {}", truncate(&item.reason, 120));
+                kres_core::async_eprintln!("       — {}", truncate(&item.reason, 120));
             }
         }
     }
@@ -2873,7 +2959,7 @@ impl Session {
         let dir_buf = dir.as_ref().map(std::path::PathBuf::from);
         if let Some(ref d) = dir_buf {
             if let Err(e) = std::fs::create_dir_all(d) {
-                println!("/extract: create {}: {e}", d.display());
+                kres_core::async_eprintln!("/extract: create {}: {e}", d.display());
                 return;
             }
         }
@@ -2887,12 +2973,12 @@ impl Session {
         if let Some(p) = resolve("report.md", report.as_ref()) {
             let findings = self.mgr.findings_snapshot().await;
             match crate::report::write_findings_to_file(&findings, &p) {
-                Ok(()) => println!(
+                Ok(()) => kres_core::async_eprintln!(
                     "/extract: wrote {} finding(s) to {}",
                     findings.len(),
                     p.display()
                 ),
-                Err(e) => println!("/extract: report {}: {e}", p.display()),
+                Err(e) => kres_core::async_eprintln!("/extract: report {}: {e}", p.display()),
             }
         }
         // Todo: write current todo list (pending+done) as markdown.
@@ -2912,8 +2998,12 @@ impl Session {
                 md.push('\n');
             }
             match std::fs::write(&p, md) {
-                Ok(()) => println!("/extract: wrote {} todo(s) to {}", items.len(), p.display()),
-                Err(e) => println!("/extract: todo {}: {e}", p.display()),
+                Ok(()) => kres_core::async_eprintln!(
+                    "/extract: wrote {} todo(s) to {}",
+                    items.len(),
+                    p.display()
+                ),
+                Err(e) => kres_core::async_eprintln!("/extract: todo {}: {e}", p.display()),
             }
         }
         // Findings: dump the structured JSON.
@@ -2921,14 +3011,14 @@ impl Session {
             let list = self.mgr.findings_snapshot().await;
             match serde_json::to_string_pretty(&list) {
                 Ok(s) => match std::fs::write(&p, s) {
-                    Ok(()) => println!(
+                    Ok(()) => kres_core::async_eprintln!(
                         "/extract: wrote {} finding(s) to {}",
                         list.len(),
                         p.display()
                     ),
-                    Err(e) => println!("/extract: findings {}: {e}", p.display()),
+                    Err(e) => kres_core::async_eprintln!("/extract: findings {}: {e}", p.display()),
                 },
-                Err(e) => println!("/extract: findings serialise: {e}"),
+                Err(e) => kres_core::async_eprintln!("/extract: findings serialise: {e}"),
             }
         }
     }
@@ -2936,7 +3026,7 @@ impl Session {
     /// `/done N` — remove the N'th (1-based) pending todo item.
     async fn cmd_done(&self, index: usize) {
         if index == 0 {
-            println!("/done: 1-based index expected");
+            kres_core::async_eprintln!("/done: 1-based index expected");
             return;
         }
         let items = self.mgr.todo_snapshot().await;
@@ -2950,7 +3040,7 @@ impl Session {
             })
             .collect();
         if index > pending.len() {
-            println!(
+            kres_core::async_eprintln!(
                 "/done: index {} out of range ({} pending)",
                 index,
                 pending.len()
@@ -2963,7 +3053,7 @@ impl Session {
             .filter(|t| t.name != target_name)
             .collect();
         self.mgr.replace_todo(new_list).await;
-        println!("/done: removed {}", truncate(&target_name, 80));
+        kres_core::async_eprintln!("/done: removed {}", truncate(&target_name, 80));
     }
 
     /// §46: decide whether the idle loop should auto-launch a
@@ -2996,16 +3086,12 @@ impl Session {
     /// `/todo --clear` — drop every todo item.
     async fn cmd_todo_clear(&self) {
         self.mgr.replace_todo(Vec::new()).await;
-        println!("/todo: cleared");
+        kres_core::async_eprintln!("/todo: cleared");
     }
 
     async fn print_todo(&self) {
         use kres_core::TodoStatus;
         let items = self.mgr.todo_snapshot().await;
-        if items.is_empty() {
-            println!("(todo list empty)");
-            return;
-        }
         let pending = items
             .iter()
             .filter(|i| i.status == TodoStatus::Pending)
@@ -3018,8 +3104,12 @@ impl Session {
             .iter()
             .filter(|i| i.status == TodoStatus::Done)
             .count();
-        println!(
-            "{} todo item(s): {} pending, {} running, {} done",
+        // Always emit the banner so /todo is visibly acknowledged
+        // even on an empty list — the "/todo:" prefix also makes
+        // the response identifiable in a busy scrollback full of
+        // agent output.
+        kres_core::async_eprintln!(
+            "/todo: {} item(s) ({} pending, {} running, {} done)",
             items.len(),
             pending,
             running,
@@ -3033,25 +3123,25 @@ impl Session {
                 TodoStatus::Blocked => "blocked",
                 TodoStatus::Skipped => "skipped",
             };
-            println!("  [{:>7}] [{}] {}", badge, i.kind, i.name);
+            kres_core::async_eprintln!("  [{:>7}] [{}] {}", badge, i.kind, i.name);
         }
         if items.len() > 30 {
-            println!("  … {} more", items.len() - 30);
+            kres_core::async_eprintln!("  … {} more", items.len() - 30);
         }
     }
 
     fn print_cost(&self) {
         let snap = self.usage.snapshot();
         if snap.is_empty() {
-            println!("(no API usage recorded yet)");
+            kres_core::async_eprintln!("(no API usage recorded yet)");
             return;
         }
         let total = self.usage.totals();
         // Show per-row input/output and cache-create/cache-read,
         // plus a total line.
-        println!("usage ({} call(s) total):", total.calls);
+        kres_core::async_eprintln!("usage ({} call(s) total):", total.calls);
         for (k, e) in &snap {
-            println!(
+            kres_core::async_eprintln!(
                 "  {:>4}/{:<24}  {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
                 k.role,
                 k.model,
@@ -3062,7 +3152,7 @@ impl Session {
                 fmt_k(e.cache_read_input_tokens),
             );
         }
-        println!(
+        kres_core::async_eprintln!(
             "  total         {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
             total.calls,
             fmt_k(total.input_tokens),
@@ -3090,7 +3180,7 @@ impl Session {
         // prompt on a different topic could quietly read paths the
         // operator forgot they'd allowed.
         let dropped_grants = kres_core::consent::get().map(|s| s.clear()).unwrap_or(0);
-        println!(
+        kres_core::async_eprintln!(
             "/clear: stopped {} task(s), reset findings + todo + accumulated context, dropped {} consent grant(s)",
             out.stopped + out.grace_expired,
             dropped_grants
@@ -3105,14 +3195,14 @@ impl Session {
     async fn cmd_compact(&self) {
         let entries = self.accumulated.lock().await.clone();
         if entries.len() <= 1 {
-            println!(
+            kres_core::async_eprintln!(
                 "/compact: nothing to compact (ledger has {} entry)",
                 entries.len()
             );
             return;
         }
         let Some(orc) = self.orchestrator.as_ref() else {
-            println!("/compact: no orchestrator configured");
+            kres_core::async_eprintln!("/compact: no orchestrator configured");
             return;
         };
         // Build the inference request: feed every accumulated entry
@@ -3134,7 +3224,7 @@ impl Session {
         let body = match serde_json::to_string_pretty(&request) {
             Ok(s) => s,
             Err(e) => {
-                println!("/compact: serialise failed: {e}");
+                kres_core::async_eprintln!("/compact: serialise failed: {e}");
                 return;
             }
         };
@@ -3159,7 +3249,9 @@ impl Session {
         let resp = match orc.fast_client.messages_streaming(&cfg, &messages).await {
             Ok(r) => r,
             Err(e) => {
-                println!("/compact: fast-agent call failed: {e}; ledger unchanged");
+                kres_core::async_eprintln!(
+                    "/compact: fast-agent call failed: {e}; ledger unchanged"
+                );
                 return;
             }
         };
@@ -3208,7 +3300,7 @@ impl Session {
         let summary = match summary {
             Some(s) => s,
             None => {
-                println!(
+                kres_core::async_eprintln!(
                     "/compact: could not parse a summary from the fast agent; ledger unchanged"
                 );
                 return;
@@ -3221,7 +3313,7 @@ impl Session {
         };
         let mut guard = self.accumulated.lock().await;
         *guard = vec![replaced];
-        println!(
+        kres_core::async_eprintln!(
             "/compact: replaced {before} entry(s) with a {}-char summary",
             summary.len()
         );
@@ -3618,7 +3710,7 @@ async fn persist_code_output(workspace: &Path, task_name: &str, files: &[kres_co
 fn report_reaped(r: &kres_core::ReapedTask) {
     match r.state {
         kres_core::TaskState::Done => {
-            println!(
+            kres_core::async_eprintln!(
                 "== done #{} {} ({} findings, {} char analysis)",
                 r.id,
                 truncate(&r.name, 60),
@@ -3631,13 +3723,13 @@ fn report_reaped(r: &kres_core::ReapedTask) {
             // past and then ... nothing. Full body on stdout matches
             // the 's behaviour.
             if !r.analysis.is_empty() {
-                println!();
-                println!("{}", r.analysis);
-                println!();
+                kres_core::async_eprintln!("");
+                kres_core::async_eprintln!("{}", r.analysis);
+                kres_core::async_eprintln!("");
             }
         }
         kres_core::TaskState::Errored => {
-            println!(
+            kres_core::async_eprintln!(
                 "== error #{} {} — {}",
                 r.id,
                 truncate(&r.name, 60),
@@ -3670,7 +3762,12 @@ fn read_stdin(tx: mpsc::UnboundedSender<String>, mut ack_rx: mpsc::UnboundedRece
     // async_println without a kres-repl dep.
     if let Ok(mut printer) = editor.create_external_printer() {
         let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let _ = kres_core::io::install_printer(Box::new(move |s| {
+        // `replace_printer` rather than `install_printer`: the
+        // caller in Session::run already installed a stdout-
+        // bootstrap printer so `print_banner` and friends had a
+        // sink. Now that the ExternalPrinter is ready, take over so
+        // subsequent lines arrive through the prompt-aware channel.
+        kres_core::io::replace_printer(Box::new(move |s| {
             let _ = ptx.send(s);
         }));
         std::thread::spawn(move || {
@@ -3789,42 +3886,64 @@ fn print_banner() {
     // (see main.rs). Here we emit the header + the quick-command
     // hint — the per-run context (skills, artifacts dir, etc.) is
     // already on stderr by the time the REPL loop starts.
-    println!("kres — kernel code research agent");
-    println!("type /help for commands, /quit to exit");
-    println!("ctrl-g: editor  |  /clear: reset  |  /quit: exit");
+    kres_core::async_eprintln!("kres — kernel code research agent");
+    kres_core::async_eprintln!("type /help for commands, /quit to exit");
+    kres_core::async_eprintln!("ctrl-g: editor  |  /clear: reset  |  /quit: exit");
 }
 
 fn print_help() {
-    println!("commands:");
-    println!("  /help, /?              show this help");
-    println!("  /tasks, /task          list running tasks");
-    println!("  /findings              summarise findings");
-    println!("  /stop                  cancel running tasks");
-    println!("  /clear                 stop tasks, reset findings + todo + accumulated context");
-    println!("  /compact               summarise accumulated context into one short entry");
-    println!("  /cost                  show API token usage");
-    println!("  /todo                  show the todo list");
-    println!("  /plan                  show the current plan (produced by define_plan)");
-    println!("  /resume [PATH]         load a persisted session.json (backup, live, or PATH)");
-    println!("  /report <path>         write findings report (markdown)");
-    println!("  /load <path>           submit a file's contents as the next prompt");
-    println!("  /edit                  open $EDITOR on a scratch file, submit on save");
-    println!("  /followup              list items deferred by goal/--turns");
-    println!(
+    kres_core::async_eprintln!("commands:");
+    kres_core::async_eprintln!("  /help, /?              show this help");
+    kres_core::async_eprintln!("  /tasks, /task          list running tasks");
+    kres_core::async_eprintln!("  /findings              summarise findings");
+    kres_core::async_eprintln!("  /stop                  cancel running tasks");
+    kres_core::async_eprintln!(
+        "  /clear                 stop tasks, reset findings + todo + accumulated context"
+    );
+    kres_core::async_eprintln!(
+        "  /compact               summarise accumulated context into one short entry"
+    );
+    kres_core::async_eprintln!("  /cost                  show API token usage");
+    kres_core::async_eprintln!("  /todo                  show the todo list");
+    kres_core::async_eprintln!(
+        "  /plan                  show the current plan (produced by define_plan)"
+    );
+    kres_core::async_eprintln!(
+        "  /resume [PATH]         load a persisted session.json (backup, live, or PATH)"
+    );
+    kres_core::async_eprintln!("  /report <path>         write findings report (markdown)");
+    kres_core::async_eprintln!(
+        "  /load <path>           submit a file's contents as the next prompt"
+    );
+    kres_core::async_eprintln!(
+        "  /edit                  open $EDITOR on a scratch file, submit on save"
+    );
+    kres_core::async_eprintln!("  /followup              list items deferred by goal/--turns");
+    kres_core::async_eprintln!(
         "  /review <target>       compose the embedded `review` template with <target> and submit"
     );
-    println!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
-    println!("  /summary-markdown [FILE]  render the markdown variant (default summary.md)");
-    println!("  /extract ...           copy artifacts (--dir, --report, --todo, --findings)");
-    println!("  /done N                remove the N'th pending todo");
-    println!("  /todo --clear          drop every todo item");
-    println!("  /reply <text>          prepend last analysis to new text, submit");
-    println!("  /next                  dispatch the next pending todo item as a prompt");
-    println!("  /continue              dispatch every unblocked pending todo");
-    println!("  /quit, /exit           leave the REPL");
-    println!("  <anything else>        submit as a prompt");
-    println!();
-    println!("override slash-command templates by dropping a file at ~/.kres/commands/<name>.md");
+    kres_core::async_eprintln!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
+    kres_core::async_eprintln!(
+        "  /summary-markdown [FILE]  render the markdown variant (default summary.md)"
+    );
+    kres_core::async_eprintln!(
+        "  /extract ...           copy artifacts (--dir, --report, --todo, --findings)"
+    );
+    kres_core::async_eprintln!("  /done N                remove the N'th pending todo");
+    kres_core::async_eprintln!("  /todo --clear          drop every todo item");
+    kres_core::async_eprintln!(
+        "  /reply <text>          prepend last analysis to new text, submit"
+    );
+    kres_core::async_eprintln!(
+        "  /next                  dispatch the next pending todo item as a prompt"
+    );
+    kres_core::async_eprintln!("  /continue              dispatch every unblocked pending todo");
+    kres_core::async_eprintln!("  /quit, /exit           leave the REPL");
+    kres_core::async_eprintln!("  <anything else>        submit as a prompt");
+    kres_core::async_eprintln!("");
+    kres_core::async_eprintln!(
+        "override slash-command templates by dropping a file at ~/.kres/commands/<name>.md"
+    );
 }
 
 fn truncate(s: &str, n: usize) -> String {

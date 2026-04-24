@@ -125,9 +125,7 @@ pub fn run_export_index(dir: &Path) -> Result<PathBuf> {
         ));
     }
     let mut rows: Vec<IndexRow> = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() {
             continue;
@@ -142,11 +140,8 @@ pub fn run_export_index(dir: &Path) -> Result<PathBuf> {
             tag: entry.file_name().to_string_lossy().into_owned(),
             id: top_level_scalar(&yaml, "id").unwrap_or_default(),
             title: top_level_scalar(&yaml, "title").unwrap_or_default(),
-            severity: parse_severity(
-                top_level_scalar(&yaml, "severity").as_deref().unwrap_or(""),
-            ),
-            status: top_level_scalar(&yaml, "status")
-                .unwrap_or_else(|| "active".to_string()),
+            severity: parse_severity(top_level_scalar(&yaml, "severity").as_deref().unwrap_or("")),
+            status: top_level_scalar(&yaml, "status").unwrap_or_else(|| "active".to_string()),
             date: top_level_scalar(&yaml, "date"),
         });
     }
@@ -217,10 +212,7 @@ fn top_level_scalar(yaml: &str, key: &str) -> Option<String> {
             continue;
         };
         let rest = rest.trim();
-        if let Some(inner) = rest
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-        {
+        if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
             return Some(unquote_yaml(inner));
         }
         return Some(rest.to_string());
@@ -260,12 +252,14 @@ fn render_index(rows: &[IndexRow]) -> String {
         out.push_str("(no findings)\n");
         return out;
     }
-    let (h, m, l, u) = rows.iter().fold((0, 0, 0, 0), |(h, m, l, u), r| match r.severity {
-        Some(Severity::High) => (h + 1, m, l, u),
-        Some(Severity::Medium) => (h, m + 1, l, u),
-        Some(Severity::Low) => (h, m, l + 1, u),
-        None => (h, m, l, u + 1),
-    });
+    let (h, m, l, u) = rows
+        .iter()
+        .fold((0, 0, 0, 0), |(h, m, l, u), r| match r.severity {
+            Some(Severity::High) => (h + 1, m, l, u),
+            Some(Severity::Medium) => (h, m + 1, l, u),
+            Some(Severity::Low) => (h, m, l + 1, u),
+            None => (h, m, l, u + 1),
+        });
     out.push_str(&format!(
         "{} finding(s): {} high, {} medium, {} low",
         rows.len(),
@@ -313,7 +307,10 @@ fn escape_md_table_cell(s: &str) -> String {
 /// `~/.kres/prompts/` so we don't crowd the slash-commands namespace.
 fn load_metadata_template() -> String {
     if let Some(home) = dirs::home_dir() {
-        let p = home.join(".kres").join("prompts").join("export-metadata.yaml");
+        let p = home
+            .join(".kres")
+            .join("prompts")
+            .join("export-metadata.yaml");
         if let Ok(s) = std::fs::read_to_string(&p) {
             if !s.trim().is_empty() {
                 return s;
@@ -385,12 +382,7 @@ fn run_git(workspace: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-fn write_metadata_yaml(
-    path: &Path,
-    f: &Finding,
-    git: &GitHead,
-    template: &str,
-) -> Result<()> {
+fn write_metadata_yaml(path: &Path, f: &Finding, git: &GitHead, template: &str) -> Result<()> {
     let ctx = build_context(f, git);
     let body = render(template, &ctx);
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
@@ -442,7 +434,10 @@ fn build_context(f: &Finding, git: &GitHead) -> Ctx {
     let mut c: Ctx = BTreeMap::new();
     c.insert("id".into(), Value::Scalar(f.id.clone()));
     c.insert("title".into(), Value::Scalar(f.title.clone()));
-    c.insert("severity".into(), Value::Scalar(severity_str(f.severity).into()));
+    c.insert(
+        "severity".into(),
+        Value::Scalar(severity_str(f.severity).into()),
+    );
     c.insert("status".into(), Value::Scalar(status_str(f.status).into()));
     c.insert("git_sha".into(), Value::Scalar(git.sha.clone()));
     c.insert("git_subject".into(), Value::Scalar(git.subject.clone()));
@@ -466,7 +461,10 @@ fn build_context(f: &Finding, git: &GitHead) -> Ctx {
             c.insert("has_introduced_by".into(), Value::Scalar("1".into()));
             c.insert("introduced_by_sha".into(), Value::Scalar(ib.sha.clone()));
             if !ib.subject.is_empty() {
-                c.insert("has_introduced_by_subject".into(), Value::Scalar("1".into()));
+                c.insert(
+                    "has_introduced_by_subject".into(),
+                    Value::Scalar("1".into()),
+                );
                 c.insert(
                     "introduced_by_subject".into(),
                     Value::Scalar(ib.subject.clone()),
@@ -512,7 +510,10 @@ fn build_context(f: &Finding, git: &GitHead) -> Ctx {
         c.insert("relevant_symbols".into(), Value::Items(items));
     }
     if !f.relevant_file_sections.is_empty() {
-        c.insert("has_relevant_file_sections".into(), Value::Scalar("1".into()));
+        c.insert(
+            "has_relevant_file_sections".into(),
+            Value::Scalar("1".into()),
+        );
         let items = f
             .relevant_file_sections
             .iter()
@@ -601,15 +602,12 @@ fn render_scoped(template: &str, parent: &Ctx, item: Option<&Ctx>) -> String {
         } else {
             (false, tag)
         };
-        match lookup(parent, item, name) {
-            Some(Value::Scalar(s)) => {
-                if raw {
-                    out.push_str(s);
-                } else {
-                    out.push_str(&yaml_scalar(s));
-                }
+        if let Some(Value::Scalar(s)) = lookup(parent, item, name) {
+            if raw {
+                out.push_str(s);
+            } else {
+                out.push_str(&yaml_scalar(s));
             }
-            _ => {}
         }
         i = after;
     }
@@ -1024,9 +1022,9 @@ mod tests {
         ];
         let mut cursor = 0usize;
         for want in order {
-            let hit = body[cursor..]
-                .find(want)
-                .unwrap_or_else(|| panic!("ordering wrong; missing {want} after byte {cursor}\n{body}"));
+            let hit = body[cursor..].find(want).unwrap_or_else(|| {
+                panic!("ordering wrong; missing {want} after byte {cursor}\n{body}")
+            });
             cursor += hit + want.len();
         }
         // Histogram line is present.

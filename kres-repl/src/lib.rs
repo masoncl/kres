@@ -26,6 +26,7 @@ pub mod session;
 pub mod settings;
 pub mod status;
 pub mod summary;
+pub mod tui;
 
 pub use commands::{parse_command, Command};
 pub use export::{run_export, run_export_index, ExportInputs};

@@ -130,8 +130,8 @@ mod tests {
         // or re-run setup.sh.
         let legacy = lookup("slow-code-agent.system.md")
             .expect("legacy basename must resolve via translation");
-        let new = lookup("slow-code-agent-audit.system.md")
-            .expect("new basename must resolve directly");
+        let new =
+            lookup("slow-code-agent-audit.system.md").expect("new basename must resolve directly");
         assert_eq!(legacy, new, "translation must return identical body");
     }
 
@@ -139,8 +139,14 @@ mod tests {
     fn translate_legacy_passes_through_unknown_basenames() {
         // Non-legacy basenames must not be rewritten — the shim is
         // opt-in per entry.
-        assert_eq!(translate_legacy_basename("todo-agent.system.md"), "todo-agent.system.md");
-        assert_eq!(translate_legacy_basename("does-not-exist.md"), "does-not-exist.md");
+        assert_eq!(
+            translate_legacy_basename("todo-agent.system.md"),
+            "todo-agent.system.md"
+        );
+        assert_eq!(
+            translate_legacy_basename("does-not-exist.md"),
+            "does-not-exist.md"
+        );
     }
 
     #[test]

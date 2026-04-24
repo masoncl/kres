@@ -398,13 +398,7 @@ impl Client {
                 Err(e) => {
                     if attempt < MAX_RETRIES && is_transport_retryable(&e) {
                         let wait = backoff_duration(attempt);
-                        log_transport_retry(
-                            "messages_streaming",
-                            attempt,
-                            MAX_RETRIES,
-                            &e,
-                            wait,
-                        );
+                        log_transport_retry("messages_streaming", attempt, MAX_RETRIES, &e, wait);
                         tokio::time::sleep(wait).await;
                         continue;
                     }

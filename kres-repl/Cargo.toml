@@ -21,6 +21,12 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 rustyline = "14"
 libc = "0.2"
+# TUI scaffolding (stage 1 of the ratatui migration). Opt-in via
+# `--tui`; the default REPL path still uses rustyline + the DECSTBM
+# status line. `crossterm` is ratatui's default backend and is the
+# source of the keyboard/resize event stream the TUI polls.
+ratatui = "0.29"
+crossterm = "0.28"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

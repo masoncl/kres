@@ -600,10 +600,8 @@ mod tests {
         // here so a future change to the deserialize policy
         // (e.g. tolerating unknown modes) doesn't silently break
         // the outer fallback.
-        let r: Option<DefineResponse> = extract_json_with_key(
-            r#"{"goal": "check x", "mode": "investigation"}"#,
-            "goal",
-        );
+        let r: Option<DefineResponse> =
+            extract_json_with_key(r#"{"goal": "check x", "mode": "investigation"}"#, "goal");
         assert!(r.is_none(), "unparseable mode collapses entire reply");
     }
 
@@ -632,7 +630,10 @@ mod tests {
         let plan = sample_plan();
         let r = build_define_goal_request("tree.c CPU hotplug", Some(&plan));
         let obj = r.as_object().unwrap();
-        assert_eq!(obj.get("task").and_then(|v| v.as_str()), Some("define_goal"));
+        assert_eq!(
+            obj.get("task").and_then(|v| v.as_str()),
+            Some("define_goal")
+        );
         let plan_v = obj.get("plan").expect("plan should be embedded");
         assert_eq!(
             plan_v.get("prompt").and_then(|v| v.as_str()),
@@ -792,12 +793,8 @@ mod tests {
     fn build_plan_titleless_slug_falls_back_to_step_n() {
         // A title that contains no slug-able characters falls back
         // to `step-<N>` so the plan is never left with an empty id.
-        let plan = build_plan_from_raw(
-            vec![step_raw("", "!!!")],
-            "prompt",
-            "goal",
-            TaskMode::Audit,
-        );
+        let plan =
+            build_plan_from_raw(vec![step_raw("", "!!!")], "prompt", "goal", TaskMode::Audit);
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].id, "step-1");
     }

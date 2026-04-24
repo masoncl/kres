@@ -213,7 +213,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
         .collect();
     active.sort_by(|a, b| severity_rank(b.severity).cmp(&severity_rank(a.severity)));
 
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: {} active finding(s) (filtered {} invalidated), {} task_prose entry(s)",
         active.len(),
         file.findings.len() - active.len(),
@@ -231,7 +231,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     // so the condense calls and logs stay stable across runs on the
     // same input.
     let (task_order, mut tasks) = bucket_task_material(&active, &file);
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: {} distinct task id(s) contributing material",
         task_order.len()
     );
@@ -267,7 +267,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     // 5. Render pass. Resolve the template once; reuse it for the
     // single-shot attempt and any partial renders below.
     let (template_src, template_text) = resolve_template(&inputs)?;
-    eprintln!("summary: template = {}", template_src);
+    kres_core::async_eprintln!("summary: template = {}", template_src);
 
     let mut render_cfg = CallConfig::defaults_for(inputs.model.clone())
         .with_max_tokens(inputs.max_tokens)
@@ -289,15 +289,11 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     // The observations block is typically small relative to
     // findings bodies — we always send it whole alongside every
     // render call (single-shot and each partial).
-    let full_prompt = build_render_prompt(
-        original_prompt,
-        &render_findings,
-        &task_observations,
-        None,
-    )?;
+    let full_prompt =
+        build_render_prompt(original_prompt, &render_findings, &task_observations, None)?;
     let full_messages = vec![user_message(&full_prompt)];
     let size = size_call(&inputs.client, &render_cfg, &full_messages, budget).await;
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: render sizing findings={} observations_chars={} tokens={:?} budget={}",
         render_findings.len(),
         task_observations.len(),
@@ -307,13 +303,23 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
 
     let needs_staging = size.map(|t| t > budget as u64).unwrap_or(false);
     let text = if !needs_staging {
-        eprintln!(
+        kres_core::async_eprintln!(
             "summary: single-shot render to {} ({} finding(s), original_prompt={})",
             inputs.model.id,
             render_findings.len(),
-            if original_prompt.is_empty() { "no" } else { "yes" },
+            if original_prompt.is_empty() {
+                "no"
+            } else {
+                "yes"
+            },
         );
-        call_and_extract(&inputs.client, &render_cfg, &full_messages, "summary render").await?
+        call_and_extract(
+            &inputs.client,
+            &render_cfg,
+            &full_messages,
+            "summary render",
+        )
+        .await?
     } else {
         stage_render(
             &inputs,
@@ -338,7 +344,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     }
     std::fs::write(&inputs.output_path, &text)
         .with_context(|| format!("writing summary to {}", inputs.output_path.display()))?;
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: wrote {} chars to {}",
         text.len(),
         inputs.output_path.display(),
@@ -366,10 +372,11 @@ fn bucket_task_material(
             if seen.insert(d.task.clone()) {
                 order.push(d.task.clone());
             }
-            out.entry(d.task.clone())
-                .or_default()
-                .per_finding
-                .push((f.id.clone(), f.title.clone(), d.analysis.clone()));
+            out.entry(d.task.clone()).or_default().per_finding.push((
+                f.id.clone(),
+                f.title.clone(),
+                d.analysis.clone(),
+            ));
         }
     }
 
@@ -421,7 +428,7 @@ async fn condense_tasks_batched(
 
     for (idx, task_id) in task_order.iter().enumerate() {
         let material = tasks.remove(task_id).unwrap_or_default();
-        eprintln!(
+        kres_core::async_eprintln!(
             "summary: packing task {}/{} id={} findings={} prose_chars={}",
             idx + 1,
             task_order.len(),
@@ -465,7 +472,7 @@ async fn condense_tasks_batched(
             continue;
         }
 
-        eprintln!(
+        kres_core::async_eprintln!(
             "summary: task {} alone exceeds budget; falling back to single-task split",
             truncate(&offender_id, 40),
         );
@@ -488,7 +495,7 @@ async fn condense_tasks_batched(
         blocks.push(block);
     }
 
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: condense produced {} block(s) across {} batch call(s)",
         blocks.len(),
         batch_n,
@@ -529,7 +536,7 @@ async fn flush_batch(
     let prompt = build_batch_condense_prompt(batch)?;
     let messages = vec![user_message(&prompt)];
     let label = format!("summary condense batch {batch_n}");
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: condense batch {} — {} task(s)",
         batch_n,
         batch.len()
@@ -557,7 +564,7 @@ async fn condense_single_task(
     if fits {
         return call_and_extract(client, cfg, &messages, label).await;
     }
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: single-task condense oversize for {} (budget={}); splitting",
         truncate(task_id, 40),
         budget,
@@ -577,8 +584,14 @@ async fn condense_single_task(
         };
         let l1 = format!("{label} 1/2");
         let l2 = format!("{label} 2/2");
-        let a = Box::pin(condense_single_task(client, cfg, task_id, &first, &l1, budget)).await?;
-        let b = Box::pin(condense_single_task(client, cfg, task_id, &second, &l2, budget)).await?;
+        let a = Box::pin(condense_single_task(
+            client, cfg, task_id, &first, &l1, budget,
+        ))
+        .await?;
+        let b = Box::pin(condense_single_task(
+            client, cfg, task_id, &second, &l2, budget,
+        ))
+        .await?;
         let mut joined = a;
         if !joined.ends_with('\n') {
             joined.push('\n');
@@ -594,13 +607,12 @@ async fn condense_single_task(
             per_finding: material.per_finding.clone(),
             prose: String::new(),
         };
-        let stripped_pending: Vec<(String, TaskMaterial)> =
-            vec![(task_id.to_string(), stripped)];
+        let stripped_pending: Vec<(String, TaskMaterial)> = vec![(task_id.to_string(), stripped)];
         let stripped_prompt = build_batch_condense_prompt(&stripped_pending)?;
         let stripped_messages = vec![user_message(&stripped_prompt)];
         let stripped_size = size_call(client, cfg, &stripped_messages, budget).await;
         if stripped_size.map(|t| t <= budget as u64).unwrap_or(true) {
-            eprintln!(
+            kres_core::async_eprintln!(
                 "summary: condense dropping task_prose ({} chars) for {} to fit budget",
                 material.prose.len(),
                 truncate(task_id, 40),
@@ -658,7 +670,7 @@ async fn stage_render(
         budget,
     )
     .await?;
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: staging: {} batch(es) over {} finding(s); rendering partials then combining",
         batches.len(),
         findings.len(),
@@ -667,11 +679,15 @@ async fn stage_render(
     let mut partials = Vec::with_capacity(batches.len());
     for (idx, batch) in batches.iter().enumerate() {
         let note = partial_note(idx + 1, batches.len());
-        let prompt_json =
-            build_render_prompt(original_prompt, batch, task_observations, Some(note.as_str()))?;
+        let prompt_json = build_render_prompt(
+            original_prompt,
+            batch,
+            task_observations,
+            Some(note.as_str()),
+        )?;
         let messages = vec![user_message(&prompt_json)];
         let label = format!("summary render partial {}/{}", idx + 1, batches.len());
-        eprintln!(
+        kres_core::async_eprintln!(
             "summary: partial {}/{} — {} finding(s), observations_chars={}",
             idx + 1,
             batches.len(),
@@ -697,7 +713,7 @@ async fn stage_render(
     }))?;
     let combine_messages = vec![user_message(&combine_json)];
     let combine_size = size_call(&inputs.client, &combine_cfg, &combine_messages, budget).await;
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: combine sizing partials={} tokens={:?} budget={}",
         partials.len(),
         combine_size,
@@ -711,7 +727,7 @@ async fn stage_render(
             ));
         }
     }
-    eprintln!(
+    kres_core::async_eprintln!(
         "summary: combining {} partial(s) into final output",
         partials.len()
     );
@@ -944,7 +960,7 @@ async fn call_and_extract(
             resp.stop_reason
         ));
     }
-    eprintln!(
+    kres_core::async_eprintln!(
         "{stage}: {} chars (usage in={} out={})",
         text.len(),
         resp.usage.input_tokens,
@@ -1116,7 +1132,10 @@ mod tests {
         };
         let (order, map) = bucket_task_material(&findings, &file);
         assert!(order.contains(&"task-prose-only".to_string()));
-        assert_eq!(map.get("task-prose-only").unwrap().prose, "general narrative");
+        assert_eq!(
+            map.get("task-prose-only").unwrap().prose,
+            "general narrative"
+        );
     }
 
     #[test]

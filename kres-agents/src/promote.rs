@@ -376,6 +376,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.is_empty(), "cancel path must return an empty extras list");
+        assert!(
+            out.is_empty(),
+            "cancel path must return an empty extras list"
+        );
     }
 }

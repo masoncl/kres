@@ -372,11 +372,7 @@ impl FindingsStore {
     /// NEVER forwarded to another LLM. Agents see findings via
     /// [`redact_findings_for_agent`] on `&[Finding]`; the
     /// file-level `task_prose` list never enters an agent payload.
-    pub async fn append_task_prose(
-        &self,
-        task: &str,
-        prose: &str,
-    ) -> Result<(), FindingsError> {
+    pub async fn append_task_prose(&self, task: &str, prose: &str) -> Result<(), FindingsError> {
         if prose.is_empty() {
             return Ok(());
         }
@@ -525,9 +521,7 @@ fn merge_into(existing: &mut Finding, incoming: &Finding, task_id: Option<&str>)
             existing.status = Status::Active;
             changed = true;
         }
-    } else if incoming.status == Status::Invalidated
-        && existing.status != Status::Invalidated
-    {
+    } else if incoming.status == Status::Invalidated && existing.status != Status::Invalidated {
         existing.status = Status::Invalidated;
         changed = true;
     }
@@ -1033,7 +1027,10 @@ mod tests {
         reactive.status = Status::Active;
         reactive.reactivate = true;
         reactive.summary = "new evidence reverses it".into();
-        let rep3 = store.apply_delta(&[reactive], Some("t3"), None).await.unwrap();
+        let rep3 = store
+            .apply_delta(&[reactive], Some("t3"), None)
+            .await
+            .unwrap();
         // The reactivation must be counted as such — not folded into
         // the generic "updated" bucket.
         assert_eq!(rep3.reactivated, 1);
@@ -1093,8 +1090,14 @@ mod tests {
         let snap = store.snapshot().await;
         assert!(snap[0].summary.starts_with("a detailed"));
         assert!(snap[0].impact.starts_with("detailed"));
-        assert_eq!(snap[0].mechanism_detail.as_deref(), Some("rich mechanism context"));
-        assert_eq!(snap[0].fix_sketch.as_deref(), Some("rich fix with file:line anchors"));
+        assert_eq!(
+            snap[0].mechanism_detail.as_deref(),
+            Some("rich mechanism context")
+        );
+        assert_eq!(
+            snap[0].fix_sketch.as_deref(),
+            Some("rich fix with file:line anchors")
+        );
         // last_updated_task still advances even when prose didn't win.
         assert_eq!(snap[0].last_updated_task.as_deref(), Some("t2"));
         std::fs::remove_dir_all(&dir).ok();
@@ -1112,7 +1115,10 @@ mod tests {
         rich.summary = "much more detailed summary with concrete specifics".into();
         store.apply_delta(&[rich], Some("t2"), None).await.unwrap();
         let snap = store.snapshot().await;
-        assert_eq!(snap[0].summary, "much more detailed summary with concrete specifics");
+        assert_eq!(
+            snap[0].summary,
+            "much more detailed summary with concrete specifics"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1318,7 +1324,11 @@ mod tests {
         {
             let store = FindingsStore::new(&base).await.unwrap();
             store
-                .apply_delta(&[sample_finding("a"), sample_finding("b")], Some("t1"), None)
+                .apply_delta(
+                    &[sample_finding("a"), sample_finding("b")],
+                    Some("t1"),
+                    None,
+                )
                 .await
                 .unwrap();
             store.db.flush().await;

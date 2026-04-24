@@ -164,9 +164,24 @@ struct ReplArgs {
     /// Plain stdio mode: skip the persistent status-line scroll
     /// region and the DECSTBM fuss. Useful when the terminal is a
     /// pipe, a dumb tty, or something that doesn't handle scroll
-    /// regions (mosh, some tmux configs).
+    /// regions (mosh, some tmux configs). Also the mode to pick when
+    /// redirecting output to a file — `--tui` is ignored when
+    /// `--stdio` is set.
     #[arg(long, default_value_t = false)]
     stdio: bool,
+    /// Force the ratatui TUI on even when stdout isn't a TTY.
+    /// Useful for debugging the TUI rendering path from inside
+    /// `script` or other wrappers. Without `--tui` and without
+    /// `--no-tui`, the TUI is used automatically on a TTY.
+    /// `--stdio` takes precedence when both are set.
+    #[arg(long, default_value_t = false)]
+    tui: bool,
+    /// Force the rustyline-based prompt line — the pre-TUI default.
+    /// Left in as an escape hatch while the TUI shakes out; pass
+    /// this if the ratatui path misbehaves in your terminal. Wins
+    /// over `--tui` when both are set; `--stdio` wins over both.
+    #[arg(long, default_value_t = false)]
+    no_tui: bool,
 
     /// Render a summary from a prior run's report.md +
     /// findings.json and exit without starting the REPL. Uses the
@@ -734,6 +749,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         results_dir: args.results.clone(),
         template_path: args.template.clone(),
         stdio: args.stdio,
+        // TUI is now the default on a TTY. Precedence:
+        // --stdio (plain)  >  --no-tui (rustyline)  >  --tui
+        // (force on)  >  auto (TUI when stdout is a TTY).
+        // Non-TTY stdout defaults to rustyline too, since ratatui
+        // needs a terminal to drive; --tui overrides that.
+        tui: !args.stdio
+            && !args.no_tui
+            && (args.tui || std::io::IsTerminal::is_terminal(&std::io::stdout())),
         workspace: args.workspace.clone(),
         persist_path,
     };

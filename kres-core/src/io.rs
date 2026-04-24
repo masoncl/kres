@@ -89,6 +89,44 @@ macro_rules! async_eprintln {
 }
 
 // ---------------------------------------------------------------
+// Markdown-block sink.
+//
+// The TUI render path can style a markdown body (fences, inline
+// backticks) only if it knows which contiguous lines belong to
+// the block. We expose a second sink callers opt into for those
+// lines; in non-TUI contexts the sink is absent and the body
+// falls through to `async_println` unchanged, so `--stdio > out`
+// stays byte-for-byte identical to today.
+// ---------------------------------------------------------------
+
+pub type MarkdownSinkFn = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
+fn md_slot() -> &'static RwLock<Option<MarkdownSinkFn>> {
+    static SLOT: OnceLock<RwLock<Option<MarkdownSinkFn>>> = OnceLock::new();
+    SLOT.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the markdown-block sink. Only the TUI path calls this;
+/// everyone else leaves the slot empty so `async_println_markdown`
+/// folds into plain `async_println`.
+pub fn install_markdown_sink(f: MarkdownSinkFn) -> Option<MarkdownSinkFn> {
+    let mut g = md_slot().write().unwrap();
+    g.replace(f)
+}
+
+/// Route a markdown body through the TUI sink when one is installed;
+/// otherwise emit the body verbatim via `async_println`. The body
+/// is a single multi-line string — do not split on newlines at the
+/// call site.
+pub fn async_println_markdown(body: &str) {
+    let g = md_slot().read().unwrap();
+    match g.as_ref() {
+        Some(f) => f(body),
+        None => async_println(body.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------
 // Active-streams registry. The REPL status line reads this to show
 // every in-flight Anthropic stream with its current token counts.
 // ---------------------------------------------------------------

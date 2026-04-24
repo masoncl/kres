@@ -3722,9 +3722,16 @@ fn report_reaped(r: &kres_core::ReapedTask) {
             // know about /summary would see agent-traffic lines fly
             // past and then ... nothing. Full body on stdout matches
             // the 's behaviour.
+            //
+            // Route the body through the markdown sink so the TUI
+            // render path can style fenced code / inline backticks
+            // via tui_markdown. The sink is only installed by
+            // `install_tui_printer`; --stdio and rustyline paths
+            // leave it empty and fold straight back to
+            // `async_println`, so their output is unchanged.
             if !r.analysis.is_empty() {
                 kres_core::async_eprintln!("");
-                kres_core::async_eprintln!("{}", r.analysis);
+                kres_core::io::async_println_markdown(&r.analysis);
                 kres_core::async_eprintln!("");
             }
         }

@@ -51,7 +51,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
@@ -180,9 +180,102 @@ pub fn install_tui_printer(scrollback: Scrollback) {
     // other pre-TUI messages; once alt screen is about to take over
     // those stdout writes would blow up the frame, so the TUI
     // scrollback takes ownership here.
+    let sb_print = scrollback.clone();
     kres_core::io::replace_printer(Box::new(move |s| {
-        scrollback.push(&s);
+        sb_print.push(&s);
     }));
+    // Second sink: markdown blocks (slow-agent analysis body). We
+    // bracket the block with sentinel lines the render path
+    // recognises and hands to tui_markdown. Non-TUI contexts don't
+    // install this sink, so `async_println_markdown` folds into
+    // `async_println` and `--stdio` stays byte-identical.
+    let sb_md = scrollback.clone();
+    kres_core::io::install_markdown_sink(Box::new(move |body| {
+        sb_md.push(MD_BLOCK_START);
+        sb_md.push(body);
+        sb_md.push(MD_BLOCK_END);
+    }));
+}
+
+/// Sentinels bracketing a markdown region in the scrollback. The
+/// render loop strips them and hands the enclosed body to
+/// `render_markdown_block`. Plain stdout never sees these — they
+/// only enter the scrollback via the TUI-only sink in
+/// `install_tui_printer`.
+pub const MD_BLOCK_START: &str = "\x01kres-md-block-start\x01";
+pub const MD_BLOCK_END: &str = "\x01kres-md-block-end\x01";
+
+/// Convert a markdown body into styled ratatui `Line`s. Small
+/// in-house renderer — no deps — recognising the three shapes the
+/// slow-agent actually uses: fenced code blocks (```…```, fence
+/// markers in dim cyan, enclosed lines in cyan), 4-space-indented
+/// code blocks (cyan), and inline `code` spans inside prose (cyan).
+/// Everything else renders as a plain `Span`. The slow-agent body
+/// is the only current caller, so scope is deliberately narrow —
+/// no headings, lists, emphasis, or links.
+pub fn render_markdown_block(body: &str) -> Vec<Line<'static>> {
+    let code_style = Style::default().fg(Color::Cyan);
+    let fence_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::DIM);
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut in_fence = false;
+    for line in body.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            // Fence delimiter (open or close). Dim-cyan the marker
+            // itself and flip fence state.
+            out.push(Line::from(Span::styled(line.to_string(), fence_style)));
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            out.push(Line::from(Span::styled(line.to_string(), code_style)));
+            continue;
+        }
+        // 4-space-indented code block (outside a fence).
+        if line.starts_with("    ") && !line.trim().is_empty() {
+            out.push(Line::from(Span::styled(line.to_string(), code_style)));
+            continue;
+        }
+        // Prose line: scan for inline `backtick` spans.
+        out.push(Line::from(split_inline_code(line, code_style)));
+    }
+    out
+}
+
+/// Turn a prose line into a vector of spans, styling anything
+/// between matching backticks as code. Unmatched backticks fall
+/// through as plain text.
+fn split_inline_code(line: &str, code_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let bytes = line.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let Some(open_rel) = line[cursor..].find('`') else {
+            spans.push(Span::raw(line[cursor..].to_string()));
+            break;
+        };
+        let open = cursor + open_rel;
+        // Plain text before the opening backtick.
+        if open > cursor {
+            spans.push(Span::raw(line[cursor..open].to_string()));
+        }
+        let Some(close_rel) = line[open + 1..].find('`') else {
+            // Unmatched: emit the rest as plain text, backtick and
+            // all, so the operator sees literally what the agent
+            // produced rather than silently losing characters.
+            spans.push(Span::raw(line[open..].to_string()));
+            break;
+        };
+        let close = open + 1 + close_rel;
+        spans.push(Span::styled(
+            line[open + 1..close].to_string(),
+            code_style,
+        ));
+        cursor = close + 1;
+    }
+    spans
 }
 
 /// Simple stdout writer used by the default / --stdio paths as a
@@ -938,10 +1031,38 @@ pub fn run_tui(
             // pane with nothing near the prompt, reading as if the
             // command produced nothing.
             let pad = scrollback_rows.saturating_sub(window.len());
-            let body: Vec<Line> = (0..pad)
-                .map(|_| Line::from(""))
-                .chain(window.into_iter().map(Line::from))
-                .collect();
+            // Expand markdown regions: when we hit MD_BLOCK_START,
+            // gather lines until the matching MD_BLOCK_END, feed the
+            // joined body through tui_markdown, and splice its
+            // styled Lines in place of the raw lines. Marker lines
+            // are dropped. A window slice that cuts through a
+            // bracketed region (MD_START before the window, or
+            // MD_END after) falls back to plain rendering for the
+            // visible half — acceptable for a first pass.
+            let mut body: Vec<Line> = (0..pad).map(|_| Line::from("")).collect();
+            let mut i = 0;
+            while i < window.len() {
+                if window[i] == MD_BLOCK_START {
+                    let start = i + 1;
+                    let end = window[start..]
+                        .iter()
+                        .position(|l| l == MD_BLOCK_END)
+                        .map(|p| start + p)
+                        .unwrap_or(window.len());
+                    let block = window[start..end].join("\n");
+                    body.extend(render_markdown_block(&block));
+                    // Skip past MD_END when we found one; otherwise
+                    // we already consumed to the window tail.
+                    i = if end < window.len() { end + 1 } else { end };
+                } else if window[i] == MD_BLOCK_END {
+                    // Dangling close marker (window started
+                    // mid-block); swallow it.
+                    i += 1;
+                } else {
+                    body.push(Line::from(window[i].clone()));
+                    i += 1;
+                }
+            }
             let output = Paragraph::new(body).wrap(Wrap { trim: false });
             f.render_widget(output, chunks[0]);
 
@@ -1400,6 +1521,70 @@ pub fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_plain_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn line_styled_text(line: &Line<'_>, style: Style) -> String {
+        line.spans
+            .iter()
+            .filter(|s| s.style == style)
+            .map(|s| s.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn render_markdown_fenced_block_styles_every_line_including_markers() {
+        let body = "before\n```\ncode a\ncode b\n```\nafter";
+        let lines = render_markdown_block(body);
+        let code_style = Style::default().fg(Color::Cyan);
+        let fence_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::DIM);
+        let texts: Vec<String> = lines.iter().map(line_plain_text).collect();
+        assert_eq!(texts, vec!["before", "```", "code a", "code b", "```", "after"]);
+        // Fence markers are dim-cyan, enclosed lines are plain cyan,
+        // prose lines carry no Cyan styling.
+        assert_eq!(lines[0].spans[0].style, Style::default(), "prose unstyled");
+        assert_eq!(lines[1].spans[0].style, fence_style, "open fence dim");
+        assert_eq!(lines[2].spans[0].style, code_style, "code a");
+        assert_eq!(lines[3].spans[0].style, code_style, "code b");
+        assert_eq!(lines[4].spans[0].style, fence_style, "close fence dim");
+        assert_eq!(lines[5].spans[0].style, Style::default(), "prose after");
+    }
+
+    #[test]
+    fn render_markdown_inline_backticks_emit_mixed_spans() {
+        let body = "see `foo_bar()` and `x` for details";
+        let lines = render_markdown_block(body);
+        assert_eq!(lines.len(), 1);
+        let code_style = Style::default().fg(Color::Cyan);
+        let code_text: String = line_styled_text(&lines[0], code_style);
+        assert_eq!(code_text, "foo_bar()x", "both backticked spans cyan");
+        let full: String = line_plain_text(&lines[0]);
+        assert_eq!(full, "see foo_bar() and x for details");
+    }
+
+    #[test]
+    fn render_markdown_unmatched_backtick_passes_through() {
+        // Don't silently drop characters when the agent emits a
+        // stray backtick — surface what it produced.
+        let body = "backtick: ` alone";
+        let lines = render_markdown_block(body);
+        let full: String = line_plain_text(&lines[0]);
+        assert_eq!(full, "backtick: ` alone");
+    }
+
+    #[test]
+    fn render_markdown_indented_code_outside_fence() {
+        let body = "prose\n    fn foo() {}\nprose";
+        let lines = render_markdown_block(body);
+        let code_style = Style::default().fg(Color::Cyan);
+        assert_eq!(lines[1].spans[0].style, code_style);
+        assert_eq!(lines[0].spans[0].style, Style::default());
+        assert_eq!(lines[2].spans[0].style, Style::default());
+    }
 
     #[test]
     fn scrollback_respects_cap() {

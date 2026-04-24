@@ -3,11 +3,12 @@ function name, commit ref (e.g. `HEAD`), diff, or code snippet
 supplied by the operator. We're doing a deep security and bug
 analysis of that target.
 
-Focus on just the target itself and the supporting code it calls,
-without expanding out into the rest of the kernel. Pay special
-attention to chains of events that trigger obscure bugs.
+Focus on the target provided and the bugs that can be triggered
+by using that target.  Pay special attention to chains of events
+that can trigger obscure bugs, but make sure the bugs somehow
+involve the target.
 
-Find *every* bug you can in the target area. Do not stop after the
+Find *every* bug you can involving the target. Do not stop after the
 first finding. Each lens below must exhaustively enumerate its
 issues — list every distinct defect, not just the worst one. A
 lens that reports only one finding is acceptable only if you are

@@ -40,8 +40,16 @@ pub fn has_printer() -> bool {
 /// Route a single line through the installed printer, falling back
 /// to `eprintln!` when none is set. Do not include a trailing
 /// newline — the sink appends one.
+///
+/// Output is rendered in dimmed ("dark white") style so the running
+/// progress chatter (fast/slow/main rounds, plan steps, fetch
+/// summaries, banner metadata) settles below the eye level of the
+/// task analysis the operator actually wants to read. Lines printed
+/// via plain `println!` (notably the slow-agent analysis body in
+/// `report_reaped`) stay at default brightness.
 pub fn async_println(line: impl Into<String>) {
-    let s = line.into();
+    use owo_colors::OwoColorize;
+    let s = format!("{}", line.into().dimmed());
     match PRINTER.get() {
         Some(f) => f(s),
         None => eprintln!("{s}"),

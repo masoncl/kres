@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 jsondb = "0.4"
+owo-colors = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }

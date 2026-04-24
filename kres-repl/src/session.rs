@@ -14,6 +14,17 @@ use kres_llm::{client::Client, RateLimiter};
 
 use crate::commands::{parse_command, Command};
 
+/// Emit a startup-banner line in dimmed ("dark white") style — mirror
+/// of the `banner!` macro in kres/src/main.rs so banner-shaped lines
+/// originating from inside Session::new (findings store init, etc.)
+/// share the metadata look.
+macro_rules! banner {
+    ($($arg:tt)*) => {{
+        use owo_colors::OwoColorize;
+        kres_core::async_eprintln!("{}", format!($($arg)*).dimmed());
+    }};
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplConfig {
     pub stop_grace: Duration,
@@ -366,7 +377,7 @@ impl Session {
         if let Some(ref p) = cfg.findings_base {
             if let Some(parent) = p.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    kres_core::async_eprintln!(
+                    banner!(
                         "findings: cannot create parent dir {}: {e}",
                         parent.display()
                     );
@@ -378,7 +389,7 @@ impl Session {
             match FindingsStore::new(p.clone()).await {
                 Ok(fs) => findings_store = Some(Arc::new(fs)),
                 Err(e) => {
-                    kres_core::async_eprintln!(
+                    banner!(
                         "findings: store init failed for {}: {e}",
                         p.display()
                     );
@@ -393,7 +404,7 @@ impl Session {
             // the top of `run()`. This preserves the prior behaviour
             // where the first reap tick establishes the in-memory
             // list BEFORE submit_prompt observes a stale snapshot.
-            kres_core::async_eprintln!(
+            banner!(
                 "findings: initialised at turn {} ({} existing)",
                 turn_n,
                 count
@@ -1660,16 +1671,22 @@ impl Session {
         let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
         print_banner();
         if !self.lenses.is_empty() {
+            use owo_colors::OwoColorize;
             println!(
-                "installed {} session-wide slow-agent lens(es):",
-                self.lenses.len()
+                "{}",
+                format!(
+                    "installed {} session-wide slow-agent lens(es):",
+                    self.lenses.len()
+                )
+                .dimmed()
             );
             for l in &self.lenses {
-                println!("  [{}] {}", l.kind, l.name);
+                println!("{}", format!("  [{}] {}", l.kind, l.name).dimmed());
             }
         }
         if let Some(ref p) = self.initial_prompt {
-            println!("submitting initial prompt from --prompt");
+            use owo_colors::OwoColorize;
+            println!("{}", "submitting initial prompt from --prompt".dimmed());
             self.submit_prompt(p.clone()).await;
         }
         let root_shutdown = self.mgr.root_shutdown().clone();
@@ -3791,9 +3808,13 @@ fn print_banner() {
     // (see main.rs). Here we emit the header + the quick-command
     // hint — the per-run context (skills, artifacts dir, etc.) is
     // already on stderr by the time the REPL loop starts.
-    println!("kres — kernel code research agent");
-    println!("type /help for commands, /quit to exit");
-    println!("ctrl-g: editor  |  /clear: reset  |  /quit: exit");
+    use owo_colors::OwoColorize;
+    println!("{}", "kres — kernel code research agent".bold().cyan());
+    println!("{}", "type /help for commands, /quit to exit".dimmed());
+    println!(
+        "{}",
+        "ctrl-g: editor  |  /clear: reset  |  /quit: exit".dimmed()
+    );
 }
 
 fn print_help() {

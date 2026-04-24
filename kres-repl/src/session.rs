@@ -14,6 +14,17 @@ use kres_llm::{client::Client, RateLimiter};
 
 use crate::commands::{parse_command, Command};
 
+/// Emit a startup-banner line in dimmed ("dark white") style — mirror
+/// of the `banner!` macro in kres/src/main.rs so banner-shaped lines
+/// originating from inside Session::new (findings store init, etc.)
+/// share the metadata look.
+macro_rules! banner {
+    ($($arg:tt)*) => {{
+        use owo_colors::OwoColorize;
+        kres_core::async_eprintln!("{}", format!($($arg)*).dimmed());
+    }};
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplConfig {
     pub stop_grace: Duration,
@@ -366,7 +377,7 @@ impl Session {
         if let Some(ref p) = cfg.findings_base {
             if let Some(parent) = p.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    kres_core::async_eprintln!(
+                    banner!(
                         "findings: cannot create parent dir {}: {e}",
                         parent.display()
                     );
@@ -378,7 +389,7 @@ impl Session {
             match FindingsStore::new(p.clone()).await {
                 Ok(fs) => findings_store = Some(Arc::new(fs)),
                 Err(e) => {
-                    kres_core::async_eprintln!(
+                    banner!(
                         "findings: store init failed for {}: {e}",
                         p.display()
                     );
@@ -393,7 +404,7 @@ impl Session {
             // the top of `run()`. This preserves the prior behaviour
             // where the first reap tick establishes the in-memory
             // list BEFORE submit_prompt observes a stale snapshot.
-            kres_core::async_eprintln!(
+            banner!(
                 "findings: initialised at turn {} ({} existing)",
                 turn_n,
                 count
@@ -1660,16 +1671,22 @@ impl Session {
         let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
         print_banner();
         if !self.lenses.is_empty() {
+            use owo_colors::OwoColorize;
             println!(
-                "installed {} session-wide slow-agent lens(es):",
-                self.lenses.len()
+                "{}",
+                format!(
+                    "installed {} session-wide slow-agent lens(es):",
+                    self.lenses.len()
+                )
+                .dimmed()
             );
             for l in &self.lenses {
-                println!("  [{}] {}", l.kind, l.name);
+                println!("{}", format!("  [{}] {}", l.kind, l.name).dimmed());
             }
         }
         if let Some(ref p) = self.initial_prompt {
-            println!("submitting initial prompt from --prompt");
+            use owo_colors::OwoColorize;
+            println!("{}", "submitting initial prompt from --prompt".dimmed());
             self.submit_prompt(p.clone()).await;
         }
         let root_shutdown = self.mgr.root_shutdown().clone();
@@ -2011,11 +2028,19 @@ impl Session {
             if let Some(gc) = &self.goal_client {
                 match kres_agents::define_goal(gc, &text, existing_plan.as_ref()).await {
                     Some(def) => {
-                        kres_core::async_eprintln!(
-                            "goal ({}): {}",
-                            def.mode.as_str(),
-                            truncate(&def.goal, 160)
-                        );
+                        {
+                            use owo_colors::OwoColorize;
+                            kres_core::async_eprintln!(
+                                "{}",
+                                format!(
+                                    "goal ({}): {}",
+                                    def.mode.as_str(),
+                                    truncate(&def.goal, 160)
+                                )
+                                .bold()
+                                .yellow()
+                            );
+                        }
                         (Some(def.goal), def.mode)
                     }
                     None => (None, kres_agents::TaskMode::default()),
@@ -3617,6 +3642,58 @@ async fn persist_code_output(workspace: &Path, task_name: &str, files: &[kres_co
     );
 }
 
+/// Colorize markdown-ish code in slow-agent analysis output:
+/// fenced ```...``` blocks (and 4-space-indented blocks) render in
+/// cyan; fence markers in dim cyan; inline `code` spans in cyan.
+/// Prose lines are left untouched.
+fn colorize_markdown_code(s: &str) -> String {
+    use owo_colors::OwoColorize;
+    let mut out = String::with_capacity(s.len());
+    let mut in_fence = false;
+    for line in s.split_inclusive('\n') {
+        let trimmed_end = line.trim_end_matches('\n');
+        let nl = &line[trimmed_end.len()..];
+        if trimmed_end.trim_start().starts_with("```") {
+            out.push_str(&format!("{}", trimmed_end.dimmed().cyan()));
+            out.push_str(nl);
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed_end.starts_with("    ") {
+            out.push_str(&format!("{}", trimmed_end.cyan()));
+            out.push_str(nl);
+            continue;
+        }
+        out.push_str(&colorize_inline_code(trimmed_end));
+        out.push_str(nl);
+    }
+    out
+}
+
+/// Tint `code` spans inside a single prose line cyan.
+fn colorize_inline_code(line: &str) -> String {
+    use owo_colors::OwoColorize;
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find('`') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('`') {
+            Some(end) => {
+                let span = &after[..end];
+                out.push_str(&format!("{}", format!("`{span}`").cyan()));
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn report_reaped(r: &kres_core::ReapedTask) {
     match r.state {
         kres_core::TaskState::Done => {
@@ -3634,7 +3711,7 @@ fn report_reaped(r: &kres_core::ReapedTask) {
             // the 's behaviour.
             if !r.analysis.is_empty() {
                 println!();
-                println!("{}", r.analysis);
+                println!("{}", colorize_markdown_code(&r.analysis));
                 println!();
             }
         }
@@ -3791,9 +3868,13 @@ fn print_banner() {
     // (see main.rs). Here we emit the header + the quick-command
     // hint — the per-run context (skills, artifacts dir, etc.) is
     // already on stderr by the time the REPL loop starts.
-    println!("kres — kernel code research agent");
-    println!("type /help for commands, /quit to exit");
-    println!("ctrl-g: editor  |  /clear: reset  |  /quit: exit");
+    use owo_colors::OwoColorize;
+    println!("{}", "kres — kernel code research agent".bold().cyan());
+    println!("{}", "type /help for commands, /quit to exit".dimmed());
+    println!(
+        "{}",
+        "ctrl-g: editor  |  /clear: reset  |  /quit: exit".dimmed()
+    );
 }
 
 fn print_help() {

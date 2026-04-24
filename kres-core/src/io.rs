@@ -40,8 +40,28 @@ pub fn has_printer() -> bool {
 /// Route a single line through the installed printer, falling back
 /// to `eprintln!` when none is set. Do not include a trailing
 /// newline — the sink appends one.
+///
+/// Output is rendered in dimmed ("dark white") style so the running
+/// progress chatter (fast/slow/main rounds, plan steps, fetch
+/// summaries, banner metadata) settles below the eye level of the
+/// task analysis the operator actually wants to read. Lines printed
+/// via plain `println!` (notably the slow-agent analysis body in
+/// `report_reaped`) stay at default brightness.
+///
+/// Callers that want a line to *escape* the dim treatment (a
+/// "headline" event like the goal definition) can pre-style it with
+/// owo-colors before invoking the macro: any input that already
+/// contains an ANSI CSI sequence (`\x1b[`) is forwarded verbatim,
+/// since wrapping pre-styled text in `.dimmed()` would override the
+/// caller's colour at the inner reset.
 pub fn async_println(line: impl Into<String>) {
-    let s = line.into();
+    use owo_colors::OwoColorize;
+    let raw = line.into();
+    let s = if raw.contains('\x1b') {
+        raw
+    } else {
+        format!("{}", raw.dimmed())
+    };
     match PRINTER.get() {
         Some(f) => f(s),
         None => eprintln!("{s}"),

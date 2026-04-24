@@ -11,6 +11,16 @@ use clap::{Args, Parser, Subcommand};
 
 mod turn;
 
+/// Emit a startup-banner line in dimmed ("dark white") style so the
+/// metadata block visually settles below the eye level of the
+/// agent-traffic lines that follow. Wraps `kres_core::async_eprintln!`.
+macro_rules! banner {
+    ($($arg:tt)*) => {{
+        use owo_colors::OwoColorize;
+        kres_core::async_eprintln!("{}", format!($($arg)*).dimmed());
+    }};
+}
+
 /// kres entry point. The REPL is the default; specifying `test` or
 /// `turn` runs the sub-tool instead.
 #[derive(Parser, Debug)]
@@ -616,22 +626,22 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         ("findings", findings_base.as_ref()),
     ] {
         match p {
-            Some(path) => kres_core::async_eprintln!("{label}: {}", path.display()),
-            None => kres_core::async_eprintln!("{label}: (none)"),
+            Some(path) => banner!("{label}: {}", path.display()),
+            None => banner!("{label}: (none)"),
         }
     }
-    kres_core::async_eprintln!("results: {}", results_dir.display());
-    kres_core::async_eprintln!("report:  {}", report_path.display());
-    kres_core::async_eprintln!("todo:    {}", todo_path.display());
+    banner!("results: {}", results_dir.display());
+    banner!("report:  {}", report_path.display());
+    banner!("todo:    {}", todo_path.display());
     // Settings summary: show whichever paths settings.json would
     // fill in for each role, so the operator can confirm the
     // per-user defaults without spelunking into ~/.kres.
     match kres_repl::Settings::default_path() {
-        Some(p) if p.exists() => kres_core::async_eprintln!("settings: {}", p.display()),
+        Some(p) if p.exists() => banner!("settings: {}", p.display()),
         Some(p) => {
-            kres_core::async_eprintln!("settings: {} (absent; using fallbacks)", p.display())
+            banner!("settings: {} (absent; using fallbacks)", p.display())
         }
-        None => kres_core::async_eprintln!("settings: (no $HOME; using fallbacks)"),
+        None => banner!("settings: (no $HOME; using fallbacks)"),
     }
     for (role, label) in [
         (kres_repl::ModelRole::Fast, "fast"),
@@ -640,14 +650,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         (kres_repl::ModelRole::Todo, "todo"),
     ] {
         match settings.model_for(role) {
-            Some(id) => kres_core::async_eprintln!("  default {label} model: {id}"),
-            None => kres_core::async_eprintln!(
+            Some(id) => banner!("  default {label} model: {id}"),
+            None => banner!(
                 "  default {label} model: (unset — agent config or sonnet_4_6 fallback)"
             ),
         }
     }
     if args.turns > 0 {
-        kres_core::async_eprintln!("--turns: stop after {} completed task run(s)", args.turns);
+        banner!("--turns: stop after {} completed task run(s)", args.turns);
     }
     // report, todo are parsed for CLI parity with ; wiring their
     // downstream use is follow-on work. Keep them non-dead:
@@ -695,7 +705,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         let chosen: Option<std::path::PathBuf> = if live.exists() {
             Some(live)
         } else if backup.exists() {
-            kres_core::async_eprintln!(
+            banner!(
                 "resume: session.json missing; loading {} instead",
                 backup.display()
             );
@@ -709,7 +719,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         };
         match load_result {
             Ok(Some(state)) => {
-                kres_core::async_eprintln!(
+                banner!(
                     "resume: {} todo item(s), {} deferred, turns done={}",
                     state.todo.len(),
                     state.deferred.len(),
@@ -717,17 +727,17 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 );
                 if let Some(ref prompt) = state.last_prompt {
                     let short: String = prompt.chars().take(80).collect();
-                    kres_core::async_eprintln!("resume: last prompt: {}", short);
+                    banner!("resume: last prompt: {}", short);
                 }
             }
             Ok(None) => {
-                kres_core::async_eprintln!(
+                banner!(
                     "resume: no session.json or session.json.prev in {} — starting clean",
                     results_dir.display()
                 );
             }
             Err(e) => {
-                kres_core::async_eprintln!("resume: {e}");
+                banner!("resume: {e}");
             }
         }
     } else {
@@ -740,13 +750,13 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             // the current in-memory state.
             let backup = results_dir.join("session.json.prev");
             match std::fs::rename(&session_json, &backup) {
-                Ok(()) => kres_core::async_eprintln!(
+                Ok(()) => banner!(
                     "note: prior session snapshot moved to {}; \
                      starting clean. Type /resume (or restart with \
                      --resume) to load it back.",
                     backup.display()
                 ),
-                Err(e) => kres_core::async_eprintln!(
+                Err(e) => banner!(
                     "note: {} exists but could not be moved aside ({e}); \
                      the first reaper tick will overwrite it. Pass \
                      --resume next time to load prior state.",
@@ -761,12 +771,12 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     let logger = match kres_core::log::TurnLogger::new(std::path::Path::new(".")) {
         Ok(lg) => {
             let lg = std::sync::Arc::new(lg);
-            kres_core::async_eprintln!("session: {}", lg.session_id());
-            kres_core::async_eprintln!("logs:    {}", lg.session_dir().display());
+            banner!("session: {}", lg.session_id());
+            banner!("logs:    {}", lg.session_dir().display());
             Some(lg)
         }
         Err(e) => {
-            kres_core::async_eprintln!(
+            banner!(
                 "logs: could not initialise turn logger ({e}); continuing unlogged"
             );
             None
@@ -809,7 +819,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         } else {
             "disabled by default (add to settings.json or pass --allow bash to enable)".to_string()
         };
-        kres_core::async_eprintln!(
+        banner!(
             "actions: allowlist = [{}] (bash {bash_status})",
             allowed_actions
                 .iter()
@@ -849,7 +859,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                     for (name, cfg) in &reg.servers {
                         match kres_mcp::McpClient::spawn(name, cfg, &log_dir).await {
                             Ok(client) => {
-                                kres_core::async_eprintln!(
+                                banner!(
                                     "mcp: spawned `{name}` (log: {})",
                                     client.stderr_log_path().display()
                                 );
@@ -861,13 +871,13 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                                     Arc::new(tokio::sync::Mutex::new(client)),
                                 );
                             }
-                            Err(e) => kres_core::async_eprintln!("mcp: spawn `{name}` failed: {e}"),
+                            Err(e) => banner!("mcp: spawn `{name}` failed: {e}"),
                         }
                     }
                 }
-                Ok(_) => kres_core::async_eprintln!("mcp-config: {} has no servers", p.display()),
+                Ok(_) => banner!("mcp-config: {} has no servers", p.display()),
                 Err(e) => {
-                    kres_core::async_eprintln!("mcp-config: load failed ({}): {e}", p.display())
+                    banner!("mcp-config: load failed ({}): {e}", p.display())
                 }
             }
         }
@@ -926,7 +936,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         usage: usage.clone(),
                         allowed_actions: allowed_actions.clone(),
                     };
-                    kres_core::async_eprintln!(
+                    banner!(
                         "main-agent: LLM-driven ({}), {} MCP server(s) routed",
                         p.display(),
                         spawned_mcp.len()
@@ -934,7 +944,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                     Arc::new(ma)
                 }
                 Err(e) => {
-                    kres_core::async_eprintln!(
+                    banner!(
                         "main-agent: config load failed ({}): {e}; falling back",
                         p.display()
                     );
@@ -945,7 +955,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         };
         if let Some(gc) = goal_client_from_main {
             session = session.with_goal_client(gc);
-            kres_core::async_eprintln!("goal agent: ready");
+            banner!("goal agent: ready");
         }
         // §50: hand the MCP client map to the session so it can
         // shut them down cleanly on REPL exit.
@@ -957,7 +967,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             Some(dir) => match kres_agents::Skills::load_dir(dir) {
                 Ok(s) => {
                     let auto = s.auto_loaded();
-                    kres_core::async_eprintln!(
+                    banner!(
                         "skills: loaded {} total, {} auto-invoked from {}",
                         s.items.len(),
                         auto.len(),
@@ -966,7 +976,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                     Some(s.to_prompt_value(&auto))
                 }
                 Err(e) => {
-                    kres_core::async_eprintln!("skills: load failed: {e}");
+                    banner!("skills: load failed: {e}");
                     None
                 }
             },
@@ -1011,14 +1021,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         max_input_tokens: tc_cfg.max_input_tokens,
                     });
                     session = session.with_todo_client(todo_client);
-                    kres_core::async_eprintln!("todo agent: ready");
+                    banner!("todo agent: ready");
                 }
-                Err(e) => kres_core::async_eprintln!("todo agent config load: {e}"),
+                Err(e) => banner!("todo agent config load: {e}"),
             }
         }
-        kres_core::async_eprintln!("orchestrator: ready (gather_turns={})", args.gather_turns);
+        banner!("orchestrator: ready (gather_turns={})", args.gather_turns);
     } else {
-        kres_core::async_eprintln!(
+        banner!(
             "orchestrator: not configured (pass --fast-agent and --slow/--slow-agent)"
         );
     }
@@ -1026,7 +1036,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         match resolve_prompt_arg(raw_arg) {
             Ok((source, body)) => {
                 let pf = kres_agents::parse_prompt_file(&body);
-                kres_core::async_eprintln!(
+                banner!(
                     "prompt: loaded {} lens(es) + {} chars of prose from {}",
                     pf.lenses.len(),
                     pf.prompt.len(),
@@ -1034,7 +1044,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 );
                 session = session.with_prompt_file(pf);
             }
-            Err(e) => kres_core::async_eprintln!("prompt: {e}"),
+            Err(e) => banner!("prompt: {e}"),
         }
     }
     session.run().await
@@ -1080,7 +1090,7 @@ async fn run_test(args: TestArgs) -> Result<()> {
         Some(id) => Model::from_id(id),
         None => Model::from_key_file(&args.key_file), // bugs.md#R1
     };
-    kres_core::async_eprintln!("model: {}", model.id);
+    banner!("model: {}", model.id);
 
     let client = Client::new(api_key)?;
     // Defaults now pick the right thinking schema per model family

@@ -52,6 +52,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Misc
 once_cell = "1"
 dirs = "5"
+owo-colors = "4"
 uuid = { version = "1", features = ["v4", "v5"] }
 # cancellation tokens for graceful shutdown (C2/C3/H7 in bugs.md)
 tokio-stream = "0.1"

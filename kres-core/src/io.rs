@@ -106,10 +106,22 @@ fn md_slot() -> &'static RwLock<Option<MarkdownSinkFn>> {
     SLOT.get_or_init(|| RwLock::new(None))
 }
 
-/// Install the markdown-block sink. Only the TUI path calls this;
-/// everyone else leaves the slot empty so `async_println_markdown`
-/// folds into plain `async_println`.
-pub fn install_markdown_sink(f: MarkdownSinkFn) -> Option<MarkdownSinkFn> {
+/// Install the markdown-block sink. Install-if-absent: succeeds
+/// when the slot is empty, returns `Err(f)` if another sink is
+/// already installed. Mirrors [`install_printer`] so two crates
+/// racing to bring up the TUI don't silently clobber each other.
+pub fn install_markdown_sink(f: MarkdownSinkFn) -> Result<(), MarkdownSinkFn> {
+    let mut g = md_slot().write().unwrap();
+    if g.is_some() {
+        return Err(f);
+    }
+    *g = Some(f);
+    Ok(())
+}
+
+/// Replace the markdown-block sink unconditionally, returning any
+/// previously-installed handler. Mirrors [`replace_printer`].
+pub fn replace_markdown_sink(f: MarkdownSinkFn) -> Option<MarkdownSinkFn> {
     let mut g = md_slot().write().unwrap();
     g.replace(f)
 }
@@ -247,4 +259,87 @@ pub fn active_streams() -> Vec<StreamSnapshot> {
             elapsed_ms: s.started_at.elapsed().as_millis(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // The printer/sink slots are process-global OnceLocks. Serialise
+    // the tests that touch them so cargo test -- --test-threads > 1
+    // doesn't race. The tests also swap in a local printer and
+    // restore it afterward so other tests in the process aren't
+    // affected.
+    fn serial() -> &'static Mutex<()> {
+        static S: OnceLock<Mutex<()>> = OnceLock::new();
+        S.get_or_init(|| Mutex::new(()))
+    }
+
+    fn capture_with_printer<F: FnOnce()>(f: F) -> Vec<String> {
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let prev = replace_printer(Box::new(move |s| cap.lock().unwrap().push(s)));
+        f();
+        // Restore whatever was there before (may be None).
+        match prev {
+            Some(p) => {
+                let _ = replace_printer(p);
+            }
+            None => {
+                *slot().write().unwrap() = None;
+            }
+        }
+        let g = captured.lock().unwrap();
+        g.clone()
+    }
+
+    #[test]
+    fn async_println_markdown_no_sink_matches_async_println_bytes() {
+        // The design promise of the markdown-block sink is that when
+        // no sink is installed (non-TUI paths), the body lands via
+        // async_println verbatim — no sentinels, no per-line split
+        // beyond what async_println does. This test pins that so a
+        // future refactor can't silently leak markers into --stdio.
+        let _g = serial().lock().unwrap();
+        // Ensure the md sink slot is empty up front.
+        let _prev_md = replace_markdown_sink(Box::new(|_| {}));
+        *md_slot().write().unwrap() = None;
+
+        let body = "line one\nline two\nline three";
+        let via_plain = capture_with_printer(|| async_println(body.to_string()));
+        let via_markdown = capture_with_printer(|| async_println_markdown(body));
+        assert_eq!(via_plain, via_markdown);
+        // Neither path should have produced sentinel lines.
+        for line in &via_plain {
+            assert!(
+                !line.starts_with('\x01'),
+                "sentinel leaked into non-sink path: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_markdown_sink_is_install_if_absent() {
+        // Mirrors install_printer's contract: second caller gets
+        // their handler back as Err, original stays installed.
+        let _g = serial().lock().unwrap();
+        *md_slot().write().unwrap() = None;
+
+        let first_mark: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let fm = first_mark.clone();
+        assert!(
+            install_markdown_sink(Box::new(move |_| {
+                *fm.lock().unwrap() = 1;
+            }))
+            .is_ok()
+        );
+        // Second installer: must be rejected.
+        let second = install_markdown_sink(Box::new(|_| {}));
+        assert!(second.is_err(), "second install must bounce");
+        // First sink is still the one that fires.
+        async_println_markdown("anything");
+        assert_eq!(*first_mark.lock().unwrap(), 1);
+        *md_slot().write().unwrap() = None;
+    }
 }

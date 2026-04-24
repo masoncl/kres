@@ -186,11 +186,11 @@ pub fn install_tui_printer(scrollback: Scrollback) {
     }));
     // Second sink: markdown blocks (slow-agent analysis body). We
     // bracket the block with sentinel lines the render path
-    // recognises and hands to tui_markdown. Non-TUI contexts don't
-    // install this sink, so `async_println_markdown` folds into
-    // `async_println` and `--stdio` stays byte-identical.
+    // recognises and hands to `render_markdown_block`. Non-TUI
+    // contexts don't install this sink, so `async_println_markdown`
+    // folds into `async_println` and `--stdio` stays byte-identical.
     let sb_md = scrollback.clone();
-    kres_core::io::install_markdown_sink(Box::new(move |body| {
+    kres_core::io::replace_markdown_sink(Box::new(move |body| {
         sb_md.push(MD_BLOCK_START);
         sb_md.push(body);
         sb_md.push(MD_BLOCK_END);
@@ -249,9 +249,8 @@ pub fn render_markdown_block(body: &str) -> Vec<Line<'static>> {
 /// through as plain text.
 fn split_inline_code(line: &str, code_style: Style) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let bytes = line.as_bytes();
     let mut cursor = 0usize;
-    while cursor < bytes.len() {
+    while cursor < line.len() {
         let Some(open_rel) = line[cursor..].find('`') else {
             spans.push(Span::raw(line[cursor..].to_string()));
             break;
@@ -1033,12 +1032,12 @@ pub fn run_tui(
             let pad = scrollback_rows.saturating_sub(window.len());
             // Expand markdown regions: when we hit MD_BLOCK_START,
             // gather lines until the matching MD_BLOCK_END, feed the
-            // joined body through tui_markdown, and splice its
-            // styled Lines in place of the raw lines. Marker lines
-            // are dropped. A window slice that cuts through a
-            // bracketed region (MD_START before the window, or
-            // MD_END after) falls back to plain rendering for the
-            // visible half — acceptable for a first pass.
+            // joined body through `render_markdown_block`, and
+            // splice its styled Lines in place of the raw lines.
+            // Marker lines are dropped. A window slice that cuts
+            // through a bracketed region (MD_START before the
+            // window, or MD_END after) falls back to plain rendering
+            // for the visible half — acceptable for a first pass.
             let mut body: Vec<Line> = (0..pad).map(|_| Line::from("")).collect();
             let mut i = 0;
             while i < window.len() {

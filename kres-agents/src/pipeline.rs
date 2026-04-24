@@ -795,7 +795,7 @@ impl Orchestrator {
              - Do NOT invent new bugs or analysis. Transcribe the prose.\n\
              - Every actionable bug described in the prose MUST appear as a \
                Finding record with this schema: id (snake_case slug), title, \
-               severity (low|medium|high|critical), status ('active'), \
+               severity (low|medium|high), status ('active'), \
                relevant_symbols (array of {{name, filename, line, definition}}), \
                relevant_file_sections (array of {{filename, line_start, \
                line_end, content}}), summary, reproducer_sketch, impact. \

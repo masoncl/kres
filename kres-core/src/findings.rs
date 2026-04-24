@@ -42,13 +42,30 @@ pub enum FindingsError {
     NoParent(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
     Medium,
     High,
-    Critical,
+}
+
+/// Legacy findings.json files written before the `critical` tier was
+/// retired still carry `"severity": "critical"`. Map those into
+/// `High` on load so old stores keep working without a migration.
+/// New writes always serialize as `low` / `medium` / `high`.
+impl<'de> Deserialize<'de> for Severity {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "low" => Ok(Severity::Low),
+            "medium" => Ok(Severity::Medium),
+            "high" | "critical" => Ok(Severity::High),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown severity {other:?} (expected low / medium / high)"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,6 +141,15 @@ pub struct Finding {
     pub first_seen_task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_updated_task: Option<String>,
+
+    /// Wall-clock timestamp of the first apply_delta that inserted
+    /// this finding. Stamped once on insert; never updated by
+    /// subsequent applies so the "when was this discovered" signal
+    /// stays stable. Missing on findings loaded from pre-field
+    /// findings.json files — those have no authoritative discovery
+    /// date on record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_finding_ids: Vec<String>,
 
@@ -144,6 +170,22 @@ pub struct Finding {
     /// is stripped before the entry enters the list.
     #[serde(default, skip_serializing_if = "is_false")]
     pub reactivate: bool,
+
+    /// Commit that introduced the bug, once a task has attributed
+    /// the finding to a specific SHA. Left `None` until a later
+    /// investigation fills it in. Only `sha` is mandatory; the
+    /// subject line is a best-effort convenience so consumers
+    /// (exports, summaries, review comments) don't need a second
+    /// `git show` round-trip to print the attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub introduced_by: Option<IntroducedBy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntroducedBy {
+    pub sha: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subject: String,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -417,6 +459,13 @@ pub fn apply_delta_to_list(
                     }
                     new_entry.last_updated_task = Some(t.to_string());
                 }
+                // Stamp discovery time on first insert. An incoming
+                // delta that already carries a first_seen_at (e.g.
+                // a migration import) is preserved; otherwise use
+                // wall-clock now. Never updated by subsequent merges.
+                if new_entry.first_seen_at.is_none() {
+                    new_entry.first_seen_at = Some(Utc::now());
+                }
                 current.push(new_entry);
                 let last_idx = current.len() - 1;
                 record_detail(&mut current[last_idx], task_id, task_analysis);
@@ -496,6 +545,7 @@ fn merge_into(existing: &mut Finding, incoming: &Finding, task_id: Option<&str>)
     changed |= prefer_longer(&mut existing.impact, &incoming.impact);
     changed |= prefer_longer_opt(&mut existing.mechanism_detail, &incoming.mechanism_detail);
     changed |= prefer_longer_opt(&mut existing.fix_sketch, &incoming.fix_sketch);
+    changed |= merge_introduced_by(&mut existing.introduced_by, &incoming.introduced_by);
 
     // Union collections.
     changed |= union_symbols(&mut existing.relevant_symbols, &incoming.relevant_symbols);
@@ -537,6 +587,43 @@ fn prefer_longer(existing: &mut String, incoming: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Merge an incoming `introduced_by` into an existing one. Rules:
+///   - Incoming `None` or empty `sha`: no-op.
+///   - Existing `None`: take incoming (both sha and subject).
+///   - Existing `Some` with same `sha`: take incoming `subject` if it
+///     is non-empty AND longer than the current one (matches the
+///     prose-downgrade guard used elsewhere).
+///   - Existing `Some` with a DIFFERENT non-empty `sha`: latest wins,
+///     including subject. A later task may have attributed the bug
+///     more precisely, and keeping the old sha silently would mask
+///     that.
+fn merge_introduced_by(
+    existing: &mut Option<IntroducedBy>,
+    incoming: &Option<IntroducedBy>,
+) -> bool {
+    let Some(inc) = incoming else { return false };
+    if inc.sha.is_empty() {
+        return false;
+    }
+    match existing {
+        None => {
+            *existing = Some(inc.clone());
+            true
+        }
+        Some(cur) if cur.sha == inc.sha => {
+            if !inc.subject.is_empty() && inc.subject.len() > cur.subject.len() {
+                cur.subject = inc.subject.clone();
+                return true;
+            }
+            false
+        }
+        Some(_) => {
+            *existing = Some(inc.clone());
+            true
+        }
+    }
 }
 
 fn prefer_longer_opt(existing: &mut Option<String>, incoming: &Option<String>) -> bool {
@@ -742,6 +829,8 @@ mod tests {
             related_finding_ids: vec![],
             reactivate: false,
             details: vec![],
+            introduced_by: None,
+            first_seen_at: None,
         }
     }
 
@@ -1069,18 +1158,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn introduced_by_takes_first_attribution_and_latest_wins() {
+        let dir = tmp_dir("introduced-by");
+        let base = dir.join("findings.json");
+        let store = FindingsStore::new(&base).await.unwrap();
+        store
+            .apply_delta(&[sample_finding("a")], Some("t1"), None)
+            .await
+            .unwrap();
+        assert!(store.snapshot().await[0].introduced_by.is_none());
+        // Empty sha is a no-op.
+        let mut noop = sample_finding("a");
+        noop.introduced_by = Some(IntroducedBy {
+            sha: "".into(),
+            subject: "ignored".into(),
+        });
+        store.apply_delta(&[noop], Some("t2"), None).await.unwrap();
+        assert!(store.snapshot().await[0].introduced_by.is_none());
+        // First real attribution sticks.
+        let mut first = sample_finding("a");
+        first.introduced_by = Some(IntroducedBy {
+            sha: "abc".into(),
+            subject: "short".into(),
+        });
+        store.apply_delta(&[first], Some("t3"), None).await.unwrap();
+        let snap = store.snapshot().await;
+        let ib = snap[0].introduced_by.as_ref().unwrap();
+        assert_eq!(ib.sha, "abc");
+        assert_eq!(ib.subject, "short");
+        // Same sha, longer subject → subject upgraded.
+        let mut upgrade = sample_finding("a");
+        upgrade.introduced_by = Some(IntroducedBy {
+            sha: "abc".into(),
+            subject: "a much longer subject line".into(),
+        });
+        store
+            .apply_delta(&[upgrade], Some("t4"), None)
+            .await
+            .unwrap();
+        let ib = store.snapshot().await[0].introduced_by.clone().unwrap();
+        assert_eq!(ib.subject, "a much longer subject line");
+        // Different sha → latest wins.
+        let mut reattrib = sample_finding("a");
+        reattrib.introduced_by = Some(IntroducedBy {
+            sha: "def".into(),
+            subject: "re-attributed".into(),
+        });
+        store
+            .apply_delta(&[reattrib], Some("t5"), None)
+            .await
+            .unwrap();
+        let ib = store.snapshot().await[0].introduced_by.clone().unwrap();
+        assert_eq!(ib.sha, "def");
+        assert_eq!(ib.subject, "re-attributed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn first_seen_at_stamps_on_insert_and_never_shifts() {
+        let dir = tmp_dir("first-seen");
+        let base = dir.join("findings.json");
+        let store = FindingsStore::new(&base).await.unwrap();
+        store
+            .apply_delta(&[sample_finding("a")], Some("t1"), None)
+            .await
+            .unwrap();
+        let ts_initial = store.snapshot().await[0].first_seen_at.unwrap();
+        // Second delta on the same id must NOT bump the stamp.
+        let mut updated = sample_finding("a");
+        updated.summary = "now with more detail".into();
+        store
+            .apply_delta(&[updated], Some("t2"), None)
+            .await
+            .unwrap();
+        let ts_after = store.snapshot().await[0].first_seen_at.unwrap();
+        assert_eq!(
+            ts_initial, ts_after,
+            "first_seen_at must be stable across merges"
+        );
+        // An incoming delta that carries an explicit first_seen_at
+        // for a NEW id is preserved (import / migration path).
+        let mut imported = sample_finding("b");
+        let pinned = chrono::DateTime::parse_from_rfc3339("2020-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        imported.first_seen_at = Some(pinned);
+        store
+            .apply_delta(&[imported], Some("t3"), None)
+            .await
+            .unwrap();
+        let b = store
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|f| f.id == "b")
+            .unwrap();
+        assert_eq!(b.first_seen_at, Some(pinned));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn severity_only_escalates() {
         let dir = tmp_dir("severity");
         let base = dir.join("findings.json");
         let store = FindingsStore::new(&base).await.unwrap();
         let mut hi = sample_finding("a");
-        hi.severity = Severity::Critical;
+        hi.severity = Severity::High;
         store.apply_delta(&[hi], Some("t1"), None).await.unwrap();
         let mut lo = sample_finding("a");
         lo.severity = Severity::Low;
         store.apply_delta(&[lo], Some("t2"), None).await.unwrap();
         let snap = store.snapshot().await;
-        assert_eq!(snap[0].severity, Severity::Critical);
+        assert_eq!(snap[0].severity, Severity::High);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_critical_severity_loads_as_high() {
+        // findings.json files written before Critical was retired
+        // still carry `"severity": "critical"`. The custom
+        // Deserialize impl must fold that into High so the store
+        // loads cleanly; subsequent writes round-trip as "high".
+        let dir = tmp_dir("legacy-critical");
+        let base = dir.join("findings.json");
+        std::fs::write(
+            &base,
+            r#"{"findings":[{"id":"old","title":"t","severity":"critical","summary":"s","reproducer_sketch":"r","impact":"i"}]}"#,
+        )
+        .unwrap();
+        let store = FindingsStore::new(&base).await.unwrap();
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].severity, Severity::High);
+        // Force a rewrite and confirm the on-disk payload no longer
+        // carries "critical" — jsondb decides whether to pretty-print
+        // or pack, so check via JSON parse instead of a byte grep.
+        store
+            .apply_delta(&[sample_finding("new")], Some("t1"), None)
+            .await
+            .unwrap();
+        store.db.flush().await;
+        let raw = std::fs::read_to_string(&base).unwrap();
+        assert!(!raw.contains("\"critical\""));
+        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let old = root["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == "old")
+            .unwrap();
+        assert_eq!(old["severity"], "high");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -254,6 +254,8 @@ mod tests {
             related_finding_ids: vec![],
             reactivate: false,
             details: vec![],
+            introduced_by: None,
+            first_seen_at: None,
         }
     }
 

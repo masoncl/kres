@@ -7,8 +7,8 @@
 //! This module provides a deterministic, severity-aware trim of a
 //! `Vec<Finding>` down to a target char budget. Rule:
 //!
-//! 1. Always keep Critical findings.
-//! 2. Drop Low, then Medium, then High until the budget fits.
+//! 1. Always keep High findings.
+//! 2. Drop Low, then Medium, until the budget fits.
 //! 3. Within the same severity, findings without a
 //!    `last_updated_task` label are dropped first (None sorts
 //!    before Some(...)), followed by the lowest `last_updated_task`
@@ -183,12 +183,14 @@ pub fn shrink_findings_to_budget(findings: &[Finding], char_budget: usize) -> Ve
     if total_char_size(findings) <= char_budget {
         return findings.to_vec();
     }
-    // Produce a drop order: Low first, then Medium, then High. Keep
-    // Critical always. Within a tier, oldest last_updated_task first
-    // (None counts as "oldest" — no task label attached).
+    // Produce a drop order: Low first, then Medium. Keep High
+    // always — High is now the top tier, inheriting the "never
+    // dropped for budget" protection the retired Critical tier had.
+    // Within a tier, oldest last_updated_task first (None counts as
+    // "oldest" — no task label attached).
     let mut indexed: Vec<(usize, &Finding)> = findings.iter().enumerate().collect();
     let mut drop_order: Vec<usize> = Vec::new();
-    for tier in [Severity::Low, Severity::Medium, Severity::High] {
+    for tier in [Severity::Low, Severity::Medium] {
         let mut in_tier: Vec<&(usize, &Finding)> =
             indexed.iter().filter(|(_, f)| f.severity == tier).collect();
         in_tier.sort_by(|a, b| {
@@ -239,6 +241,8 @@ mod tests {
             related_finding_ids: vec![],
             reactivate: false,
             details: vec![],
+            introduced_by: None,
+            first_seen_at: None,
         }
     }
 
@@ -267,13 +271,16 @@ mod tests {
     }
 
     #[test]
-    fn always_keeps_critical_even_when_over_budget() {
+    fn always_keeps_high_even_when_over_budget() {
+        // High is now the top tier — the "never drop for budget"
+        // protection that used to apply to Critical transferred to
+        // High when the Critical tier was retired.
         let f = vec![
-            make("crit", Severity::Critical, 1_000_000),
-            make("high", Severity::High, 100),
+            make("big-high", Severity::High, 1_000_000),
+            make("low", Severity::Low, 100),
         ];
         let out = shrink_findings_to_budget(&f, 100);
-        assert!(out.iter().any(|f| f.id == "crit"));
+        assert!(out.iter().any(|f| f.id == "big-high"));
     }
 
     #[test]

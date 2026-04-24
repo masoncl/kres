@@ -2233,19 +2233,17 @@ impl Session {
             println!("(no findings yet)");
             return;
         }
-        let (hi, med, lo, crit) = findings.iter().fold((0, 0, 0, 0), |(h, m, l, c), f| {
+        let (hi, med, lo) = findings.iter().fold((0, 0, 0), |(h, m, l), f| {
             use kres_core::findings::Severity::*;
             match f.severity {
-                Critical => (h, m, l, c + 1),
-                High => (h + 1, m, l, c),
-                Medium => (h, m + 1, l, c),
-                Low => (h, m, l + 1, c),
+                High => (h + 1, m, l),
+                Medium => (h, m + 1, l),
+                Low => (h, m, l + 1),
             }
         });
         println!(
-            "{} findings: {} critical, {} high, {} medium, {} low",
+            "{} findings: {} high, {} medium, {} low",
             findings.len(),
-            crit,
             hi,
             med,
             lo

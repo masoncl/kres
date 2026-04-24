@@ -78,7 +78,7 @@ Rationale:
 |---|---|---|
 | `id` | string | Short snake_case slug, ≤40 chars. Stable across updates. |
 | `title` | string | One-line human title. |
-| `severity` | enum | `low` / `medium` / `high` / `critical`. Scored by exploit potential, not textbook CVSS. |
+| `severity` | enum | `low` / `medium` / `high`. Scored by exploit potential, not textbook CVSS. Legacy `critical` values in pre-existing findings.json files are folded into `high` on load. |
 | `status` | enum | `active` or `invalidated`. Default `active`. |
 | `relevant_symbols` | array[object] | **Embedded** symbol records that the reader needs to understand the bug. Each: `{name, filename, line, definition}`. Pull only what's actually referenced in summary/reproducer_sketch — NOT the entire session's symbol list. At least one required. |
 | `relevant_file_sections` | array[object] | **Embedded** source slices that aren't whole symbols (headers, tables, assembly, macros). Each: `{filename, line_start, line_end, content}`. Optional if every cited region is captured via `relevant_symbols`. |

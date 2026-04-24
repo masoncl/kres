@@ -530,6 +530,18 @@ pub async fn git(workspace: &Path, args: &GitArgs) -> Result<String, AgentError>
         let err = String::from_utf8_lossy(&out.stderr).to_string();
         text.push_str(&err);
     }
+    // A successful git query with no matches (e.g. a `log <range> --
+    // <paths>` that hits zero commits) returns exit 0 with empty
+    // stdout+stderr. The main agent wraps tool output in a `--- git
+    // ... ---\n<body>` envelope, so an empty body reads as "the tool
+    // never ran" and the fast/slow agents loop, re-requesting the
+    // same query. Emit an explicit marker so the caller can tell
+    // "ran, produced nothing" apart from "never ran". (Observed in
+    // session 81d6b079, where `git log <window> -- ip_tunnels.h` was
+    // issued five times and each empty reply was read as MISSING.)
+    if text.is_empty() {
+        text.push_str("(no output)\n");
+    }
     Ok(text)
 }
 
@@ -1131,6 +1143,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn git_marks_empty_output_as_no_output() {
+        // Build a repo with one commit, then run a `log` query that
+        // matches nothing. git exits 0 with empty stdout+stderr; the
+        // tool must return a non-empty marker so the agent can tell
+        // "ran with no matches" apart from "never ran".
+        let dir = tmpdir("git-empty");
+        let run = |argv: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(argv)
+                .current_dir(&dir)
+                .output()
+                .expect("git run");
+            assert!(status.status.success(), "git {argv:?} failed");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), b"hi").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        // Path filter that matches zero commits.
+        let args: GitArgs =
+            serde_json::from_value(serde_json::json!({"command": "log --oneline -- missing.c"}))
+                .unwrap();
+        let text = git(&dir, &args).await.unwrap();
+        assert!(
+            text.contains("(no output)"),
+            "expected (no output) marker, got {text:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Markdown report writer.
 //!
 //! Produces a human-friendly report of the current findings list.
-//! Groups by severity (critical → high → medium → low), renders
+//! Groups by severity (high → medium → low), renders
 //! mechanism_detail / fix_sketch / open_questions when present.
 
 use std::io::Write;
@@ -21,12 +21,7 @@ pub fn render_findings_markdown(findings: &[Finding]) -> String {
     out.push_str(&severity_histogram(findings));
     out.push('\n');
 
-    for sev in [
-        Severity::Critical,
-        Severity::High,
-        Severity::Medium,
-        Severity::Low,
-    ] {
+    for sev in [Severity::High, Severity::Medium, Severity::Low] {
         let bucket: Vec<&Finding> = findings.iter().filter(|f| f.severity == sev).collect();
         if bucket.is_empty() {
             continue;
@@ -40,15 +35,14 @@ pub fn render_findings_markdown(findings: &[Finding]) -> String {
 }
 
 fn severity_histogram(findings: &[Finding]) -> String {
-    let (c, h, m, l) = findings
+    let (h, m, l) = findings
         .iter()
-        .fold((0, 0, 0, 0), |(c, h, m, l), f| match f.severity {
-            Severity::Critical => (c + 1, h, m, l),
-            Severity::High => (c, h + 1, m, l),
-            Severity::Medium => (c, h, m + 1, l),
-            Severity::Low => (c, h, m, l + 1),
+        .fold((0, 0, 0), |(h, m, l), f| match f.severity {
+            Severity::High => (h + 1, m, l),
+            Severity::Medium => (h, m + 1, l),
+            Severity::Low => (h, m, l + 1),
         });
-    format!("- {} critical, {} high, {} medium, {} low\n", c, h, m, l)
+    format!("- {} high, {} medium, {} low\n", h, m, l)
 }
 
 fn render_finding(out: &mut String, f: &Finding) {
@@ -178,6 +172,8 @@ mod tests {
             related_finding_ids: vec!["other".into()],
             reactivate: false,
             details: vec![],
+            introduced_by: None,
+            first_seen_at: None,
         }
     }
 
@@ -192,14 +188,14 @@ mod tests {
         let findings = vec![
             finding("a", Severity::Low),
             finding("b", Severity::High),
-            finding("c", Severity::Critical),
+            finding("c", Severity::Medium),
         ];
         let md = render_findings_markdown(&findings);
-        let crit_pos = md.find("## Critical").unwrap();
         let high_pos = md.find("## High").unwrap();
+        let med_pos = md.find("## Medium").unwrap();
         let low_pos = md.find("## Low").unwrap();
-        assert!(crit_pos < high_pos);
-        assert!(high_pos < low_pos);
+        assert!(high_pos < med_pos);
+        assert!(med_pos < low_pos);
     }
 
     #[test]

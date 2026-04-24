@@ -59,6 +59,8 @@ parallel-lens review.
    ```
    cd linux
    kres --results review --prompt 'review: fs/btrfs/ctree.c' --turns 2
+   kres --summary-markdown --results review
+   # review/summary.md now has your results
    ```
 
    `--prompt 'review: X'` invokes the embedded review template —
@@ -75,6 +77,19 @@ kernel `review-prompts` repo for subsystem knowledge. Both are
 configured via `setup.sh` flags — see
 [docs/configuration.md](docs/configuration.md) for details.
 
+## Exporting findings
+
+You can export results into either text or markdown:
+
+- [docs/summary.md](docs/summary.md) — `/summary`,
+  `kres --summary`, and the summary output format.
+
+But these scans can produce a lot of results, and churning through a giant
+text file isn't the easiest way to walk them.  You can also dump them into
+a one-dir-per-finding format:
+
+- [docs/exporting.md](docs/exporting.md) — `kres --export DIR`:
+
 ## Further reading
 
 - [docs/agents.md](docs/agents.md) — fast / main / slow / todo /
@@ -83,8 +98,6 @@ configured via `setup.sh` flags — see
   parallel-lens review flow behind `--prompt "review:"`.
 - [docs/coding-tasks.md](docs/coding-tasks.md) — reproducer and
   fix generation (`code_output`, `code_edits`, `bash` verify).
-- [docs/summary.md](docs/summary.md) — `/summary`,
-  `kres --summary`, and the summary output format.
 - [docs/turns-and-follow.md](docs/turns-and-follow.md) — when
   kres decides a non-interactive run is done.
 - [docs/action-allowlist.md](docs/action-allowlist.md) — which

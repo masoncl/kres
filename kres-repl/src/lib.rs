@@ -20,6 +20,7 @@
 //!   (bugs.md#M8 UX, adapted).
 
 pub mod commands;
+pub mod export;
 pub mod report;
 pub mod session;
 pub mod settings;
@@ -27,6 +28,7 @@ pub mod status;
 pub mod summary;
 
 pub use commands::{parse_command, Command};
+pub use export::{run_export, run_export_index, ExportInputs};
 pub use report::{append_task_section, render_findings_markdown, write_findings_to_file};
 pub use session::{build_orchestrator, ReplConfig, Session};
 pub use settings::{pick_model, ModelRole, Settings};

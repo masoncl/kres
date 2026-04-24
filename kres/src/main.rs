@@ -190,6 +190,26 @@ struct ReplArgs {
     #[arg(long, default_value_t = false)]
     summary_markdown: bool,
 
+    /// Export every finding from `findings.json` as a per-finding
+    /// folder under DIR. Each entry becomes `DIR/<tag>/` with a
+    /// `meta.yaml` (id, severity, workspace git sha/subject, cross
+    /// references) and a `FINDING.md` carrying the full body
+    /// (summary, mechanism, reproducer, impact, fix sketch, open
+    /// questions, per-task analysis). Inputs honour --results /
+    /// --findings the same way --summary does. Exits without
+    /// starting the REPL.
+    #[arg(long, value_name = "DIR")]
+    export: Option<PathBuf>,
+
+    /// Walk every `<tag>/metadata.yaml` under DIR (the output of a
+    /// prior `--export`) and write `DIR/INDEX.md` — a single
+    /// markdown index sorted by severity (high → low) and then by
+    /// the `date` field (oldest first, so long-standing bugs stay
+    /// visible at the top of each severity band). Exits without
+    /// starting the REPL; no findings.json is consulted.
+    #[arg(long, value_name = "DIR")]
+    export_index: Option<PathBuf>,
+
     /// Override the summary template path for --summary /
     /// --summary-markdown. Accepted by `/summary` too. When
     /// omitted, kres reads `~/.kres/commands/summary.md` (or
@@ -499,10 +519,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // template and filename further down.
     let summary_mode = args.summary || args.summary_markdown;
     let markdown = args.summary_markdown;
+    let export_mode = args.export.is_some();
+    let export_index_mode = args.export_index.is_some();
 
-    // In --summary mode we avoid creating a fresh session directory
-    // because the operator points at an existing run's artifacts.
-    let results_dir = match (args.results.clone(), summary_mode) {
+    // In --summary / --export mode we avoid creating a fresh session
+    // directory because the operator points at an existing run's
+    // artifacts.
+    let standalone = summary_mode || export_mode || export_index_mode;
+    let results_dir = match (args.results.clone(), standalone) {
         (Some(d), _) => d,
         (None, true) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         (None, false) => {
@@ -602,6 +626,46 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             }
             r = summary_fut => r?,
         }
+        return Ok(());
+    }
+
+    // --- --export DIR: per-finding folder tree -------------------
+    // Iterates findings.json (honouring --results / --findings),
+    // writes DIR/<tag>/meta.yaml + DIR/<tag>/FINDING.md for every
+    // finding, then exits. No REPL, no MCP, no orchestrator.
+    if let Some(ref export_dir) = args.export {
+        let findings_path = match findings_base.as_ref() {
+            Some(p) if p.exists() => p.clone(),
+            Some(p) => {
+                return Err(anyhow::anyhow!(
+                    "--export: findings file {} does not exist",
+                    p.display()
+                ));
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "--export: no findings path configured (pass --findings or --results)"
+                ));
+            }
+        };
+        eprintln!("--export: findings = {}", findings_path.display());
+        eprintln!("--export: output   = {}", export_dir.display());
+        kres_repl::run_export(kres_repl::ExportInputs {
+            findings_path,
+            output_dir: export_dir.clone(),
+            workspace: args.workspace.clone(),
+        })
+        .await?;
+        return Ok(());
+    }
+
+    // --- --export-index DIR: walk a prior --export dir ------------
+    // Reads every <tag>/metadata.yaml under DIR, sorts by severity
+    // then date, writes DIR/INDEX.md, and exits.
+    if let Some(ref index_dir) = args.export_index {
+        eprintln!("--export-index: dir    = {}", index_dir.display());
+        let out = kres_repl::run_export_index(index_dir)?;
+        eprintln!("--export-index: wrote  = {}", out.display());
         return Ok(());
     }
 

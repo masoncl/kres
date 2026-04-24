@@ -867,7 +867,6 @@ fn combine_system_prompt(markdown: bool) -> String {
 /// Rank used by the severity sort. Higher = more severe.
 fn severity_rank(s: Severity) -> u8 {
     match s {
-        Severity::Critical => 4,
         Severity::High => 3,
         Severity::Medium => 2,
         Severity::Low => 1,
@@ -994,6 +993,8 @@ mod tests {
                 })
                 .collect(),
             reactivate: false,
+            introduced_by: None,
+            first_seen_at: None,
         }
     }
 
@@ -1001,15 +1002,15 @@ mod tests {
     fn severity_sort_desc_with_stable_within_band() {
         let findings = [
             f("a", Severity::Low, Status::Active, vec![]),
-            f("b", Severity::Critical, Status::Active, vec![]),
+            f("b", Severity::High, Status::Active, vec![]),
             f("c", Severity::Medium, Status::Active, vec![]),
-            f("d", Severity::Critical, Status::Active, vec![]),
+            f("d", Severity::High, Status::Active, vec![]),
             f("e", Severity::High, Status::Active, vec![]),
         ];
         let mut got: Vec<Finding> = findings.to_vec();
         got.sort_by(|a, b| severity_rank(b.severity).cmp(&severity_rank(a.severity)));
         let ids: Vec<&str> = got.iter().map(|x| x.id.as_str()).collect();
-        // Critical (b,d) first (input order), then High (e), Medium (c), Low (a).
+        // High (b, d, e) first in input order, then Medium (c), Low (a).
         assert_eq!(ids, vec!["b", "d", "e", "c", "a"]);
     }
 

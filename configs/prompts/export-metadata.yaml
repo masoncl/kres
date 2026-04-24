@@ -1,0 +1,27 @@
+# kres finding metadata
+id: {{id}}
+title: {{title}}
+severity: {{!severity}}
+status: {{!status}}
+git:
+  sha: {{git_sha}}
+  subject: {{git_subject}}
+{{#has_date}}date: {{date}}
+{{/has_date}}{{#has_introduced_by}}introduced_by:
+  sha: {{introduced_by_sha}}
+{{#has_introduced_by_subject}}  subject: {{introduced_by_subject}}
+{{/has_introduced_by_subject}}{{/has_introduced_by}}{{#has_first_seen_task}}first_seen_task: {{first_seen_task}}
+{{/has_first_seen_task}}{{#has_last_updated_task}}last_updated_task: {{last_updated_task}}
+{{/has_last_updated_task}}{{#has_related_finding_ids}}related_finding_ids:
+{{#related_finding_ids}}  - {{item}}
+{{/related_finding_ids}}{{/has_related_finding_ids}}{{#has_relevant_symbols}}relevant_symbols:
+{{#relevant_symbols}}  - name: {{name}}
+    filename: {{filename}}
+    line: {{!line}}
+{{/relevant_symbols}}{{/has_relevant_symbols}}{{#has_relevant_file_sections}}relevant_file_sections:
+{{#relevant_file_sections}}  - filename: {{filename}}
+    line_start: {{!line_start}}
+    line_end: {{!line_end}}
+{{/relevant_file_sections}}{{/has_relevant_file_sections}}{{#has_open_questions}}open_questions:
+{{#open_questions}}  - {{item}}
+{{/open_questions}}{{/has_open_questions}}

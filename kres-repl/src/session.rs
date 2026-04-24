@@ -2028,11 +2028,19 @@ impl Session {
             if let Some(gc) = &self.goal_client {
                 match kres_agents::define_goal(gc, &text, existing_plan.as_ref()).await {
                     Some(def) => {
-                        kres_core::async_eprintln!(
-                            "goal ({}): {}",
-                            def.mode.as_str(),
-                            truncate(&def.goal, 160)
-                        );
+                        {
+                            use owo_colors::OwoColorize;
+                            kres_core::async_eprintln!(
+                                "{}",
+                                format!(
+                                    "goal ({}): {}",
+                                    def.mode.as_str(),
+                                    truncate(&def.goal, 160)
+                                )
+                                .bold()
+                                .yellow()
+                            );
+                        }
                         (Some(def.goal), def.mode)
                     }
                     None => (None, kres_agents::TaskMode::default()),
@@ -3634,6 +3642,58 @@ async fn persist_code_output(workspace: &Path, task_name: &str, files: &[kres_co
     );
 }
 
+/// Colorize markdown-ish code in slow-agent analysis output:
+/// fenced ```...``` blocks (and 4-space-indented blocks) render in
+/// cyan; fence markers in dim cyan; inline `code` spans in cyan.
+/// Prose lines are left untouched.
+fn colorize_markdown_code(s: &str) -> String {
+    use owo_colors::OwoColorize;
+    let mut out = String::with_capacity(s.len());
+    let mut in_fence = false;
+    for line in s.split_inclusive('\n') {
+        let trimmed_end = line.trim_end_matches('\n');
+        let nl = &line[trimmed_end.len()..];
+        if trimmed_end.trim_start().starts_with("```") {
+            out.push_str(&format!("{}", trimmed_end.dimmed().cyan()));
+            out.push_str(nl);
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence || trimmed_end.starts_with("    ") {
+            out.push_str(&format!("{}", trimmed_end.cyan()));
+            out.push_str(nl);
+            continue;
+        }
+        out.push_str(&colorize_inline_code(trimmed_end));
+        out.push_str(nl);
+    }
+    out
+}
+
+/// Tint `code` spans inside a single prose line cyan.
+fn colorize_inline_code(line: &str) -> String {
+    use owo_colors::OwoColorize;
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(start) = rest.find('`') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('`') {
+            Some(end) => {
+                let span = &after[..end];
+                out.push_str(&format!("{}", format!("`{span}`").cyan()));
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn report_reaped(r: &kres_core::ReapedTask) {
     match r.state {
         kres_core::TaskState::Done => {
@@ -3651,7 +3711,7 @@ fn report_reaped(r: &kres_core::ReapedTask) {
             // the 's behaviour.
             if !r.analysis.is_empty() {
                 println!();
-                println!("{}", r.analysis);
+                println!("{}", colorize_markdown_code(&r.analysis));
                 println!();
             }
         }

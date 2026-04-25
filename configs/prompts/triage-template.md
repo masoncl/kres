@@ -48,7 +48,14 @@ Use exactly the section headings below, in this order. Every section
 is required. Keep prose tight — short triage doc, not a re-run of
 FINDING.md.
 
+The very first line of `summary.md` is a relative-link header that
+points back at the per-finding `FINDING.md` and `metadata.yaml`
+sitting in the same directory. Emit it verbatim, then a blank line,
+then the `# Subject:` heading.
+
 ```
+[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)
+
 # Subject: <one-line bug description>
 
 # Status
@@ -132,7 +139,10 @@ determined which subsystem this bug belongs to, fill in that subsystem field.
 ## Rules
 
 - The Subject line is the `# Subject:` heading itself — don't add a
-  separate first heading above it.
+  separate first heading above it. The only line allowed before
+  `# Subject:` is the verbatim cross-link line
+  `[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)` followed
+  by one blank line.
 - Status values are exactly one of `Fixed`, `Plausible`, `Unknown`,
   `Invalid`. Match the metadata's `status:` when it's `invalidated`
   (→ `Invalid`); otherwise pick the best fit from the FINDING.md

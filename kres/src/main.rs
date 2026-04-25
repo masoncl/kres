@@ -537,7 +537,11 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // `--results DIR` sets the default dir for findings/report/todo.
     // Individual `--findings FILE`, `--report FILE`, `--todo FILE`
     // override their own slot. When --results is absent, the default
-    // is ~/.kres/sessions/<session-id>/ (session-id is a timestamp).
+    // is ~/.kres/sessions/<session-id>/. The session-id is a UTC
+    // timestamp + pid: bulk-launching parallel kres processes (e.g.
+    // a triage-all wrapper) used to collide on the timestamp alone
+    // because chrono's seconds-resolution string was identical for
+    // every process started in the same second.
     // Treat --summary and --summary-markdown as the same "standalone
     // summary" entry; the markdown flag just picks the variant
     // template and filename further down.
@@ -555,7 +559,8 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         (None, true) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         (None, false) => {
             let base = kres_dir().unwrap_or_else(|| PathBuf::from("."));
-            let session_id = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+            let session_id = format!("{ts}-{}", std::process::id());
             base.join("sessions").join(session_id)
         }
     };

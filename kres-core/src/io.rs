@@ -328,12 +328,10 @@ mod tests {
 
         let first_mark: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
         let fm = first_mark.clone();
-        assert!(
-            install_markdown_sink(Box::new(move |_| {
-                *fm.lock().unwrap() = 1;
-            }))
-            .is_ok()
-        );
+        assert!(install_markdown_sink(Box::new(move |_| {
+            *fm.lock().unwrap() = 1;
+        }))
+        .is_ok());
         // Second installer: must be rejected.
         let second = install_markdown_sink(Box::new(|_| {}));
         assert!(second.is_err(), "second install must bounce");

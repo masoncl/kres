@@ -62,9 +62,9 @@ impl ConsentStore {
         // also filters this token, but leaves the rule here as
         // belt-and-braces for any future caller that resolves a path
         // outside grant_paths_from_text.)
-        if dir.parent().is_none() {
-            return None;
-        }
+        // `Path::parent` returns None only at the filesystem root,
+        // so the `?` here propagates the rejection cleanly.
+        dir.parent()?;
         let mut g = self.granted.write().unwrap();
         g.insert(dir.clone());
         Some(dir)
@@ -380,7 +380,10 @@ mod tests {
             Path::new("/tmp"),
             "lists of `relevant_symbols` / `relevant_file_sections` and yes / no / n/a",
         );
-        assert!(added.is_empty(), "bare separators must not grant: {added:?}");
+        assert!(
+            added.is_empty(),
+            "bare separators must not grant: {added:?}"
+        );
         assert!(!s.is_allowed(Path::new("/etc/passwd")));
     }
 

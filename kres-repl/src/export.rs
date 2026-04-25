@@ -139,6 +139,13 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
 const INDEX_SCRIPT_BODY: &str = include_str!("../../scripts/findings-index.py");
 const INDEX_SCRIPT_NAME: &str = "findings-index.py";
 
+/// Bundled README explaining the export layout and how to use
+/// findings-index.py. Same install discipline as the script: copied
+/// into the export dir on first use; never overwritten on re-run, so
+/// operator edits survive a kres rebuild.
+const EXPORT_README_BODY: &str = include_str!("../../scripts/export-README.md");
+const EXPORT_README_NAME: &str = "README.md";
+
 /// Install `findings-index.py` into `dir` (if absent) and run it
 /// with cwd = `dir`. The script walks `<dir>/*/metadata.yaml`, sorts
 /// the rows by severity then date then id, and writes both
@@ -158,8 +165,26 @@ pub fn run_export_index(dir: &Path) -> Result<PathBuf> {
             dir.display()
         ));
     }
+    install_export_readme(dir);
     run_index_script(dir);
     Ok(dir.join("INDEX.md"))
+}
+
+/// Install the bundled `README.md` into `dir` if it isn't already
+/// there. Same don't-overwrite rule as `run_index_script`: an
+/// operator-edited README survives kres re-runs. Failures log to
+/// stderr but do not propagate — the README is documentation, not
+/// load-bearing for the export.
+fn install_export_readme(dir: &Path) {
+    let readme_path = dir.join(EXPORT_README_NAME);
+    if readme_path.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&readme_path, EXPORT_README_BODY) {
+        eprintln!("--export: couldn't install {} ({e})", readme_path.display());
+        return;
+    }
+    eprintln!("--export: installed {}", readme_path.display());
 }
 
 /// Copy the bundled index-html generator into `dir` if it isn't
@@ -173,10 +198,7 @@ fn run_index_script(dir: &Path) {
     let script_path = dir.join(INDEX_SCRIPT_NAME);
     if !script_path.exists() {
         if let Err(e) = std::fs::write(&script_path, INDEX_SCRIPT_BODY) {
-            eprintln!(
-                "--export: couldn't install {} ({e})",
-                script_path.display()
-            );
+            eprintln!("--export: couldn't install {} ({e})", script_path.display());
             return;
         }
         #[cfg(unix)]
@@ -184,10 +206,7 @@ fn run_index_script(dir: &Path) {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o755);
             if let Err(e) = std::fs::set_permissions(&script_path, perms) {
-                eprintln!(
-                    "--export: couldn't chmod {} ({e})",
-                    script_path.display()
-                );
+                eprintln!("--export: couldn't chmod {} ({e})", script_path.display());
                 return;
             }
         }
@@ -199,18 +218,10 @@ fn run_index_script(dir: &Path) {
         .status();
     match status {
         Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "--export: {} exited with {}",
-            script_path.display(),
-            s
-        ),
-        Err(e) => eprintln!(
-            "--export: failed to run {} ({e})",
-            script_path.display()
-        ),
+        Ok(s) => eprintln!("--export: {} exited with {}", script_path.display(), s),
+        Err(e) => eprintln!("--export: failed to run {} ({e})", script_path.display()),
     }
 }
-
 
 /// Disk override wins when it exists and is non-empty; else the
 /// compiled-in copy. Mirrors the `~/.kres/commands/<name>.md`
@@ -1042,6 +1053,42 @@ mod tests {
     }
 
     #[test]
+    fn export_index_installs_readme_and_preserves_local_edits() {
+        // run_export_index installs README.md alongside the script.
+        // Same don't-overwrite contract: the bundled copy lands on
+        // first run, an operator edit survives a re-run.
+        let dir = tmp_dir("export-index-readme-install");
+        std::fs::create_dir_all(dir.join("findings/a_high")).unwrap();
+        std::fs::write(
+            dir.join("findings/a_high/metadata.yaml"),
+            "id: \"a\"\ntitle: \"some bug\"\nseverity: high\nstatus: active\n",
+        )
+        .unwrap();
+        run_export_index(&dir).unwrap();
+        let readme = dir.join("README.md");
+        assert!(
+            readme.exists(),
+            "README.md should be installed in {}",
+            dir.display()
+        );
+        let body = std::fs::read_to_string(&readme).unwrap();
+        assert_eq!(
+            body, EXPORT_README_BODY,
+            "first install should match the bundled README verbatim"
+        );
+        // Operator-edited README must survive a second run.
+        let edited = "# my custom export README\n";
+        std::fs::write(&readme, edited).unwrap();
+        run_export_index(&dir).unwrap();
+        let body_after = std::fs::read_to_string(&readme).unwrap();
+        assert_eq!(
+            body_after, edited,
+            "second run must not overwrite an operator-edited README"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn finding_md_related_emits_markdown_link_for_known_ids() {
         let mut f = finding_sample();
         f.related_finding_ids = vec!["present/id".into(), "absent_id".into()];
@@ -1075,7 +1122,10 @@ mod tests {
             out.contains("filename: \"drivers/net/x.c\""),
             "missing filename: {out}"
         );
-        assert!(out.contains("subsystem: \"\"\n"), "missing subsystem: {out}");
+        assert!(
+            out.contains("subsystem: \"\"\n"),
+            "missing subsystem: {out}"
+        );
     }
 
     #[test]

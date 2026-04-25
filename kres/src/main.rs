@@ -101,6 +101,15 @@ struct ReplArgs {
     /// cap still wins there.
     #[arg(long, default_value_t = false)]
     follow: bool,
+    /// Exit the REPL once the work-stop condition fires, instead of
+    /// staying open waiting for further operator input. Same exit
+    /// path as the existing piped-stdout case (auto-renders summary
+    /// before teardown). Useful for batch-style invocations on a
+    /// real TTY where the operator wants the kres process to end as
+    /// soon as `--turns N` exhausts or `--turns 0` hits goal-met /
+    /// no-progress / no-goal-batch-finished.
+    #[arg(long, default_value_t = false)]
+    one: bool,
     /// Resume from a prior `session.json` in the results dir.
     /// When false (default), kres ignores any existing session.json
     /// and starts clean — even when `--results DIR` points at a
@@ -765,7 +774,10 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         // so once the work-stop condition fires there is no one to
         // type the next prompt. Match the existing `--turns N` exit
         // path and quit the REPL when stdout isn't a tty.
-        exit_on_idle: !std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        // `--one` forces the same exit path the piped-stdout case
+        // takes; otherwise default to "exit when stdout has no
+        // terminal on the other end".
+        exit_on_idle: args.one || !std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
     let mut session = Session::new(mgr, cfg).await;
     // Resume from a prior session.json ONLY when `--resume` was
@@ -1268,6 +1280,14 @@ mod tests {
         assert!(c.cmd.is_none());
         assert_eq!(c.repl.prompt.as_deref(), Some("file.md"));
         assert_eq!(c.repl.turns, 3);
+    }
+
+    #[test]
+    fn one_flag_defaults_off_and_parses() {
+        let bare = Cli::try_parse_from(["kres"]).unwrap();
+        assert!(!bare.repl.one, "--one must default off");
+        let with = Cli::try_parse_from(["kres", "--one"]).unwrap();
+        assert!(with.repl.one, "--one must parse as a bare bool flag");
     }
 
     #[test]

@@ -238,16 +238,6 @@ pub struct Session {
     /// Lets the reaper tick skip no-op fsyncs when nothing changed.
     /// Zero means "never persisted" and always triggers a write.
     persist_sig: Arc<std::sync::atomic::AtomicU64>,
-    /// Set to true by the reaper when the --turns cap is reached.
-    /// The main REPL loop checks this after root_shutdown breaks the
-    /// select; when true, /summary is invoked before teardown so the
-    /// operator gets a summary.txt on a clean --turns N run.
-    turns_exhausted: Arc<std::sync::atomic::AtomicBool>,
-    /// True once any task has run in Coding mode during this session.
-    /// Suppresses the teardown summary — coding-mode sessions don't
-    /// have findings to summarise and the summary template would
-    /// produce gibberish.
-    any_coding_task: Arc<std::sync::atomic::AtomicBool>,
     /// Set by `/stop`; cleared by `submit_prompt` and `/continue`.
     /// While set, the idle-loop auto-continue does not fire. Without
     /// this latch `/stop` only cancels the currently-running tasks,
@@ -434,8 +424,6 @@ impl Session {
                 interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                 last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                 persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 stop_notify: Arc::new(tokio::sync::Notify::new()),
                 status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -464,8 +452,6 @@ impl Session {
             interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
             last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
             persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
             status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -865,7 +851,6 @@ impl Session {
         // instead of burying the file in
         // ~/.kres/sessions/<ts>/code/hello-world.c.
         let code_output_root_for_reaper: PathBuf = self.cfg.workspace.clone();
-        let turns_exhausted_for_reaper = self.turns_exhausted.clone();
         let stop_latched_for_reaper = self.stop_latched.clone();
         let stop_notify_for_reaper = self.stop_notify.clone();
         let turns_limit = self.cfg.turns_limit;
@@ -1584,12 +1569,6 @@ impl Session {
                                 "[{carry} pending item(s) deferred — see /followup]"
                             );
                         }
-                        // Flag set BEFORE cancel so the main loop,
-                        // which breaks on root_shutdown.cancelled(),
-                        // sees the flag already asserted when it
-                        // reaches the post-loop /summary gate.
-                        turns_exhausted_for_reaper
-                            .store(true, std::sync::atomic::Ordering::Release);
                         kres_core::async_eprintln!("exiting REPL.");
                         mgr_for_reaper.root_shutdown().cancel();
                         break;
@@ -1690,9 +1669,9 @@ impl Session {
                         // /followup's deferred list. Done/Skipped
                         // items stay so the plan step rollup can
                         // still see them. Unlike the --turns N path
-                        // we do NOT cancel the root shutdown or flag
-                        // turns_exhausted — the user wants to keep
-                        // driving the REPL after goal met.
+                        // we do NOT cancel the root shutdown — the
+                        // user wants to keep driving the REPL after
+                        // goal met.
                         let drained = mgr_for_reaper.drain_pending_blocked().await;
                         let carry = drained.len();
                         let mut deferred = deferred_for_reaper.lock().await;
@@ -1704,14 +1683,11 @@ impl Session {
                             );
                         }
                         turns0_stop_announced = true;
-                        // Non-tty stdout: exit on first stop, same as
-                        // `--turns N`. Set turns_exhausted so the
-                        // post-loop summary auto-renders, then cancel
+                        // Non-tty stdout (or --one): exit on first
+                        // stop, same as `--turns N`. Cancel
                         // root_shutdown to break the REPL select on
                         // root_shutdown.cancelled().
                         if exit_on_idle {
-                            turns_exhausted_for_reaper
-                                .store(true, std::sync::atomic::Ordering::Release);
                             mgr_for_reaper.root_shutdown().cancel();
                             break;
                         }
@@ -1908,34 +1884,10 @@ impl Session {
             }
         }
 
-        // --turns exit path: reaper flips turns_exhausted when the
-        // slow-agent run count hits cfg.turns_limit, then cancels
-        // root_shutdown to break the REPL loop above. On a clean
-        // --turns run, render a summary via /summary before
-        // teardown so the operator gets the artifact without having
-        // to run `kres --summary` afterwards.
-        //
-        // Suppress the auto-summary when the session ran any coding
-        // task: coding sessions don't produce findings, and the
-        // bug-summary template would emit gibberish against the
-        // coding notes in report.md.
-        let coding_session = self
-            .any_coding_task
-            .load(std::sync::atomic::Ordering::Acquire);
-        if self
-            .turns_exhausted
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            if coding_session {
-                kres_core::async_eprintln!(
-                    "--turns: skipping summary (coding session — see <workspace>/ for emitted files)"
-                );
-            } else {
-                kres_core::async_eprintln!("--turns: rendering summary.txt before exit");
-                self.cmd_summary(None, false).await;
-            }
-        }
-
+        // --turns exit path drops straight into teardown — no
+        // auto-summary. Operators who want the artifact run /summary
+        // before quitting, or `kres --summary` against the results
+        // dir afterwards.
         let out = self.mgr.stop_all(self.cfg.stop_grace).await;
         if out.requested > 0 {
             kres_core::async_eprintln!(
@@ -2117,15 +2069,6 @@ impl Session {
             } else {
                 (None, kres_agents::TaskMode::default())
             };
-        // Latch the session-wide "coding session" flag as soon as any
-        // task is submitted in coding mode. The teardown path reads
-        // this to suppress the teardown /summary — a coding session
-        // has no findings to summarise, and running the bug-summary
-        // template over coding notes produces nonsense.
-        if matches!(task_mode, kres_agents::TaskMode::Coding) {
-            self.any_coding_task
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
         // Ask the goal agent for a plan decomposition, but only on
         // operator-typed submissions — pipeline-driven follow-ups
         // already live under the original plan and should not spawn

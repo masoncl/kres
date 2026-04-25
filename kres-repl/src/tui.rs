@@ -215,9 +215,7 @@ pub const MD_BLOCK_END: &str = "\x01kres-md-block-end\x01";
 /// no headings, lists, emphasis, or links.
 pub fn render_markdown_block(body: &str) -> Vec<Line<'static>> {
     let code_style = Style::default().fg(Color::Cyan);
-    let fence_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::DIM);
+    let fence_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut in_fence = false;
     for line in body.split('\n') {
@@ -268,10 +266,7 @@ fn split_inline_code(line: &str, code_style: Style) -> Vec<Span<'static>> {
             break;
         };
         let close = open + 1 + close_rel;
-        spans.push(Span::styled(
-            line[open + 1..close].to_string(),
-            code_style,
-        ));
+        spans.push(Span::styled(line[open + 1..close].to_string(), code_style));
         cursor = close + 1;
     }
     spans
@@ -1538,11 +1533,12 @@ mod tests {
         let body = "before\n```\ncode a\ncode b\n```\nafter";
         let lines = render_markdown_block(body);
         let code_style = Style::default().fg(Color::Cyan);
-        let fence_style = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::DIM);
+        let fence_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM);
         let texts: Vec<String> = lines.iter().map(line_plain_text).collect();
-        assert_eq!(texts, vec!["before", "```", "code a", "code b", "```", "after"]);
+        assert_eq!(
+            texts,
+            vec!["before", "```", "code a", "code b", "```", "after"]
+        );
         // Fence markers are dim-cyan, enclosed lines are plain cyan,
         // prose lines carry no Cyan styling.
         assert_eq!(lines[0].spans[0].style, Style::default(), "prose unstyled");

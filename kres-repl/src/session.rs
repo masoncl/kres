@@ -3547,11 +3547,25 @@ pub async fn build_orchestrator(
 }
 
 /// Print a one-line summary of a reaped task.
-/// Write code_output files emitted by a Coding-mode task to
-/// `<workspace>/<path>`. Rejects absolute paths and traversal
-/// segments (`..`) so a malformed model reply can't drop files
-/// outside the workspace root. Each file is written with a
-/// tmp + rename so a crash doesn't leave a partial artifact.
+/// Write code_output files emitted by a Coding-mode task.
+///
+/// Path handling, mirroring the rule `edit_file` already uses for
+/// outside-workspace edits (kres-agents/src/tools.rs:resolve_workspace):
+///
+///   * Relative paths land at `<workspace>/<path>` — same default
+///     `<workspace>` rooting that's served the in-tree coding flow.
+///   * Absolute paths are accepted ONLY when they resolve under the
+///     workspace OR under a directory the operator named in a prompt
+///     this session (granted via `consent::grant_paths_from_text`).
+///     This is what lets a triage prompt that names an absolute bug
+///     folder receive `summary.md` writes there directly, without
+///     dropping write-anywhere across the FS.
+///   * `..` traversal segments are always rejected — they don't make
+///     sense in either rooting and are how a malformed reply would
+///     try to escape both the workspace and the consent gate.
+///
+/// Each file is written with a tmp + rename so a crash doesn't leave
+/// a partial artifact.
 /// One applied (or attempted) CodeEdit. The reaper folds these
 /// back into the task's analysis trailer so a failure ("old_string
 /// not found", "ambiguous match") is visible to the NEXT slow-agent
@@ -3671,21 +3685,36 @@ async fn persist_code_output(workspace: &Path, task_name: &str, files: &[kres_co
         kres_core::async_eprintln!("[coding] create {} failed: {e}", base.display());
         return;
     }
+    let ws_canon = base.canonicalize().unwrap_or_else(|_| base.clone());
     let mut wrote = 0usize;
     for f in files {
         let rel = std::path::Path::new(&f.path);
-        if rel.is_absolute()
-            || rel
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             kres_core::async_eprintln!(
-                "[coding] rejecting suspicious path '{}' (absolute or contains '..')",
+                "[coding] rejecting suspicious path '{}' (contains '..')",
                 f.path
             );
             continue;
         }
-        let out = base.join(rel);
+        let out = if rel.is_absolute() {
+            let allowed = rel.starts_with(&ws_canon)
+                || kres_core::consent::get()
+                    .map(|s| s.is_allowed(rel))
+                    .unwrap_or(false);
+            if !allowed {
+                kres_core::async_eprintln!(
+                    "[coding] rejecting absolute path '{}' (outside workspace and no consent on file — mention the containing directory in a prompt to grant write access)",
+                    f.path
+                );
+                continue;
+            }
+            rel.to_path_buf()
+        } else {
+            base.join(rel)
+        };
         if let Some(parent) = out.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 kres_core::async_eprintln!("[coding] mkdir {} failed: {e}", parent.display());
@@ -4241,5 +4270,105 @@ mod tests {
     #[test]
     fn truncate_ellipsises_long() {
         assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+
+    fn code_output_tmp_dir(nonce: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "kres-code-output-{}-{}-{:x}",
+            nonce,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn code_output_relative_lands_under_workspace() {
+        let ws = code_output_tmp_dir("rel");
+        let files = vec![kres_core::CodeFile {
+            path: "summary.md".into(),
+            content: "hello".into(),
+            purpose: String::new(),
+        }];
+        persist_code_output(&ws, "task1", &files).await;
+        let written = std::fs::read_to_string(ws.join("summary.md")).unwrap();
+        assert_eq!(written, "hello");
+        std::fs::remove_dir_all(&ws).ok();
+    }
+
+    #[tokio::test]
+    async fn code_output_absolute_outside_workspace_without_consent_is_rejected() {
+        // Fresh consent store with NO grants.
+        let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
+        if let Some(s) = kres_core::consent::get() {
+            s.clear();
+        }
+        let ws = code_output_tmp_dir("abs-rejected-ws");
+        let outside = code_output_tmp_dir("abs-rejected-out");
+        let target = outside.join("summary.md");
+        let files = vec![kres_core::CodeFile {
+            path: target.display().to_string(),
+            content: "nope".into(),
+            purpose: String::new(),
+        }];
+        persist_code_output(&ws, "task1", &files).await;
+        assert!(
+            !target.exists(),
+            "consent gate should have blocked the absolute write"
+        );
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[tokio::test]
+    async fn code_output_absolute_with_consent_writes_through() {
+        let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
+        let store = kres_core::consent::get().expect("consent installed");
+        store.clear();
+        let ws = code_output_tmp_dir("abs-allowed-ws");
+        let bug_dir = code_output_tmp_dir("abs-allowed-bug");
+        // Operator-mention equivalent: grant the bug dir.
+        store
+            .grant_from_mention(&bug_dir)
+            .expect("grant existing dir");
+        let target = bug_dir.join("summary.md");
+        let files = vec![kres_core::CodeFile {
+            path: target.display().to_string(),
+            content: "triage body".into(),
+            purpose: "triage summary".into(),
+        }];
+        persist_code_output(&ws, "task1", &files).await;
+        let written = std::fs::read_to_string(&target).expect("file written");
+        assert_eq!(written, "triage body");
+        // Make sure we did NOT also write a copy under the workspace.
+        let basename = target.file_name().unwrap();
+        assert!(!ws.join(basename).exists());
+        store.clear();
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&bug_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn code_output_parentdir_traversal_is_rejected() {
+        let ws = code_output_tmp_dir("parent");
+        let files = vec![kres_core::CodeFile {
+            path: "../escape.md".into(),
+            content: "no".into(),
+            purpose: String::new(),
+        }];
+        persist_code_output(&ws, "task1", &files).await;
+        let parent = ws.parent().unwrap();
+        assert!(
+            !parent.join("escape.md").exists(),
+            ".. traversal must be blocked"
+        );
+        std::fs::remove_dir_all(&ws).ok();
     }
 }

@@ -129,9 +129,16 @@ def collect_rows(root):
         with open(meta, encoding="utf-8") as f:
             yaml_text = f.read()
         subsystem = parse_top_level(yaml_text, "subsystem") or ""
+        # Prefer the triage summary when it's been written; fall back
+        # to the raw FINDING.md so untriaged rows still link somewhere.
+        if os.path.isfile(os.path.join(path, "summary.md")):
+            link_file = "summary.md"
+        else:
+            link_file = "FINDING.md"
         rows.append({
             "tag": name,
             "tag_path": tag_prefix + name,
+            "link_file": link_file,
             "id": parse_top_level(yaml_text, "id") or "",
             "title": parse_top_level(yaml_text, "title") or "",
             "severity": (parse_top_level(yaml_text, "severity") or "").strip(),
@@ -193,13 +200,14 @@ def build_markdown(rows):
         subsystem = r["subsystem"] if r["subsystem"] else "—"
         parts.append(
             "| {sev} | {subsys} | {date} | {status} | "
-            "[`{id}`]({tag_path}/FINDING.md) | {title} |".format(
+            "[`{id}`]({tag_path}/{link}) | {title} |".format(
                 sev=sev,
                 subsys=md_escape_cell(subsystem),
                 date=date_display,
                 status=r["status"],
                 id=r["id"],
                 tag_path=r["tag_path"],
+                link=r["link_file"],
                 title=md_escape_cell(r["title"]),
             )
         )
@@ -409,8 +417,8 @@ def build_html(rows):
         parts.append("<td>{}</td>".format(e(date_display)))
         parts.append("<td>{}</td>".format(e(r["status"])))
         parts.append(
-            '<td><a href="{}/FINDING.md"><code>{}</code></a></td>'
-            .format(e(r["tag_path"]), e(r["id"]))
+            '<td><a href="{}/{}"><code>{}</code></a></td>'
+            .format(e(r["tag_path"]), e(r["link_file"]), e(r["id"]))
         )
         parts.append("<td>{}</td>".format(e(r["title"])))
         parts.append("</tr>")

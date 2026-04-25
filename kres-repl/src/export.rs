@@ -397,6 +397,22 @@ fn severity_str(s: Severity) -> &'static str {
     }
 }
 
+/// Pick the canonical top-level filename for a finding.
+/// Order: first relevant symbol → first relevant file section → "".
+fn primary_filename(f: &Finding) -> String {
+    if let Some(sym) = f.relevant_symbols.first() {
+        if !sym.filename.is_empty() {
+            return sym.filename.clone();
+        }
+    }
+    if let Some(sec) = f.relevant_file_sections.first() {
+        if !sec.filename.is_empty() {
+            return sec.filename.clone();
+        }
+    }
+    String::new()
+}
+
 fn status_str(s: Status) -> &'static str {
     match s {
         Status::Active => "active",
@@ -441,6 +457,18 @@ fn build_context(f: &Finding, git: &GitHead) -> Ctx {
     c.insert("status".into(), Value::Scalar(status_str(f.status).into()));
     c.insert("git_sha".into(), Value::Scalar(git.sha.clone()));
     c.insert("git_subject".into(), Value::Scalar(git.subject.clone()));
+    // Canonical top-level filename: prefer the first relevant symbol's
+    // file (named code site), fall back to the first relevant file
+    // section, then empty. The template emits the field unconditionally
+    // so an empty value renders as `filename: ""` — readers can grep
+    // for unattributed findings without writing a tri-state check.
+    let primary_filename = primary_filename(f);
+    c.insert("filename".into(), Value::Scalar(primary_filename));
+    // Subsystem is not currently in the Finding schema; leave the slot
+    // present so readers and downstream tools see a consistent shape.
+    // A later todo will derive this from `filename` via a path-prefix
+    // rule.
+    c.insert("subsystem".into(), Value::Scalar(String::new()));
 
     // Use first_seen_at when the finding carries one; fall back to
     // wall-clock now for legacy records (pre-first_seen_at findings.json
@@ -1051,6 +1079,33 @@ mod tests {
         // Absent id falls through to plain code formatting.
         assert!(body.contains(", `absent_id`"), "missing fallback: {body}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embedded_template_emits_top_level_filename_and_blank_subsystem() {
+        // Sample finding has a relevant_symbol at drivers/net/x.c —
+        // the canonical top-level `filename:` should reflect that.
+        // `subsystem:` is intentionally blank for now (later todo).
+        let out = render(
+            METADATA_TEMPLATE,
+            &build_context(&finding_sample(), &git_sample()),
+        );
+        assert!(
+            out.contains("filename: \"drivers/net/x.c\""),
+            "missing filename: {out}"
+        );
+        assert!(out.contains("subsystem: \"\"\n"), "missing subsystem: {out}");
+    }
+
+    #[test]
+    fn primary_filename_falls_back_to_file_sections_then_empty() {
+        // No symbols, but a file section: filename comes from there.
+        let mut f = finding_sample();
+        f.relevant_symbols.clear();
+        assert_eq!(primary_filename(&f), "drivers/net/x.c");
+        // Neither symbols nor sections: empty string.
+        f.relevant_file_sections.clear();
+        assert_eq!(primary_filename(&f), "");
     }
 
     #[test]

@@ -3,6 +3,8 @@ id: {{id}}
 title: {{title}}
 severity: {{!severity}}
 status: {{!status}}
+filename: {{filename}}
+subsystem: {{subsystem}}
 git:
   sha: {{git_sha}}
   subject: {{git_subject}}

@@ -6,7 +6,7 @@ THAN 72, INSERT A NEWLINE AND WORD-WRAP BEFORE EMITTING.  THIS IS A HARD
 LIMIT, NOT A SUGGESTION.  THE ONLY LINES ALLOWED TO EXCEED 72 CHARACTERS
 ARE VERBATIM CODE FRAGMENTS QUOTED FROM SOURCE (function prototypes,
 struct definitions, identifiers where breaking would change meaning).
-EVERY PROSE LINE — FRAMING, SUBJECT:, QUESTIONS, CALL CHAINS,
+EVERY PROSE LINE — FRAMING, SUBJECT:, STATEMENTS, CALL CHAINS,
 OBSERVATIONS — WRAPS AT 72.  IF A Subject: LINE WOULD EXCEED 72
 CHARACTERS, TIGHTEN THE WORDING UNTIL IT FITS; NEVER BREAK A Subject:
 LINE ACROSS TWO LINES.
@@ -22,7 +22,7 @@ analysis task that contributed to a finding.  Your job is to turn
 those inputs into a single markdown bug report covering every bug
 that was found.  Treat the task_observations text as supporting
 detail to fold into the relevant bug's section — quote from it when
-it sharpens the question, do not attribute observations to tasks.
+it sharpens the statement, do not attribute observations to tasks.
 
 - If original_prompt is non-empty, open the report with one or two
 sentences of context that restates what the run was looking into,
@@ -53,21 +53,20 @@ technical bug report.
   - Call issues "bugs", never use the word critical.
   - NEVER EVER USE ALL CAPS.
 
-- Explain the bugs as questions about the code, but do not mention
+- Explain the bugs as statements about the code, but do not mention
 any specific author.
   - don't say: Did you corrupt memory here?
-  - instead say: Can this corrupt memory? or Does this code ...
+  - instead say: This code corrupts memory ...
 
-- Vary your question phrasing.  Don't start with "Does this code ..."
+- Vary your statement phrasing.  Don't start with "This code ..."
 every time.
 
 - Make statements specifically about the sources you're referencing:
-  - If the bug is a leak, don't call it a 'resource leak', ask
-    specifically about the resource you think is leaking.  'Does this
-    code leak the folio?'
-  - Don't say: 'Does this loop have a bounds checking issue?' Name the
-    variable you think is overflowing: "Does this code overflow
-    xyz[]?"
+  - If the bug is a leak, don't call it a 'resource leak', name
+    specifically the resource you think is leaking.  'This code leaks
+    the folio.'
+  - Don't say: 'This loop has a bounds checking issue.'  Name the
+    variable you think is overflowing: 'This code overflows xyz[].'
 
 - Do not add explanatory content about why something matters or what
 benefits a fix would provide.  State the issue and the suggestion,
@@ -97,7 +96,7 @@ detail you want to cite, drop that detail rather than guess.
 
 ## Ensure clear, concise paragraphs
 
-Never make long or dense confusing paragraphs, ask short questions
+Never make long or dense confusing paragraphs.  State the bug plainly,
 backed up by code snippets, or call chains if needed.
 
 The examples below use a fictional `drivers/example/widget.c` so the
@@ -105,16 +104,16 @@ format is clear without tying the sample to any real bug.
 
 ### AVOID
 ```
-Can this sequence actually occur?  Looking at widget_claim() in
+This sequence can occur.  Looking at widget_claim() in
 drivers/example/widget.c, if CPU1 already called widget_release() which
-sets w->owner = NULL, wouldn't CPU2 check owner, see it is NULL, take
+sets w->owner = NULL, CPU2 checks owner, sees it is NULL, and takes
 the 'already released' path with mutex_unlock/put_widget/goto retry
-instead of calling widget_release() again?
+instead of calling widget_release() again.
 ```
 
 ### USE INSTEAD
 ```
-Can this sequence actually occur?  Looking at `widget_claim()` in
+This sequence can occur.  Looking at `widget_claim()` in
 `drivers/example/widget.c`, if CPU1 already called `widget_release()`
 and set `w->owner = NULL`:
 
@@ -122,7 +121,7 @@ CPU1
 widget_release()
    w->owner = NULL;
 
-CPU2 would see this in `widget_claim()`:
+CPU2 then sees this in `widget_claim()`:
 
 ```c
 if (!w->owner) {
@@ -134,8 +133,8 @@ if (!w->owner) {
 }
 ```
 
-and take the `goto retry` path instead of calling `widget_release()`
-again?
+and takes the `goto retry` path instead of calling `widget_release()`
+again.
 ```
 
 Dense paragraphs are hard to read.  Spread the information out so
@@ -144,8 +143,8 @@ it is easier to follow.
 If you have a series of factual sentences, break them up into logical
 groups with a blank line between each group.
 
-If you have a series of statements followed by a question, put a blank
-line before the question.
+If a paragraph builds up to the punchline (the actual bug claim), put
+a blank line before the punchline.
 
 ## NEVER EVER ALL CAPS
 
@@ -260,9 +259,8 @@ including the Subject:
    wrap a `bug-impact:` line.  If the sentence would not fit, tighten
    the wording.
 4. A blank line.
-5. A concise question or statement of the bug, phrased as a question
-   where possible.
-6. Any code snippets needed to make the question concrete.  Wrap
+5. A concise plain statement of the bug.
+6. Any code snippets needed to make the statement concrete.  Wrap
    C snippets in ```c fenced code blocks; use inline backticks for
    short identifiers within prose.
 7. The call chain, if relevant.  Write it inline as `funcA() ->
@@ -292,7 +290,7 @@ fictional and exists only to show the shape.
 bug-severity: high
 bug-impact: deadlock between widget teardown and reinit on SMP systems
 
-Can this sequence deadlock against a concurrent `widget_reinit()`?  In
+This sequence deadlocks against a concurrent `widget_reinit()`.  In
 `drivers/example/widget.c:widget_destroy()`, the cleanup path takes
 the locks in this order:
 
@@ -314,5 +312,5 @@ raw_spin_lock(&w->ref_lock);
 Call chain reaching the bad ordering: `module_exit()` ->
 `widget_teardown()` -> `widget_destroy()`.
 
-Does lockdep complain about this when CONFIG_PROVE_LOCKING is enabled?
+lockdep flags this when CONFIG_PROVE_LOCKING is enabled.
 ```

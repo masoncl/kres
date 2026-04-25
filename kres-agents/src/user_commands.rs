@@ -36,6 +36,10 @@ const TABLE: &[(&str, &str)] = &[
         "summary-markdown",
         include_str!("../../configs/prompts/bug-summary-markdown.md"),
     ),
+    (
+        "triage",
+        include_str!("../../configs/prompts/triage-template.md"),
+    ),
 ];
 
 /// Return the body for `name` — disk override wins, then the
@@ -128,12 +132,28 @@ mod tests {
 
     #[test]
     fn all_expected_commands_are_present() {
-        for expected in ["review", "summary", "summary-markdown"] {
+        for expected in ["review", "summary", "summary-markdown", "triage"] {
             assert!(
                 lookup(expected).is_some(),
                 "expected embedded command {expected} not found"
             );
         }
+    }
+
+    #[test]
+    fn triage_body_contains_template_markers() {
+        // Sanity check — same shape as the review marker test.
+        // If the include_str stops pointing at triage-template.md
+        // this catches it.
+        let body = lookup("triage").unwrap();
+        assert!(
+            body.contains("# Subject:"),
+            "triage body missing `# Subject:` heading"
+        );
+        assert!(
+            body.contains("triage summary"),
+            "triage body missing the code_output `purpose` example"
+        );
     }
 
     #[test]

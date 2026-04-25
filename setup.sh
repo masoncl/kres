@@ -247,7 +247,7 @@ mkdir -p "${DEST}/prompts"
 shopt -s nullglob
 for src in "${CONFIGS_SRC}/prompts"/*.md; do
   case "$(basename "$src")" in
-    *.system.md | bug-summary.md | bug-summary-markdown.md | review-template.md)
+    *.system.md | bug-summary.md | bug-summary-markdown.md | review-template.md | triage-template.md)
       # Embedded in the binary; skip.
       ;;
     *)

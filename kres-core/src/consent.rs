@@ -55,6 +55,16 @@ impl ConsentStore {
         } else {
             return None;
         };
+        // Granting the filesystem root would make is_allowed() true
+        // for every absolute path on the host, which defeats the
+        // entire consent gate. A bare `/` token is never a meaningful
+        // operator mention; refuse to record it. (`looks_like_path`
+        // also filters this token, but leaves the rule here as
+        // belt-and-braces for any future caller that resolves a path
+        // outside grant_paths_from_text.)
+        if dir.parent().is_none() {
+            return None;
+        }
         let mut g = self.granted.write().unwrap();
         g.insert(dir.clone());
         Some(dir)
@@ -187,6 +197,15 @@ fn strip_token_punctuation(s: &str) -> &str {
 
 fn looks_like_path(s: &str) -> bool {
     if s.is_empty() {
+        return false;
+    }
+    // Bare separators that operator prose uses as conjunctions —
+    // `foo / bar`, `yes / no` — split into a lone "/" token. Never
+    // a real path mention; resolves to filesystem root if we let it
+    // through, which would consent-grant the entire FS. Same logic
+    // for the lone parent / current-dir tokens which can sneak in
+    // when prompts use `..` or `.` as ellipsis.
+    if matches!(s, "/" | "." | "..") {
         return false;
     }
     // Skip URL-scheme tokens — `https://github.com/x`, `s3://bucket/key`,
@@ -347,6 +366,30 @@ mod tests {
         let s = ConsentStore::new();
         let added = grant_paths_from_text(&s, Path::new("/tmp"), "just some text no paths here");
         assert!(added.is_empty());
+    }
+
+    #[test]
+    fn text_scanner_ignores_bare_slash_separator() {
+        // Regression: a prompt with prose like "lists of `foo` /
+        // `bar`" used to produce a "/" token from split_whitespace,
+        // which resolved to filesystem root and granted `/` — making
+        // is_allowed() true for every absolute path on the host.
+        let s = ConsentStore::new();
+        let added = grant_paths_from_text(
+            &s,
+            Path::new("/tmp"),
+            "lists of `relevant_symbols` / `relevant_file_sections` and yes / no / n/a",
+        );
+        assert!(added.is_empty(), "bare separators must not grant: {added:?}");
+        assert!(!s.is_allowed(Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn grant_from_mention_refuses_filesystem_root() {
+        let s = ConsentStore::new();
+        let got = s.grant_from_mention(Path::new("/"));
+        assert!(got.is_none(), "granting / would defeat the consent gate");
+        assert!(!s.is_allowed(Path::new("/etc/passwd")));
     }
 
     #[test]

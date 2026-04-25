@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Commit-msg hook for the kres repo.
+#
+# Rejects any commit whose message has a prose line longer than 100
+# characters. Lines starting with `#` are git's editor template
+# comments and are stripped before the message is recorded — they're
+# skipped here so the hook matches what git actually stores.
+#
+# To install:   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+msg_file="$1"
+limit=100
+
+bad=$(awk -v limit="$limit" '
+    /^#/ { next }
+    { if (length($0) > limit) printf "  line %d (%d chars): %s\n", NR, length($0), $0 }
+' "$msg_file")
+
+if [[ -n "$bad" ]]; then
+    cat >&2 <<EOF
+commit-msg: rejecting message — prose line(s) over ${limit} chars:
+${bad}
+
+Re-wrap the offending line(s) and retry. Use --no-verify only if you
+must bypass.
+EOF
+    exit 1
+fi

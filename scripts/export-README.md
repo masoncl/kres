@@ -1,5 +1,7 @@
 # kres export tree
 
+→ **[Browse the findings index](INDEX.md)**
+
 This directory was produced by `kres --export`. It holds one folder
 per finding plus a few entry-point files to help you browse and
 filter the set.

@@ -3,13 +3,20 @@
 //!
 //! For each finding in the store, the export writes:
 //!
-//!   <dir>/<tag>/metadata.yaml  structured metadata (id, severity,
-//!                              git HEAD sha/subject, cross-refs,
-//!                              symbol and file-section locations)
-//!   <dir>/<tag>/FINDING.md     human-readable full body: summary,
-//!                              mechanism, reproducer, impact, fix
-//!                              sketch, open questions, per-task
-//!                              analysis details
+//!   <dir>/findings/<tag>/metadata.yaml  structured metadata (id,
+//!                                       severity, git HEAD sha/
+//!                                       subject, cross-refs, symbol
+//!                                       and file-section locations)
+//!   <dir>/findings/<tag>/FINDING.md     human-readable full body:
+//!                                       summary, mechanism,
+//!                                       reproducer, impact, fix
+//!                                       sketch, open questions,
+//!                                       per-task analysis details
+//!
+//! Top-level files at `<dir>/` (INDEX.md, index.html,
+//! findings-index.py) sit alongside the `findings/` subtree so a
+//! GitHub Pages publish of the export keeps the entry-point files
+//! at the root and per-finding clutter one level down.
 //!
 //! `<tag>` is the finding's `id`, sanitized so it's safe as a
 //! directory name. Collisions after sanitizing get a numeric suffix.
@@ -65,6 +72,13 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
 
     std::fs::create_dir_all(&output_dir)
         .with_context(|| format!("creating export dir {}", output_dir.display()))?;
+    // Per-finding folders live under <output_dir>/findings/ so the
+    // top-level dir holds only entry-point files (INDEX.md,
+    // index.html, findings-index.py, …). Created up front so the
+    // per-tag mkdir below sees an existing parent.
+    let findings_root = output_dir.join("findings");
+    std::fs::create_dir_all(&findings_root)
+        .with_context(|| format!("creating findings dir {}", findings_root.display()))?;
 
     let store = FindingsStore::new(&findings_path)
         .await
@@ -89,7 +103,7 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
     let mut written = 0usize;
     for f in &findings {
         let tag = &id_to_tag[&f.id];
-        let finding_dir = output_dir.join(tag);
+        let finding_dir = findings_root.join(tag);
         std::fs::create_dir_all(&finding_dir)
             .with_context(|| format!("creating {}", finding_dir.display()))?;
         write_metadata_yaml(&finding_dir.join("metadata.yaml"), f, &git, &template)?;
@@ -112,11 +126,31 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
     Ok(())
 }
 
-/// Walk `<dir>/*/metadata.yaml` and write `<dir>/INDEX.md` — one
-/// row per finding, grouped by severity (High → Medium → Low), and
-/// inside each group ordered by `date` ascending so the
-/// longest-standing bug sits at the top. Findings with no date sink
-/// to the bottom of their group but remain present.
+/// Bundled findings index + search tool. Compiled into the kres
+/// binary so it travels with the release; copied into the export
+/// directory by [`run_index_script`] on first use, then invoked with
+/// `--generate` to refresh INDEX.md and index.html.
+///
+/// The script lives at `scripts/findings-index.py` in the source
+/// tree. Operators can edit the per-export-dir copy freely — kres
+/// won't overwrite it on re-runs of `--export` or `--export-index`.
+/// Beyond the regen path kres drives, the same script also exposes
+/// `--search QUERY` for ad-hoc filtering of the dir from the shell.
+const INDEX_SCRIPT_BODY: &str = include_str!("../../scripts/findings-index.py");
+const INDEX_SCRIPT_NAME: &str = "findings-index.py";
+
+/// Install `findings-index.py` into `dir` (if absent) and run it
+/// with cwd = `dir`. The script walks `<dir>/*/metadata.yaml`, sorts
+/// the rows by severity then date then id, and writes both
+/// `<dir>/INDEX.md` and `<dir>/index.html`. kres no longer renders
+/// either file directly so operators can iterate on layout, columns,
+/// or filters without rebuilding the binary — they edit the per-export
+/// copy of the script in place.
+///
+/// Returns the expected `INDEX.md` path. Whether the file actually
+/// exists on return depends on the script: a missing python3 or a
+/// hand-edit that errors out leaves the markdown un-refreshed and
+/// `run_index_script` logs a diagnostic to stderr.
 pub fn run_export_index(dir: &Path) -> Result<PathBuf> {
     if !dir.is_dir() {
         return Err(anyhow::anyhow!(
@@ -124,182 +158,59 @@ pub fn run_export_index(dir: &Path) -> Result<PathBuf> {
             dir.display()
         ));
     }
-    let mut rows: Vec<IndexRow> = Vec::new();
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
+    run_index_script(dir);
+    Ok(dir.join("INDEX.md"))
+}
+
+/// Copy the bundled index-html generator into `dir` if it isn't
+/// already there, then run it with cwd = `dir`. Failures along
+/// either step print a diagnostic to stderr but do not propagate —
+/// INDEX.md is already on disk, and the script itself is editable
+/// by the operator, so a missing python interpreter or a hand-edited
+/// script that errors out shouldn't abort an otherwise-successful
+/// export.
+fn run_index_script(dir: &Path) {
+    let script_path = dir.join(INDEX_SCRIPT_NAME);
+    if !script_path.exists() {
+        if let Err(e) = std::fs::write(&script_path, INDEX_SCRIPT_BODY) {
+            eprintln!(
+                "--export: couldn't install {} ({e})",
+                script_path.display()
+            );
+            return;
         }
-        let meta = entry.path().join("metadata.yaml");
-        if !meta.exists() {
-            continue;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o755);
+            if let Err(e) = std::fs::set_permissions(&script_path, perms) {
+                eprintln!(
+                    "--export: couldn't chmod {} ({e})",
+                    script_path.display()
+                );
+                return;
+            }
         }
-        let yaml = std::fs::read_to_string(&meta)
-            .with_context(|| format!("reading {}", meta.display()))?;
-        rows.push(IndexRow {
-            tag: entry.file_name().to_string_lossy().into_owned(),
-            id: top_level_scalar(&yaml, "id").unwrap_or_default(),
-            title: top_level_scalar(&yaml, "title").unwrap_or_default(),
-            severity: parse_severity(top_level_scalar(&yaml, "severity").as_deref().unwrap_or("")),
-            status: top_level_scalar(&yaml, "status").unwrap_or_else(|| "active".to_string()),
-            date: top_level_scalar(&yaml, "date"),
-        });
+        eprintln!("--export: installed {}", script_path.display());
     }
-    rows.sort_by(|a, b| {
-        // Severity desc (High first); within a tier, oldest date
-        // first; None dates go to the end of their tier; finally fall
-        // back to id for determinism.
-        let sev = severity_sort_key(b.severity).cmp(&severity_sort_key(a.severity));
-        if sev != std::cmp::Ordering::Equal {
-            return sev;
-        }
-        match (a.date.as_deref(), b.date.as_deref()) {
-            (Some(x), Some(y)) => x.cmp(y).then_with(|| a.id.cmp(&b.id)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.id.cmp(&b.id),
-        }
-    });
-
-    let out_path = dir.join("INDEX.md");
-    std::fs::write(&out_path, render_index(&rows))
-        .with_context(|| format!("writing {}", out_path.display()))?;
-    Ok(out_path)
-}
-
-#[derive(Debug)]
-struct IndexRow {
-    tag: String,
-    id: String,
-    title: String,
-    severity: Option<Severity>,
-    status: String,
-    date: Option<String>,
-}
-
-fn severity_sort_key(s: Option<Severity>) -> u8 {
-    match s {
-        Some(Severity::High) => 3,
-        Some(Severity::Medium) => 2,
-        Some(Severity::Low) => 1,
-        None => 0,
+    let status = std::process::Command::new(&script_path)
+        .arg("--generate")
+        .current_dir(dir)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "--export: {} exited with {}",
+            script_path.display(),
+            s
+        ),
+        Err(e) => eprintln!(
+            "--export: failed to run {} ({e})",
+            script_path.display()
+        ),
     }
 }
 
-fn parse_severity(s: &str) -> Option<Severity> {
-    match s {
-        "low" => Some(Severity::Low),
-        "medium" => Some(Severity::Medium),
-        "high" => Some(Severity::High),
-        _ => None,
-    }
-}
-
-/// Parse a top-level scalar field from our generated metadata.yaml.
-/// Recognises two shapes:
-///   key: "quoted value"
-///   key: unquoted-value
-/// Ignores indented continuations and nested mappings. Returns the
-/// raw string value (quotes and backslash escapes unwrapped).
-fn top_level_scalar(yaml: &str, key: &str) -> Option<String> {
-    let needle = format!("{key}: ");
-    for line in yaml.lines() {
-        // Indented lines belong to nested mappings / list items.
-        if line.starts_with(' ') || line.starts_with('\t') {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix(&needle) else {
-            continue;
-        };
-        let rest = rest.trim();
-        if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-            return Some(unquote_yaml(inner));
-        }
-        return Some(rest.to_string());
-    }
-    None
-}
-
-/// Reverse of yaml_scalar: unwrap backslash-escapes we know about.
-/// Unknown escapes pass through as the literal char.
-fn unquote_yaml(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('\\') => out.push('\\'),
-            Some('"') => out.push('"'),
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
-fn render_index(rows: &[IndexRow]) -> String {
-    let mut out = String::new();
-    out.push_str("# kres findings index\n\n");
-    let ts = chrono::Utc::now().to_rfc3339();
-    out.push_str(&format!("_generated: {ts}_\n\n"));
-    if rows.is_empty() {
-        out.push_str("(no findings)\n");
-        return out;
-    }
-    let (h, m, l, u) = rows
-        .iter()
-        .fold((0, 0, 0, 0), |(h, m, l, u), r| match r.severity {
-            Some(Severity::High) => (h + 1, m, l, u),
-            Some(Severity::Medium) => (h, m + 1, l, u),
-            Some(Severity::Low) => (h, m, l + 1, u),
-            None => (h, m, l, u + 1),
-        });
-    out.push_str(&format!(
-        "{} finding(s): {} high, {} medium, {} low",
-        rows.len(),
-        h,
-        m,
-        l
-    ));
-    if u > 0 {
-        out.push_str(&format!(", {u} unknown-severity"));
-    }
-    out.push_str("\n\n");
-    out.push_str("| Severity | Date | Status | ID | Title |\n");
-    out.push_str("|---|---|---|---|---|\n");
-    for r in rows {
-        let sev = r
-            .severity
-            .map(|s| match s {
-                Severity::High => "high",
-                Severity::Medium => "medium",
-                Severity::Low => "low",
-            })
-            .unwrap_or("?");
-        let date = r.date.as_deref().unwrap_or("—");
-        let title = escape_md_table_cell(&r.title);
-        out.push_str(&format!(
-            "| {sev} | {date} | {status} | [`{id}`]({tag}/FINDING.md) | {title} |\n",
-            status = r.status,
-            id = r.id,
-            tag = r.tag,
-            title = title,
-        ));
-    }
-    out
-}
-
-fn escape_md_table_cell(s: &str) -> String {
-    // Pipes break GFM table cells; newlines break the row. Replace
-    // both with something that keeps the row intact.
-    s.replace('|', "\\|").replace('\n', " ")
-}
 
 /// Disk override wins when it exists and is non-empty; else the
 /// compiled-in copy. Mirrors the `~/.kres/commands/<name>.md`
@@ -991,29 +902,10 @@ mod tests {
     }
 
     #[test]
-    fn top_level_scalar_parses_quoted_and_raw() {
-        let y = "id: \"race_x\"\nseverity: high\n  nested: ignore\nstatus: active\n";
-        assert_eq!(top_level_scalar(y, "id").as_deref(), Some("race_x"));
-        assert_eq!(top_level_scalar(y, "severity").as_deref(), Some("high"));
-        assert_eq!(top_level_scalar(y, "status").as_deref(), Some("active"));
-        assert_eq!(top_level_scalar(y, "nested"), None, "indented line ignored");
-        assert_eq!(top_level_scalar(y, "missing"), None);
-    }
-
-    #[test]
-    fn top_level_scalar_unquotes_escapes() {
-        let y = "title: \"a \\\"quoted\\\" title\"\n";
-        assert_eq!(
-            top_level_scalar(y, "title").as_deref(),
-            Some("a \"quoted\" title")
-        );
-    }
-
-    #[test]
     fn export_index_sorts_by_severity_then_date_then_id() {
         let dir = tmp_dir("export-index");
         let write = |tag: &str, body: &str| {
-            let d = dir.join(tag);
+            let d = dir.join("findings").join(tag);
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("metadata.yaml"), body).unwrap();
         };
@@ -1042,11 +934,11 @@ mod tests {
         // Severity desc, oldest-first within a tier, undated at the
         // bottom of its tier.
         let order = [
-            "[`a`](a_older_high/FINDING.md)",
-            "[`b`](b_newer_high/FINDING.md)",
-            "[`c`](c_no_date_high/FINDING.md)",
-            "[`d`](d_medium/FINDING.md)",
-            "[`e`](e_low/FINDING.md)",
+            "[`a`](findings/a_older_high/FINDING.md)",
+            "[`b`](findings/b_newer_high/FINDING.md)",
+            "[`c`](findings/c_no_date_high/FINDING.md)",
+            "[`d`](findings/d_medium/FINDING.md)",
+            "[`e`](findings/e_low/FINDING.md)",
         ];
         let mut cursor = 0usize;
         for want in order {
@@ -1057,6 +949,95 @@ mod tests {
         }
         // Histogram line is present.
         assert!(body.contains("3 high, 1 medium, 1 low"), "{body}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_index_renders_subsystem_column() {
+        // Two findings with subsystem set, one without — the column
+        // should appear in the header, populated rows show the value,
+        // and a missing/blank value renders as `—`.
+        let dir = tmp_dir("export-index-subsystem");
+        let write = |tag: &str, body: &str| {
+            let d = dir.join("findings").join(tag);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("metadata.yaml"), body).unwrap();
+        };
+        write(
+            "with_subsystem",
+            "id: \"a\"\ntitle: \"named\"\nseverity: high\nstatus: active\nsubsystem: \"mm/folio\"\n",
+        );
+        write(
+            "blank_subsystem",
+            "id: \"b\"\ntitle: \"blank\"\nseverity: medium\nstatus: active\nsubsystem: \"\"\n",
+        );
+        write(
+            "no_subsystem",
+            "id: \"c\"\ntitle: \"missing\"\nseverity: low\nstatus: active\n",
+        );
+        let out = run_export_index(&dir).unwrap();
+        let body = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            body.contains("| Severity | Subsystem | Date | Status | ID | Title |"),
+            "header missing Subsystem column: {body}"
+        );
+        assert!(
+            body.contains("| high | mm/folio |"),
+            "populated subsystem cell missing: {body}"
+        );
+        // Both blank and absent subsystem render as the em-dash
+        // placeholder. Two rows × one em-dash each = 2 occurrences in
+        // the subsystem column.  Each row also has a `—` for date,
+        // so any cell-level grep is brittle; check the row prefix.
+        assert!(
+            body.contains("| medium | — |"),
+            "blank subsystem should render as em-dash: {body}"
+        );
+        assert!(
+            body.contains("| low | — |"),
+            "missing subsystem should render as em-dash: {body}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_index_installs_index_script_and_preserves_local_edits() {
+        // run_export_index installs findings-index.py into the export
+        // dir on first call, then runs it with --generate. We don't
+        // assert on the resulting INDEX.md/index.html (that depends
+        // on python3 being on PATH), but we do assert:
+        //   1. The script lands at <dir>/findings-index.py.
+        //   2. Its body matches the bundled copy verbatim.
+        //   3. A subsequent run does NOT overwrite an operator's
+        //      hand-edited copy — the "if not already present" rule.
+        let dir = tmp_dir("export-index-script-install");
+        std::fs::create_dir_all(dir.join("findings/a_high")).unwrap();
+        std::fs::write(
+            dir.join("findings/a_high/metadata.yaml"),
+            "id: \"a\"\ntitle: \"some bug\"\nseverity: high\nstatus: active\n",
+        )
+        .unwrap();
+        run_export_index(&dir).unwrap();
+        let script = dir.join("findings-index.py");
+        assert!(
+            script.exists(),
+            "findings-index.py should be installed in {}",
+            dir.display()
+        );
+        let body = std::fs::read_to_string(&script).unwrap();
+        assert_eq!(
+            body, INDEX_SCRIPT_BODY,
+            "first install should match the bundled copy verbatim"
+        );
+        // Operator-edited script body must survive a second run.
+        let edited = "#!/usr/bin/env python3\nprint('operator edit')\n";
+        std::fs::write(&script, edited).unwrap();
+        run_export_index(&dir).unwrap();
+        let body_after = std::fs::read_to_string(&script).unwrap();
+        assert_eq!(
+            body_after, edited,
+            "second run must not overwrite an operator-edited script"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

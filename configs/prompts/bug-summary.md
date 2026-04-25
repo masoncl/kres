@@ -103,18 +103,16 @@ format is clear without tying the sample to any real bug.
 
 ### AVOID
 ```
-This sequence can occur.  Looking at widget_claim() in
-drivers/example/widget.c, if CPU1 already called widget_release() which
-sets w->owner = NULL, CPU2 checks owner, sees it is NULL, and takes
-the 'already released' path with mutex_unlock/put_widget/goto retry
-instead of calling widget_release() again.
+Looking at widget_claim() in drivers/example/widget.c, if CPU1 already called
+widget_release() which sets w->owner = NULL, CPU2 checks owner, sees it is
+NULL, and takes the 'already released' path with mutex_unlock/put_widget/goto
+retry instead of calling widget_release() again.
 ```
 
 ### USE INSTEAD
 ```
-This sequence can occur.  Looking at widget_claim() in
-drivers/example/widget.c, if CPU1 already called widget_release() and set
-w->owner = NULL:
+Looking at widget_claim() in drivers/example/widget.c, if CPU1 already called
+widget_release() and set w->owner = NULL:
 
 CPU1
 widget_release()

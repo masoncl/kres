@@ -86,6 +86,49 @@ this summary.md is what gets read while triaging, so keep it
 skimmable.>
 ```
 
+## Wording choices
+
+- Dense paragraphs are hard to read.  Spread the information out so
+it is easier to follow.
+  - If you have a series of factual sentences, break them up into logical
+groups with a blank line between each group.
+  - If you have a series of statements followed by a question, put a blank
+line before the question.
+
+### AVOID
+```
+Looking at widget_claim() in drivers/example/widget.c, if CPU1 already called
+widget_release() which sets w->owner = NULL, CPU2 checks owner, sees it is
+NULL, and takes the 'already released' path with mutex_unlock/put_widget/goto
+retry instead of calling widget_release() again.
+```
+
+### USE INSTEAD
+```
+Looking at widget_claim() in drivers/example/widget.c, if CPU1 already called
+widget_release() and set w->owner = NULL:
+
+CPU1
+widget_release()
+   w->owner = NULL;
+
+CPU2 then sees this in widget_claim():
+    if (!w->owner) {
+        pr_debug("widget %p already released\n", w);
+        mutex_unlock(&w->lock);
+        put_widget(w);
+        ...
+        goto retry;
+    }
+
+and takes the goto retry path instead of calling widget_release() again.
+```
+
+## metadata.yml update
+- `metadata.yml` contains a subsystem field that may not be filled in.  If you've
+determined which subsystem this bug belongs to, fill in that subsystem field.
+- THIS IS THE ONLY EDIT YOU'RE ALLOWED TO MAKE IN `metadata.yml`
+
 ## Rules
 
 - The Subject line is the `# Subject:` heading itself — don't add a
@@ -106,4 +149,5 @@ skimmable.>
   write `unknown` — don't guess.
 - Details is a synopsis, not a re-paste of FINDING.md. Three to six
   sentences is plenty.
-- Do not edit FINDING.md or metadata.yaml. Only write summary.md.
+- Do not edit FINDING.md. Only write summary.md.
+

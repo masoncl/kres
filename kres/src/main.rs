@@ -759,6 +759,11 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             && (args.tui || std::io::IsTerminal::is_terminal(&std::io::stdout())),
         workspace: args.workspace.clone(),
         persist_path,
+        // Piped/redirected stdout has no operator on the other end,
+        // so once the work-stop condition fires there is no one to
+        // type the next prompt. Match the existing `--turns N` exit
+        // path and quit the REPL when stdout isn't a tty.
+        exit_on_idle: !std::io::IsTerminal::is_terminal(&std::io::stdout()),
     };
     let mut session = Session::new(mgr, cfg).await;
     // Resume from a prior session.json ONLY when `--resume` was

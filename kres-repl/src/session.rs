@@ -77,6 +77,13 @@ pub struct ReplConfig {
     /// resumed by re-invoking kres with the same `--results DIR`.
     /// None disables persistence (no-op writes).
     pub persist_path: Option<PathBuf>,
+    /// When true, exit the REPL once the work-stop condition fires
+    /// (`--turns 0` goal-met / no-progress / no-goal-batch-finished),
+    /// instead of staying open waiting for further operator input.
+    /// Defaulted to `!stdout.is_terminal()` from main.rs so a piped
+    /// invocation (`kres ... > out.txt`) terminates after the
+    /// turns stop, matching the existing `--turns N` exit path.
+    pub exit_on_idle: bool,
 }
 
 impl Default for ReplConfig {
@@ -93,6 +100,7 @@ impl Default for ReplConfig {
             tui: false,
             workspace: PathBuf::from("."),
             persist_path: None,
+            exit_on_idle: false,
         }
     }
 }
@@ -862,6 +870,7 @@ impl Session {
         let stop_notify_for_reaper = self.stop_notify.clone();
         let turns_limit = self.cfg.turns_limit;
         let follow_followups = self.cfg.follow_followups;
+        let exit_on_idle = self.cfg.exit_on_idle;
         // §16: findings-signature watchdog. Every successful merge
         // increments `quiescent` when the merged list's signature
         // matches the prior one; five consecutive no-change merges
@@ -1666,9 +1675,12 @@ impl Session {
                                 "no new findings for {no_new_findings_streak} consecutive run(s)"
                             )
                         };
-                        kres_core::async_eprintln!(
-                            "\n=== --turns 0: {reason} — REPL staying open; submit another prompt, /summary, or /quit ==="
-                        );
+                        let suffix = if exit_on_idle {
+                            "exiting (stdout is not a terminal)"
+                        } else {
+                            "REPL staying open; submit another prompt, /summary, or /quit"
+                        };
+                        kres_core::async_eprintln!("\n=== --turns 0: {reason} — {suffix} ===");
                         // Flip InProgress → Pending before the drain
                         // so the deferred list is complete; an item
                         // mid-run at goal-met time shouldn't silently
@@ -1692,6 +1704,17 @@ impl Session {
                             );
                         }
                         turns0_stop_announced = true;
+                        // Non-tty stdout: exit on first stop, same as
+                        // `--turns N`. Set turns_exhausted so the
+                        // post-loop summary auto-renders, then cancel
+                        // root_shutdown to break the REPL select on
+                        // root_shutdown.cancelled().
+                        if exit_on_idle {
+                            turns_exhausted_for_reaper
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            mgr_for_reaper.root_shutdown().cancel();
+                            break;
+                        }
                     }
                 }
                 // Persist session state at the end of every reaper

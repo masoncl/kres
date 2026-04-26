@@ -125,6 +125,40 @@ Examples:
 A bad regex or a malformed expression exits 2 with a one-line
 diagnostic on stderr; the table is not printed.
 
+### Saved subset indexes (`index-config.yaml`)
+
+Drop a file at `./index-config.yaml` to have `--generate` emit one
+markdown index per entry every time it runs. The format is a list of
+`{file, query}` mappings — one block per output file:
+
+```yaml
+# Saved subset indexes regenerated on every `findings-index.py --generate`.
+- file: INDEX-high.md
+  query: severity:high
+
+- file: INDEX-workqueue.md
+  query: subsystem:work
+
+- file: INDEX-recent-uaf.md
+  query: regex:uaf -a since:2026-04-01
+```
+
+Rules:
+
+- `file:` is a plain basename inside the export dir. `..`, `/`, and
+  hidden files (leading `.`) are refused so a typo can't write
+  outside the tree.
+- `query:` is the same expression syntax as `--search QUERY`
+  (key:regex clauses, `-a` / `-o` / parens).
+- Lines starting with `#` and blank lines are skipped.
+- The umbrella `INDEX.md` and `index.html` are always written; the
+  config adds files on top.
+- A bad regex or malformed query reports a one-line error to
+  stderr, skips that file, and continues with the rest. The script
+  exits 1 if any entry errored.
+
+The config itself is operator-managed — kres doesn't ship one.
+
 ## Editing the script
 
 `findings-index.py` is bundled into the kres binary and copied here

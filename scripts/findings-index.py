@@ -6,11 +6,13 @@ Two modes, picked by mutually exclusive flags:
   findings-index.py --generate
       Walk every `<tag>/metadata.yaml` under the current directory and
       write:
-        * INDEX.md   — markdown table covering all findings.
-        * index.html — same table with client-side filters for
-                       browser / GitHub Pages viewing.
-      Use `--search subsystem:<regex>` to pivot a large tree by area
-      without scanning the whole list.
+        * INDEX.md            — markdown table covering all findings.
+        * index.html          — same table with client-side filters
+                                for browser / GitHub Pages viewing.
+        * INDEX-<custom>.md   — one per `{file, query}` entry in
+                                `index-config.yaml`, if present.
+      Use `--search subsystem:<regex>` for ad-hoc pivots that don't
+      need a saved file.
 
   findings-index.py --search "<query>"
       Print a markdown table — same format as INDEX.md — covering only
@@ -606,6 +608,154 @@ def filter_rows(rows, expr):
     return [r for r in rows if expr.matches(r)]
 
 
+# --- index-config.yaml: per-export named subset indexes ----------------
+#
+# Stdlib has no YAML reader and the script can't add a pip dependency
+# (it bundles into the kres binary and copies into export dirs). The
+# config has a tiny fixed shape — a list of `{file, query}` mappings
+# — so a hand-rolled minimal parser handles it.
+#
+# Sample contents:
+#
+#     # ~/local/kernel-bugs/index-config.yaml
+#     - file: INDEX-high.md
+#       query: severity:high
+#     - file: INDEX-workqueue.md
+#       query: subsystem:work
+#     - file: INDEX-recent-uaf.md
+#       query: regex:uaf -a since:2026-04-01
+#
+# Filenames must be plain basenames inside the export dir — no `..`,
+# no slashes, no absolute paths. Each query goes through the same
+# parser as `--search QUERY` and produces a markdown table identical
+# in shape to INDEX.md.
+
+CONFIG_FILENAME = "index-config.yaml"
+
+
+def _strip_yaml_quotes(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    return s
+
+
+def _kv(line, lineno):
+    if ":" not in line:
+        raise ValueError(
+            "{}: expected `key: value`, got {!r}".format(lineno, line)
+        )
+    key, _, value = line.partition(":")
+    return key.strip(), _strip_yaml_quotes(value)
+
+
+def parse_index_config(path):
+    """Parse a list of `- file: X\\n  query: Y` blocks.
+
+    Returns `[]` when the file is missing — the config is optional.
+    Raises ValueError on malformed input so the operator sees their
+    typo instead of getting silent no-ops.
+    """
+    if not os.path.isfile(path):
+        return []
+    entries = []
+    cur = None
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, start=1):
+            line = raw.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            if line.startswith("- "):
+                if cur is not None:
+                    entries.append(cur)
+                cur = {}
+                rest = line[2:].lstrip()
+                if rest:
+                    k, v = _kv(rest, lineno)
+                    cur[k] = v
+                continue
+            if line.startswith("  ") and cur is not None:
+                k, v = _kv(line.strip(), lineno)
+                cur[k] = v
+                continue
+            raise ValueError(
+                "{}: unexpected indentation / no current entry: {!r}".format(
+                    lineno, line
+                )
+            )
+    if cur is not None:
+        entries.append(cur)
+    return entries
+
+
+def _safe_basename(filename):
+    """Reject anything that isn't a plain basename inside the export
+    dir. Path traversal / absolute paths get refused so a typo can't
+    write outside the tree.
+    """
+    if not filename:
+        return False
+    if filename in (".", "..") or "/" in filename or "\\" in filename:
+        return False
+    if filename.startswith("."):  # hidden file would be confusing
+        return False
+    return True
+
+
+def write_custom_indexes(rows, root, config_path):
+    """Generate one markdown file per `{file, query}` entry in the
+    index-config.yaml. Returns (written, errors) so main() can report.
+    """
+    try:
+        entries = parse_index_config(config_path)
+    except ValueError as exc:
+        print(
+            "{}: parse error on line {}".format(config_path, exc),
+            file=sys.stderr,
+        )
+        return 0, 1
+
+    written = 0
+    errors = 0
+    for entry in entries:
+        filename = entry.get("file", "")
+        query = entry.get("query", "")
+        if not filename or not query:
+            print(
+                "index-config: entry missing file or query: {!r}".format(entry),
+                file=sys.stderr,
+            )
+            errors += 1
+            continue
+        if not _safe_basename(filename):
+            print(
+                "index-config: refusing suspicious filename "
+                "{!r} (must be a plain basename inside the export dir)".format(
+                    filename
+                ),
+                file=sys.stderr,
+            )
+            errors += 1
+            continue
+        try:
+            expr = parse_query(query)
+        except ValueError as exc:
+            print(
+                "index-config: query for {!r} invalid: {}".format(filename, exc),
+                file=sys.stderr,
+            )
+            errors += 1
+            continue
+        filtered = filter_rows(rows, expr)
+        out_path = os.path.join(root, filename)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(build_markdown(filtered))
+        print(
+            "  custom: {} ({} row(s))".format(out_path, len(filtered)),
+            file=sys.stderr,
+        )
+        written += 1
+    return written, errors
 
 
 def main():
@@ -645,7 +795,19 @@ def main():
             ),
             file=sys.stderr,
         )
-        return 0
+        # Optional per-export named indexes via index-config.yaml.
+        # Absent config → silently skipped.
+        config_path = os.path.join(root, CONFIG_FILENAME)
+        custom_written, custom_errors = write_custom_indexes(
+            rows, root, config_path
+        )
+        if custom_written or custom_errors:
+            print(
+                "index-config: {} custom index(es) written, "
+                "{} error(s)".format(custom_written, custom_errors),
+                file=sys.stderr,
+            )
+        return 1 if custom_errors else 0
 
     # --search QUERY
     try:

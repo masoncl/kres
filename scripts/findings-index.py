@@ -35,6 +35,17 @@ Two modes, picked by mutually exclusive flags:
         subsystem:<regex>     — matches against the row's subsystem
                                 ("—" when blank)
         status:<regex>        — matches against the row's status
+        file:<regex>          — matches against any filename the
+                                metadata.yaml lists (primary
+                                `filename:` plus every
+                                `relevant_symbols` / `relevant_file_
+                                sections` entry — same set FINDING.md
+                                cites)
+        function:<regex>      — matches against any symbol name in
+                                metadata.yaml's `relevant_symbols`
+                                list (functions, macros, types —
+                                same set FINDING.md's `Relevant
+                                symbols` block cites)
         regex:<regex>         — matches against the joined row text
                                 (sev + subsystem + date + status +
                                 id + title)
@@ -101,6 +112,64 @@ def _unquote(s):
     return "".join(out)
 
 
+def all_filenames(yaml_text):
+    """Return every distinct `filename:` value referenced anywhere in
+    a metadata.yaml — top-level (the primary), and all the indented
+    occurrences under `relevant_symbols` / `relevant_file_sections`.
+    Same set FINDING.md cites in its `Relevant symbols` and
+    `Relevant file sections` blocks.
+    """
+    out = set()
+    for line in yaml_text.splitlines():
+        stripped = line.lstrip()
+        if not stripped.startswith("filename:"):
+            continue
+        rest = stripped[len("filename:"):].strip()
+        if not rest:
+            continue
+        if rest.startswith('"') and rest.endswith('"') and len(rest) >= 2:
+            rest = _unquote(rest[1:-1])
+        if rest:
+            out.add(rest)
+    return sorted(out)
+
+
+def all_function_names(yaml_text):
+    """Return every distinct symbol name listed under
+    `relevant_symbols:` — i.e. the function / macro / type names
+    FINDING.md's `Relevant symbols` section cites.
+
+    A small state machine tracks whether we're inside the
+    `relevant_symbols:` block. The kres-emitted metadata.yaml has no
+    other top-level `name:` key, so a simple "we just hit a fresh
+    top-level key" check leaves the section cleanly.
+    """
+    out = set()
+    in_symbols = False
+    for line in yaml_text.splitlines():
+        if line.startswith("relevant_symbols:"):
+            in_symbols = True
+            continue
+        if line and not line[0].isspace() and ":" in line:
+            in_symbols = False
+            continue
+        if not in_symbols:
+            continue
+        stripped = line.strip()
+        # Either `- name: foo` or `  name: foo` lands here.
+        if stripped.startswith("- name:"):
+            value = stripped[len("- name:"):].strip()
+        elif stripped.startswith("name:"):
+            value = stripped[len("name:"):].strip()
+        else:
+            continue
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            value = _unquote(value[1:-1])
+        if value:
+            out.add(value)
+    return sorted(out)
+
+
 def collect_rows(root):
     """Walk `<root>/findings/<tag>/metadata.yaml` for every finding.
 
@@ -147,6 +216,8 @@ def collect_rows(root):
             "status": parse_top_level(yaml_text, "status") or "active",
             "date": parse_top_level(yaml_text, "date"),
             "subsystem": subsystem if subsystem else None,
+            "filenames": all_filenames(yaml_text),
+            "functions": all_function_names(yaml_text),
         })
     return rows
 
@@ -431,8 +502,12 @@ def build_html(rows):
     return "\n".join(parts) + "\n"
 
 
-_QUERY_KEYS = ("severity", "subsystem", "status", "since", "regex")
-_REGEX_KEYS = ("severity", "subsystem", "status", "regex")
+_QUERY_KEYS = (
+    "severity", "subsystem", "status", "since", "regex", "file", "function",
+)
+_REGEX_KEYS = (
+    "severity", "subsystem", "status", "regex", "file", "function",
+)
 
 
 def _row_haystack(r):
@@ -481,6 +556,22 @@ class _Clause:
             return self.pattern.search(sub_eff) is not None
         if self.key == "status":
             return self.pattern.search(row["status"]) is not None
+        if self.key == "file":
+            # Match against any filename the metadata.yaml lists —
+            # primary `filename:` plus every relevant_symbols /
+            # relevant_file_sections entry. One hit wins.
+            return any(
+                self.pattern.search(fn) is not None
+                for fn in row.get("filenames", [])
+            )
+        if self.key == "function":
+            # Match against any symbol name listed under
+            # `relevant_symbols:` (function / macro / type). One hit
+            # wins.
+            return any(
+                self.pattern.search(fn) is not None
+                for fn in row.get("functions", [])
+            )
         if self.key == "regex":
             return self.pattern.search(_row_haystack(row)) is not None
         if self.key == "since":

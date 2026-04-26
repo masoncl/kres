@@ -101,6 +101,12 @@ Recognised keys (every value is a case-insensitive regex except
   | `severity`  | one of `high` / `medium` / `low` / `?`           |
   | `subsystem` | the `subsystem:` field (`—` when blank)          |
   | `status`    | `active` / `invalidated`                         |
+  | `file`      | any filename in metadata.yaml — the primary      |
+  |             | `filename:` plus every relevant-symbols /        |
+  |             | relevant-file-sections entry FINDING.md cites    |
+  | `function`  | any symbol name under `relevant_symbols:`        |
+  |             | (functions, macros, types — same set FINDING.md  |
+  |             | cites in its `Relevant symbols` block)           |
   | `regex`     | the joined row text (sev + subsys + date +       |
   |             | status + id + title)                             |
   | `since`     | YYYY-MM-DD; row's date must be ≥ this           |
@@ -120,7 +126,26 @@ Examples:
 
 # loose regex — match any subsystem string starting with "btr"
 ./findings-index.py --search "subsystem:^btr"
+
+# every finding that touches a file under net/ipv4/
+./findings-index.py --search "file:^net/ipv4/"
+
+# exact-match a single function (anchor with ^ and $)
+./findings-index.py --search "function:^acpi_os_execute$"
+
+# any finding that touches a `pwq_*` symbol with severity high
+./findings-index.py --search "function:^pwq_ -a severity:high"
+
+# touched workqueue.c AND high severity
+./findings-index.py --search "file:workqueue.c -a severity:high"
 ```
+
+`file:` and `function:` both look beyond the visible table cells —
+`file:` searches the union of every filename FINDING.md cites (the
+primary `filename:` plus everything under `relevant_symbols:` and
+`relevant_file_sections:`), and `function:` searches every symbol
+name under `relevant_symbols:`. Use anchors (`^foo$`) for exact
+matches, `^foo` for prefix, plain `foo` for substring.
 
 A bad regex or a malformed expression exits 2 with a one-line
 diagnostic on stderr; the table is not printed.
@@ -141,6 +166,13 @@ markdown index per entry every time it runs. The format is a list of
 
 - file: INDEX-recent-uaf.md
   query: regex:uaf -a since:2026-04-01
+
+# Touch points by file path or symbol — handy for area owners.
+- file: INDEX-net-ipv4.md
+  query: file:^net/ipv4/
+
+- file: INDEX-pwq-symbols.md
+  query: function:^pwq_
 ```
 
 Rules:

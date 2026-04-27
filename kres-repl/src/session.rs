@@ -871,6 +871,17 @@ impl Session {
         // count strictly increases.
         let mut no_new_findings_streak: u32 = 0;
         const NO_NEW_FINDINGS_STOP: u32 = 3;
+        // Watchdog: if N consecutive reaped tasks come back Errored,
+        // the pipeline is busted (revoked key, dead model, network
+        // dropped, etc.) and re-queueing the same items via the todo
+        // agent just burns API budget. Bail loudly. Reset on any
+        // Done reap — a single success means things are working.
+        // Without this, sessions like .kres/logs/6f3f0daf-… (269
+        // failed slow calls in 50 min, 0 successes) silently spin
+        // forever because the todo agent keeps re-queueing
+        // "Prior execution returned empty analysis; must re-run."
+        let mut consecutive_errors: u32 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 3;
         // Latch for the --turns 0 auto-stop banner. The stop check
         // below runs on every 250ms tick, but the operator only
         // wants to SEE "goal met" once; re-firing it every tick
@@ -1311,7 +1322,21 @@ impl Session {
                     if let Some(ref tc) = todo_client {
                         let current = mgr_for_reaper.todo_snapshot().await;
                         let completed_query = r.name.clone();
-                        let analysis = r.analysis.clone();
+                        // Errored tasks reach this path with
+                        // analysis="". Without surfacing the error
+                        // here the todo agent reads "no analysis" as
+                        // "task didn't run, re-queue" and we spin
+                        // (see consecutive_errors comment above).
+                        // Inject the error so the agent has something
+                        // concrete to react to (skip vs. retry).
+                        let analysis = if matches!(r.state, TaskState::Errored) {
+                            format!(
+                                "[task errored: {}]",
+                                r.error.as_deref().unwrap_or("(no error text)")
+                            )
+                        } else {
+                            r.analysis.clone()
+                        };
                         let followups = r.followups.clone();
                         kres_core::async_eprintln!(
                             "[todo update] before: {} item(s) ({} pending, {} done); {} new followup(s)",
@@ -1534,6 +1559,40 @@ impl Session {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Consecutive-error watchdog: surface a busted
+                    // pipeline instead of letting the todo agent
+                    // re-queue the same items forever (see counter
+                    // declaration above for context).
+                    match r.state {
+                        TaskState::Errored => {
+                            consecutive_errors = consecutive_errors.saturating_add(1);
+                        }
+                        TaskState::Done => {
+                            consecutive_errors = 0;
+                        }
+                        _ => {}
+                    }
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        kres_core::async_eprintln!(
+                            "\n=== {consecutive_errors} CONSECUTIVE TASK FAILURES — halting ===\nlast error: {}\ncheck the kres terminal for [rate-limit]/[stream-interrupt] lines, verify the slow/fast API key + model id, then /continue or restart kres --resume.",
+                            r.error.as_deref().unwrap_or("(no error text)")
+                        );
+                        mgr_for_reaper.reset_in_progress_to_pending().await;
+                        let drained = mgr_for_reaper.drain_pending_blocked().await;
+                        let carry = drained.len();
+                        let mut deferred = deferred_for_reaper.lock().await;
+                        deferred.extend(drained);
+                        drop(deferred);
+                        if carry > 0 {
+                            kres_core::async_eprintln!(
+                                "[{carry} pending item(s) moved to /followup]"
+                            );
+                        }
+                        if exit_on_idle {
+                            mgr_for_reaper.root_shutdown().cancel();
+                            break;
                         }
                     }
                 }

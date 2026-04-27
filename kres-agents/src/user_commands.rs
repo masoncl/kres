@@ -40,6 +40,7 @@ const TABLE: &[(&str, &str)] = &[
         "triage",
         include_str!("../../configs/prompts/triage-template.md"),
     ),
+    ("fix", include_str!("../../configs/prompts/fix-template.md")),
 ];
 
 /// Return the body for `name` — disk override wins, then the
@@ -132,12 +133,32 @@ mod tests {
 
     #[test]
     fn all_expected_commands_are_present() {
-        for expected in ["review", "summary", "summary-markdown", "triage"] {
+        for expected in ["review", "summary", "summary-markdown", "triage", "fix"] {
             assert!(
                 lookup(expected).is_some(),
                 "expected embedded command {expected} not found"
             );
         }
+    }
+
+    #[test]
+    fn fix_body_contains_template_markers() {
+        // The fix template is the patch+review iteration prompt for
+        // the coding-mode slow agent. If include_str! stops pointing
+        // at fix-template.md, a different body would silently load
+        // and the run would not iterate through compile/review.
+        // Anchor on the unique GOAL line + the [INVALID] escape
+        // hatch — these are load-bearing for the iteration semantics
+        // the operator wired up.
+        let body = lookup("fix").unwrap();
+        assert!(
+            body.contains("kres FIX flow"),
+            "fix body missing FIX-flow header"
+        );
+        assert!(
+            body.contains("[INVALID]"),
+            "fix body missing the bug-invalidated escape hatch"
+        );
     }
 
     #[test]

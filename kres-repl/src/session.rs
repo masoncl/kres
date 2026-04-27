@@ -1808,6 +1808,7 @@ impl Session {
                 Command::Summary { filename } => self.cmd_summary(filename, false).await,
                 Command::SummaryMarkdown { filename } => self.cmd_summary(filename, true).await,
                 Command::Review { target } => self.cmd_review(target).await,
+                Command::Fix { target } => self.cmd_fix(target).await,
                 Command::Extract {
                     dir,
                     report,
@@ -2886,6 +2887,43 @@ impl Session {
         }
     }
 
+    /// `/fix <target>` — compose the embedded `fix` slash-command
+    /// template with the operator's target string and submit the
+    /// result as a new prompt. Uses the same user_commands::compose
+    /// path as `--prompt "fix: ..."` so the CLI and REPL share one
+    /// code path for the fix flow.
+    ///
+    /// Unlike the `--prompt "fix: ..."` CLI form (which auto-adds
+    /// `bash` to the session allowlist before the orchestrator is
+    /// built), this REPL command runs after the allowlist has been
+    /// frozen. If `bash` was not enabled at startup, the compile and
+    /// fix-warnings steps will return `bash not in the allowed-action
+    /// list` — relaunch with `--allow bash` for the fix flow to work
+    /// end-to-end. We don't have a handle on the resolved allowlist
+    /// from the session, so the hint is unconditional.
+    async fn cmd_fix(&self, target: String) {
+        let target = target.trim();
+        if target.is_empty() {
+            async_println(
+                "/fix: expected a target, e.g. /fix ~/local/kernel-bugs/findings/<id> or \
+                 /fix race in net/sched/cls_bpf.c free path",
+            );
+            return;
+        }
+        let Some((src, body)) = kres_agents::user_commands::compose("fix", target) else {
+            async_println(
+                "/fix: `fix` template missing from the embedded table — this is a build bug",
+            );
+            return;
+        };
+        async_println(format!(
+            "/fix: composed prompt from {src} ({} chars); compile/fix-warnings steps need \
+             `bash` in the action allowlist — relaunch with `--allow bash` if it isn't.",
+            body.len()
+        ));
+        self.submit_prompt(body).await;
+    }
+
     /// `/review <target>` — compose the embedded `review`
     /// slash-command template with the operator's target string
     /// and submit the result as a new prompt. Uses the same
@@ -3923,6 +3961,9 @@ fn print_help() {
     kres_core::async_eprintln!("  /followup              list items deferred by goal/--turns");
     kres_core::async_eprintln!(
         "  /review <target>       compose the embedded `review` template with <target> and submit"
+    );
+    kres_core::async_eprintln!(
+        "  /fix <target>          compose the embedded `fix` template (finding dir or prose) and submit; needs --allow bash"
     );
     kres_core::async_eprintln!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
     kres_core::async_eprintln!(

@@ -426,31 +426,6 @@ fn kres_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".kres"))
 }
 
-/// Cheap pre-resolve check: does `--prompt <raw>` name the `fix`
-/// slash-command (either `fix: ...` or `/fix ...`)? Used by run_repl
-/// to auto-enable `bash` for the session before the allowlist is
-/// computed; intentionally string-only so it does not duplicate the
-/// full path/file/template walk that `resolve_prompt_arg` performs.
-///
-/// Returns false for any prompt whose first word is not literally
-/// `fix` (or `/fix`). A prose prompt that happens to mention "fix"
-/// later does not trigger the auto-enable — only the slash-command
-/// invocation does, matching how the operator opts in.
-fn prompt_arg_invokes_fix_flow(raw: Option<&str>) -> bool {
-    let raw = match raw {
-        Some(s) => s.trim_start(),
-        None => return false,
-    };
-    let head: &str = if let Some(rest) = raw.strip_prefix('/') {
-        rest.split_whitespace().next().unwrap_or("")
-    } else if let Some((h, _)) = raw.split_once(':') {
-        h.trim()
-    } else {
-        return false;
-    };
-    head == "fix"
-}
-
 /// Map `--slow <tag>` to a concrete model id when the tag is a
 /// known shorthand. Keeps the flag useful as a model selector on
 /// top of its historical role as a max_tokens variant picker.
@@ -480,29 +455,11 @@ fn resolve_default(cli: Option<&PathBuf>, default_name: &str) -> Option<PathBuf>
     }
 }
 
-async fn run_repl(mut args: ReplArgs) -> Result<()> {
+async fn run_repl(args: ReplArgs) -> Result<()> {
     use kres_agents::WorkspaceFetcher;
     use kres_core::TaskManager;
     use kres_repl::{build_orchestrator, ReplConfig, Session};
     use std::sync::Arc;
-
-    // The fix flow needs `bash` to run `make` / `cargo build` for
-    // step 3 (compile) and step 4 (fix warnings). bash is OFF by
-    // default — operators have to opt in. When the operator launches
-    // kres with `--prompt "fix: <target>"` (or `/fix <target>`), they
-    // are unambiguously asking for that flow, so add bash to the
-    // session's allowlist on their behalf rather than failing the
-    // first compile followup with `bash not in the allowed-action
-    // list`. The allowlist is additive, so an operator-supplied
-    // `--allow bash` is a no-op duplicate.
-    if prompt_arg_invokes_fix_flow(args.prompt.as_deref())
-        && !args.allow.iter().any(|a| a == "bash")
-    {
-        args.allow.push("bash".to_string());
-        kres_core::async_eprintln!(
-            "fix flow detected in --prompt — auto-enabling `bash` (compile/run) for this session"
-        );
-    }
 
     // --- Resolve agent configs -------------------------------------
     // Explicit path wins; otherwise look in ~/.kres/<default>.
@@ -1415,25 +1372,6 @@ mod tests {
         let (src, body) = resolve_prompt_arg("why does func() return: unusual values?").unwrap();
         assert_eq!(src, "<inline>");
         assert!(body.contains("unusual values"));
-    }
-
-    #[test]
-    fn prompt_arg_invokes_fix_flow_recognises_colon_and_slash() {
-        // The auto-`bash` block in run_repl gates on this — it must
-        // fire for both invocation forms (`fix: ...` and `/fix ...`)
-        // and stay quiet for everything else, especially prose that
-        // happens to contain the word "fix".
-        assert!(prompt_arg_invokes_fix_flow(Some("fix: ~/bug")));
-        assert!(prompt_arg_invokes_fix_flow(Some("  fix: prose")));
-        assert!(prompt_arg_invokes_fix_flow(Some("/fix ~/bug")));
-        assert!(prompt_arg_invokes_fix_flow(Some("/fix")));
-        assert!(!prompt_arg_invokes_fix_flow(Some("review: target")));
-        assert!(!prompt_arg_invokes_fix_flow(Some(
-            "please fix this race in net/sched"
-        )));
-        assert!(!prompt_arg_invokes_fix_flow(Some("fix-everything: x")));
-        assert!(!prompt_arg_invokes_fix_flow(None));
-        assert!(!prompt_arg_invokes_fix_flow(Some("")));
     }
 
     #[test]

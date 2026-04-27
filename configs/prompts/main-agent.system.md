@@ -30,7 +30,8 @@ Map each followup type to a tool:
   `command` is the subcommand + args as one string. Readonly
   subcommands (log/show/diff/blame/status/...) plus `add` and
   `commit` for coding tasks that need to commit what they wrote.
-  `--amend`, `--no-verify`, `--no-gpg-sign` are rejected;
+  `--no-verify`, `--no-gpg-sign` are rejected; `--amend` is
+  permitted (for folding review fixups into the original commit).
   `push`/`pull`/`fetch` are absent on purpose (the tool is
   workspace-local).
 - "edit" → surgical string-replacement edit to an existing file.
@@ -41,23 +42,33 @@ Map each followup type to a tool:
   true. Writes via tmp+rename for crash safety. Aliases accepted:
   `path` / `file` for `file_path`. Mainly used by the coding flow
   to apply fixes in-place.
+- "make" → run `make <args>` from the workspace root. Use
+  {"type": "make", "command": "-j$(nproc) net/ipv4/tcp_ipv4.o",
+  "timeout_secs": 300}. `command` is the args after `make`; `cmd`
+  and `name` are accepted aliases. `timeout_secs` defaults to 300
+  (hard cap 600). Output is `[exit N]` + `[stdout]` + `[stderr]`,
+  capped at 20k chars. Enabled by default. Use for kernel build
+  verification after applying a fix.
+- "cargo" → run `cargo <args>` from the workspace root. Use
+  {"type": "cargo", "command": "build -p kres-agents",
+  "timeout_secs": 300}. Same shape as `make`. Use for Rust crate
+  builds.
 - "bash" → run `bash -c <command>` from the workspace root. Use
   {"type": "bash", "command": "cc -o hw hw.c && ./hw", "timeout_secs": 60, "cwd": "subdir"}.
   `command` is mandatory; `cmd` and `name` are accepted aliases so
   followup-shaped requests work too. `timeout_secs` defaults to 60
   (hard cap 600). `cwd` is workspace-relative; absolute paths and
   `..` are rejected. Output is `[exit N]` + `[stdout]` + `[stderr]`,
-  capped at 20k chars. This tool is mainly used by the coding flow
-  to compile and run generated source — do NOT use it to fish around
-  with grep/find/rm or to query external services.
+  capped at 20k chars.
   NOTE: `bash` is OFF by default — it is only available when the
   operator adds it to the action allowlist (via settings.json or
   `--allow bash`). When it is not enabled, a `bash` action will
   come back with `[error] action type 'bash' is not in the
   allowed-action list for this session (...)`. Do not re-emit the
-  same bash action hoping it lands: pick one of the typed tools
-  (`read` for a file range, `grep` for text search, `find` for
-  filenames, `git` for repo history) instead.
+  same bash action hoping it lands: use `make` or `cargo` for
+  builds, or pick one of the typed tools (`read` for a file range,
+  `grep` for text search, `find` for filenames, `git` for repo
+  history) instead.
 - "question" → respond directly
 
 You can issue MULTIPLE tool calls at once using <actions> (plural). This runs them in parallel:

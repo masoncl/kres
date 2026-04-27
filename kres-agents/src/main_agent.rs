@@ -648,6 +648,36 @@ async fn dispatch_non_mcp(
                 Err(e) => (format!("[error] {e}"), None),
             }
         }
+        "make" | "cargo" => {
+            // Both "make" and "cargo" are thin wrappers over bash_run
+            // that prepend the binary name. They exist as first-class
+            // action types so coding flows can compile without
+            // requiring `--allow bash`. Anything else (env vars, sudo,
+            // pipes, redirects) belongs in `bash` which the operator
+            // must opt into separately.
+            let tool = ty;
+            let command = action
+                .get("command")
+                .or_else(|| action.get("cmd"))
+                .or_else(|| action.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let timeout_secs = action
+                .get("timeout_secs")
+                .or_else(|| action.get("timeout"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300);
+            let args = BashArgs {
+                command: format!("{tool} {command}"),
+                timeout_secs: Some(timeout_secs),
+                cwd: None,
+            };
+            match bash_run(workspace, &args).await {
+                Ok(t) => (t, None),
+                Err(e) => (format!("[error] {e}"), None),
+            }
+        }
         "bash" => {
             // Accept `command`, `cmd`, and `name` — `name` is what
             // the slow/fast agents emit when a bash call comes in as

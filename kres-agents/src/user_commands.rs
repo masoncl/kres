@@ -41,6 +41,10 @@ const TABLE: &[(&str, &str)] = &[
         include_str!("../../configs/prompts/triage-template.md"),
     ),
     ("fix", include_str!("../../configs/prompts/fix-template.md")),
+    (
+        "commit-kernel",
+        include_str!("../../configs/prompts/commit-kernel-template.md"),
+    ),
 ];
 
 /// Return the body for `name` — disk override wins, then the
@@ -108,6 +112,16 @@ pub fn embedded_names() -> impl Iterator<Item = &'static str> {
 /// `--prompt "/name extra"`) and the REPL (`/review target` etc).
 /// Returns `Some((source-label, body))` when `name` resolves to
 /// a known command, `None` when the lookup fails.
+///
+/// Special-case for `fix`: the FIX flow tells the slow agent to
+/// emit a `git commit -s` once the patch is applied, but leaves
+/// "kernel-style commit message" to the model's training prior.
+/// To make the rules concrete, append the body of the
+/// `commit-kernel` template (75-col wrap, 70-75 char subject,
+/// Assisted-by trailer, etc.) under a `COMMIT MESSAGE STYLE`
+/// header so a single prompt carries both flows. The two bodies
+/// are kept DRY in `configs/prompts/`; this function is the only
+/// place they meet.
 pub fn compose(name: &str, extra: &str) -> Option<(String, String)> {
     let body = lookup(name)?;
     let extra = extra.trim();
@@ -115,6 +129,19 @@ pub fn compose(name: &str, extra: &str) -> Option<(String, String)> {
         body
     } else {
         format!("{extra}\n\n{body}")
+    };
+    let composed = if name == "fix" {
+        match lookup("commit-kernel") {
+            Some(commit_body) => format!(
+                "{composed}\n\n---\n\n# COMMIT MESSAGE STYLE (appended by /fix)\n\n{commit_body}"
+            ),
+            // Defensive: commit-kernel has been in the embedded
+            // table since 43361ca; if it ever goes missing the FIX
+            // flow still works, just without the explicit rules.
+            None => composed,
+        }
+    } else {
+        composed
     };
     Some((format!("/{name} (user_commands)"), composed))
 }
@@ -133,12 +160,38 @@ mod tests {
 
     #[test]
     fn all_expected_commands_are_present() {
-        for expected in ["review", "summary", "summary-markdown", "triage", "fix"] {
+        for expected in [
+            "review",
+            "summary",
+            "summary-markdown",
+            "triage",
+            "fix",
+            "commit-kernel",
+        ] {
             assert!(
                 lookup(expected).is_some(),
                 "expected embedded command {expected} not found"
             );
         }
+    }
+
+    #[test]
+    fn commit_kernel_body_contains_template_markers() {
+        // The commit-kernel template encodes the kernel-style
+        // commit-message rules (Rule 0: 72-char wrap; subject ≤70;
+        // imperative mood; -s for sign-off). If include_str! ever
+        // points at the wrong file, those rules silently disappear
+        // and the agent reverts to free-form prose. Anchor on the
+        // distinctive "Rule 0" marker plus the AVOID list header.
+        let body = lookup("commit-kernel").unwrap();
+        assert!(
+            body.contains("Rule 0"),
+            "commit-kernel body missing Rule 0 (72-char wrap)"
+        );
+        assert!(
+            body.contains("What to AVOID"),
+            "commit-kernel body missing the AVOID checklist"
+        );
     }
 
     #[test]
@@ -280,5 +333,51 @@ mod tests {
     #[test]
     fn compose_unknown_name_returns_none() {
         assert!(compose("no-such-command", "target").is_none());
+    }
+
+    #[test]
+    fn compose_fix_appends_commit_kernel_body() {
+        // The FIX flow needs the commit-kernel rules in front of the
+        // slow agent at git-commit time. compose("fix", ...) auto-
+        // appends commit-kernel under a COMMIT MESSAGE STYLE header
+        // so the slow agent doesn't fall back to its training prior
+        // (per-file bullets, "[PATCH]" prefix, etc.).
+        let (_, body) = compose("fix", "/path/to/finding").unwrap();
+        // Sanity: the FIX body is still present in front.
+        assert!(body.contains("kres FIX flow"), "fix body missing: {body:?}");
+        // The commit-kernel rules land after a separator + header.
+        assert!(
+            body.contains("# COMMIT MESSAGE STYLE (appended by /fix)"),
+            "missing append marker: {body:?}"
+        );
+        // Anchor a few load-bearing rules from commit-kernel so a
+        // future drift in either template gets caught.
+        assert!(body.contains("Rule 0"), "commit-kernel missing in fix body");
+        assert!(
+            body.contains("Assisted-by:"),
+            "commit-kernel Assisted-by trailer missing in fix body"
+        );
+    }
+
+    #[test]
+    fn compose_review_does_not_append_commit_kernel() {
+        // Only fix gets the commit-kernel append. Other commands
+        // (review, summary, triage, commit-kernel itself) must NOT
+        // pick up the appendix.
+        let (_, body) = compose("review", "fs/btrfs/ctree.c").unwrap();
+        assert!(
+            !body.contains("# COMMIT MESSAGE STYLE (appended by /fix)"),
+            "review body unexpectedly carries the fix appendix"
+        );
+    }
+
+    #[test]
+    fn compose_commit_kernel_does_not_self_append() {
+        // /commit-kernel must not append itself recursively.
+        let (_, body) = compose("commit-kernel", "describe the change").unwrap();
+        assert!(
+            !body.contains("# COMMIT MESSAGE STYLE (appended by /fix)"),
+            "commit-kernel body unexpectedly self-appends"
+        );
     }
 }

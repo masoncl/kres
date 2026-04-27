@@ -113,13 +113,22 @@ FOLLOWUPS — same schema the fast agent uses:
 - "search" — regex grep. name = pattern. add "path" to scope.
 - "file" — name = glob
 - "read" — name = "file.c:100+50"
-- "git" — git command string. Readonly subcommands plus `add` and
-  `commit` (for committing what you just wrote). `--amend` and
-  `--no-verify` are rejected; no remote-touching subcommands.
+- "git" — git command string. Readonly subcommands plus `add`,
+  `commit`, and `commit --amend` (for folding review fixups into
+  the original commit). `--no-verify` is rejected; no
+  remote-touching subcommands.
+- "make" — `make <args>` from the workspace root. `name` is the
+  args after `make`; optional `timeout_secs` (default 300, cap
+  600). Enabled by default — no `--allow` needed. Use for kernel
+  build verification:
+  `{"type": "make", "name": "-j$(nproc) net/ipv4/tcp_ipv4.o"}`.
+- "cargo" — `cargo <args>` from the workspace root. Same shape.
+  `{"type": "cargo", "name": "build -p kres-agents"}`.
 - "bash" — `bash -c <command>` from the workspace root. `name` is
   the command; optional `timeout_secs` (default 60, cap 600) and
-  `cwd` (workspace-relative). Use for compile/run verification of
-  the files you just emitted. The output you get back looks like
+  `cwd` (workspace-relative). OFF by default — requires
+  `--allow bash`. Prefer `make` or `cargo` for builds. The output
+  you get back looks like
   `[exit 0]\n[stdout]\n...\n[stderr]\n...\n`; use it to decide
   whether the artifact needs another revision.
 - "question" — free-form text

@@ -1249,15 +1249,36 @@ pub fn apply_skill_reads(skills: &mut Option<Value>, reads: &[String]) {
             Ok(content) => {
                 files_map.insert(path.clone(), Value::String(content));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match resolve_skill_read_in_subdirs(path) {
+                    Some((resolved, content)) => {
+                        tracing::info!(
+                            target: "kres_agents",
+                            asked = %path,
+                            resolved = %resolved.display(),
+                            "skill_read resolved via subdir lookup"
+                        );
+                        files_map.insert(path.clone(), Value::String(content));
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "kres_agents",
+                            path,
+                            "skill_read failed: {e}"
+                        );
+                        files_map.insert(
+                            path.clone(),
+                            Value::String(format!("[skill_read failed: {e}]")),
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "kres_agents",
                     path,
                     "skill_read failed: {e}"
                 );
-                // Surface the error back to the agent so it can
-                // adjust — an empty string would be silently
-                // misleading.
                 files_map.insert(
                     path.clone(),
                     Value::String(format!("[skill_read failed: {e}]")),
@@ -1265,6 +1286,48 @@ pub fn apply_skill_reads(skills: &mut Option<Value>, reads: &[String]) {
             }
         }
     }
+}
+
+/// When the agent emits a skill_read for a path that doesn't exist,
+/// look in immediate subdirectories of the requested file's parent
+/// for a basename match. Skill libraries (review-prompts/kernel/)
+/// commonly nest by topic — for example, `subsystem/vfs.md` lives a
+/// directory deeper than `technical-patterns.md`. The agent has all
+/// the path information in its prompt but routinely drops the
+/// nesting segment when composing absolute paths. Rather than rely
+/// on prompt wording the LLM has already proven it ignores, fall
+/// back to a single-level subdirectory search.
+///
+/// Strict resolution rules:
+/// - search only one level of subdirectories (no recursion) so a
+///   stray match deep in `examples/` doesn't substitute for an
+///   intentional read
+/// - require EXACTLY ONE candidate; multiple matches are
+///   ambiguous and we'd rather fail loudly than guess
+///
+/// Returns the resolved path + file content on a hit, None
+/// otherwise.
+fn resolve_skill_read_in_subdirs(path: &str) -> Option<(std::path::PathBuf, String)> {
+    let p = std::path::Path::new(path);
+    let parent = p.parent()?;
+    let basename = p.file_name()?;
+    let entries = std::fs::read_dir(parent).ok()?;
+    let mut matches: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let candidate = entry.path().join(basename);
+        if candidate.is_file() {
+            matches.push(candidate);
+        }
+    }
+    if matches.len() != 1 {
+        return None;
+    }
+    let resolved = matches.into_iter().next().unwrap();
+    let content = std::fs::read_to_string(&resolved).ok()?;
+    Some((resolved, content))
 }
 
 /// Strip a lens to `{type, name, id?, reason?}` for the
@@ -1444,5 +1507,67 @@ mod tests {
         assert_eq!(body, "hello skill body");
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Regression for the FIX-flow vfs.md miss: agent emitted
+    /// kernel/vfs.md but the file is actually at
+    /// kernel/subsystem/vfs.md. The reaper used to surface the
+    /// raw NotFound back to the agent and the slow agent would
+    /// proceed without the subsystem guide. Now the subdir
+    /// fallback picks it up when there's exactly one match.
+    #[test]
+    fn apply_skill_reads_falls_back_to_one_subdir_match() {
+        let root = std::env::temp_dir().join(format!("kres-skill-subdir-{}", std::process::id()));
+        let sub = root.join("subsystem");
+        std::fs::create_dir_all(&sub).unwrap();
+        let actual = sub.join("vfs.md");
+        std::fs::write(&actual, "VFS body").unwrap();
+        let asked = root.join("vfs.md"); // does NOT exist at this level
+        let mut skills = Some(json!({"kernel": {"content": "", "files": {}}}));
+        apply_skill_reads(&mut skills, &[asked.to_string_lossy().to_string()]);
+        let body = skills
+            .as_ref()
+            .and_then(|v| v.get("kernel"))
+            .and_then(|k| k.get("files"))
+            .and_then(|f| f.get(asked.to_str().unwrap()))
+            .and_then(|v| v.as_str())
+            .expect("file body");
+        assert_eq!(body, "VFS body");
+        let _ = std::fs::remove_file(&actual);
+        let _ = std::fs::remove_dir(&sub);
+        let _ = std::fs::remove_dir(&root);
+    }
+
+    /// Two subdir matches → ambiguous, do NOT guess. Surface the
+    /// original NotFound so the agent / operator can resolve.
+    #[test]
+    fn apply_skill_reads_subdir_fallback_refuses_ambiguity() {
+        let root =
+            std::env::temp_dir().join(format!("kres-skill-subdir-ambig-{}", std::process::id()));
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("dup.md"), "from a").unwrap();
+        std::fs::write(b.join("dup.md"), "from b").unwrap();
+        let asked = root.join("dup.md");
+        let mut skills = Some(json!({"kernel": {"content": "", "files": {}}}));
+        apply_skill_reads(&mut skills, &[asked.to_string_lossy().to_string()]);
+        let body = skills
+            .as_ref()
+            .and_then(|v| v.get("kernel"))
+            .and_then(|k| k.get("files"))
+            .and_then(|f| f.get(asked.to_str().unwrap()))
+            .and_then(|v| v.as_str())
+            .expect("file slot");
+        assert!(
+            body.starts_with("[skill_read failed:"),
+            "ambiguous fallback should surface original NotFound, got: {body:?}"
+        );
+        let _ = std::fs::remove_file(a.join("dup.md"));
+        let _ = std::fs::remove_file(b.join("dup.md"));
+        let _ = std::fs::remove_dir(&a);
+        let _ = std::fs::remove_dir(&b);
+        let _ = std::fs::remove_dir(&root);
     }
 }

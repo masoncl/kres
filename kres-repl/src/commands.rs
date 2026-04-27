@@ -55,6 +55,18 @@ pub enum Command {
     /// ~/.kres/commands/review.md wins over the embedded copy)
     /// with the trailing target text and queues it as a new task.
     Review { target: String },
+    /// `/fix <target>` — submit a prompt equivalent to
+    /// `--prompt "fix: <target>"`. Composes the `fix` slash-command
+    /// template (disk override at ~/.kres/commands/fix.md wins over
+    /// the embedded copy) with the trailing target text and queues
+    /// it as a new task. `<target>` is either an absolute path to a
+    /// kres-exported finding directory or a freeform prose
+    /// description of the bug. Coding mode is selected by the goal
+    /// classifier; bash must be in the action allowlist for the
+    /// compile + fix-warnings steps to land — start kres with
+    /// `--allow bash` (or use `--prompt "fix: ..."` from the CLI,
+    /// which auto-enables bash for the run).
+    Fix { target: String },
     /// `/extract [--dir DIR] [--report F] [--todo F] [--findings F]`
     /// — copy session artifacts to operator-chosen destinations.
     Extract {
@@ -137,6 +149,17 @@ pub fn parse_command(line: &str) -> Command {
                     )
                 } else {
                     Command::Review { target }
+                }
+            }
+            "fix" => {
+                let target = rest.trim().to_string();
+                if target.is_empty() {
+                    Command::Unknown(
+                        "fix (expected: /fix <target>, e.g. /fix ~/local/kernel-bugs/findings/<id>)"
+                            .into(),
+                    )
+                } else {
+                    Command::Fix { target }
                 }
             }
             "extract" => Command::Extract {
@@ -294,6 +317,38 @@ mod tests {
         match parse_command("/review") {
             Command::Unknown(s) => {
                 assert!(s.starts_with("review"), "got {s}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fix_with_target() {
+        match parse_command("/fix /home/clm/local/kernel-bugs/findings/sample") {
+            Command::Fix { target } => {
+                assert_eq!(target, "/home/clm/local/kernel-bugs/findings/sample");
+            }
+            other => panic!("expected Fix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_fix_with_prose_target() {
+        // /fix accepts arbitrary trailing prose too (the template
+        // tells the slow agent to discriminate path-vs-prose).
+        match parse_command("/fix race in net/sched/cls_bpf.c free path") {
+            Command::Fix { target } => {
+                assert_eq!(target, "race in net/sched/cls_bpf.c free path");
+            }
+            other => panic!("expected Fix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_without_target_is_unknown() {
+        match parse_command("/fix") {
+            Command::Unknown(s) => {
+                assert!(s.starts_with("fix"), "got {s}");
             }
             other => panic!("expected Unknown, got {other:?}"),
         }

@@ -44,14 +44,18 @@ no cp, no relative-path hack:
 Unless you're quoting code, lines MUST be wrapped at 78 characters.  Long
 lines are not allowed, count characters as you write.
 
-Use exactly the section headings below, in this order. Every section
-is required. Keep prose tight — short triage doc, not a re-run of
-FINDING.md.
+The very first line of `summary.md` MUST be the verbatim cross-link
+header below — no edits, no substitutions, no omitting:
 
-The very first line of `summary.md` is a relative-link header that
-points back at the per-finding `FINDING.md` and `metadata.yaml`
-sitting in the same directory. Emit it verbatim, then a blank line,
-then the `# Subject:` heading.
+    [FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)
+
+Then one blank line. Then the section headings below, in this
+order. Every section is required. Keep prose tight — short triage
+doc, not a re-run of FINDING.md.
+
+**Skipping the cross-link line is a template violation. Output
+that starts with `# Subject:` is wrong** — the cross-link line
+comes first, always.
 
 ```
 [FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)
@@ -138,11 +142,15 @@ determined which subsystem this bug belongs to, fill in that subsystem field.
 
 ## Rules
 
+- The FIRST line of `summary.md` MUST be
+  `[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)`
+  followed by one blank line. Skipping it is a template violation —
+  every summary.md needs the cross-link so a triager landing on it
+  can drop into FINDING.md or metadata.yaml without leaving the
+  page.
 - The Subject line is the `# Subject:` heading itself — don't add a
-  separate first heading above it. The only line allowed before
-  `# Subject:` is the verbatim cross-link line
-  `[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)` followed
-  by one blank line.
+  separate first heading above it. The cross-link line above is the
+  only thing that comes before `# Subject:`.
 - Status values are exactly one of `Fixed`, `Plausible`, `Unknown`,
   `Invalid`. Match the metadata's `status:` when it's `invalidated`
   (→ `Invalid`); otherwise pick the best fit from the FINDING.md

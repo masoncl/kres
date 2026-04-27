@@ -55,7 +55,8 @@ use kres_llm::Model;
 /// (`bash sed` for range reads, `bash find` for file locates).
 /// Coding flows that genuinely need `cc && ./repro` can opt in via
 /// `--allow bash` or via settings.actions.allowed.
-pub const DEFAULT_ALLOWED_ACTIONS: &[&str] = &["grep", "find", "read", "git", "edit"];
+pub const DEFAULT_ALLOWED_ACTIONS: &[&str] =
+    &["grep", "find", "read", "git", "edit", "make", "cargo"];
 
 /// Every action type the main agent might emit. Used for typo
 /// detection when an operator writes `--allow bsah` or sticks
@@ -66,7 +67,9 @@ pub const DEFAULT_ALLOWED_ACTIONS: &[&str] = &["grep", "find", "read", "git", "e
 /// gate in dispatch_non_mcp never consults the `"mcp"` entry (MCP
 /// actions are gated by mcp.json server registration, not this
 /// list), so including it here is effectively documentation.
-pub const KNOWN_ACTION_TYPES: &[&str] = &["grep", "find", "read", "git", "edit", "bash", "mcp"];
+pub const KNOWN_ACTION_TYPES: &[&str] = &[
+    "grep", "find", "read", "git", "edit", "bash", "make", "cargo", "mcp",
+];
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Settings {

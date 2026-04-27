@@ -16,7 +16,7 @@
 //!   - done items the agent dropped preserved (coverage signal)
 //!   - missing coverage on done items carried forward
 //!   - a programmatic dedup backstop for pending items
-//!   - a pending cap of 20 (done items don't count)
+//!   - plan-linked pending items the agent forgot are restored
 //!
 //! On any failure we fall back to a token-overlap dedup that merges
 //! the new followups into the existing list — the todo list must
@@ -233,7 +233,7 @@ pub async fn update_todo_via_agent_with_logger(
     };
 
     // --- Reconcile with existing done items ---------------------------
-    let (done_from_agent, pending_from_agent): (Vec<TodoItem>, Vec<TodoItem>) = parsed
+    let (done_from_agent, mut pending_from_agent): (Vec<TodoItem>, Vec<TodoItem>) = parsed
         .into_iter()
         .partition(|t| t.status == TodoStatus::Done);
     let original_done: HashMap<String, TodoItem> = todo_list
@@ -265,36 +265,107 @@ pub async fn update_todo_via_agent_with_logger(
         }
     }
 
+    // --- Preserve plan-linked pending items the agent dropped --------
+    // The reconcile loop above trusts the agent for the pending list:
+    // whatever it returns is the new pending state. That breaks when
+    // the agent's response is truncated or it just forgets an item —
+    // a linked plan step is left orphaned, the rollup never flips it
+    // to done, and dependent steps stall. We can't know which case we
+    // are in, but we DO know which pending items are load-bearing for
+    // the plan: those with a `step_id` pointing at a step that is
+    // still alive (not Done/Skipped). Restore those silently.
+    //
+    // Items without a step_id are operator/agent ad-hoc adds — those
+    // we still trust the agent on. Items whose step IS terminal are
+    // legitimately stale and should disappear.
+    if let Some(plan) = plan {
+        let active_step_ids: HashSet<String> = plan
+            .steps
+            .iter()
+            .filter(|s| !s.status.is_terminal())
+            .map(|s| s.id.clone())
+            .collect();
+        let mut agent_emitted_ids: HashSet<String> = HashSet::new();
+        for t in done_final.iter().chain(pending_from_agent.iter()) {
+            if !t.id.is_empty() {
+                agent_emitted_ids.insert(t.id.clone());
+            }
+        }
+        let mut restored: Vec<String> = Vec::new();
+        for orig in todo_list.iter() {
+            if orig.status != TodoStatus::Pending
+                && orig.status != TodoStatus::InProgress
+                && orig.status != TodoStatus::Blocked
+            {
+                continue;
+            }
+            if orig.id.is_empty() || orig.step_id.is_empty() {
+                continue;
+            }
+            if agent_emitted_ids.contains(&orig.id) {
+                continue;
+            }
+            if !active_step_ids.contains(&orig.step_id) {
+                continue;
+            }
+            // Agent dropped a pending item that's still tied to a
+            // live plan step. Restore it as Pending so the work
+            // stays visible; the agent gets another chance next
+            // round to mark it done or genuinely retire it.
+            let mut item = orig.clone();
+            item.status = TodoStatus::Pending;
+            restored.push(item.id.clone());
+            pending_from_agent.push(item);
+        }
+        if !restored.is_empty() {
+            tracing::info!(
+                target: "kres_agents",
+                "todo agent dropped {} plan-linked pending item(s); \
+                 restored: {}",
+                restored.len(),
+                restored.join(", ")
+            );
+        }
+    }
+
     // --- Programmatic dedup backstop for pending items ----------------
-    let mut ref_token_sets: Vec<(String, HashSet<String>)> = Vec::new();
+    // Two items are duplicates only when they refer to the same code:
+    // either both bags lack file-path tokens (pure-prose tasks like
+    // "investigate slab corruption") and ≥70% of remaining tokens
+    // overlap, OR their path-token sets share at least one path AND
+    // overall token overlap ≥70%. Items whose path-token sets are
+    // both non-empty and disjoint are NEVER duplicates — they
+    // operate on different files. This is what keeps sibling
+    // compile-verify-v4 / compile-verify-v6 steps from collapsing
+    // into one (their .o paths differ even though the surrounding
+    // prose is near-identical).
+    let mut ref_entries: Vec<DedupEntry> = Vec::new();
     for d in done_final.iter().chain(preserved.iter()) {
         let bag = format!("{} {} {}", d.name, d.reason, d.coverage);
-        let toks = dedup_tokens(&bag);
-        if !toks.is_empty() {
-            ref_token_sets.push((d.name.clone(), toks));
+        let entry = DedupEntry::from_bag(d.name.clone(), &bag);
+        if !entry.is_empty() {
+            ref_entries.push(entry);
         }
     }
     let mut filtered_pending: Vec<TodoItem> = Vec::new();
     let mut dropped: Vec<(String, String)> = Vec::new();
     for p in pending_from_agent.into_iter() {
         let bag = format!("{} {}", p.name, p.reason);
-        let ptoks = dedup_tokens(&bag);
-        if ptoks.is_empty() {
+        let entry = DedupEntry::from_bag(p.name.clone(), &bag);
+        if entry.is_empty() {
             filtered_pending.push(p);
             continue;
         }
         let mut dup = false;
-        for (dname, dtoks) in &ref_token_sets {
-            let overlap = ptoks.intersection(dtoks).count();
-            let denom = ptoks.len().min(dtoks.len());
-            if denom > 0 && (overlap as f64) / (denom as f64) >= 0.7 {
+        for r in &ref_entries {
+            if entry.is_duplicate_of(r) {
                 dup = true;
-                dropped.push((p.name.clone(), dname.clone()));
+                dropped.push((p.name.clone(), r.label.clone()));
                 break;
             }
         }
         if !dup {
-            ref_token_sets.push((p.name.clone(), ptoks));
+            ref_entries.push(entry);
             filtered_pending.push(p);
         }
     }
@@ -313,18 +384,22 @@ pub async fn update_todo_via_agent_with_logger(
         );
     }
 
-    // --- Apply pending cap (done items don't count) -------------------
-    const PENDING_CAP: usize = 20;
-    if filtered_pending.len() > PENDING_CAP {
-        filtered_pending.truncate(PENDING_CAP);
-    }
-
     // Order: done-from-agent, preserved-done, filtered-pending
     let mut result =
         Vec::with_capacity(done_final.len() + preserved.len() + filtered_pending.len());
     result.extend(done_final);
     result.extend(preserved);
     result.extend(filtered_pending);
+
+    // The agent is told to emit `id` for every item but new pending
+    // followups it creates this round can come back with an empty id.
+    // Without an id, depends_on can't reference the item and the
+    // dispatch/resolve loop in cmd_continue / cmd_next /
+    // should_auto_continue treats it as nameless. Synthesize stable
+    // ids here before returning so every downstream consumer can
+    // count on `id` being populated.
+    assign_ids(&mut result);
+
     Ok(TodoUpdate {
         todo: result,
         plan: returned_plan,
@@ -479,18 +554,71 @@ const DEDUP_STOP_TOKENS: &[&str] = &[
     "tail",
 ];
 
+/// One side of a dedup comparison: the full token bag plus the
+/// subset that looks like a file path (has at least one `.` or
+/// `/`). Two entries are duplicates when they describe the same
+/// code, which we approximate as: same file paths involved AND
+/// ≥70% overall token overlap. Empty path-sets fall back to
+/// pure overlap so prose-only tasks ("investigate slab corruption")
+/// still dedup correctly.
+struct DedupEntry {
+    label: String,
+    all: HashSet<String>,
+    paths: HashSet<String>,
+}
+
+impl DedupEntry {
+    fn from_bag(label: String, bag: &str) -> Self {
+        let all = dedup_tokens(bag);
+        let paths: HashSet<String> = all
+            .iter()
+            .filter(|t| t.contains('/') || t.contains('.'))
+            .cloned()
+            .collect();
+        Self { label, all, paths }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.all.is_empty()
+    }
+
+    fn is_duplicate_of(&self, other: &DedupEntry) -> bool {
+        // Different file footprints → different work, even when prose
+        // matches. Both sides must have paths for the disjoint test
+        // to apply; if either side is path-free the heuristic falls
+        // back to overlap-only.
+        if !self.paths.is_empty() && !other.paths.is_empty() && self.paths.is_disjoint(&other.paths)
+        {
+            return false;
+        }
+        let overlap = self.all.intersection(&other.all).count();
+        let denom = self.all.len().min(other.all.len());
+        denom > 0 && (overlap as f64) / (denom as f64) >= 0.7
+    }
+}
+
 /// Extract tokens useful for near-duplicate detection of todo items.
 /// Lowercased file paths, section refs (§3b), and C-identifier-like
 /// substrings of length >= 5.
+///
+/// The path-extension list covers kernel sources (`.c`/`.h`/`.S`),
+/// kernel build artifacts (`.o`/`.ko`/`.a`/`.so`), and the other
+/// languages kres analysis touches (`.rs`/`.go`/`.py`/`.md`/`.sh`).
+/// Build artifacts MUST be in the list — sibling compile-verify
+/// steps name `.o` targets and the path is the only thing that
+/// disambiguates them; without it the heuristic sees only the
+/// shared prose ("compile cleanly", "stderr", "warnings") and
+/// drops the second sibling as a duplicate.
 pub fn dedup_tokens(s: &str) -> HashSet<String> {
     let mut out: HashSet<String> = HashSet::new();
     if s.is_empty() {
         return out;
     }
     let lower = s.to_lowercase();
-    // Pass 1: file-path tokens. Lean scan mirroring
+    // Pass 1: file-path tokens.
     for ext in &[
-        ".c", ".h", ".bpf.c", ".go", ".py", ".rs", ".s", ".md", ".sh",
+        ".bpf.c", // longest-match before .c
+        ".c", ".h", ".s", ".o", ".ko", ".so", ".a", ".rs", ".go", ".py", ".md", ".sh",
     ] {
         let mut start = 0;
         while let Some(off) = lower[start..].find(ext) {
@@ -946,6 +1074,95 @@ mod tests {
         let toks = dedup_tokens("the and for abc");
         // None of these are length >= 5 and non-stop.
         assert!(toks.is_empty());
+    }
+
+    #[test]
+    fn dedup_tokens_extracts_object_files() {
+        // Sibling compile-verify steps in the FIX flow name `.o`
+        // targets. Without `.o` in the path-extension list the
+        // path component is invisible to the heuristic and the
+        // second sibling gets dropped as a prose-overlap dup.
+        let v4 = dedup_tokens("-j$(nproc) net/ipv4/tcp_ipv4.o");
+        let v6 = dedup_tokens("-j$(nproc) net/ipv6/tcp_ipv6.o");
+        assert!(
+            v4.contains("net/ipv4/tcp_ipv4.o"),
+            "v4 path missing: {v4:?}"
+        );
+        assert!(
+            v6.contains("net/ipv6/tcp_ipv6.o"),
+            "v6 path missing: {v6:?}"
+        );
+        assert!(
+            v4.is_disjoint(&HashSet::from(["net/ipv6/tcp_ipv6.o".to_string()])),
+            "v4 should not contain v6 path"
+        );
+    }
+
+    #[test]
+    fn dedup_entry_keeps_v4_v6_siblings_distinct() {
+        // Regression for the FIX-flow stall: compile-verify-v4 and
+        // compile-verify-v6 share most prose tokens but the .o path
+        // disambiguates them. The dedup heuristic must treat
+        // disjoint file footprints as distinct work, otherwise v6
+        // gets silently dropped and downstream depends_on breaks.
+        let v4 = DedupEntry::from_bag(
+            "compile-verify-v4".into(),
+            concat!(
+                "-j$(nproc) net/ipv4/tcp_ipv4.o ",
+                "Verify v4 patch compiles cleanly; capture stderr for ",
+                "new warnings or errors introduced by the inet_twsk_put ",
+                "fix in tcp_ipv4.c."
+            ),
+        );
+        let v6 = DedupEntry::from_bag(
+            "compile-verify-v6".into(),
+            concat!(
+                "-j$(nproc) net/ipv6/tcp_ipv6.o ",
+                "Verify v6 patch compiles cleanly; capture stderr for ",
+                "new warnings or errors introduced by the inet_twsk_put ",
+                "fix in tcp_ipv6.c."
+            ),
+        );
+        assert!(!v6.is_duplicate_of(&v4), "v6 incorrectly marked dup of v4");
+        assert!(!v4.is_duplicate_of(&v6), "v4 incorrectly marked dup of v6");
+    }
+
+    #[test]
+    fn dedup_entry_still_catches_prose_only_duplicates() {
+        // A pure-prose task with no path tokens: heuristic must still
+        // collapse near-restatements so the agent's accidental
+        // re-adds get filtered.
+        let a = DedupEntry::from_bag(
+            "investigate slab corruption".into(),
+            "investigate slab corruption in scrub_something helper",
+        );
+        let b = DedupEntry::from_bag(
+            "look at slab corruption".into(),
+            "investigate slab corruption helper scrub_something",
+        );
+        assert!(b.is_duplicate_of(&a));
+    }
+
+    #[test]
+    fn dedup_entry_catches_dup_when_paths_overlap() {
+        // Two items both touching the same file with similar prose
+        // are still duplicates — only DISJOINT path footprints
+        // exempt the comparison.
+        let a = DedupEntry::from_bag("audit-fs-foo".into(), "audit fs/foo.c locking around bar()");
+        let b = DedupEntry::from_bag(
+            "audit-fs-foo-2".into(),
+            "audit fs/foo.c locking around bar() callers",
+        );
+        assert!(b.is_duplicate_of(&a));
+    }
+
+    #[test]
+    fn dedup_tokens_extracts_kernel_module_artifacts() {
+        let toks = dedup_tokens("rebuild drivers/net/ethernet/intel/ice/ice.ko after fix");
+        assert!(
+            toks.contains("drivers/net/ethernet/intel/ice/ice.ko"),
+            ".ko path missing: {toks:?}"
+        );
     }
 
     #[test]

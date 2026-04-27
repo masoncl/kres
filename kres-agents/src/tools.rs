@@ -169,8 +169,9 @@ pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentErro
 ///
 /// The second tranche (`add`, `commit`) is the commit-flow surface —
 /// added for coding tasks that need to commit the source they just
-/// wrote. Destructive history rewrites (`--amend`), hook skipping
-/// (`--no-verify`), and signature skipping (`--no-gpg-sign`) are
+/// wrote. `--amend` is permitted (the fix flow uses it to fold
+/// review fixups into the original commit). Hook skipping
+/// (`--no-verify`) and signature skipping (`--no-gpg-sign`) are
 /// rejected via `reject_risky_git_flag` below, and operations that
 /// touch a remote (`push`, `pull`, `fetch`, `clone`) are deliberately
 /// absent — the tool is workspace-local.
@@ -564,27 +565,38 @@ fn reject_risky_git_flag(arg: &str) -> Option<&'static str> {
         "--upload-pack" | "--receive-pack" => Some("specifies a remote helper to run"),
         "-P" | "--paginate" => Some("forces a pager"),
         "--help" | "-h" => Some("can invoke the man pager"),
-        // Commit-flow guards. Rewriting history (--amend) or
-        // bypassing the local tooling (--no-verify, --no-gpg-sign)
-        // is off the table for the coding tool surface: the
-        // operator's CLAUDE.md explicitly calls out that these
-        // flags should never be used by the assistant.
-        "--amend" => Some("rewrites the previous commit"),
+        // --amend is permitted: the fix flow needs it to fold
+        // warning fixes into the original commit after review.
+        // --no-verify and --no-gpg-sign stay rejected.
         "--no-verify" => Some("skips pre-commit / commit-msg hooks"),
         "--no-gpg-sign" => Some("bypasses commit signing policy"),
         _ => None,
     }
 }
 
-/// Super-simple shell split: honours single and double quotes but no
-/// backslash escapes. Good enough for the readonly git surface.
+/// Shell split: honours single and double quotes plus backslash
+/// escapes inside double-quoted strings (`\"` → literal `"`).
+/// Needed for commit messages that contain inner quotes, e.g.
+/// `-m "Fixes: 659a2899a57d (\"tcp: add datapath...\")"`.
 fn shell_split(s: &str) -> Option<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
+    let mut escape = false;
     for ch in s.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
         match ch {
+            '\\' if in_double => {
+                escape = true;
+            }
+            '\\' if !in_single && !in_double => {
+                escape = true;
+            }
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
             c if c.is_whitespace() && !in_single && !in_double => {
@@ -595,7 +607,7 @@ fn shell_split(s: &str) -> Option<Vec<String>> {
             c => current.push(c),
         }
     }
-    if in_single || in_double {
+    if in_single || in_double || escape {
         return None;
     }
     if !current.is_empty() {
@@ -1045,7 +1057,6 @@ mod tests {
             "log --exec=/bin/sh",
             "log -h",
             "log --upload-pack=/bin/sh",
-            "commit --amend -m x",
             "commit --no-verify -m x",
             "commit --no-gpg-sign -m x",
         ] {
@@ -1128,7 +1139,11 @@ mod tests {
         // tokio spawn. Whatever the spawn returns (it may well
         // error because /tmp isn't a git repo), it must NOT be
         // the "not in allowlist" or "rejected" strings.
-        for cmd in ["add README.md", "commit -s -m \"msg\""] {
+        for cmd in [
+            "add README.md",
+            "commit -s -m \"msg\"",
+            "commit --amend -s -m \"revised msg\"",
+        ] {
             let v = serde_json::json!({"command": cmd});
             let args: GitArgs = serde_json::from_value(v).unwrap();
             let res = git(std::path::Path::new("/tmp"), &args).await;
@@ -1209,5 +1224,25 @@ mod tests {
     #[test]
     fn shell_split_unbalanced_quote_errors() {
         assert!(shell_split("log 'oops").is_none());
+    }
+
+    #[test]
+    fn shell_split_escaped_quotes_in_double() {
+        // Commit messages with Fixes: tags have inner quotes:
+        // -m "Fixes: 659a (\"tcp: add datapath\")"
+        // shell_split must treat \" inside double quotes as a
+        // literal quote character, not as end-of-string.
+        let parts = shell_split(
+            r#"commit -s -m "subject" -m "Fixes: 659a (\"tcp: add datapath\")" -m "Assisted-by: kres""#,
+        )
+        .unwrap();
+        assert_eq!(parts[0], "commit");
+        assert_eq!(parts[1], "-s");
+        assert_eq!(parts[2], "-m");
+        assert_eq!(parts[3], "subject");
+        assert_eq!(parts[4], "-m");
+        assert_eq!(parts[5], r#"Fixes: 659a ("tcp: add datapath")"#);
+        assert_eq!(parts[6], "-m");
+        assert_eq!(parts[7], "Assisted-by: kres");
     }
 }

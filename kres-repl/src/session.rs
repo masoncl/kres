@@ -218,6 +218,24 @@ pub struct Session {
     /// file") into something narrow the judge trivially marks met;
     /// passing the raw prompt restores the ground truth.
     task_prompts: Arc<tokio::sync::Mutex<std::collections::HashMap<kres_core::TaskId, String>>>,
+    /// Session-wide goal + mode set by the most recent operator-typed
+    /// submission. Pipeline-driven follow-ups (cmd_next, cmd_continue,
+    /// auto-continue) inherit this instead of running a fresh
+    /// define_goal — the goal classifier, given a single-followup
+    /// brief like "run `git add ...`", produces a narrow per-task
+    /// goal ("Confirm git add succeeded") that check_goal trivially
+    /// marks met after the action runs. Goal-met then drains the
+    /// rest of the todo list to /followup and the run terminates
+    /// short of commit/compile/review.
+    ///
+    /// Debugged via session 6a58e4fc (2026-04-27): a /fix run got
+    /// through `git add` then stopped because the follow-up's
+    /// derived goal asked only for the staging confirmation. With
+    /// this slot, follow-ups inherit the original /fix-flow goal
+    /// ("Produce a reviewed, committed git patch ...") so check_goal
+    /// keeps the loop running until the patch is actually committed
+    /// and reviewed.
+    session_goal: Arc<tokio::sync::Mutex<Option<(String, kres_agents::TaskMode)>>>,
     /// Accumulated per-task findings — the flat
     /// `{task, analysis}` list that `/summary` and `/report`
     /// consume (§6).
@@ -419,6 +437,7 @@ impl Session {
                 logger: None,
                 task_goals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 task_prompts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+                session_goal: Arc::new(tokio::sync::Mutex::new(None)),
                 accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
@@ -447,6 +466,7 @@ impl Session {
             logger: None,
             task_goals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             task_prompts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            session_goal: Arc::new(tokio::sync::Mutex::new(None)),
             accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
@@ -871,6 +891,17 @@ impl Session {
         // count strictly increases.
         let mut no_new_findings_streak: u32 = 0;
         const NO_NEW_FINDINGS_STOP: u32 = 3;
+        // Watchdog: if N consecutive reaped tasks come back Errored,
+        // the pipeline is busted (revoked key, dead model, network
+        // dropped, etc.) and re-queueing the same items via the todo
+        // agent just burns API budget. Bail loudly. Reset on any
+        // Done reap — a single success means things are working.
+        // Without this, sessions like .kres/logs/6f3f0daf-… (269
+        // failed slow calls in 50 min, 0 successes) silently spin
+        // forever because the todo agent keeps re-queueing
+        // "Prior execution returned empty analysis; must re-run."
+        let mut consecutive_errors: u32 = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 3;
         // Latch for the --turns 0 auto-stop banner. The stop check
         // below runs on every 250ms tick, but the operator only
         // wants to SEE "goal met" once; re-firing it every tick
@@ -914,6 +945,45 @@ impl Session {
                     } else {
                         Vec::new()
                     };
+                    // Execute git add/commit followups directly in the
+                    // reaper instead of turning them into pipeline
+                    // tasks. The main agent is a data-retrieval agent
+                    // and only runs read-only git commands; when a
+                    // "git add" todo dispatches as a pipeline task,
+                    // the fast agent declares ready_for_slow without
+                    // executing it, the slow agent hallucinates
+                    // success, and the todo is marked done with
+                    // nothing staged. Executing here mirrors how
+                    // code_edits are applied directly above.
+                    let mut git_results: Vec<String> = Vec::new();
+                    if matches!(r.mode, kres_core::TaskMode::Coding) {
+                        for fu in &r.followups {
+                            let Some(kind) = reaper_followup_kind(fu) else {
+                                continue;
+                            };
+                            let Some(name) = fu
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                            else {
+                                continue;
+                            };
+                            let workspace = &code_output_root_for_reaper;
+                            let result = match kind {
+                                ReaperFollowup::Git => run_reaper_git(workspace, name).await,
+                                ReaperFollowup::PublishFix => {
+                                    run_publish_fix(workspace, name).await
+                                }
+                            };
+                            kres_core::async_eprintln!(
+                                "[reaper {}] {}: {}",
+                                kind.label(),
+                                truncate(name, 60),
+                                truncate(result.trim(), 120),
+                            );
+                            git_results.push(result);
+                        }
+                    }
 
                     // For Coding-mode tasks the slow agent is told to
                     // keep prose short and put the artifact in
@@ -924,7 +994,9 @@ impl Session {
                     // sitting on disk (session 597b4bf7). Append a
                     // short trailer listing what landed so the goal
                     // agent has concrete evidence to judge on.
-                    let effective_analysis = if r.code_output.is_empty() && applied_edits.is_empty()
+                    let effective_analysis = if r.code_output.is_empty()
+                        && applied_edits.is_empty()
+                        && git_results.is_empty()
                     {
                         r.analysis.clone()
                     } else {
@@ -962,6 +1034,12 @@ impl Session {
                             }
                         }
                         s.push_str(&format_applied_edits_trailer(&applied_edits));
+                        if !git_results.is_empty() {
+                            s.push_str("\n---\nGit operations:\n");
+                            for gr in &git_results {
+                                s.push_str(&format!("- {}\n", gr));
+                            }
+                        }
                         s
                     };
                     if !effective_analysis.is_empty() {
@@ -1311,8 +1389,34 @@ impl Session {
                     if let Some(ref tc) = todo_client {
                         let current = mgr_for_reaper.todo_snapshot().await;
                         let completed_query = r.name.clone();
-                        let analysis = r.analysis.clone();
-                        let followups = r.followups.clone();
+                        // Errored tasks reach this path with
+                        // analysis="". Without surfacing the error
+                        // here the todo agent reads "no analysis" as
+                        // "task didn't run, re-queue" and we spin
+                        // (see consecutive_errors comment above).
+                        // Inject the error so the agent has something
+                        // concrete to react to (skip vs. retry).
+                        let analysis = if matches!(r.state, TaskState::Errored) {
+                            format!(
+                                "[task errored: {}]",
+                                r.error.as_deref().unwrap_or("(no error text)")
+                            )
+                        } else {
+                            r.analysis.clone()
+                        };
+                        // Filter out followups the reaper already
+                        // executed directly (above). Only the rest
+                        // go to the todo agent for promotion to
+                        // pending tasks.
+                        let followups: Vec<_> = if matches!(r.mode, kres_core::TaskMode::Coding) {
+                            r.followups
+                                .iter()
+                                .filter(|f| reaper_followup_kind(f).is_none())
+                                .cloned()
+                                .collect()
+                        } else {
+                            r.followups.clone()
+                        };
                         kres_core::async_eprintln!(
                             "[todo update] before: {} item(s) ({} pending, {} done); {} new followup(s)",
                             current.len(),
@@ -1387,153 +1491,215 @@ impl Session {
                     // moves to the deferred list and running tasks
                     // get cancelled so the operator reclaims the
                     // prompt.
-                    // Goal is now per-task: each reaped task carries
-                    // an id, and submit_prompt parked its goal under
-                    // that id in task_goals. Pull it out (removing so
-                    // it doesn't live forever) and evaluate against
-                    // the accumulated analysis.
-                    let per_task_goal = task_goals_for_reaper.lock().await.remove(&r.id);
-                    let per_task_prompt = task_prompts_for_reaper
-                        .lock()
-                        .await
-                        .remove(&r.id)
-                        .unwrap_or_default();
-                    if let (Some(gc), Some(goal)) = (goal_client_for_reaper.clone(), per_task_goal)
-                    {
-                        let entries = accumulated_for_reaper.lock().await.clone();
+                    //
+                    // For coding-mode tasks (fix flow), skip the
+                    // per-task goal check entirely. A "turn" in
+                    // the fix flow is the full fix+compile+review
+                    // cycle, not each individual sub-task (git add,
+                    // git commit, make, etc.). Checking after each
+                    // sub-step wastes tokens and risks a premature
+                    // met=true. The todo list drives iteration;
+                    // check_goal runs only when the list drains
+                    // (no more pending items) or when an
+                    // audit/generic task completes.
+                    if matches!(r.mode, kres_core::TaskMode::Coding) {
                         kres_core::async_eprintln!(
+                            "[goal check] skipped for coding-mode task — \
+                             goal evaluated when todo list drains"
+                        );
+                        // Still clean up the per-task goal/prompt
+                        // entries so they don't leak.
+                        task_goals_for_reaper.lock().await.remove(&r.id);
+                        task_prompts_for_reaper.lock().await.remove(&r.id);
+                    } else {
+                        // Goal is now per-task: each reaped task carries
+                        // an id, and submit_prompt parked its goal under
+                        // that id in task_goals. Pull it out (removing so
+                        // it doesn't live forever) and evaluate against
+                        // the accumulated analysis.
+                        let per_task_goal = task_goals_for_reaper.lock().await.remove(&r.id);
+                        let per_task_prompt = task_prompts_for_reaper
+                            .lock()
+                            .await
+                            .remove(&r.id)
+                            .unwrap_or_default();
+                        if let (Some(gc), Some(goal)) =
+                            (goal_client_for_reaper.clone(), per_task_goal)
+                        {
+                            let entries = accumulated_for_reaper.lock().await.clone();
+                            kres_core::async_eprintln!(
                             "[goal check] checking against {} accumulated analysis/es ({}k chars)",
                             entries.len(),
                             entries.iter().map(|e| e.analysis.len()).sum::<usize>() / 1000,
                         );
-                        let mut combined = String::new();
-                        for (i, e) in entries.iter().enumerate() {
-                            if i > 0 {
-                                combined.push_str("\n\n---\n\n");
+                            let mut combined = String::new();
+                            for (i, e) in entries.iter().enumerate() {
+                                if i > 0 {
+                                    combined.push_str("\n\n---\n\n");
+                                }
+                                combined.push_str(&format!("## {}\n\n{}", e.task, e.analysis));
                             }
-                            combined.push_str(&format!("## {}\n\n{}", e.task, e.analysis));
-                        }
-                        let plan_for_check = mgr_for_reaper.plan_snapshot().await;
-                        let check = kres_agents::check_goal(
-                            &gc,
-                            &per_task_prompt,
-                            &goal,
-                            &combined,
-                            plan_for_check.as_ref(),
-                        )
-                        .await;
-                        kres_core::async_eprintln!(
-                            "[goal check] met={} reason={}",
-                            check.met,
-                            truncate(&check.reason, 120)
-                        );
-                        if check.met {
+                            let plan_for_check = mgr_for_reaper.plan_snapshot().await;
+                            let check = kres_agents::check_goal(
+                                &gc,
+                                &per_task_prompt,
+                                &goal,
+                                &combined,
+                                plan_for_check.as_ref(),
+                            )
+                            .await;
                             kres_core::async_eprintln!(
-                                "[goal met: {}]",
-                                truncate(&check.reason, 200)
+                                "[goal check] met={} reason={}",
+                                check.met,
+                                truncate(&check.reason, 120)
                             );
-                            // Any lingering InProgress items belong
-                            // to tasks the reaper already handled;
-                            // flip them to Pending so they join the
-                            // deferred drain below instead of being
-                            // silently dropped.
-                            mgr_for_reaper.reset_in_progress_to_pending().await;
-                            // Drain pending todos into the deferred
-                            // ledger so /followup can list them.
-                            // Done/Skipped items stay on the todo
-                            // list so their step_id linkage survives
-                            // — the next sync_plan_from_todo tick
-                            // can then flip any fully-covered plan
-                            // step to Done.
-                            let drained = mgr_for_reaper.drain_pending_blocked().await;
-                            let carry = drained.len();
-                            let mut deferred = deferred_for_reaper.lock().await;
-                            deferred.extend(drained);
-                            drop(deferred);
-                            if carry > 0 {
+                            if check.met {
                                 kres_core::async_eprintln!(
+                                    "[goal met: {}]",
+                                    truncate(&check.reason, 200)
+                                );
+                                // Any lingering InProgress items belong
+                                // to tasks the reaper already handled;
+                                // flip them to Pending so they join the
+                                // deferred drain below instead of being
+                                // silently dropped.
+                                mgr_for_reaper.reset_in_progress_to_pending().await;
+                                // Drain pending todos into the deferred
+                                // ledger so /followup can list them.
+                                // Done/Skipped items stay on the todo
+                                // list so their step_id linkage survives
+                                // — the next sync_plan_from_todo tick
+                                // can then flip any fully-covered plan
+                                // step to Done.
+                                let drained = mgr_for_reaper.drain_pending_blocked().await;
+                                let carry = drained.len();
+                                let mut deferred = deferred_for_reaper.lock().await;
+                                deferred.extend(drained);
+                                drop(deferred);
+                                if carry > 0 {
+                                    kres_core::async_eprintln!(
                                     "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
                                 );
-                            }
-                            // Per-task goal already removed at the
-                            // top of this branch by .remove(&r.id);
-                            // nothing else to clear.
-                        } else if !check.missing.is_empty() {
-                            kres_core::async_eprintln!(
-                                "[goal not yet met — missing: {}]",
-                                check.missing.join(", ")
-                            );
-                            // Spec in CLAUDE.md: "Goal not met → only
-                            // missing items become followups." Previous
-                            // code only printed the list; the items
-                            // were discarded. Match by
-                            // converting each missing item to a
-                            // 'question'-typed followup and funneling
-                            // them through the todo agent so they get
-                            // deduped against existing items and
-                            // appended as new todos.
-                            if let Some(ref tc) = todo_client {
-                                let reason_prefix = format!(
-                                    "goal not met: {}",
-                                    check.reason.chars().take(100).collect::<String>()
-                                );
-                                let missing_fus: Vec<serde_json::Value> = check
-                                    .missing
-                                    .iter()
-                                    .map(|m| {
-                                        serde_json::json!({
-                                            "type": "question",
-                                            "name": m,
-                                            "reason": reason_prefix,
-                                        })
-                                    })
-                                    .collect();
-                                let current = mgr_for_reaper.todo_snapshot().await;
-                                let completed_query = r.name.clone();
+                                }
+                                // Per-task goal already removed at the
+                                // top of this branch by .remove(&r.id);
+                                // nothing else to clear.
+                            } else if !check.missing.is_empty() {
                                 kres_core::async_eprintln!(
+                                    "[goal not yet met — missing: {}]",
+                                    check.missing.join(", ")
+                                );
+                                // Spec in CLAUDE.md: "Goal not met → only
+                                // missing items become followups." Previous
+                                // code only printed the list; the items
+                                // were discarded. Match by
+                                // converting each missing item to a
+                                // 'question'-typed followup and funneling
+                                // them through the todo agent so they get
+                                // deduped against existing items and
+                                // appended as new todos.
+                                if let Some(ref tc) = todo_client {
+                                    let reason_prefix = format!(
+                                        "goal not met: {}",
+                                        check.reason.chars().take(100).collect::<String>()
+                                    );
+                                    let missing_fus: Vec<serde_json::Value> = check
+                                        .missing
+                                        .iter()
+                                        .map(|m| {
+                                            serde_json::json!({
+                                                "type": "question",
+                                                "name": m,
+                                                "reason": reason_prefix,
+                                            })
+                                        })
+                                        .collect();
+                                    let current = mgr_for_reaper.todo_snapshot().await;
+                                    let completed_query = r.name.clone();
+                                    kres_core::async_eprintln!(
                                     "[goal-not-met → todo update] injecting {} missing item(s) as question followups",
                                     missing_fus.len()
                                 );
-                                let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
-                                match kres_agents::update_todo_via_agent_with_logger(
-                                    tc,
-                                    &completed_query,
-                                    "",
-                                    &missing_fus,
-                                    &current,
-                                    &lenses_for_reaper,
-                                    plan_for_todo.as_ref(),
-                                    logger_for_reaper.clone(),
-                                )
-                                .await
-                                {
-                                    Ok(updated) => {
-                                        kres_core::async_eprintln!(
+                                    let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
+                                    match kres_agents::update_todo_via_agent_with_logger(
+                                        tc,
+                                        &completed_query,
+                                        "",
+                                        &missing_fus,
+                                        &current,
+                                        &lenses_for_reaper,
+                                        plan_for_todo.as_ref(),
+                                        logger_for_reaper.clone(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(updated) => {
+                                            kres_core::async_eprintln!(
                                             "[goal-not-met → todo update] after: {} item(s) ({} pending, {} done)",
                                             updated.todo.len(),
                                             updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Pending).count(),
                                             updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Done).count(),
                                         );
-                                        if let Some(rewrite) = updated.plan {
-                                            let prior = mgr_for_reaper.plan_snapshot().await;
-                                            let new_plan = rewrite.apply_to(prior.as_ref());
-                                            log_plan_change(
-                                                "todo agent: plan rewrite (goal-not-met)",
-                                                prior.as_ref(),
-                                                &new_plan,
-                                            );
-                                            mgr_for_reaper.set_plan(Some(new_plan)).await;
+                                            if let Some(rewrite) = updated.plan {
+                                                let prior = mgr_for_reaper.plan_snapshot().await;
+                                                let new_plan = rewrite.apply_to(prior.as_ref());
+                                                log_plan_change(
+                                                    "todo agent: plan rewrite (goal-not-met)",
+                                                    prior.as_ref(),
+                                                    &new_plan,
+                                                );
+                                                mgr_for_reaper.set_plan(Some(new_plan)).await;
+                                            }
+                                            mgr_for_reaper.replace_todo(updated.todo).await;
                                         }
-                                        mgr_for_reaper.replace_todo(updated.todo).await;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            target: "kres_repl",
-                                            "todo-agent update (missing items) failed: {e}"
-                                        );
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                target: "kres_repl",
+                                                "todo-agent update (missing items) failed: {e}"
+                                            );
+                                        }
                                     }
                                 }
                             }
+                        }
+                    } // else (non-coding goal check)
+                      // Consecutive-error watchdog: surface a busted
+                      // pipeline instead of letting the todo agent
+                      // re-queue the same items forever (see counter
+                      // declaration above for context).
+                    match r.state {
+                        TaskState::Errored => {
+                            consecutive_errors = consecutive_errors.saturating_add(1);
+                        }
+                        TaskState::Done => {
+                            consecutive_errors = 0;
+                        }
+                        _ => {}
+                    }
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        kres_core::async_eprintln!(
+                            "\n=== {consecutive_errors} CONSECUTIVE TASK FAILURES — halting ===\nlast error: {}\ncheck the kres terminal for [rate-limit]/[stream-interrupt] lines, verify the slow/fast API key + model id, then /continue or restart kres --resume.",
+                            r.error.as_deref().unwrap_or("(no error text)")
+                        );
+                        // Reset so a /continue retry that fails again
+                        // takes another full MAX_CONSECUTIVE_ERRORS run
+                        // before re-firing, instead of re-printing the
+                        // banner on every subsequent Errored reap.
+                        consecutive_errors = 0;
+                        mgr_for_reaper.reset_in_progress_to_pending().await;
+                        let drained = mgr_for_reaper.drain_pending_blocked().await;
+                        let carry = drained.len();
+                        let mut deferred = deferred_for_reaper.lock().await;
+                        deferred.extend(drained);
+                        drop(deferred);
+                        if carry > 0 {
+                            kres_core::async_eprintln!(
+                                "[{carry} pending item(s) moved to /followup]"
+                            );
+                        }
+                        if exit_on_idle {
+                            mgr_for_reaper.root_shutdown().cancel();
+                            break;
                         }
                     }
                 }
@@ -1927,6 +2093,32 @@ impl Session {
         Ok(())
     }
 
+    /// Call the goal agent for `text` and announce the resolved
+    /// goal+mode under `label` ("fresh", "inherited", "fallback").
+    /// Returns (None, default_mode) when the goal client is
+    /// unavailable or the agent declines to produce one.
+    async fn derive_goal(
+        &self,
+        text: &str,
+        plan: Option<&kres_core::Plan>,
+        label: &str,
+    ) -> (Option<String>, kres_agents::TaskMode) {
+        let Some(gc) = &self.goal_client else {
+            return (None, kres_agents::TaskMode::default());
+        };
+        match kres_agents::define_goal(gc, text, plan).await {
+            Some(def) => {
+                kres_core::async_eprintln!(
+                    "goal ({}, {label}): {}",
+                    def.mode.as_str(),
+                    truncate(&def.goal, 160)
+                );
+                (Some(def.goal), def.mode)
+            }
+            None => (None, kres_agents::TaskMode::default()),
+        }
+    }
+
     /// Operator-typed submission (REPL line, `--prompt`, /load,
     /// /edit, /reply, /continue's stashed-interrupted resume).
     /// Prepends the accumulated-analysis ledger as "Recent context"
@@ -1937,12 +2129,24 @@ impl Session {
 
     /// Pipeline-driven submission (cmd_next / cmd_continue's
     /// batch-dispatch loop — auto-continue also funnels through
-    /// here). The todo item already carries a structured brief and
-    /// the slow agent still sees previous_findings + original_prompt
-    /// via RunContext, so re-injecting the ledger as a preamble
-    /// would double-count (see review of 04ea466): it would widen
-    /// narrow fetch tasks, bust the fast-agent's cached prefix, and
-    /// pay 8k chars per turn on every follow-up.
+    /// here).
+    ///
+    /// For audit/generic tasks the todo item already carries a
+    /// structured brief and the slow agent sees previous_findings
+    /// plus original_prompt via RunContext, so re-injecting the
+    /// ledger would double-count — it would widen narrow fetch
+    /// tasks, bust the fast-agent's cached prefix, and pay 8k
+    /// chars per turn on every follow-up.
+    ///
+    /// For coding-mode tasks (fix flow) the accumulated analysis
+    /// IS the critical state: it carries what was fixed, what the
+    /// build said, what the review found. Without it each follow-up
+    /// task starts cold and re-does work the prior task already
+    /// finished. Session 841f1305 (2026-04-27): the compile-
+    /// verification task couldn't compose a commit message because
+    /// the finding text and diff were in the prior task's context
+    /// only, not the preamble. Subsequent tasks looped back to
+    /// compiling instead of progressing to commit.
     ///
     /// `todo_tag` is the dispatching TodoItem's id (or name when id
     /// is empty) — fed into findings provenance via apply_delta so a
@@ -2053,22 +2257,59 @@ impl Session {
         // through this same path, so without the plan they'd produce
         // goals with no step attribution and the todo_update path
         // downstream can't flip the parent step to `done`.
+        //
+        // include_recent_context is the operator-vs-pipeline
+        // discriminator. Operator-typed submissions (true) get a
+        // fresh define_goal call AND cache the result as the
+        // session-wide goal. Pipeline-driven follow-ups (false)
+        // INHERIT that cached goal: re-running define_goal on a
+        // single-followup brief like "run `git add ...`" produces
+        // narrow per-task goals ("Confirm git add succeeded") that
+        // check_goal-met trivially, draining the rest of the todo
+        // list to /followup short of commit/compile/review. See
+        // session_goal field comment + session 6a58e4fc replay.
+        // Defensive fallback: if no session goal is cached (e.g. a
+        // /resume followed by /continue, or a pipeline submission
+        // before any operator submission), fall back to the live
+        // define_goal call so we get something rather than nothing.
         let existing_plan = self.mgr.plan_snapshot().await;
         let (defined_goal, task_mode): (Option<String>, kres_agents::TaskMode) =
-            if let Some(gc) = &self.goal_client {
-                match kres_agents::define_goal(gc, &text, existing_plan.as_ref()).await {
-                    Some(def) => {
-                        kres_core::async_eprintln!(
-                            "goal ({}): {}",
-                            def.mode.as_str(),
-                            truncate(&def.goal, 160)
-                        );
-                        (Some(def.goal), def.mode)
-                    }
-                    None => (None, kres_agents::TaskMode::default()),
+            if include_recent_context {
+                // Operator-typed submission: derive a fresh goal and
+                // cache it for downstream pipeline follow-ups.
+                let r = self
+                    .derive_goal(&text, existing_plan.as_ref(), "fresh")
+                    .await;
+                if let Some(g) = r.0.as_ref() {
+                    *self.session_goal.lock().await = Some((g.clone(), r.1));
                 }
+                r
             } else {
-                (None, kres_agents::TaskMode::default())
+                // Pipeline follow-up: inherit the cached session goal
+                // so a narrow brief like "git add foo" doesn't get
+                // its own one-shot goal that trivially evaluates met
+                // and drains the rest of the todo list.
+                let cached = self.session_goal.lock().await.clone();
+                if let Some((g, m)) = cached {
+                    kres_core::async_eprintln!(
+                        "goal ({}, inherited): {}",
+                        m.as_str(),
+                        truncate(&g, 160)
+                    );
+                    (Some(g), m)
+                } else {
+                    // No session goal cached (e.g. /resume followed
+                    // by /continue, or a pipeline submission before
+                    // any operator submission). Fall back to a
+                    // fresh derivation and cache it.
+                    let r = self
+                        .derive_goal(&text, existing_plan.as_ref(), "fallback")
+                        .await;
+                    if let Some(g) = r.0.as_ref() {
+                        *self.session_goal.lock().await = Some((g.clone(), r.1));
+                    }
+                    r
+                }
             };
         // Ask the goal agent for a plan decomposition, but only on
         // operator-typed submissions — pipeline-driven follow-ups
@@ -2103,15 +2344,24 @@ impl Session {
         let prompt_for_park = text.clone();
         // Build the prompt that actually reaches the fast agent:
         // for operator-typed submissions (`include_recent_context =
-        // true`) we prepend the accumulated-analysis ledger so a
-        // follow-up prompt like "now verify it runs clean" doesn't
-        // arrive cold. Pipeline-driven submits (cmd_next,
-        // cmd_continue's batch loop) skip the preamble because the
-        // todo item already carries a focused brief and the slow
-        // agent receives previous_findings + original_prompt via
-        // RunContext anyway.  /clear wipes the ledger; /compact
-        // shrinks it to a single summary entry.
-        let text = if include_recent_context {
+        // true`) we always prepend the accumulated-analysis ledger.
+        //
+        // For pipeline-driven submits in CODING mode we also include
+        // the preamble: the fix flow's accumulated analysis carries
+        // what was fixed, what the build said, what the review found.
+        // Without it each follow-up task starts cold and re-does work
+        // the prior task already finished (session 841f1305: compile-
+        // verification task couldn't compose a commit message because
+        // finding text and diff were in the prior task's context
+        // only). For audit/generic pipeline follow-ups we skip it —
+        // the todo brief is self-contained and the preamble would
+        // bust the fast-agent's cached prefix for no benefit.
+        //
+        // /clear wipes the ledger; /compact shrinks it to a single
+        // summary entry.
+        let include_preamble =
+            include_recent_context || matches!(task_mode, kres_agents::TaskMode::Coding);
+        let text = if include_preamble {
             let context_preamble = build_recent_context_preamble(
                 &self.accumulated.lock().await,
                 RECENT_CONTEXT_CAP_CHARS,
@@ -2381,11 +2631,7 @@ impl Session {
         // idle loop pick them up.
         const BATCH_CAP: usize = 10;
         let items = self.mgr.todo_snapshot().await;
-        let done: std::collections::BTreeSet<String> = items
-            .iter()
-            .filter(|i| i.status == TodoStatus::Done)
-            .map(|i| i.name.clone())
-            .collect();
+        let done = done_id_set(&items);
         let mut dispatched = 0usize;
         let mut blocked = 0usize;
         let mut remaining = 0usize;
@@ -2433,11 +2679,10 @@ impl Session {
         use kres_core::TodoStatus;
         let items = self.mgr.todo_snapshot().await;
         // Pick the first item whose dependencies are all done.
-        let done: std::collections::BTreeSet<String> = items
-            .iter()
-            .filter(|i| i.status == TodoStatus::Done)
-            .map(|i| i.name.clone())
-            .collect();
+        // depends_on contains ids; resolve via done_id_set so the
+        // match works for items that came in with explicit agent
+        // ids (matches /continue and should_auto_continue).
+        let done = done_id_set(&items);
         let next = items.iter().find(|i| {
             i.status == TodoStatus::Pending && i.depends_on.iter().all(|d| done.contains(d))
         });
@@ -2892,15 +3137,6 @@ impl Session {
     /// result as a new prompt. Uses the same user_commands::compose
     /// path as `--prompt "fix: ..."` so the CLI and REPL share one
     /// code path for the fix flow.
-    ///
-    /// Unlike the `--prompt "fix: ..."` CLI form (which auto-adds
-    /// `bash` to the session allowlist before the orchestrator is
-    /// built), this REPL command runs after the allowlist has been
-    /// frozen. If `bash` was not enabled at startup, the compile and
-    /// fix-warnings steps will return `bash not in the allowed-action
-    /// list` — relaunch with `--allow bash` for the fix flow to work
-    /// end-to-end. We don't have a handle on the resolved allowlist
-    /// from the session, so the hint is unconditional.
     async fn cmd_fix(&self, target: String) {
         let target = target.trim();
         if target.is_empty() {
@@ -2917,8 +3153,7 @@ impl Session {
             return;
         };
         async_println(format!(
-            "/fix: composed prompt from {src} ({} chars); compile/fix-warnings steps need \
-             `bash` in the action allowlist — relaunch with `--allow bash` if it isn't.",
+            "/fix: composed prompt from {src} ({} chars)",
             body.len()
         ));
         self.submit_prompt(body).await;
@@ -3066,9 +3301,6 @@ impl Session {
     /// pending item whose deps are satisfied.
     async fn should_auto_continue(&self) -> bool {
         use kres_core::TodoStatus;
-        // /stop parks the latch. The operator has to re-consent
-        // (via /continue or a new prompt) before auto-continue
-        // resumes.
         if self.stop_latched.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
@@ -3077,11 +3309,7 @@ impl Session {
             return false;
         }
         let items = self.mgr.todo_snapshot().await;
-        let done: std::collections::BTreeSet<String> = items
-            .iter()
-            .filter(|i| i.status == TodoStatus::Done)
-            .map(|i| i.name.clone())
-            .collect();
+        let done = done_id_set(&items);
         items.iter().any(|i| {
             i.status == TodoStatus::Pending && i.depends_on.iter().all(|d| done.contains(d))
         })
@@ -3178,6 +3406,11 @@ impl Session {
         self.accumulated.lock().await.clear();
         *self.last_analysis.lock().await = None;
         self.deferred.lock().await.clear();
+        // Drop the cached session goal too. Without this, the
+        // first pipeline-driven follow-up after /clear would
+        // inherit the prior topic's goal — exactly the
+        // cross-topic bleed /clear exists to prevent.
+        *self.session_goal.lock().await = None;
         // Drop every outside-workspace read consent. The store is
         // global (OnceLock); without this a /clear would leave
         // grants from the prior topic in place and a follow-up
@@ -3963,7 +4196,7 @@ fn print_help() {
         "  /review <target>       compose the embedded `review` template with <target> and submit"
     );
     kres_core::async_eprintln!(
-        "  /fix <target>          compose the embedded `fix` template (finding dir or prose) and submit; needs --allow bash"
+        "  /fix <target>          compose the embedded `fix` template (finding dir or prose) and submit"
     );
     kres_core::async_eprintln!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
     kres_core::async_eprintln!(
@@ -3987,6 +4220,430 @@ fn print_help() {
     kres_core::async_eprintln!(
         "override slash-command templates by dropping a file at ~/.kres/commands/<name>.md"
     );
+}
+
+/// Followup types the reaper executes directly (instead of routing
+/// through the main agent and a follow-up task). The list is the
+/// single source of truth for both the dispatch loop and the
+/// todo-agent input filter, so adding a new reaper-handled type
+/// only requires one entry here.
+#[derive(Debug, Clone, Copy)]
+enum ReaperFollowup {
+    Git,
+    PublishFix,
+}
+
+impl ReaperFollowup {
+    fn label(self) -> &'static str {
+        match self {
+            ReaperFollowup::Git => "git",
+            ReaperFollowup::PublishFix => "publish-fix",
+        }
+    }
+}
+
+fn reaper_followup_kind(fu: &serde_json::Value) -> Option<ReaperFollowup> {
+    match fu.get("type").and_then(|v| v.as_str()) {
+        Some("git") => Some(ReaperFollowup::Git),
+        Some("publish-fix") => Some(ReaperFollowup::PublishFix),
+        _ => None,
+    }
+}
+
+/// Build a set of ids (falling back to name when id is empty) for
+/// done TodoItems. Used by `cmd_continue` and `should_auto_continue`
+/// to resolve `depends_on` — which contains ids, not names.
+fn done_id_set(items: &[kres_core::TodoItem]) -> std::collections::BTreeSet<String> {
+    items
+        .iter()
+        .filter(|i| i.status == kres_core::TodoStatus::Done)
+        .map(|i| {
+            if i.id.is_empty() {
+                i.name.clone()
+            } else {
+                i.id.clone()
+            }
+        })
+        .collect()
+}
+
+/// Execute a git followup from the reaper.
+///
+/// For `commit` followups the slow agent must FIRST write the
+/// commit message to a workspace file via a `code_output` entry,
+/// THEN reference that file with `-F <path>` in the followup
+/// command:
+///
+/// ```text
+/// code_output: [{path: ".kres-commit-msg.tmp", content: "..."}]
+/// followup:   {type: "git", name: "commit -s -F .kres-commit-msg.tmp"}
+/// ```
+///
+/// The reaper applies code_output before processing followups so
+/// the file is already on disk when this function runs. We read
+/// it back to validate line lengths (kernel rule: prose wraps at
+/// 75 cols; reject if any non-trailer non-indented line exceeds
+/// 100), then hand the command to the existing git tool. `-m` is
+/// rejected outright so the agent never reverts to embedded
+/// message strings.
+///
+/// Non-commit git commands (add, diff, log, etc.) pass straight
+/// through to `kres_agents::tools::git`.
+async fn run_reaper_git(workspace: &Path, command: &str) -> String {
+    let trimmed = command.trim();
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let subcommand = tokens.first().copied().unwrap_or("");
+    let label = if subcommand.is_empty() {
+        "git"
+    } else {
+        subcommand
+    };
+
+    if subcommand == "commit" {
+        if let Err(rejection) = validate_commit_command(workspace, &tokens).await {
+            return rejection;
+        }
+    }
+
+    let args = kres_agents::tools::GitArgs {
+        command: command.to_string(),
+    };
+    match kres_agents::tools::git(workspace, &args).await {
+        Ok(out) => format!("[git {label}] {}", out.trim()),
+        Err(e) => format!("[git {label} FAILED] {e}"),
+    }
+}
+
+/// Inspect a tokenised `git commit ...` invocation before sending it
+/// to the git tool. Returns Err with the reaper-style rejection text
+/// when the slow agent has emitted an unsupported shape:
+///
+/// - `-m` / `--message` in any form: the reaper requires the message
+///   to come from a file via `-F` so the line-wrap validator can run
+///   and so multi-paragraph bodies survive without -m juggling.
+/// - missing `-F <path>` on initial commits: ditto.
+///
+/// `git commit --amend` without `-F` is allowed — git reuses the
+/// previous message, which is exactly what the FIX flow's step 4
+/// (fold compile-warning fixes into the original commit) wants.
+async fn validate_commit_command(workspace: &Path, tokens: &[&str]) -> Result<(), String> {
+    if let Some(t) = tokens.iter().find(|t| token_is_message_flag(t)) {
+        return Err(format!(
+            "[git commit REJECTED] do not pass `-m` / `--message` ({t}); \
+             write the full commit message to a workspace file via a \
+             `code_output` entry (e.g. `.kres-commit-msg.tmp`), then \
+             point at it with `-F <path>` in the git command."
+        ));
+    }
+    let has_amend = tokens.contains(&"--amend");
+    let mut msg_path: Option<&str> = None;
+    for pair in tokens.windows(2) {
+        if pair[0] == "-F" || pair[0] == "--file" {
+            msg_path = Some(pair[1]);
+            break;
+        }
+    }
+    // Trailing -F with no path: git itself would reject too, but we
+    // want a kres-shaped error so the slow agent's analysis trailer
+    // is actionable.
+    if msg_path.is_none() && tokens.last().is_some_and(|t| *t == "-F" || *t == "--file") {
+        return Err("[git commit REJECTED] `-F` flag has no path argument".into());
+    }
+    let Some(msg_path) = msg_path else {
+        if has_amend {
+            // --amend reuses the existing message; nothing to validate.
+            return Ok(());
+        }
+        return Err(
+            "[git commit REJECTED] missing `-F <path>`. Write the commit \
+             message to a workspace file via `code_output` first, then \
+             commit with `-F <that-path>`."
+                .into(),
+        );
+    };
+
+    let full_path = if std::path::Path::new(msg_path).is_absolute() {
+        std::path::PathBuf::from(msg_path)
+    } else {
+        workspace.join(msg_path)
+    };
+    let message = tokio::fs::read_to_string(&full_path).await.map_err(|e| {
+        format!(
+            "[git commit FAILED] cannot read commit message file {}: {e}",
+            full_path.display()
+        )
+    })?;
+    if let Some((idx, bad_line)) = find_overlong_commit_line(&message, 100) {
+        return Err(format!(
+            "[git commit REJECTED] {} line {} is {} chars (>100); \
+             wrap prose at 75 cols (kernel rule). Re-emit a corrected \
+             `code_output` entry for this file, then retry the commit. \
+             Offending line: {}",
+            full_path.display(),
+            idx + 1,
+            bad_line.chars().count(),
+            truncate(bad_line, 80),
+        ));
+    }
+    Ok(())
+}
+
+/// True when `t` is any spelling of the git `-m` / `--message` flag:
+/// `-m`, `-m<msg>` (no space, valid git syntax), `--message`,
+/// `--message=<msg>`. Distinct from other `-m*` and `--m*` flags
+/// (`-M`, `--metadata`, `--mailto`, `--minimal`) which we want to
+/// pass through untouched.
+fn token_is_message_flag(t: &str) -> bool {
+    if matches!(t, "-m" | "--message") {
+        return true;
+    }
+    if t.starts_with("--message=") {
+        return true;
+    }
+    // `-mFOO` or `-m"foo"` — short-form with no space. Reject the
+    // double-dash family (`--metadata`, `--mailto`) which also
+    // starts with `-m`.
+    t.starts_with("-m") && t.len() > 2 && !t.starts_with("--")
+}
+
+async fn git_rev_parse_head(workspace: &Path) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.current_dir(workspace);
+    cmd.args(["rev-parse", "HEAD"]);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Publish the workspace's HEAD commit as `auto-generated-fix.diff`
+/// inside a kres finding directory. Triggered by the slow agent's
+/// `publish-fix` followup as the last step of the FIX flow, after
+/// build and review have passed. The argument is the absolute path
+/// to a finding directory (the kres --export shape with
+/// `metadata.yaml`, `FINDING.md`, `summary.md`).
+///
+/// On success the directory gains:
+/// - `auto-generated-fix.diff` — the output of
+///   `git format-patch -1 --stdout HEAD` from the workspace.
+/// - `metadata.yaml` gains an `auto_generated_fix:` key naming
+///   the patch file (idempotent — skipped if already present).
+/// - `summary.md`'s cross-link header gains a third link
+///   pointing at the patch (idempotent).
+///
+/// Failures append a `[publish-fix FAILED] ...` line to the
+/// returned trailer text but do not abort the run.
+async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> String {
+    let dir = std::path::PathBuf::from(finding_dir);
+    if !dir.is_absolute() {
+        return format!("[publish-fix FAILED] finding_dir must be absolute: {finding_dir}");
+    }
+    let metadata_path = dir.join("metadata.yaml");
+    let finding_path = dir.join("FINDING.md");
+    if !metadata_path.exists() || !finding_path.exists() {
+        return format!(
+            "[publish-fix FAILED] {finding_dir} is not a kres finding directory \
+             (missing metadata.yaml or FINDING.md)"
+        );
+    }
+
+    let fix_path = dir.join("auto-generated-fix.diff");
+
+    // Skip when auto-generated-fix.diff already records the current
+    // HEAD. The FIX flow has two paths that emit `publish-fix`: the
+    // review task's slow agent ends with one, and the dedicated
+    // `publish-fix` plan step emits another. Without this guard
+    // `git format-patch` runs twice for the same SHA and rewrites
+    // an identical file. `git format-patch -1 --stdout HEAD` opens
+    // each patch with `From <40-hex-sha> Mon Sep 17 00:00:00 2001`,
+    // so comparing that prefix to `git rev-parse HEAD` is enough to
+    // detect "already published this commit". A real amend changes
+    // HEAD's sha and falls through to the rewrite path.
+    if let Some(head_sha) = git_rev_parse_head(workspace).await {
+        if let Ok(existing) = tokio::fs::read_to_string(&fix_path).await {
+            if existing
+                .lines()
+                .next()
+                .is_some_and(|l| l.starts_with(&format!("From {head_sha} ")))
+            {
+                return format!(
+                    "[publish-fix] {} already up to date for HEAD {}",
+                    fix_path.display(),
+                    &head_sha[..12.min(head_sha.len())],
+                );
+            }
+        }
+    }
+
+    // Run `git format-patch -1 --stdout HEAD` in the workspace.
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.current_dir(workspace);
+    cmd.args(["format-patch", "-1", "--stdout", "HEAD"]);
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return format!("[publish-fix FAILED] git format-patch spawn: {e}"),
+        Err(_) => return "[publish-fix FAILED] git format-patch timed out".to_string(),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return format!(
+            "[publish-fix FAILED] git format-patch exited {}: {}",
+            out.status.code().unwrap_or(-1),
+            stderr.trim()
+        );
+    }
+    let patch = String::from_utf8_lossy(&out.stdout).into_owned();
+    if patch.is_empty() {
+        return "[publish-fix FAILED] git format-patch produced empty output".to_string();
+    }
+
+    if let Err(e) = tokio::fs::write(&fix_path, &patch).await {
+        return format!("[publish-fix FAILED] write {}: {e}", fix_path.display());
+    }
+
+    // Update metadata.yaml: append `auto_generated_fix:
+    // auto-generated-fix.diff` if not already present. Avoid YAML
+    // libraries here — kres findings ship as flat key:value lines
+    // and a textual append is robust.
+    match tokio::fs::read_to_string(&metadata_path).await {
+        Ok(metadata) => {
+            if !metadata
+                .lines()
+                .any(|l| l.trim_start().starts_with("auto_generated_fix:"))
+            {
+                let mut updated = metadata.trim_end().to_string();
+                updated.push('\n');
+                updated.push_str("auto_generated_fix: auto-generated-fix.diff\n");
+                if let Err(e) = tokio::fs::write(&metadata_path, updated).await {
+                    return format!(
+                        "[publish-fix FAILED] write {}: {e}",
+                        metadata_path.display()
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            return format!("[publish-fix FAILED] read {}: {e}", metadata_path.display());
+        }
+    }
+
+    // Update summary.md: extend the cross-link header line with a
+    // link to the patch. Idempotent: skip when already present.
+    let summary_path = dir.join("summary.md");
+    if summary_path.exists() {
+        match tokio::fs::read_to_string(&summary_path).await {
+            Ok(summary) => {
+                let link = "[auto-generated-fix.diff](auto-generated-fix.diff)";
+                if !summary.contains(link) {
+                    // Look for the cross-link header
+                    // ([FINDING.md]...|[metadata.yaml]...) and append
+                    // ` | <link>`. If absent, prepend the link as a
+                    // standalone first line.
+                    let cross_link = "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)";
+                    let updated = if let Some(pos) = summary.find(cross_link) {
+                        let end = pos + cross_link.len();
+                        format!("{} | {}{}", &summary[..end], link, &summary[end..])
+                    } else {
+                        format!("{link}\n\n{summary}")
+                    };
+                    if let Err(e) = tokio::fs::write(&summary_path, updated).await {
+                        return format!(
+                            "[publish-fix FAILED] write {}: {e}",
+                            summary_path.display()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                return format!("[publish-fix FAILED] read {}: {e}", summary_path.display());
+            }
+        }
+    }
+
+    format!(
+        "[publish-fix] wrote {} ({} bytes), updated metadata.yaml + summary.md",
+        fix_path.display(),
+        patch.len()
+    )
+}
+
+/// Walk the commit message line-by-line and return the first line
+/// (with its 0-based index) that exceeds `cap` characters and is
+/// not exempt from the wrap rule.
+///
+/// Exempt lines, per submitting-patches.rst:
+/// - Trailer tags (`Word(-word)*: value`) — line 148 says tags are
+///   "exempt from the wrap-at-75-columns rule in order to simplify
+///   parsing scripts".
+/// - Lines indented by 4+ spaces or a tab — quoted code per
+///   submitting-patches.rst:792-805.
+///
+/// Returns `None` when every line is within the cap.
+fn find_overlong_commit_line(msg: &str, cap: usize) -> Option<(usize, &str)> {
+    for (idx, line) in msg.lines().enumerate() {
+        if line.chars().count() <= cap {
+            continue;
+        }
+        if is_trailer_line(line) {
+            continue;
+        }
+        if line.starts_with("    ") || line.starts_with('\t') {
+            continue;
+        }
+        return Some((idx, line));
+    }
+    None
+}
+
+/// Detect a kernel-style trailer tag from
+/// Documentation/process/submitting-patches.rst. Either:
+///
+/// - a known single-word tag (`Fixes:`, `Closes:`, `Link:`, `Cc:`,
+///   `BugLink:`, `Bug:`), OR
+/// - a hyphenated multi-word tag conventionally ending in `-by` or
+///   `-on` (`Reported-by:`, `Signed-off-by:`, `Co-developed-by:`,
+///   `Tested-by:`, `Reviewed-by:`, `Acked-by:`, `Suggested-by:`,
+///   `Assisted-by:`, `Based-on:`).
+///
+/// Stricter than "any `Word: …` prefix" on purpose: prose lines
+/// that happen to start with `Note:`, `Example:`, `Fix:` would
+/// otherwise be exempted from the 100-char cap and hide real
+/// over-long body content.
+fn is_trailer_line(line: &str) -> bool {
+    let Some(colon) = line.find(':') else {
+        return false;
+    };
+    let key = &line[..colon];
+    if key.is_empty() {
+        return false;
+    }
+    let first = key.chars().next().unwrap();
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return false;
+    }
+    const SINGLE_WORD: &[&str] = &["Fixes", "Closes", "Link", "Cc", "Bug", "BugLink"];
+    if SINGLE_WORD.contains(&key) {
+        return true;
+    }
+    if key.contains('-') {
+        return key.ends_with("-by") || key.ends_with("-on");
+    }
+    false
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -4207,6 +4864,81 @@ mod tests {
     #[test]
     fn truncate_preserves_short() {
         assert_eq!(truncate("abc", 5), "abc");
+    }
+
+    #[test]
+    fn token_is_message_flag_accepts_all_spellings() {
+        // -m / --message in the forms git accepts must trip the gate.
+        for t in [
+            "-m",
+            "--message",
+            "--message=foo",
+            "-mfoo",
+            "-m\"hello world\"",
+        ] {
+            assert!(token_is_message_flag(t), "should match -m form: {t:?}");
+        }
+    }
+
+    #[test]
+    fn token_is_message_flag_passes_through_lookalikes() {
+        // Other -m*/--m* flags must NOT be classified as -m. The
+        // false-positive set used to include `--metadata` etc when
+        // we were doing a substring scan over the full command.
+        for t in [
+            "-M",          // git's "detect renames" flag
+            "--metadata",  // hypothetical / future
+            "--mailto",    // git format-patch
+            "--minimal",   // git diff
+            "--max-count", // git log
+            "-F",
+            "-s",
+            "--amend",
+            "commit",
+        ] {
+            assert!(!token_is_message_flag(t), "should not match -m form: {t:?}");
+        }
+    }
+
+    #[test]
+    fn find_overlong_commit_line_skips_trailers_and_indented_code() {
+        // 120-char trailer is allowed; 90-char prose line trips at
+        // cap=80; an indented quoted-code line is exempt.
+        let msg = concat!(
+            "subject line\n",
+            "\n",
+            "Short prose paragraph.\n",
+            "Some prose line that is moderately long but under cap.\n",
+            "    indented quoted code that is intentionally much longer than the cap should be skipped\n",
+            "\n",
+            "Fixes: 0123456789abcdef0123456789abcdef01234567 (\"a very long subject line that exceeds the cap easily\")\n",
+            "Signed-off-by: Name <email@example.com>\n"
+        );
+        assert!(find_overlong_commit_line(msg, 80).is_none());
+
+        let bad = concat!(
+            "subject\n",
+            "\n",
+            "This is a single very long prose line that should trip the cap because it has way more characters than the limit allows.\n"
+        );
+        let (idx, line) = find_overlong_commit_line(bad, 80).expect("should detect");
+        assert_eq!(idx, 2);
+        assert!(line.contains("very long prose"));
+    }
+
+    #[test]
+    fn find_overlong_commit_line_does_not_exempt_prose_with_colon() {
+        // Body prose like "Note: ..." or "Example: ..." starts with
+        // an uppercase word + colon but is NOT a kernel trailer.
+        // is_trailer_line used to accept any Word: prefix and let
+        // long prose through; the cap must still trip.
+        let bad = concat!(
+            "subject\n",
+            "\n",
+            "Note: this is a long-ish prose line that exceeds the configured cap and must trip the check.\n"
+        );
+        let (idx, _) = find_overlong_commit_line(bad, 80).expect("should detect");
+        assert_eq!(idx, 2);
     }
 
     #[test]

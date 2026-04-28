@@ -1713,18 +1713,7 @@ impl Session {
                         kres_core::async_eprintln!(
                             "\n=== --turns {turns_limit} reached — {done} task run(s) completed ==="
                         );
-                        // Flip any in-flight items to Pending so the
-                        // drain below carries them to the deferred
-                        // list too — otherwise a task that happened
-                        // to be mid-run when the cap hit would be
-                        // lost from both the todo list and /followup.
                         mgr_for_reaper.reset_in_progress_to_pending().await;
-                        // §32: move every pending/blocked todo item
-                        // to the deferred list so /followup can list
-                        // them. Done/Skipped items stay on the todo
-                        // list so their step_id linkage is still
-                        // available for sync_plan_from_todo on the
-                        // next persist tick.
                         let drained = mgr_for_reaper.drain_pending_blocked().await;
                         let carry = drained.len();
                         let mut deferred = deferred_for_reaper.lock().await;
@@ -1738,6 +1727,33 @@ impl Session {
                         kres_core::async_eprintln!("exiting REPL.");
                         mgr_for_reaper.root_shutdown().cancel();
                         break;
+                    }
+                    // Goal met before --turns N reached: the goal-met
+                    // branch above (line ~1556) drained pending todos
+                    // to deferred but intentionally did not cancel
+                    // root_shutdown (interactive REPL stays open). In
+                    // exit_on_idle mode the process must exit — check
+                    // the same followups_drained condition the --turns 0
+                    // path uses.
+                    if exit_on_idle && done > 0 {
+                        let active = mgr_for_reaper.active_count().await;
+                        let todo = mgr_for_reaper.todo_snapshot().await;
+                        let pending_or_blocked = todo
+                            .iter()
+                            .filter(|t| {
+                                matches!(
+                                    t.status,
+                                    kres_core::TodoStatus::Pending | kres_core::TodoStatus::Blocked
+                                )
+                            })
+                            .count();
+                        if active == 0 && pending_or_blocked == 0 {
+                            kres_core::async_eprintln!(
+                                "\n=== goal met, todo list drained ({done} run(s)) — exiting ==="
+                            );
+                            mgr_for_reaper.root_shutdown().cancel();
+                            break;
+                        }
                     }
                 } else {
                     // --turns 0 (unlimited) — stopping rule:

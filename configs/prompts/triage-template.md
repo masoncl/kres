@@ -64,7 +64,7 @@ comes first, always.
 
 # Status
 
-<one of: Fixed, Plausible, Unknown, Invalid>
+<one of: Fixed, Plausible, Unconfirmed, Unknown, Invalid>
 
 # Subsystem
 
@@ -136,9 +136,19 @@ and takes the goto retry path instead of calling widget_release() again.
 ```
 
 ## metadata.yml update
-- `metadata.yml` contains a subsystem field that may not be filled in.  If you've
-determined which subsystem this bug belongs to, fill in that subsystem field.
-- THIS IS THE ONLY EDIT YOU'RE ALLOWED TO MAKE IN `metadata.yml`
+
+You may edit `metadata.yaml` in exactly two ways:
+
+1. `subsystem:` — if the field is empty and you've determined which
+   subsystem this bug belongs to, fill it in.
+2. `status:` — if you picked `Unconfirmed` for the summary's
+   `# Status` and the metadata currently says `status: active`,
+   flip it to `status: unconfirmed`. Do not touch the status field
+   in any other case (leave `active`, `invalidated`, etc. alone).
+   Confirmed bugs stay `active`; only open-question findings
+   become `unconfirmed`.
+
+NO OTHER EDITS to `metadata.yaml` are permitted.
 
 ## Rules
 
@@ -151,10 +161,33 @@ determined which subsystem this bug belongs to, fill in that subsystem field.
 - The Subject line is the `# Subject:` heading itself — don't add a
   separate first heading above it. The cross-link line above is the
   only thing that comes before `# Subject:`.
-- Status values are exactly one of `Fixed`, `Plausible`, `Unknown`,
-  `Invalid`. Match the metadata's `status:` when it's `invalidated`
-  (→ `Invalid`); otherwise pick the best fit from the FINDING.md
-  evidence. Use `Unknown` when you can't tell, not a guess.
+- Status values are exactly one of `Fixed`, `Plausible`,
+  `Unconfirmed`, `Unknown`, `Invalid`. Match the metadata's
+  `status:` when it's `invalidated` (→ `Invalid`); otherwise pick
+  the best fit from the FINDING.md evidence. Use `Unknown` when
+  you can't tell, not a guess.
+- Use `Unconfirmed` when the finding is not a bug report but a set
+  of open questions or unverified hypotheses — i.e. the analysis
+  could not demonstrate the defect, only flag callees or paths
+  that *would* be bugs if some unverified condition holds. Tells:
+  - FINDING.md's narrative is dominated by an `## Open questions`
+    list, "Unverified callees", or "could not be verified from
+    the supplied symbols" language.
+  - The summary/impact uses "may", "if any internal allocation",
+    "would sleep", "must thread", or similar conditional phrasing
+    rather than a demonstrated failure.
+  - `metadata.yaml`'s `open_questions:` list carries the load of
+    the finding (the questions *are* the finding, not loose ends
+    around a confirmed defect).
+  - Example: `atomic_cgwb_create_gfp_sleep` — the call chain to
+    `cgwb_create(GFP_ATOMIC)` is confirmed correct, and the
+    finding only asks whether `percpu_ref_init()`,
+    `percpu_counter_init()`, and `fprop_local_init_percpu()`
+    honour the gfp flag. Nothing was shown to sleep; the finding
+    is a question, not a bug. → `Unconfirmed`.
+  Pick `Plausible` instead when FINDING.md actually demonstrates
+  the defect path (concrete code citation showing the bad
+  behaviour) but no crash/repro has been observed in the wild.
 - Subsystem is one sentence. Name the kernel area (e.g. "btrfs
   extent allocator", "TCP input path", "mac80211 rx") plus the file
   and function. Pull the file from `metadata.yaml`'s `filename:`

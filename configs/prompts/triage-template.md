@@ -164,30 +164,68 @@ NO OTHER EDITS to `metadata.yaml` are permitted.
 - Status values are exactly one of `Fixed`, `Plausible`,
   `Unconfirmed`, `Unknown`, `Invalid`. Match the metadata's
   `status:` when it's `invalidated` (→ `Invalid`); otherwise pick
-  the best fit from the FINDING.md evidence. Use `Unknown` when
-  you can't tell, not a guess.
-- Use `Unconfirmed` when the finding is not a bug report but a set
-  of open questions or unverified hypotheses — i.e. the analysis
-  could not demonstrate the defect, only flag callees or paths
-  that *would* be bugs if some unverified condition holds. Tells:
-  - FINDING.md's narrative is dominated by an `## Open questions`
-    list, "Unverified callees", or "could not be verified from
-    the supplied symbols" language.
-  - The summary/impact uses "may", "if any internal allocation",
-    "would sleep", "must thread", or similar conditional phrasing
-    rather than a demonstrated failure.
-  - `metadata.yaml`'s `open_questions:` list carries the load of
-    the finding (the questions *are* the finding, not loose ends
-    around a confirmed defect).
-  - Example: `atomic_cgwb_create_gfp_sleep` — the call chain to
-    `cgwb_create(GFP_ATOMIC)` is confirmed correct, and the
-    finding only asks whether `percpu_ref_init()`,
-    `percpu_counter_init()`, and `fprop_local_init_percpu()`
-    honour the gfp flag. Nothing was shown to sleep; the finding
-    is a question, not a bug. → `Unconfirmed`.
-  Pick `Plausible` instead when FINDING.md actually demonstrates
-  the defect path (concrete code citation showing the bad
-  behaviour) but no crash/repro has been observed in the wild.
+  the best fit from the FINDING.md evidence.
+
+- **Decide status BEFORE writing prose.** Walk the checklist below
+  in order and pick the first match. Do not reach for `Unknown`
+  until you've actively ruled out `Unconfirmed`.
+
+- `Unconfirmed` — pick this whenever **the finding's own
+  narrative admits the bug is contingent on something the
+  analysis did not verify.** This is the default for any
+  question-style finding. Concrete tells, ANY ONE of which forces
+  `Unconfirmed`:
+  - Literal hedging tags in FINDING.md: `[UNVERIFIED]`,
+    `[UNVERIFIED — depends on …]`, `(UNVERIFIED)`, "unverified
+    callees", "could not be verified from the supplied symbols",
+    "source was not provided", "source was not available".
+  - A non-empty `## Open questions` section in FINDING.md, OR a
+    non-empty `open_questions:` list in metadata.yaml, where the
+    answer to any listed question would change whether the bug
+    exists. (Loose ends around an otherwise demonstrated defect
+    are NOT this — see `Plausible` below.)
+  - Sentences in FINDING.md or its task narrative of the shape
+    "If X does Y, this finding is resolved" / "the bug does not
+    exist if …" / "depends on whether …" / "must thread … through
+    every internal allocation" / "must not take any mutex".
+  - Conditional framing in the Summary or Impact: "may sleep",
+    "would sleep", "if any internal allocation ignores the gfp",
+    "if … then … silent corruption", without a demonstrated path
+    that actually executes the bad behaviour.
+  - Worked examples:
+    - `atomic_cgwb_create_gfp_sleep`: call chain to
+      `cgwb_create(GFP_ATOMIC)` is confirmed correct; the entire
+      finding is whether three callees honour the gfp flag.
+      Nothing was shown to sleep. → `Unconfirmed`.
+    - `dup_anon_vma_stale_dst_anon_vma`: FINDING.md's Summary
+      opens with `[UNVERIFIED — depends on
+      cleanup_partial_anon_vmas() behaviour]`, and the Details
+      state "The entire finding is conditional on whether
+      `cleanup_partial_anon_vmas()` resets `dst->anon_vma`". One
+      unverified callee gates the whole bug. → `Unconfirmed`,
+      NOT `Unknown`.
+
+- `Plausible` — the defect is **demonstrated** by the FINDING.md
+  evidence (concrete code citations showing the bad path actually
+  executes), but no crash / repro / fix has been observed
+  upstream. Open questions may exist around severity or
+  triggerability, but they don't gate whether the bug is real.
+
+- `Fixed` — FINDING.md or metadata cite an upstream commit that
+  resolves the issue.
+
+- `Unknown` — reserved for the narrow case where FINDING.md is
+  too thin or contradictory for you to classify it at all (e.g.
+  the narrative is empty, or the symbols don't match the
+  described path). **If the finding clearly documents that it is
+  contingent on unverified facts, that is `Unconfirmed`, not
+  `Unknown`.** "I, the triager, can't tell whether the bug is
+  real" because the finding itself can't tell either → that's
+  `Unconfirmed`.
+
+- `Invalid` — metadata says `status: invalidated`, OR FINDING.md
+  walks through evidence that the originally suspected bug does
+  not exist.
 - Subsystem is one sentence. Name the kernel area (e.g. "btrfs
   extent allocator", "TCP input path", "mac80211 rx") plus the file
   and function. Pull the file from `metadata.yaml`'s `filename:`

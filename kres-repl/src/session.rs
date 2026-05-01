@@ -1402,7 +1402,7 @@ impl Session {
                                 r.error.as_deref().unwrap_or("(no error text)")
                             )
                         } else {
-                            r.analysis.clone()
+                            effective_analysis.clone()
                         };
                         // Filter out followups the reaper already
                         // executed directly (above). Only the rest
@@ -2140,7 +2140,7 @@ impl Session {
     /// Prepends the accumulated-analysis ledger as "Recent context"
     /// so a follow-up operator prompt doesn't start cold.
     async fn submit_prompt(&self, text: String) {
-        self.submit_prompt_inner(text, true, None).await
+        self.submit_prompt_inner(text, true, None, None).await
     }
 
     /// Pipeline-driven submission (cmd_next / cmd_continue's
@@ -2167,8 +2167,14 @@ impl Session {
     /// `todo_tag` is the dispatching TodoItem's id (or name when id
     /// is empty) — fed into findings provenance via apply_delta so a
     /// stored finding records which todo produced it.
-    async fn submit_from_pipeline(&self, text: String, todo_tag: Option<String>) {
-        self.submit_prompt_inner(text, false, todo_tag).await
+    async fn submit_from_pipeline(
+        &self,
+        text: String,
+        todo_tag: Option<String>,
+        step_id: Option<String>,
+    ) {
+        self.submit_prompt_inner(text, false, todo_tag, step_id)
+            .await
     }
 
     async fn submit_prompt_inner(
@@ -2176,6 +2182,7 @@ impl Session {
         text: String,
         include_recent_context: bool,
         todo_tag: Option<String>,
+        step_id: Option<String>,
     ) {
         let Some(orc) = self.orchestrator.clone() else {
             kres_core::async_eprintln!("(no orchestrator configured — prompt dropped)");
@@ -2230,6 +2237,12 @@ impl Session {
         // references expand; a missing file leaves the `/load …`
         // text in place and emits an error to the REPL.
         let text = expand_inline_load(&text);
+
+        // Extract an embedded plan from the prompt template, if present.
+        // The stripped text is used downstream; agents never see the
+        // PLAN: block. If the parse fails, embedded_steps is None and
+        // the normal define_plan LLM call fires later.
+        let (text, embedded_steps) = kres_core::extract_embedded_plan(&text);
 
         // Save the first submitted prompt to <results>/prompt.md so
         // later runs (re-invocations of `kres --summary` against the
@@ -2327,6 +2340,30 @@ impl Session {
                     r
                 }
             };
+        // Step-level context injection: a plan step can carry a
+        // `context` string (e.g. review lenses protocol) that gets
+        // prepended to the derived task's prompt. This puts the
+        // step's protocol directly in the question where the slow
+        // agent can't miss it, without changing the pipeline mode
+        // or system prompt.
+        let text = if let Some(ref sid) = step_id {
+            let ctx = existing_plan
+                .as_ref()
+                .map(|p| p.step_context(sid))
+                .unwrap_or("");
+            if ctx.is_empty() {
+                text
+            } else {
+                kres_core::async_eprintln!(
+                    "injecting step context from plan step {} ({}k chars)",
+                    sid,
+                    ctx.len() / 1000,
+                );
+                format!("{ctx}\n\n---\n\n{text}")
+            }
+        } else {
+            text
+        };
         // Ask the goal agent for a plan decomposition, but only on
         // operator-typed submissions — pipeline-driven follow-ups
         // already live under the original plan and should not spawn
@@ -2339,9 +2376,24 @@ impl Session {
         if include_recent_context {
             if let (Some(gc), Some(goal)) = (&self.goal_client, defined_goal.as_ref()) {
                 let existing = self.mgr.plan_snapshot().await;
-                if let Some(plan) =
+                let plan = if let Some(steps) = embedded_steps {
+                    let steps = kres_core::plan::normalize_steps(steps);
+                    if steps.is_empty() {
+                        kres_agents::define_plan(gc, &text, goal, task_mode, existing.as_ref())
+                            .await
+                    } else {
+                        kres_core::async_eprintln!(
+                            "[embedded plan] {} step(s) from prompt template",
+                            steps.len()
+                        );
+                        let mut plan = kres_core::Plan::new(&text, goal, task_mode);
+                        plan.steps = steps;
+                        Some(plan)
+                    }
+                } else {
                     kres_agents::define_plan(gc, &text, goal, task_mode, existing.as_ref()).await
-                {
+                };
+                if let Some(plan) = plan {
                     log_plan_change("define_plan", existing.as_ref(), &plan);
                     self.mgr.set_plan(Some(plan)).await;
                 }
@@ -2676,7 +2728,12 @@ impl Session {
             } else {
                 item.name.clone()
             };
-            self.submit_from_pipeline(prompt, Some(tag)).await;
+            let sid = if item.step_id.is_empty() {
+                None
+            } else {
+                Some(item.step_id.clone())
+            };
+            self.submit_from_pipeline(prompt, Some(tag), sid).await;
             dispatched += 1;
         }
         let mut msg = format!("/continue: dispatched {dispatched} item(s)");
@@ -2733,7 +2790,12 @@ impl Session {
         } else {
             item.name.clone()
         };
-        self.submit_from_pipeline(prompt, Some(tag)).await;
+        let sid = if item.step_id.is_empty() {
+            None
+        } else {
+            Some(item.step_id.clone())
+        };
+        self.submit_from_pipeline(prompt, Some(tag), sid).await;
     }
 
     async fn cmd_edit(&self) {

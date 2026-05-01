@@ -65,6 +65,15 @@ pub struct PlanStep {
     /// todo is terminal.
     #[serde(default)]
     pub todo_ids: Vec<String>,
+    /// Additional context injected into the prompt for todos
+    /// linked to this step. When non-empty, the dispatch path
+    /// prepends it to the derived task's prompt so the slow agent
+    /// sees the step's protocol (e.g. review lenses) alongside
+    /// the coding system prompt. Complements `description` (which
+    /// rides in the plan JSON) by putting the protocol directly
+    /// in the question where it's unmissable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
 }
 
 fn default_pending() -> PlanStepStatus {
@@ -79,6 +88,7 @@ impl PlanStep {
             description: String::new(),
             status: PlanStepStatus::Pending,
             todo_ids: Vec::new(),
+            context: String::new(),
         }
     }
 }
@@ -121,7 +131,23 @@ impl PlanRewrite {
     /// the title. The LLM cannot corrupt the plan's step-id
     /// invariants no matter how sloppy its reply is.
     pub fn apply_to(self, prior: Option<&Plan>) -> Plan {
-        let steps = normalize_steps(self.steps);
+        let mut steps = normalize_steps(self.steps);
+        // Carry forward template-authored `context` from prior steps
+        // with matching ids. The context field is set by embedded
+        // plan templates (fix-template.md) and is not something
+        // agents produce, so a rewrite that omits it should inherit
+        // rather than silently drop.
+        if let Some(p) = &prior {
+            for step in &mut steps {
+                if step.context.is_empty() {
+                    if let Some(prior_step) = p.steps.iter().find(|s| s.id == step.id) {
+                        if !prior_step.context.is_empty() {
+                            step.context.clone_from(&prior_step.context);
+                        }
+                    }
+                }
+            }
+        }
         match prior {
             Some(p) => Plan {
                 prompt: p.prompt.clone(),
@@ -188,6 +214,113 @@ pub fn normalize_steps(steps: Vec<PlanStep>) -> Vec<PlanStep> {
     out
 }
 
+/// Extract an embedded plan from prompt text. A template can include
+/// a `PLAN:` block with a JSON plan; when found, the block is stripped
+/// from the text and the steps are returned. On parse failure or
+/// missing marker, returns the original text and None.
+pub fn extract_embedded_plan(text: &str) -> (String, Option<Vec<PlanStep>>) {
+    let marker_pos = text
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.trim().starts_with("PLAN:"))
+        .map(|(i, _)| i);
+    let Some(marker_line) = marker_pos else {
+        return (text.to_string(), None);
+    };
+
+    let lines: Vec<&str> = text.lines().collect();
+    let after_marker = lines[marker_line]
+        .trim()
+        .strip_prefix("PLAN:")
+        .unwrap()
+        .trim();
+
+    let json_start_line;
+    let json_text_start;
+    if after_marker.starts_with('{') {
+        json_start_line = marker_line;
+        json_text_start = text.find("PLAN:").unwrap() + "PLAN:".len();
+        let rest = &text[json_text_start..];
+        let trimmed_offset = rest.len() - rest.trim_start().len();
+        let json_text_start = json_text_start + trimmed_offset;
+        let _ = json_text_start; // used below
+    } else {
+        json_start_line = marker_line + 1;
+    }
+    let _ = json_start_line;
+
+    // Find the JSON by scanning for balanced braces from the first '{' after PLAN:
+    let plan_marker = text.find("PLAN:").unwrap();
+    let rest = &text[plan_marker + "PLAN:".len()..];
+    let brace_offset = match rest.find('{') {
+        Some(o) => o,
+        None => return (text.to_string(), None),
+    };
+    let json_start = plan_marker + "PLAN:".len() + brace_offset;
+    let mut depth = 0i32;
+    let mut json_end = json_start;
+    for (i, ch) in text[json_start..].char_indices() {
+        match ch {
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    json_end = json_start + i + ch.len_utf8();
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        tracing::warn!(
+            target: "kres_core",
+            "PLAN: block has unbalanced braces; ignoring embedded plan"
+        );
+        return (text.to_string(), None);
+    }
+
+    let json_str = &text[json_start..json_end];
+    let parsed: Result<PlanRewrite, _> = serde_json::from_str(json_str);
+    match parsed {
+        Ok(rewrite) if !rewrite.steps.is_empty() => {
+            // Strip the PLAN: line and the JSON block from the text.
+            // Find the full block boundaries (PLAN: marker through end of JSON).
+            let block_start = plan_marker;
+            let mut block_end = json_end;
+            // Consume trailing whitespace/newlines after the JSON.
+            while block_end < text.len()
+                && text
+                    .as_bytes()
+                    .get(block_end)
+                    .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                block_end += 1;
+            }
+            let mut stripped = String::with_capacity(text.len());
+            stripped.push_str(&text[..block_start]);
+            stripped.push_str(&text[block_end..]);
+            // Trim trailing whitespace from the join point.
+            let stripped = stripped.trim_end().to_string();
+            (stripped, Some(rewrite.steps))
+        }
+        Ok(_) => {
+            tracing::warn!(
+                target: "kres_core",
+                "PLAN: block parsed but contains no steps; ignoring"
+            );
+            (text.to_string(), None)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "kres_core",
+                "PLAN: block JSON parse failed: {e}; ignoring embedded plan"
+            );
+            (text.to_string(), None)
+        }
+    }
+}
+
 /// Produce a kebab-case slug from a step title, truncated to 60
 /// chars. Keeps ASCII letters / digits and collapses everything
 /// else into single `-` separators; strips leading/trailing `-`;
@@ -224,6 +357,16 @@ impl Plan {
             steps: Vec::new(),
             created_at: Utc::now(),
         }
+    }
+
+    /// Look up the context for a step by id. Returns an empty
+    /// string when the step doesn't exist or has no context.
+    pub fn step_context(&self, step_id: &str) -> &str {
+        self.steps
+            .iter()
+            .find(|s| s.id == step_id)
+            .map(|s| s.context.as_str())
+            .unwrap_or("")
     }
 
     /// Flip a step's status by id.
@@ -481,6 +624,36 @@ mod tests {
         assert_eq!(s.id, "");
         assert_eq!(s.title, "");
         assert_eq!(s.status, PlanStepStatus::Pending);
+        assert!(s.context.is_empty());
+    }
+
+    #[test]
+    fn step_context_serde_roundtrip() {
+        let mut s = PlanStep::new("review", "Review the patch");
+        s.context = "Apply review lenses.".into();
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("Apply review lenses."));
+        let back: PlanStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.context, "Apply review lenses.");
+    }
+
+    #[test]
+    fn step_context_omitted_when_empty() {
+        let s = PlanStep::new("write", "Write the fix");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("context"));
+    }
+
+    #[test]
+    fn plan_step_context_returns_text() {
+        let mut p = Plan::new("fix", "fix the bug", TaskMode::Coding);
+        let mut review = PlanStep::new("review-patch", "Review");
+        review.context = "Apply lenses.".into();
+        p.steps.push(PlanStep::new("write-fix", "Write"));
+        p.steps.push(review);
+        assert_eq!(p.step_context("review-patch"), "Apply lenses.");
+        assert_eq!(p.step_context("write-fix"), "");
+        assert_eq!(p.step_context("nonexistent"), "");
     }
 
     #[test]
@@ -498,6 +671,45 @@ mod tests {
         assert_eq!(built.mode, TaskMode::Audit);
         assert_eq!(built.steps.len(), 1);
         assert_eq!(built.steps[0].id, "audit-foo");
+    }
+
+    #[test]
+    fn apply_to_carries_forward_context_from_matching_prior_steps() {
+        let mut prior = Plan::new("fix", "fix bug", TaskMode::Coding);
+        let mut review = PlanStep::new("review-patch", "Review");
+        review.context = "REVIEW PROTOCOL\nlens checklist here".into();
+        prior.steps.push(PlanStep::new("write-fix", "Write"));
+        prior.steps.push(review);
+        // Rewrite keeps the same step ids but omits context (as an
+        // LLM rewrite would).
+        let rewrite = PlanRewrite {
+            steps: vec![
+                step("write-fix", "Write the fix"),
+                step("review-patch", "Review the patch"),
+            ],
+        };
+        let built = rewrite.apply_to(Some(&prior));
+        assert_eq!(built.steps.len(), 2);
+        assert!(built.steps[0].context.is_empty());
+        assert_eq!(
+            built.steps[1].context,
+            "REVIEW PROTOCOL\nlens checklist here"
+        );
+    }
+
+    #[test]
+    fn apply_to_does_not_override_explicit_context() {
+        let mut prior = Plan::new("fix", "fix bug", TaskMode::Coding);
+        let mut review = PlanStep::new("review-patch", "Review");
+        review.context = "old context".into();
+        prior.steps.push(review);
+        let mut rewrite_step = step("review-patch", "Review v2");
+        rewrite_step.context = "new context".into();
+        let rewrite = PlanRewrite {
+            steps: vec![rewrite_step],
+        };
+        let built = rewrite.apply_to(Some(&prior));
+        assert_eq!(built.steps[0].context, "new context");
     }
 
     #[test]
@@ -523,5 +735,88 @@ mod tests {
         a.status = TodoStatus::InProgress;
         p.sync_from_todo(&[a]);
         assert_eq!(p.steps[0].status, PlanStepStatus::Skipped);
+    }
+
+    #[test]
+    fn extract_embedded_plan_parses_valid_block() {
+        let text = r#"Some preamble text.
+
+PLAN:
+{"steps": [
+  {"id": "research", "title": "Research the bug"},
+  {"id": "write-fix", "title": "Write the fix"}
+]}
+
+More text after."#;
+        let (stripped, steps) = extract_embedded_plan(text);
+        let steps = steps.expect("should parse");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].id, "research");
+        assert_eq!(steps[1].title, "Write the fix");
+        assert!(stripped.contains("Some preamble text."));
+        assert!(stripped.contains("More text after."));
+        assert!(!stripped.contains("PLAN:"));
+    }
+
+    #[test]
+    fn extract_embedded_plan_no_marker() {
+        let text = "Just a normal prompt with no plan.";
+        let (stripped, steps) = extract_embedded_plan(text);
+        assert!(steps.is_none());
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn extract_embedded_plan_bad_json() {
+        let text = "Before\n\nPLAN:\n{not valid json\n\nAfter";
+        let (stripped, steps) = extract_embedded_plan(text);
+        assert!(steps.is_none());
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn extract_embedded_plan_inline_json() {
+        let text = r#"PLAN: {"steps": [{"id": "s1", "title": "Do it"}]}
+Rest of prompt."#;
+        let (stripped, steps) = extract_embedded_plan(text);
+        let steps = steps.expect("should parse");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, "s1");
+        assert!(stripped.contains("Rest of prompt."));
+        assert!(!stripped.contains("PLAN:"));
+    }
+
+    #[test]
+    fn extract_embedded_plan_with_step_context() {
+        let text = r#"Preamble.
+
+PLAN:
+{"steps": [
+  {"id": "write-fix", "title": "Write the fix"},
+  {"id": "review-patch", "title": "Review the patch", "context": "Apply review lenses."}
+]}
+
+Tail."#;
+        let (stripped, steps) = extract_embedded_plan(text);
+        let steps = steps.expect("should parse");
+        assert_eq!(steps.len(), 2);
+        assert!(steps[0].context.is_empty());
+        assert_eq!(steps[1].context, "Apply review lenses.");
+        assert!(!stripped.contains("PLAN:"));
+        assert!(stripped.contains("Tail."));
+    }
+
+    #[test]
+    fn extract_embedded_plan_indented_marker() {
+        let text = r#"Preamble.
+
+   PLAN:
+   {"steps": [{"id": "x", "title": "Step X"}]}
+
+Tail."#;
+        let (stripped, steps) = extract_embedded_plan(text);
+        let steps = steps.expect("should parse");
+        assert_eq!(steps.len(), 1);
+        assert!(!stripped.contains("PLAN:"));
     }
 }

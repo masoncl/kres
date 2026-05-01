@@ -908,7 +908,19 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          - Remove ONLY pending items that are no longer relevant\n\
          - Max 20 pending items (done items don't count toward the limit)\n\
          - PARALLELISM: most items can run in parallel. Only add \
-         depends_on when an item truly requires another's results first.",
+         depends_on when an item truly requires another's results first.\n\
+         - FIX-AND-AMEND INVALIDATION: when the analysis shows that \
+         code_edits were applied and a commit was amended (the patch \
+         changed since the last review), any done todo that reviewed \
+         or verified the PRIOR version of the patch is now stale. \
+         Re-emit it as a NEW pending item (new id, same step_id) so \
+         the amended patch gets a fresh review. This is NOT a new \
+         followup — it is a re-creation of a stale done item, so \
+         the dedup algorithm does not apply to it. Update \
+         depends_on on any downstream item (e.g. publish) to point \
+         at the new id. This applies to review, verification, and \
+         approval items — not to research or context-gathering \
+         items whose results are still valid.",
     );
     s
 }

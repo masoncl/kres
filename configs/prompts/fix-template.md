@@ -167,32 +167,32 @@ pipeline turns. Advance only when the prior step is complete.
 
    The review pass is bounded to TWO turns. Turn one issues
    findings against the patch. Turn two either:
-   - confirms the patch is clean (goal met, run terminates), OR
+   - confirms the patch is clean (proceed to PUBLISH below in
+     the SAME turn), OR
    - applies ONE final round of `code_edits` + recompile +
-     `git commit --amend -s` (steps 3-4 again). Context from all
-     prior steps (the finding, the fix, the build output, and
-     the review findings) is in the accumulated preamble — use
-     it to make the right edit. Do not iterate review beyond
-     two turns — escalate remaining concerns to the operator
-     in `analysis`.
+     `git commit --amend -s` (steps 3-4 again), then on the
+     turn after the amend lands runs PUBLISH below. Context
+     from all prior steps (the finding, the fix, the build
+     output, and the review findings) is in the accumulated
+     preamble — use it to make the right edit. Do not iterate
+     review beyond two turns — escalate remaining concerns to
+     the operator in `analysis`.
 
-   DO NOT emit a `publish-fix` followup from this step. That is
-   step 6's exclusive job. Step 5 either confirms the patch
-   clean (no followups) or amends (code_edits + git followups
-   only). Emitting publish-fix here causes the reaper to write
-   `auto-generated-fix.diff` twice for the same HEAD.
-
-6. PUBLISH (only when the bug input was a kres finding dir)
-   Once steps 2-5 are done — patch committed, build clean,
-   review clean — and the BUG INPUT was an absolute path to a
-   kres finding directory (one that contains `metadata.yaml`
-   and `FINDING.md`), emit one followup:
-   `{"type": "publish-fix", "name": "<absolute finding dir>"}`.
+   PUBLISH (must fire in the same turn that closes review):
+   when review confirms clean AND the BUG INPUT was an absolute
+   path to a kres finding directory (one that contains
+   `metadata.yaml` and `FINDING.md`), emit exactly one followup
+   in this turn:
+       {"type": "publish-fix", "name": "<absolute finding dir>"}
    The reaper writes `auto-generated-fix.diff` (the output of
    `git format-patch -1 --stdout HEAD`) into that directory,
    appends `auto_generated_fix:` to its `metadata.yaml`, and
-   adds a cross-link in `summary.md`. Skip this step entirely
-   when the BUG INPUT was free-form prose.
+   adds a cross-link in `summary.md`. Emit publish-fix EXACTLY
+   ONCE per HEAD — if you already emitted it on a prior turn
+   for the current HEAD, do not re-emit. Skip publish-fix
+   entirely when the BUG INPUT was free-form prose, and skip
+   it on the amend turn (the next turn, after the amend
+   commit lands, is when publish-fix fires).
 
 OUTPUT RULES
 

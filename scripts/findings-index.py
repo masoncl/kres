@@ -867,6 +867,14 @@ def main():
         help="print a filtered markdown table to stdout (see module "
              "doc for query syntax)",
     )
+    parser.add_argument(
+        "-o",
+        choices=["dirs"],
+        default=None,
+        help="output format for --search: 'dirs' prints one absolute "
+             "finding directory path per line instead of the markdown "
+             "table",
+    )
     args = parser.parse_args()
 
     root = os.getcwd()
@@ -907,7 +915,16 @@ def main():
     except ValueError as exc:
         print("search: {}".format(exc), file=sys.stderr)
         return 2
-    sys.stdout.write(build_markdown(filtered))
+    if args.o == "dirs":
+        findings_root = os.path.join(root, "findings")
+        if not os.path.isdir(findings_root):
+            findings_root = root
+        for r in filtered:
+            sys.stdout.write(
+                os.path.join(findings_root, r["tag"]) + "\n"
+            )
+    else:
+        sys.stdout.write(build_markdown(filtered))
     return 0
 
 

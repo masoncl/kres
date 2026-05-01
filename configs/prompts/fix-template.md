@@ -230,6 +230,45 @@ pipeline turns. Advance only when the prior step is complete.
    it on the amend turn (the next turn, after the amend
    commit lands, is when publish-fix fires).
 
+RECORD-INVALIDATION — when you reach `[INVALID]` AND the BUG INPUT
+was an absolute path to a kres finding directory (one that contains
+`metadata.yaml` and `FINDING.md`), update those two files in the
+SAME turn that writes `[INVALID]` to `analysis`. The operator named
+the finding directory in the prompt, so the consent gate already
+permits writes there. Emit `code_output` entries with absolute
+paths and the FULL post-update file body:
+
+    code_output: [
+      {
+        "path": "<absolute finding dir>/metadata.yaml",
+        "content": "<verbatim current body, only change is status: invalidated>",
+        "purpose": "record [INVALID] determination"
+      },
+      {
+        "path": "<absolute finding dir>/FINDING.md",
+        "content": "<verbatim current body, only change is the **Status:** line set to invalidated>",
+        "purpose": "mirror metadata status flip"
+      }
+    ]
+
+Both files were loaded in step 1; quote them VERBATIM and change
+ONLY:
+- `metadata.yaml`: the `status:` field → `invalidated`. Leave
+  every other field (id, severity, filename, relevant_symbols,
+  verification, etc.) untouched.
+- `FINDING.md`: the `**Status:**` line near the top of the file
+  → `**Status:** invalidated`. Do not edit any other part of
+  FINDING.md — the `[INVALID]` evidence stays in `analysis`,
+  which the operator reads alongside the finding dir.
+
+Do not invent new fields and do not append narrative. Skip this
+block entirely when the BUG INPUT was free-form prose (no
+directory to write back to). Skip it when `metadata.yaml`
+already says `status: invalidated` on disk — re-asserting an
+existing status is wasted I/O. Status is sticky in the kres
+findings model; do not flip an `invalidated` finding back to
+`active` from this template.
+
 OUTPUT RULES
 
 - Never paste a unified diff or `.patch` file as `code_output`

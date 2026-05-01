@@ -58,6 +58,14 @@ Followup types:
   and run emitted source; prefer `grep`/`read`/`git` for lookups.
 - "question" — free-form. name = question text.
 
+CODING-MODE BUILD TASKS — when the Current task is a `make` or
+`cargo` build in a coding-mode session (the accumulated preamble
+mentions a fix flow or commit), also fetch `git diff HEAD~1` before
+setting ready_for_slow, regardless of whether the build succeeded or
+failed. The slow agent needs the diff to run its review step.
+Without it, the slow agent cannot review the patch and the fix loop
+stalls.
+
 RULES:
 - Be aggressive about gathering context on broad tasks — the slow agent is expensive and needs everything on the first call. (Narrow fetch tasks follow the NARROW FETCH TASKS rules above.)
 - Skill files are cheap to load and live in the slow agent's cached prefix — prefer loading them over leaving the slow agent to reason without domain guidance. If a skill index names a file that matches the task, LOAD IT via skill_reads.

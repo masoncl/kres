@@ -37,7 +37,7 @@ pub use findings::{
 pub use lens::LensSpec;
 pub use log::{LoggedUsage, TurnLogger};
 pub use mode::{CodeEdit, CodeFile, TaskMode};
-pub use plan::{Plan, PlanRewrite, PlanStep, PlanStepStatus};
+pub use plan::{extract_embedded_plan, Plan, PlanRewrite, PlanStep, PlanStepStatus};
 pub use session_state::{SessionState, SessionStateError};
 pub use shrink::{
     estimate_tokens, finding_char_size, fit_payload, shrink_findings_to_budget,

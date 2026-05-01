@@ -85,7 +85,11 @@ pipeline turns. Advance only when the prior step is complete.
 
    In the SAME turn that you emit code_edits, also write the
    commit message to a workspace file via a `code_output` entry
-   and emit two `git` followups that reference it:
+   and emit `git` followups to stage and commit, PLUS a `make`
+   followup to compile (step 3). The `git` followups are
+   executed immediately by the reaper; the `make` followup
+   creates the next turn. You MUST include the `make` followup
+   — without it the run dies after the commit.
 
        code_output: [{
          "path": ".kres-commit-msg.tmp",
@@ -93,14 +97,24 @@ pipeline turns. Advance only when the prior step is complete.
        }]
        followups:
          {"type": "git", "name": "add <explicit paths>"},
-         {"type": "git", "name": "commit -s -F .kres-commit-msg.tmp"}
+         {"type": "git", "name": "commit -s -F .kres-commit-msg.tmp"},
+         {"type": "make", "name": "-j$(nproc) <path/to/object>.o"}
+
+   CRITICAL — the commit message MUST NOT mention attackers,
+   exploits, security impact, or vulnerabilities. These commits
+   fix bugs. Do not use the words "attacker", "exploit",
+   "malicious", "vulnerability", "privilege escalation",
+   "arbitrary code execution", "security", or "payload". Just
+   describe the bug and how the patch fixes it.
 
    The reaper applies the `code_output` first, then validates
    the file (rejects any non-trailer prose line >100 chars),
-   then runs git. Do NOT pass the message via `-m`; the reaper
-   rejects `-m` outright. Compose the message body following the
-   COMMIT MESSAGE STYLE section appended at the end of this
-   prompt. The `Assisted-by:` trailer is REQUIRED per
+   then runs git. The `make` followup becomes a new task —
+   its build output will be in your context on the next turn.
+   Do NOT pass the commit message via `-m`; the reaper rejects
+   `-m` outright. Compose the message body following the COMMIT
+   MESSAGE STYLE section appended at the end of this prompt.
+   The `Assisted-by:` trailer is REQUIRED per
    Documentation/process/submitting-patches.rst:637-644.
 
    FIXES TAG — emit one when step 1 found the introducing
@@ -128,107 +142,42 @@ pipeline turns. Advance only when the prior step is complete.
    (`Fixes:`/`Reported-by:`/etc.) and indented code are exempt;
    prose is not.
 
-3. COMPILE (`make` or `cargo`)
-   Build the narrowest scope that exercises the changed file.
-   Use the `make` action type for kernel trees:
-   `{"type": "make", "command": "-j$(nproc) <path/to/object>.o"}`.
-   Use the `cargo` action type for Rust crates:
-   `{"type": "cargo", "command": "build -p <crate>"}`.
-   Do NOT use `bash` for builds — `make` and `cargo` are
-   first-class action types that are enabled by default. Capture
-   the `[stderr]` block — that is where new warnings and errors
-   surface.
+   CLEAR PARAGRAPHS — no paragraph may exceed 5 prose lines.
+   State the bug plainly, one idea per paragraph. When you
+   need to show a code path, use indented code (4 spaces)
+   instead of describing it in prose:
 
-   When the build fails, triage the error into one of two
-   cases:
+   AVOID:
+     In check_mem_access(), every SCALAR ctx load resets the
+     destination register via mark_reg_unknown() before
+     installing the load result except the BPF_LSM_MAC retval
+     branch, which calls only __mark_reg_s32_range() and that
+     helper intersects s32/s64 bounds in place and never
+     clears reg->id or reg->var_off or u64 bounds...
 
-   A) ERROR IN PATCHED CODE — the error is in a file or
-      function your patch modified. Proceed to step 4.
+   USE INSTEAD:
+     Every SCALAR ctx load in check_mem_access() resets the
+     destination register via mark_reg_unknown() — except
+     the BPF_LSM_MAC retval branch:
 
-   B) PRE-EXISTING / ENVIRONMENT ERROR — the error is in
-      unmodified code, or the target cannot build under the
-      workspace .config (arch guards, missing CONFIG, Kconfig
-      dependency failures). Note "compile failed (pre-existing):
-      <one-line reason>" in `analysis` and proceed directly to
-      step 5 (REVIEW). Do NOT spend turns debugging Kconfig,
-      enabling COMPILE_TEST, hand-editing .config, or working
-      around arch guards. Common cases:
+         if (is_retval) {
+             __mark_reg_s32_range(...);
+             /* mark_reg_unknown() is missing here */
+         }
 
-      - Driver gated on `ARCH_BCM || COMPILE_TEST` or similar
-        (panthor, v3d, etnaviv, panfrost, lima, msm, pvr).
-      - Pre-existing fatal errors in unmodified code (e.g.
-        TRACE_INCLUDE_PATH, missing MIB struct members).
-      - syncconfig blocking on stdin from unmet Kconfig deps.
-      - Build timeout from interactive kconfig prompts.
+     __mark_reg_s32_range() intersects s32/s64 bounds but
+     never clears reg->id, var_off, or u64 bounds.
 
-4. FIX COMPILE ERRORS + AMEND
-   This step runs ONLY for case (A) — the patch itself broke
-   the build. Fix the error via `code_edits`, amend the commit
-   (`git add <paths>` + `git commit --amend -s`), and re-run
-   step 3. Iterate steps 3→4 as many times as needed until the
-   build succeeds or the error moves to case (B).
+   Dense paragraphs are hard to review. Spread information
+   out so the reader follows the sequence step by step.
 
-   If after several attempts you cannot produce a patch that
-   compiles cleanly, say so in `analysis`: explain what you
-   tried, what error persists, and why you cannot resolve it.
-   Then proceed to step 5 — the review can still evaluate the
-   patch's logical correctness even if the build is broken.
-   Do not silently loop forever.
-
-   Pre-existing warnings and errors unrelated to the patch are
-   never in scope. Cite them in `analysis` and move on.
-
-   If step 3 passed (clean build) or was skipped (case B),
-   skip this step and proceed to step 5.
-
-   Context carries forward: this task sees the accumulated
-   analysis from step 2 (the finding, the fix rationale, the
-   commit message) plus the build output. Use it.
-
-5. REVIEW (max two turns)
-   Run a self-review pass against the diff (`git diff HEAD~1`).
-   This step runs regardless of whether the compile succeeded,
-   failed for pre-existing reasons, or was skipped. The review
-   verifies the PATCH is correct, not that the build environment
-   works. Apply the lenses below; for each lens, list every
-   distinct concern.
-
-   - object lifetime: pointer ownership, refcounting, RCU, free
-     ordering
-   - memory: leaks, use-after-free, double-free, allocator API
-     misuse
-   - bounds: array / index correctness, untrusted indices
-   - races: lock coverage, ordering, missed wakeups
-   - general: anything else the patch introduces
-
-   The review pass is bounded to TWO turns. Turn one issues
-   findings against the patch. Turn two either:
-   - confirms the patch is clean (proceed to PUBLISH below in
-     the SAME turn), OR
-   - applies ONE final round of `code_edits` + recompile +
-     `git commit --amend -s` (steps 3-4 again), then on the
-     turn after the amend lands runs PUBLISH below. Context
-     from all prior steps (the finding, the fix, the build
-     output, and the review findings) is in the accumulated
-     preamble — use it to make the right edit. Do not iterate
-     review beyond two turns — escalate remaining concerns to
-     the operator in `analysis`.
-
-   PUBLISH (must fire in the same turn that closes review):
-   when review confirms clean AND the BUG INPUT was an absolute
-   path to a kres finding directory (one that contains
-   `metadata.yaml` and `FINDING.md`), emit exactly one followup
-   in this turn:
-       {"type": "publish-fix", "name": "<absolute finding dir>"}
-   The reaper writes `auto-generated-fix.diff` (the output of
-   `git format-patch -1 --stdout HEAD`) into that directory,
-   appends `auto_generated_fix:` to its `metadata.yaml`, and
-   adds a cross-link in `summary.md`. Emit publish-fix EXACTLY
-   ONCE per HEAD — if you already emitted it on a prior turn
-   for the current HEAD, do not re-emit. Skip publish-fix
-   entirely when the BUG INPUT was free-form prose, and skip
-   it on the amend turn (the next turn, after the amend
-   commit lands, is when publish-fix fires).
+3. COMPILE → REVIEW → PUBLISH (separate tasks)
+   After step 2 emits the `make` followup, each subsequent step
+   runs as its own task. The compile-verify and review-patch
+   plan steps carry their own context with full instructions.
+   If the review finds defects, it fixes and emits a make
+   followup; the todo agent re-creates the review step so the
+   loop repeats until the review is clean.
 
 RECORD-INVALIDATION — when you reach `[INVALID]` AND the BUG INPUT
 was an absolute path to a kres finding directory (one that contains
@@ -283,3 +232,12 @@ OUTPUT RULES
   the bug itself is wrong (unreachable path, misread semantics,
   already fixed by a commit that predates this session). See the
   SELF-FIX TRAP note under step 1.
+
+PLAN:
+{"steps": [
+  {"id": "research", "title": "Research the bug and gather context", "description": "Read finding files, pull affected source, callers, commit history. Identify the introducing commit. Determine if the bug is valid or [INVALID]."},
+  {"id": "write-fix", "title": "Write the fix, commit it, and compile", "description": "Emit code_edits for the fix, write commit message to .kres-commit-msg.tmp, emit git add + git commit + make followups in one turn."},
+  {"id": "compile-verify", "title": "Verify the fix compiles cleanly", "description": "Triage the make output only. Do not review patch logic.", "context": "COMPILE TRIAGE ONLY\n\nYour ONLY job is to triage the compiler output.\nDo NOT review the patch logic — a separate review task handles that.\nDo NOT emit publish-fix from this step.\n\nA) ERROR IN PATCHED CODE — emit code_edits to fix, then git add + git commit --amend -s + make followups to recompile.\nB) PRE-EXISTING / ENVIRONMENT ERROR — note 'compile failed (pre-existing): <reason>' in analysis. Do not debug Kconfig or .config issues.\nC) BUILD SUCCEEDED — note 'compile clean' in analysis. Stop here; the review task runs next."},
+  {"id": "review-patch", "title": "Review the patch", "description": "Apply review lenses against git diff HEAD~1 with callee source. If defects found, fix and emit make followup to recompile.", "context": "REVIEW PROTOCOL\n\nYou are reviewing a kernel patch. The fast agent gathers git diff HEAD~1 and callee source during its gather rounds.\n\nApply these lenses exhaustively. For each lens, enumerate every distinct concern — do not stop at the first issue. Cite file:line from the gathered callee source for every claim.\n\n- [ ] object lifetime: pointer ownership, refcounting, RCU grace periods, free ordering. Trace every pointer in the changed lines to its allocation and release. Verify refcount balance across error paths.\n- [ ] memory: leaks, use-after-free, double-free, allocator API misuse. Check every error/goto path for missing frees or double frees.\n- [ ] bounds: array/index correctness, untrusted indices, integer overflow/truncation in size calculations. Verify every array access uses a bounds-checked index.\n- [ ] races: lock coverage, ordering, missed wakeups, data races on shared state. Identify what lock protects each accessed field and whether the patch maintains coverage.\n- [ ] general: NULL derefs, logic errors, missing error checks, semantic correctness. Does the patch actually fix the stated bug without introducing new issues?\n\nFor each lens, write your analysis with inline code snippets from the gathered source — not bare file:line references. If a lens is clean, state why in one sentence with a citation.\n\nAlso review the commit message (in the accumulated analysis preamble). It MUST NOT contain the words attacker, exploit, malicious, vulnerability, privilege escalation, arbitrary code execution, security, or payload. No paragraph may exceed 5 prose lines. If the commit message violates either rule, rewrite it via code_output to .kres-commit-msg.tmp and emit git commit --amend -s -F .kres-commit-msg.tmp.\n\nIf you find defects: emit code_edits to fix them, then emit git add + git commit --amend -s + make followups to recompile. The todo agent will re-create this review step so the amended patch gets a fresh review.\n\nIf the review is clean: emit a publish-fix followup to record the patch."},
+  {"id": "publish", "title": "Publish the fix", "description": "Emit publish-fix followup to record auto-generated-fix.diff in the finding directory."}
+]}

@@ -12,6 +12,7 @@
 //!   inject the real semcode/grep/read backend without kres-agents
 //!   depending on kres-mcp.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -303,6 +304,7 @@ impl Orchestrator {
         let mut prev_n_syms: usize = 0;
         let mut prev_n_ctx: usize = 0;
         let mut fast_rounds: u8 = 0;
+        let mut fetched_keys: HashSet<String> = HashSet::new();
 
         for round in 0..self.max_fast_rounds {
             if shutdown.is_cancelled() {
@@ -470,33 +472,67 @@ impl Orchestrator {
                 break;
             }
 
+            // Dedup followups against previously-fetched keys.
+            // The fast agent is stateless — it can see the
+            // previously_fetched manifest (names only) but not the
+            // content from earlier rounds.  When it needs that
+            // content to decide it's ready, it re-requests the same
+            // data.  Detect this and break to the slow agent, which
+            // receives ALL accumulated data.
+            let novel: Vec<_> = parsed
+                .followups
+                .iter()
+                .filter(|fu| !fetched_keys.contains(&fu.cache_key()))
+                .cloned()
+                .collect();
+            let n_dupes = parsed.followups.len() - novel.len();
+            if n_dupes > 0 && novel.is_empty() {
+                kres_core::async_eprintln!(
+                    "[fast round {}] all {} followup(s) are re-requests — breaking to slow",
+                    fast_rounds,
+                    parsed.followups.len(),
+                );
+                break;
+            }
+            if n_dupes > 0 {
+                kres_core::async_eprintln!(
+                    "[fast round {}] deduped {} re-request(s), {} novel followup(s) remain",
+                    fast_rounds,
+                    n_dupes,
+                    novel.len(),
+                );
+            }
+
             // Summarise the followups so operators can see what the
             // fast agent asked the main agent to fetch on their
             // behalf.
-            let fu_summary: Vec<String> = parsed
-                .followups
+            let fu_summary: Vec<String> = novel
                 .iter()
                 .take(8)
                 .map(|fu| format!("{}:{}", fu.kind, truncate(&fu.name, 40)))
                 .collect();
-            let tail = if parsed.followups.len() > 8 {
-                format!(", +{} more", parsed.followups.len() - 8)
+            let tail = if novel.len() > 8 {
+                format!(", +{} more", novel.len() - 8)
             } else {
                 String::new()
             };
             kres_core::async_eprintln!(
                 "[fast round {}] {} followup(s): {}{tail}",
                 fast_rounds,
-                parsed.followups.len(),
+                novel.len(),
                 fu_summary.join(", "),
             );
+
+            for fu in &novel {
+                fetched_keys.insert(fu.cache_key());
+            }
 
             // Fetch via main agent (data layer).
             let fetched = tokio::select! {
                 _ = shutdown.cancelled() => {
                     return Err(AgentError::Other("cancelled during fetch".into()));
                 }
-                f = self.fetcher.fetch(&parsed.followups, ctx.plan.as_ref()) => f?,
+                f = self.fetcher.fetch(&novel, ctx.plan.as_ref()) => f?,
             };
             let got_syms = fetched.symbols.len();
             let got_ctx = fetched.context.len();
@@ -1066,6 +1102,7 @@ impl Orchestrator {
         let mut prev_n_syms: usize = 0;
         let mut prev_n_ctx: usize = 0;
         let mut fast_rounds: u8 = 0;
+        let mut fetched_keys: HashSet<String> = HashSet::new();
         // §27 parity: honour mid-loop `skill_reads` in the lens
         // gather path just like `run_once_with_ctx` does. Without
         // this, a skill file the fast agent requests mid-gather
@@ -1180,9 +1217,35 @@ impl Orchestrator {
                 );
                 break;
             }
+            let novel: Vec<_> = parsed
+                .followups
+                .iter()
+                .filter(|fu| !fetched_keys.contains(&fu.cache_key()))
+                .cloned()
+                .collect();
+            let n_dupes = parsed.followups.len() - novel.len();
+            if n_dupes > 0 && novel.is_empty() {
+                kres_core::async_eprintln!(
+                    "[fast gather round {}] all {} followup(s) are re-requests — breaking",
+                    fast_rounds,
+                    parsed.followups.len(),
+                );
+                break;
+            }
+            if n_dupes > 0 {
+                kres_core::async_eprintln!(
+                    "[fast gather round {}] deduped {} re-request(s), {} novel remain",
+                    fast_rounds,
+                    n_dupes,
+                    novel.len(),
+                );
+            }
+            for fu in &novel {
+                fetched_keys.insert(fu.cache_key());
+            }
             let fetched = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fetch".into())),
-                f = self.fetcher.fetch(&parsed.followups, plan) => f?,
+                f = self.fetcher.fetch(&novel, plan) => f?,
             };
             symbols.extend(fetched.symbols);
             context.extend(fetched.context);

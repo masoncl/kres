@@ -139,23 +139,59 @@ pipeline turns. Advance only when the prior step is complete.
    the `[stderr]` block — that is where new warnings and errors
    surface.
 
-4. FIX WARNINGS + AMEND
-   For every NEW warning or error introduced by the patch, emit a
-   `code_edit` to address it and re-run step 3. Pre-existing
-   warnings unrelated to the fix are not in scope — cite them in
-   `analysis` and move on. Do not silence a warning by deleting
-   an unrelated check; address the root cause. After fixing, use
-   `git add <paths>` + `git commit --amend -s` to fold the
-   fix-up into the original commit.
+   When the build fails, triage the error into one of two
+   cases:
+
+   A) ERROR IN PATCHED CODE — the error is in a file or
+      function your patch modified. Proceed to step 4.
+
+   B) PRE-EXISTING / ENVIRONMENT ERROR — the error is in
+      unmodified code, or the target cannot build under the
+      workspace .config (arch guards, missing CONFIG, Kconfig
+      dependency failures). Note "compile failed (pre-existing):
+      <one-line reason>" in `analysis` and proceed directly to
+      step 5 (REVIEW). Do NOT spend turns debugging Kconfig,
+      enabling COMPILE_TEST, hand-editing .config, or working
+      around arch guards. Common cases:
+
+      - Driver gated on `ARCH_BCM || COMPILE_TEST` or similar
+        (panthor, v3d, etnaviv, panfrost, lima, msm, pvr).
+      - Pre-existing fatal errors in unmodified code (e.g.
+        TRACE_INCLUDE_PATH, missing MIB struct members).
+      - syncconfig blocking on stdin from unmet Kconfig deps.
+      - Build timeout from interactive kconfig prompts.
+
+4. FIX COMPILE ERRORS + AMEND
+   This step runs ONLY for case (A) — the patch itself broke
+   the build. Fix the error via `code_edits`, amend the commit
+   (`git add <paths>` + `git commit --amend -s`), and re-run
+   step 3. Iterate steps 3→4 as many times as needed until the
+   build succeeds or the error moves to case (B).
+
+   If after several attempts you cannot produce a patch that
+   compiles cleanly, say so in `analysis`: explain what you
+   tried, what error persists, and why you cannot resolve it.
+   Then proceed to step 5 — the review can still evaluate the
+   patch's logical correctness even if the build is broken.
+   Do not silently loop forever.
+
+   Pre-existing warnings and errors unrelated to the patch are
+   never in scope. Cite them in `analysis` and move on.
+
+   If step 3 passed (clean build) or was skipped (case B),
+   skip this step and proceed to step 5.
 
    Context carries forward: this task sees the accumulated
    analysis from step 2 (the finding, the fix rationale, the
    commit message) plus the build output. Use it.
 
 5. REVIEW (max two turns)
-   Once the build is clean, run a self-review pass against the
-   diff (`git diff HEAD~1`). Apply the lenses below; for each
-   lens, list every distinct concern.
+   Run a self-review pass against the diff (`git diff HEAD~1`).
+   This step runs regardless of whether the compile succeeded,
+   failed for pre-existing reasons, or was skipped. The review
+   verifies the PATCH is correct, not that the build environment
+   works. Apply the lenses below; for each lens, list every
+   distinct concern.
 
    - object lifetime: pointer ownership, refcounting, RCU, free
      ordering

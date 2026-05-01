@@ -24,13 +24,17 @@ those two files or in the actual source tree at `metadata.yaml`'s
 ## Output
 
 Write the triage to `DIR/summary.md`, replacing any existing copy.
-Do NOT edit `FINDING.md`. `metadata.yaml` is editable in two
-narrow ways — see "metadata.yaml updates" below.
+`metadata.yaml` and `FINDING.md` are editable only in the narrow
+ways described under "metadata.yaml updates" and "FINDING.md
+status header" below — no other edits to either file.
 
 Emit summary.md as a single `code_output` entry with `path` set
 to the **absolute** `DIR/summary.md` path. The operator named
 `DIR` in the prompt, so the consent gate already permits writes
-there — no bash, no cp, no relative-path hack:
+there — no bash, no cp, no relative-path hack. If you also need
+to update `metadata.yaml` or the `**Status:**` line in
+`FINDING.md`, emit those as additional `code_output` entries with
+their own absolute paths and full file contents:
 
 ```
 "code_output": [
@@ -119,12 +123,21 @@ something the analysis did not verify. This is the default for
 question-style findings — anything where confirming the bug
 would require reading code the analysis did not have.
 
-ANY ONE of these tells forces `Unconfirmed`:
+ANY ONE of these tells forces `Unconfirmed`, **but only when the
+hedge or question gates whether the bug exists**. A hedge or
+open question attached to a peripheral concern — fix strategy,
+severity, a sibling finding, a non-load-bearing detail — leaves
+the verdict at `Plausible` if the core defect is otherwise
+demonstrated. Read each tag in context; do not match by keyword.
 
 - Hedging tags in FINDING.md: `[UNVERIFIED]`,
   `[UNVERIFIED — depends on …]`, `(UNVERIFIED)`, "unverified
   callees", "could not be verified from the supplied symbols",
-  "source was not provided", "source was not available".
+  "source was not provided", "source was not available". Apply
+  the gating test above — a `[UNVERIFIED]` next to "exact
+  locking model determines fix strategy" does not force
+  `Unconfirmed`; one next to "whether the bad path executes at
+  all" does.
 - A non-empty `## Open questions` section in FINDING.md or
   `open_questions:` list in metadata.yaml whose answers would
   change whether the bug exists. (Loose ends around an otherwise
@@ -173,10 +186,32 @@ edits are permitted.
 
 1. `subsystem:` — if the field is empty and you've identified
    the subsystem, fill it in.
-2. `status:` — if and only if you picked `Unconfirmed` AND the
-   metadata currently says `status: active`, flip it to
-   `status: unconfirmed`. In every other case the status field
-   is left exactly as it is (`active`, `invalidated`, etc.).
+2. `status:` — set it to match the verdict you picked in the
+   Status section above, using this mapping:
+
+   | summary verdict | metadata `status:` |
+   | --------------- | ------------------ |
+   | Fixed           | fixed              |
+   | Plausible       | active             |
+   | Unconfirmed     | unconfirmed        |
+   | Invalid         | invalidated        |
+   | Unknown         | leave as-is        |
+
+   Apply the mapping every time, in both directions. If the
+   metadata already says `unconfirmed` and you have now picked
+   `Plausible`, flip it to `active`. If it says `active` and
+   you picked `Invalid`, flip it to `invalidated`. The only
+   case where the field is left untouched is `Unknown`, which
+   means the finding itself is too thin to classify.
+
+## FINDING.md status header
+
+`FINDING.md` carries a `**Status:**` line near the top (around
+line 4) holding the same `active`/`fixed`/`invalidated`/
+`unconfirmed` enum as `metadata.yaml`. Whenever you change
+`metadata.yaml`'s `status:`, update that line to the same
+value so the two stay in sync. Do not touch any other part of
+`FINDING.md`.
 
 ## Wording
 

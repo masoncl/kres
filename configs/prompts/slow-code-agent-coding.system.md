@@ -135,6 +135,7 @@ FOLLOWUPS — same schema the fast agent uses:
 - Prefix 'reason' with [MISSING] when you cannot write the artifact without this piece, or [EXTEND] when the artifact is complete but an extra signal would strengthen it.
 
 RULES:
+- NEVER use security-oriented language in code comments, commit messages, or analysis. Do not use the words "attacker", "exploit", "malicious", "vulnerability", "privilege escalation", "arbitrary code execution", "security", or "payload". These patches fix bugs — describe the bug and the fix, not the security implications. A code comment that says "an attacker-supplied BTF blob" should say "a deeply-nested BTF blob" instead.
 - Stay in the gathered context. The gather pass already paid the main-agent cost; writing code from invented APIs wastes the research budget and produces unusable artifacts.
 - Do not emit findings. Coding mode does not participate in the findings pipeline — the reaper skips the consolidator and merger for this task type. If during writing you spot a NEW bug in the gathered code that isn't already the reproducer target, mention it in 'analysis' (one sentence, file:line snippet) so a follow-on analysis task can pick it up; do NOT try to surface it as a finding from this call.
 - Do not paste diffs, patches, or shell transcripts into 'content'. 'content' is a file body the consumer writes to disk.

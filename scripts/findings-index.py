@@ -49,6 +49,9 @@ Two modes, picked by mutually exclusive flags:
         regex:<regex>         — matches against the joined row text
                                 (sev + subsystem + date + status +
                                 id + title)
+        has:<filename>        — matches findings that contain the named
+                                file (e.g. has:summary.md to select only
+                                triaged findings)
         since:<YYYY-MM-DD>    — date >= since (undated rows excluded)
 
 A copy of this script is installed alongside the exported findings the
@@ -209,6 +212,7 @@ def collect_rows(root):
         rows.append({
             "tag": name,
             "tag_path": tag_prefix + name,
+            "dir_path": path,
             "link_file": link_file,
             "id": parse_top_level(yaml_text, "id") or "",
             "title": parse_top_level(yaml_text, "title") or "",
@@ -504,6 +508,7 @@ def build_html(rows):
 
 _QUERY_KEYS = (
     "severity", "subsystem", "status", "since", "regex", "file", "function",
+    "has",
 )
 _REGEX_KEYS = (
     "severity", "subsystem", "status", "regex", "file", "function",
@@ -574,6 +579,10 @@ class _Clause:
             )
         if self.key == "regex":
             return self.pattern.search(_row_haystack(row)) is not None
+        if self.key == "has":
+            return os.path.isfile(
+                os.path.join(row["dir_path"], self.value)
+            )
         if self.key == "since":
             return bool(row["date"]) and row["date"] >= self.value
         return False

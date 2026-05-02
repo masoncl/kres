@@ -4853,6 +4853,8 @@ pub(crate) fn findings_signature(
                 f.id.clone(),
                 match f.status {
                     kres_core::findings::Status::Active => "active".to_string(),
+                    kres_core::findings::Status::Unconfirmed => "unconfirmed".to_string(),
+                    kres_core::findings::Status::Fixed => "fixed".to_string(),
                     kres_core::findings::Status::Invalidated => "invalidated".to_string(),
                 },
                 f.summary.clone(),

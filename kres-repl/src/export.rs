@@ -338,6 +338,8 @@ fn primary_filename(f: &Finding) -> String {
 fn status_str(s: Status) -> &'static str {
     match s {
         Status::Active => "active",
+        Status::Unconfirmed => "unconfirmed",
+        Status::Fixed => "fixed",
         Status::Invalidated => "invalidated",
     }
 }

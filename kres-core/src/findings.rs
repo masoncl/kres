@@ -74,6 +74,8 @@ impl<'de> Deserialize<'de> for Severity {
 pub enum Status {
     #[default]
     Active,
+    Unconfirmed,
+    Fixed,
     Invalidated,
 }
 

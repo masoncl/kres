@@ -1357,14 +1357,19 @@ impl Session {
                             quiescent_announced = true;
                         }
                     }
-                    // §turns0: only count tasks that actually produced
-                    // analysis. A strict growth in the merged findings
-                    // list resets the streak; anything else — whether
-                    // the delta was empty, or apply_delta folded it
-                    // into existing findings — counts as "no new
-                    // findings".
+                    // §turns0: a task counts as progress if it grew
+                    // its mode's primary output. Audit/generic grow
+                    // the merged findings list; coding grows
+                    // code_output / code_edits. Anything else — empty
+                    // delta, apply_delta folded into existing findings,
+                    // a coding turn that produced neither file nor
+                    // edit — ticks the streak.
                     if !r.analysis.is_empty() {
-                        let grew = final_list.len() > pre_size;
+                        let grew = if r.mode.produces_findings() {
+                            final_list.len() > pre_size
+                        } else {
+                            !r.code_output.is_empty() || !r.code_edits.is_empty()
+                        };
                         if grew {
                             no_new_findings_streak = 0;
                         } else {

@@ -13,10 +13,14 @@
 //!                                       sketch, open questions,
 //!                                       per-task analysis details
 //!
-//! Top-level files at `<dir>/` (INDEX.md, index.html,
-//! findings-index.py) sit alongside the `findings/` subtree so a
-//! GitHub Pages publish of the export keeps the entry-point files
-//! at the root and per-finding clutter one level down.
+//! `--export` writes the per-finding folders under
+//! `<dir>/findings/` and installs the bundled README.md and
+//! findings-index.py at the top level so the search/regen
+//! tooling is ready to hand. It does *not* run the script:
+//! INDEX.md and index.html are produced by the separate
+//! `--export-index <dir>` mode, which shells out to python3.
+//! Splitting the two keeps `--export` free of any python3
+//! dependency at run time.
 //!
 //! `<tag>` is the finding's `id`, sanitized so it's safe as a
 //! directory name. Collisions after sanitizing get a numeric suffix.
@@ -116,13 +120,13 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
         written,
         output_dir.display()
     );
-    // Regenerate INDEX.md so every --export run leaves a ready-to-read
-    // top-level overview alongside the per-finding folders. Parses the
-    // metadata.yaml files we just wrote rather than reusing the
-    // in-memory findings list — keeps the code path identical to
-    // `--export-index` so the two outputs can't drift.
-    let index = run_export_index(&output_dir)?;
-    eprintln!("--export: index   = {}", index.display());
+    // Drop the bundled README + findings-index.py alongside the
+    // per-finding folders so operators have the search/regen tooling
+    // ready to hand. We install only — running `--generate` is left
+    // to `--export-index DIR`, which keeps `--export` free of any
+    // python3 dependency.
+    install_export_readme(&output_dir);
+    install_index_script(&output_dir);
     Ok(())
 }
 
@@ -187,31 +191,43 @@ fn install_export_readme(dir: &Path) {
     eprintln!("--export: installed {}", readme_path.display());
 }
 
-/// Copy the bundled index-html generator into `dir` if it isn't
-/// already there, then run it with cwd = `dir`. Failures along
-/// either step print a diagnostic to stderr but do not propagate —
-/// INDEX.md is already on disk, and the script itself is editable
-/// by the operator, so a missing python interpreter or a hand-edited
-/// script that errors out shouldn't abort an otherwise-successful
-/// export.
-fn run_index_script(dir: &Path) {
+/// Install the bundled findings-index.py into `dir` if it isn't
+/// already there. Returns the script path on success, `None` on a
+/// write/chmod error (already logged to stderr). Don't-overwrite
+/// rule matches the README install: an operator-edited script
+/// survives kres re-runs.
+fn install_index_script(dir: &Path) -> Option<PathBuf> {
     let script_path = dir.join(INDEX_SCRIPT_NAME);
-    if !script_path.exists() {
-        if let Err(e) = std::fs::write(&script_path, INDEX_SCRIPT_BODY) {
-            eprintln!("--export: couldn't install {} ({e})", script_path.display());
-            return;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o755);
-            if let Err(e) = std::fs::set_permissions(&script_path, perms) {
-                eprintln!("--export: couldn't chmod {} ({e})", script_path.display());
-                return;
-            }
-        }
-        eprintln!("--export: installed {}", script_path.display());
+    if script_path.exists() {
+        return Some(script_path);
     }
+    if let Err(e) = std::fs::write(&script_path, INDEX_SCRIPT_BODY) {
+        eprintln!("--export: couldn't install {} ({e})", script_path.display());
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        if let Err(e) = std::fs::set_permissions(&script_path, perms) {
+            eprintln!("--export: couldn't chmod {} ({e})", script_path.display());
+            return None;
+        }
+    }
+    eprintln!("--export: installed {}", script_path.display());
+    Some(script_path)
+}
+
+/// Install findings-index.py (if needed) and invoke it with
+/// `--generate` to regenerate INDEX.md and index.html. Failures
+/// along either step print a diagnostic to stderr but do not
+/// propagate — the script itself is editable by the operator, so
+/// a missing python interpreter or a hand-edited script that
+/// errors out shouldn't abort an otherwise-successful export.
+fn run_index_script(dir: &Path) {
+    let Some(script_path) = install_index_script(dir) else {
+        return;
+    };
     let status = std::process::Command::new(&script_path)
         .arg("--generate")
         .current_dir(dir)

@@ -586,9 +586,33 @@ impl Session {
         self.mgr
             .set_completed_run_count(state.completed_run_count)
             .await;
+        // Pull deferred items back into the active todo list as
+        // Pending so auto-continue can dispatch them immediately
+        // after resume. Without this, the deferred list is
+        // invisible to should_auto_continue (which checks the todo
+        // list only), and --one / exit_on_idle sessions exit before
+        // deferred work is ever dispatched.
         {
+            use kres_core::TodoStatus;
             let mut def = self.deferred.lock().await;
             *def = state.deferred.clone();
+            if !def.is_empty() {
+                let carry = def.len();
+                let mut items = self.mgr.todo_snapshot().await;
+                let existing: std::collections::BTreeSet<String> =
+                    items.iter().map(|i| i.name.clone()).collect();
+                for mut d in def.drain(..) {
+                    if existing.contains(&d.name) {
+                        continue;
+                    }
+                    d.status = TodoStatus::Pending;
+                    items.push(d);
+                }
+                self.mgr.replace_todo(items).await;
+                kres_core::async_eprintln!(
+                    "resume: pulled {carry} deferred item(s) into todo list"
+                );
+            }
         }
         if let Some(p) = state.last_prompt.clone() {
             *self.last_prompt.lock().await = Some(p);

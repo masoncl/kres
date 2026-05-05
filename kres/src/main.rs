@@ -762,7 +762,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         // persistence.
         results_dir: args.results.clone(),
         template_path: args.template.clone(),
-        stdio: args.stdio,
+        stdio: args.stdio || !std::io::IsTerminal::is_terminal(&std::io::stdout()),
         // TUI is now the default on a TTY. Precedence:
         // --stdio (plain)  >  --no-tui (rustyline)  >  --tui
         // (force on)  >  auto (TUI when stdout is a TTY).

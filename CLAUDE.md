@@ -110,7 +110,11 @@ stdout is not a TTY (piped/batch) or `--one` is passed:
 the reaper calls `drain_pending_blocked()`, moving all
 pending/blocked items to deferred. This makes
 `pending_or_blocked == 0` so `followups_drained` fires on the
-next reaper tick.
+next reaper tick. Exception: when `--follow` and `--turns N > 0`
+are both set, the goal-met handler immediately pulls deferred
+items back into the todo list as Pending so auto-continue
+dispatches them and the session keeps working until the turns cap
+is reached.
 
 **Implication**: under `--turns 0` with a goal agent, a todo item
 stuck at `Pending` does not block termination if the goal agent
@@ -118,6 +122,19 @@ declares "met" (the drain clears it). But if the goal agent keeps
 saying "not met" while a todo is stuck `Pending`, the session
 cannot self-terminate — `pending_or_blocked > 0` forever and the
 stagnation watchdog only fires with `--follow`.
+
+**`--resume`**: loads a prior `session.json` (plan, todo list,
+deferred list, completed_run_count). Deferred items are
+automatically pulled into the todo list as Pending so
+auto-continue can dispatch them immediately. When `--resume`
+loads successfully, `--prompt` is ignored (with a stderr warning)
+to prevent `define_goal` + `define_plan` from overwriting the
+resumed plan.
+
+**`--stdio` auto-detection**: `cfg.stdio` is set automatically
+when stdout is not a TTY. This suppresses DECSTBM scroll-region
+escape sequences that would otherwise pollute piped/redirected
+output. The explicit `--stdio` flag still works as an override.
 
 `--gather-turns` (default 5) is a **separate** cap: max fast↔main
 gather rounds within a single task before forcing the slow agent.

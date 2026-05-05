@@ -1606,9 +1606,39 @@ impl Session {
                                 deferred.extend(drained);
                                 drop(deferred);
                                 if carry > 0 {
-                                    kres_core::async_eprintln!(
-                                    "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
-                                );
+                                    if follow_followups && turns_limit > 0 {
+                                        // --follow + --turns N: pull the
+                                        // deferred items right back into
+                                        // the todo list so auto-continue
+                                        // dispatches them. Without this,
+                                        // goal-met drains to deferred,
+                                        // followups_drained fires, and
+                                        // the session exits with turns
+                                        // still remaining.
+                                        let mut def = deferred_for_reaper.lock().await;
+                                        let mut items = mgr_for_reaper.todo_snapshot().await;
+                                        let existing: std::collections::BTreeSet<String> =
+                                            items.iter().map(|i| i.name.clone()).collect();
+                                        let mut pulled = 0usize;
+                                        for mut d in def.drain(..) {
+                                            if existing.contains(&d.name) {
+                                                continue;
+                                            }
+                                            d.status = kres_core::TodoStatus::Pending;
+                                            items.push(d);
+                                            pulled += 1;
+                                        }
+                                        drop(def);
+                                        mgr_for_reaper.replace_todo(items).await;
+                                        kres_core::async_eprintln!(
+                                            "[goal met, --follow: pulled {pulled} deferred item(s) back into todo list ({} turns remaining)]",
+                                            turns_limit.saturating_sub(mgr_for_reaper.completed_run_count().await)
+                                        );
+                                    } else {
+                                        kres_core::async_eprintln!(
+                                            "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
+                                        );
+                                    }
                                 }
                                 // Per-task goal already removed at the
                                 // top of this branch by .remove(&r.id);

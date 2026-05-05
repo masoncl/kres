@@ -54,6 +54,75 @@ User prompt → Task created → Task thread starts
 - Auto-progress checks goal after each completed task for early exit
 - Deferred items (identified but not started when goal met) saved via `/followup`
 
+### Session Termination (`--turns`)
+
+`--turns N` controls when the REPL exits. The counter is
+`completed_run_count`, incremented in `TaskManager::finish_ok`
+(kres-core task.rs) when a reaped task produced non-empty
+`analysis`, `code_output`, or `code_edits`:
+
+```rust
+let produced = !entry.analysis.is_empty()
+    || !entry.code_output.is_empty()
+    || !entry.code_edits.is_empty();
+if produced {
+    g.completed_run_count = g.completed_run_count.saturating_add(1);
+}
+```
+
+One completed task = one fast+slow agent cycle for a single todo
+item.
+
+**`--turns N > 0`**: stop after N completed task runs. Once
+`done >= turns_limit` in the reaper loop, it drains
+pending/blocked todos to `/followup` and cancels root shutdown.
+
+**`--turns 0` (default, unlimited)**: stop condition is computed
+in the reaper's `else` branch (`// --turns 0 (unlimited)`):
+
+```rust
+let should_stop = if follow_followups {
+    followups_drained || no_progress
+} else if goal_configured {
+    followups_drained
+} else {
+    no_goal_batch_stop
+};
+```
+
+Where `followups_drained = active == 0 && pending_or_blocked == 0`,
+`no_progress = no_new_findings_streak >= 3`, and
+`no_goal_batch_stop = !goal_configured && !follow_followups && active == 0`.
+
+So:
+- With `--follow`: stop on drained OR 3-run stagnation streak.
+- With goal agent (no `--follow`): stop **only** when drained.
+  The stagnation streak is ignored.
+- Without goal agent or `--follow`: stop when `active == 0`
+  (batch finished), defers leftover followups.
+
+`exit_on_idle` (set in main.rs `ReplConfig` init) controls whether
+the REPL exits on stop or stays open for more input. True when
+stdout is not a TTY (piped/batch) or `--one` is passed:
+`args.one || !std::io::IsTerminal::is_terminal(&std::io::stdout())`.
+
+**Goal-met drain**: when `check_goal` returns `check.met == true`,
+the reaper calls `drain_pending_blocked()`, moving all
+pending/blocked items to deferred. This makes
+`pending_or_blocked == 0` so `followups_drained` fires on the
+next reaper tick.
+
+**Implication**: under `--turns 0` with a goal agent, a todo item
+stuck at `Pending` does not block termination if the goal agent
+declares "met" (the drain clears it). But if the goal agent keeps
+saying "not met" while a todo is stuck `Pending`, the session
+cannot self-terminate — `pending_or_blocked > 0` forever and the
+stagnation watchdog only fires with `--follow`.
+
+`--gather-turns` (default 5) is a **separate** cap: max fast↔main
+gather rounds within a single task before forcing the slow agent.
+Per-task, not per-session.
+
 ### Plan + Session Persistence
 - `kres_core::Plan` holds the planner's decomposition: `prompt`, `goal`,
   `mode`, and `steps` (each with `id`, `title`, `status`, `todo_ids`
@@ -189,3 +258,90 @@ Rate limiters are shared across agents that use the same API key string.
   code.jsonl                  # All fast + slow agent turns
   main.jsonl                  # All main agent turns
 ```
+
+Note: `~/.kres/sessions/` holds per-run artifacts (findings.json,
+report.md, session.json) but NOT the JSONL logs. The JSONL logs
+live only in `<cwd>/.kres/logs/<uuid>/`, created by `TurnLogger::new`
+(kres-core log.rs). The uuid is derived from pid + timestamp via
+uuid5 so parallel kres processes don't collide.
+
+## Reading JSONL Log Files
+
+Both `code.jsonl` and `main.jsonl` are newline-delimited JSON. Each
+line is a `LogEntry` with fields: `role`, `content`, and optionally
+`usage` (token counts) and `thinking` (slow agent reasoning).
+
+### code.jsonl
+
+Alternating user/assistant records for the fast+slow agent pipeline.
+
+**User records** (`role: "user"`): the `content` field is a JSON
+string containing the prompt assembled by the pipeline. Key fields:
+
+| Field | Description |
+|-------|-------------|
+| `question` | The task prompt (e.g. `COMPILE TRIAGE ONLY ...` or the original user prompt) |
+| `plan` | Current plan with `steps[]`, each having `title` and `status` (`pending`/`done`/`skipped`) |
+| `skills` | Loaded skill file contents |
+| `symbols` | Source code gathered by the main agent |
+| `context` | Additional context (prior analysis, tool results) |
+| `previously_fetched` | Manifest of data gathered in earlier rounds |
+
+**Assistant records** (`role: "assistant"`): `content` is either
+structured JSON (fast agent) or raw prose (slow agent).
+
+Fast agent JSON — keys:
+
+| Field | Description |
+|-------|-------------|
+| `analysis` | Free-text narrative of what the agent found/decided |
+| `followups` | Array of `{type, name, reason}` — data requests or actions. Types: `read`, `source`, `git`, `make`, `search`, `publish-fix`, `bash`, `callers`, `question` |
+| `ready_for_slow` | `true` = fast agent is done gathering, hand off to slow agent |
+| `skill_reads` | Additional skill files to load |
+| `code_edits` | Array of `{path, old_string, new_string}` surgical edits (coding mode) |
+| `code_output` | Array of `{path, content}` file writes (coding mode) |
+
+Slow agent raw text — not valid JSON. This is the deep analysis
+or review output. Starts with `[INVALID]` when the bug is
+determined to be not real. In review steps, may contain `DEFECT`
+markers.
+
+### main.jsonl
+
+Alternating user/assistant records for the main agent, todo agent,
+and goal agent.
+
+**Main agent assistant responses**: either `<actions>[...]</actions>`
+XML containing data-fetch requests (`read`, `source`, `git`, `grep`,
+`mcp`, `make`, `bash`), or JSON with `goal`/`mode` (initial goal
+definition) or `todo` (todo-list updates).
+
+**Todo agent responses** — JSON with a `todo` key containing the
+full todo list. Each item has:
+
+| Field | Description |
+|-------|-------------|
+| `id` | Stable identifier (e.g. `research-done`, `compile-verify`) |
+| `name` | Human-readable description |
+| `status` | `pending`, `done`, `blocked`, `skipped` |
+| `reason` | Why the item was created or completed |
+| `depends_on` | List of item ids that must complete first |
+
+**Plain text responses** from the main agent (e.g. `"done"`,
+`"compile clean — ..."`) appear between action rounds when the
+agent reports results or concludes a service cycle.
+
+### Tracing a session through logs
+
+To understand what a session did:
+
+1. Scan `code.jsonl` user records for the `plan.steps[].status`
+   progression — this shows which steps completed vs stuck.
+2. Scan `code.jsonl` assistant records: JSON = fast agent
+   (look at `analysis` + `followups`), raw text = slow agent
+   (look for `[INVALID]`, `DEFECT`, or review verdicts).
+3. Check `main.jsonl` for `todo` entries to see todo item status
+   transitions — this is where `compile-verify: pending → done`
+   (or not) gets recorded.
+4. Token usage is on every assistant record in the `usage` field:
+   `{input, output, cache_creation, cache_read}`.

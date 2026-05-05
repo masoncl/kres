@@ -790,6 +790,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // state when the operator re-uses a results dir by accident.
     // When the flag is absent but a session.json is present, log a
     // hint so the operator knows the state is available.
+    let mut resumed_ok = false;
     if args.resume {
         // Prefer the live session.json; fall back to
         // session.json.prev when the live file is missing. The
@@ -826,6 +827,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                     let short: String = prompt.chars().take(80).collect();
                     kres_core::async_eprintln!("resume: last prompt: {}", short);
                 }
+                resumed_ok = true;
             }
             Ok(None) => {
                 kres_core::async_eprintln!(
@@ -1130,18 +1132,25 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         );
     }
     if let Some(ref raw_arg) = args.prompt {
-        match resolve_prompt_arg(raw_arg) {
-            Ok((source, body)) => {
-                let pf = kres_agents::parse_prompt_file(&body);
-                kres_core::async_eprintln!(
-                    "prompt: loaded {} lens(es) + {} chars of prose from {}",
-                    pf.lenses.len(),
-                    pf.prompt.len(),
-                    source,
-                );
-                session = session.with_prompt_file(pf);
+        if resumed_ok {
+            kres_core::async_eprintln!(
+                "resume: ignoring --prompt because --resume loaded prior state; \
+                 use /continue to dispatch pending items"
+            );
+        } else {
+            match resolve_prompt_arg(raw_arg) {
+                Ok((source, body)) => {
+                    let pf = kres_agents::parse_prompt_file(&body);
+                    kres_core::async_eprintln!(
+                        "prompt: loaded {} lens(es) + {} chars of prose from {}",
+                        pf.lenses.len(),
+                        pf.prompt.len(),
+                        source,
+                    );
+                    session = session.with_prompt_file(pf);
+                }
+                Err(e) => kres_core::async_eprintln!("prompt: {e}"),
             }
-            Err(e) => kres_core::async_eprintln!("prompt: {e}"),
         }
     }
     session.run().await

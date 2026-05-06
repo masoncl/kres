@@ -151,8 +151,9 @@ const EXPORT_README_BODY: &str = include_str!("../../scripts/export-README.md");
 const EXPORT_README_NAME: &str = "README.md";
 
 /// Install `findings-index.py` into `dir` (if absent) and run it
-/// with cwd = `dir`. The script walks `<dir>/*/metadata.yaml`, sorts
-/// the rows by severity then date then id, and writes both
+/// with cwd = `dir`. The script walks
+/// `<dir>/findings/*/metadata.yaml`, sorts the rows by severity then
+/// date then id, and writes both
 /// `<dir>/INDEX.md` and `<dir>/index.html`. kres no longer renders
 /// either file directly so operators can iterate on layout, columns,
 /// or filters without rebuilding the binary — they edit the per-export

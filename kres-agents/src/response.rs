@@ -64,11 +64,6 @@ pub struct CodeResponse {
     pub strategy: ParseStrategy,
 }
 
-/// Re-export of kres_core::CodeEdit so older callers that import
-/// `kres_agents::CodeEdit` continue to compile. The canonical type
-/// lives in kres-core so TaskOutcome can carry it.
-pub use kres_core::CodeEdit;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ParseStrategy {
     #[default]
@@ -228,13 +223,13 @@ fn value_to_plan(v: Value) -> Option<kres_core::PlanRewrite> {
     }
 }
 
-fn value_to_code_edits(v: Value) -> Vec<CodeEdit> {
+fn value_to_code_edits(v: Value) -> Vec<kres_core::CodeEdit> {
     let Value::Array(items) = v else {
         return vec![];
     };
     items
         .into_iter()
-        .filter_map(|i| serde_json::from_value::<CodeEdit>(i).ok())
+        .filter_map(|i| serde_json::from_value::<kres_core::CodeEdit>(i).ok())
         .filter(|e| !e.file_path.is_empty() && !e.old_string.is_empty())
         .collect()
 }

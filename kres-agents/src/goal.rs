@@ -164,6 +164,16 @@ fn build_define_goal_request(prompt: &str, plan: Option<&kres_core::Plan>) -> se
                          ignore the plan and frame the goal on the \
                          query's own terms — do not force-fit an \
                          unrelated prompt into an existing step.\n\
+                         Treat tool names, workflow names, and output \
+                         schema names in the prompt as infrastructure, \
+                         not as the codebase under review. For example, \
+                         a request for Finding records names the output \
+                         format; it does not imply the target project. \
+                         If the target is a git ref such as HEAD, scope \
+                         the goal to the changes introduced by that ref \
+                         in the current workspace repository, not to a \
+                         whole-tree audit unless the prompt explicitly \
+                         asks for one.\n\
                          Return JSON only:\n\
                          {\"goal\": \"specific completion criteria\", \
                           \"mode\": \"audit\" | \"generic\" | \"coding\"}"
@@ -247,13 +257,12 @@ pub async fn define_goal(
 /// every file one by one") against the derived `goal` string that
 /// may have compressed or generalised that intent during
 /// define_goal.
-pub async fn check_goal(
-    gc: &GoalClient,
+fn build_check_goal_request(
     original_prompt: &str,
     goal: &str,
     analysis: &str,
     plan: Option<&kres_core::Plan>,
-) -> GoalCheck {
+) -> serde_json::Value {
     let mut request = json!({
         "task": "check_goal",
         "original_prompt": original_prompt,
@@ -269,8 +278,19 @@ pub async fn check_goal(
                          list the remaining items in `missing`. When a \
                          `plan` field is present, use it as a checklist: \
                          treat the goal as unmet when concrete, untouched \
-                         plan steps still apply to this prompt. Return \
-                         JSON only:\n\
+                         plan steps still apply to this prompt. In audit \
+                         mode, negative coverage claims require evidence. \
+                         Do not accept claims such as no remaining users, \
+                         all callers updated, old path unreachable, only \
+                         reader, or only writer unless the analysis cites \
+                         concrete source, type, search, caller/callee, or history \
+                         evidence. If a plan step says to trace unchanged \
+                         callers, callees, callbacks, readers, writers, \
+                         shared helpers, or old-contract users, and the \
+                         analysis only asserts that this was checked without \
+                         naming the concrete evidence, set met=false and \
+                         put the missing source/type/search/callgraph/history \
+                         item in `missing`. Return JSON only:\n\
                          {\"met\": true/false, \"reason\": \"why or why not\", \
                          \"missing\": [\"what still needs to be done\"]}"
     });
@@ -282,6 +302,17 @@ pub async fn check_goal(
                 .insert("plan".into(), v);
         }
     }
+    request
+}
+
+pub async fn check_goal(
+    gc: &GoalClient,
+    original_prompt: &str,
+    goal: &str,
+    analysis: &str,
+    plan: Option<&kres_core::Plan>,
+) -> GoalCheck {
+    let request = build_check_goal_request(original_prompt, goal, analysis, plan);
     let body = match serde_json::to_string_pretty(&request) {
         Ok(s) => s,
         Err(_) => return assume_met(),
@@ -399,7 +430,16 @@ pub async fn define_plan(
                          churning ids orphans todos that were \
                          pointing at them. Only produce a wholly \
                          fresh plan when the new prompt is clearly \
-                         a different topic. Return JSON only:\n\
+                         a different topic. Treat tool names, workflow \
+                         names, and schema names in the prompt as \
+                         infrastructure, not as source-tree names. If \
+                         the target is HEAD or another git ref, first \
+                         decompose around files, symbols, or subsystems \
+                         in the current workspace repository's target \
+                         diff/stat; do not add a repo-survey step or \
+                         whole-tree audit unless the prompt explicitly \
+                         asks for one. Do not invent a project layout \
+                         from the tool/schema wording. Return JSON only:\n\
                          {\"steps\": [{\"id\": \"audit-...\", \"title\": \"...\", \
                          \"description\": \"...\"}]}"
     });
@@ -582,7 +622,7 @@ mod tests {
         // Generic — matches goal.txt's "Default to 'generic' when
         // ambiguous" policy.
         let r: DefineResponse =
-            extract_json_with_key(r#"{"goal": "audit btrfs for efficiency"}"#, "goal").unwrap();
+            extract_json_with_key(r#"{"goal": "audit target for efficiency"}"#, "goal").unwrap();
         assert!(r.mode.is_none(), "mode field absent in reply");
         assert_eq!(r.mode.unwrap_or_default(), kres_core::TaskMode::Generic);
     }
@@ -656,6 +696,42 @@ mod tests {
         assert!(
             r.as_object().unwrap().get("plan").is_none(),
             "plan key should be absent when caller passes None",
+        );
+    }
+
+    #[test]
+    fn define_goal_request_treats_schema_names_as_infrastructure() {
+        let r = build_define_goal_request("review HEAD and emit Finding records", None);
+        let instructions = r
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .expect("instructions present");
+        assert!(instructions.contains("schema names"));
+        assert!(instructions.contains("current workspace repository"));
+        assert!(instructions.contains("does not imply the target project"));
+        assert!(instructions.contains("not to a whole-tree audit"));
+    }
+
+    #[test]
+    fn check_goal_request_rejects_unsupported_negative_coverage_claims() {
+        let plan = sample_plan();
+        let r = build_check_goal_request(
+            "review target for concrete bugs",
+            "audit target",
+            "analysis says old path unreachable",
+            Some(&plan),
+        );
+        let instructions = r
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .expect("instructions present");
+        assert!(instructions.contains("negative coverage claims require evidence"));
+        assert!(instructions.contains("all callers updated"));
+        assert!(instructions.contains("source, type, search, caller/callee, or history"));
+        assert!(instructions.contains("set met=false"));
+        assert!(
+            r.as_object().unwrap().get("plan").is_some(),
+            "plan key should be present for checklist-based goal judging",
         );
     }
 

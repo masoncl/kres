@@ -28,8 +28,8 @@ The results of every turn are used to reprioritize the todo list, and identify
 additional context needed for the next round.
 
 See [docs/agents.md](docs/agents.md) for the task flow and
-[docs/review-template.md](docs/review-template.md) for the
-parallel-lens review.
+[docs/workflow.md](docs/workflow.md) for the shipped review and fix
+workflows.
 
 ## Quick start
 
@@ -58,18 +58,17 @@ parallel-lens review.
 
    ```
    cd linux
-   kres --results review --prompt 'review: fs/btrfs/ctree.c' --turns 2
+   kres --results review --prompt 'review: fs/btrfs/ctree.c'
    kres --summary-markdown --results review
    # review/summary.md now has your results
    ```
 
-   `--prompt 'review: X'` invokes the embedded review template —
-   a five-lens parallel audit over the target. `--results DIR`
+   `--prompt 'review: X'` invokes the embedded review workflow —
+   a parallel lensed audit over the target. `--results DIR`
    keeps the run's artifacts under `DIR/` (findings.json,
-   report.md, summary.txt). `--turns 2` stops after two
-   completed tasks; see
-   [docs/turns-and-follow.md](docs/turns-and-follow.md) for the
-   other stop modes.
+   report.md, summary.txt). For workflow prompts, `--turns N`
+   caps workflow step executions; for ordinary REPL task runs, see
+   [docs/turns-and-follow.md](docs/turns-and-follow.md).
 
 Two optional integrations are worth wiring up while you're
 here: semcode-mcp for whole-program code navigation and the
@@ -94,8 +93,8 @@ a one-dir-per-finding format:
 
 - [docs/agents.md](docs/agents.md) — fast / main / slow / todo /
   merger flow and how follow-up tasks drive larger reviews.
-- [docs/review-template.md](docs/review-template.md) — the
-  parallel-lens review flow behind `--prompt "review:"`.
+- [docs/workflow.md](docs/workflow.md) — the workflow-backed
+  `/review`, `/triage`, and `/fix` flows.
 - [docs/coding-tasks.md](docs/coding-tasks.md) — reproducer and
   fix generation (`code_output`, `code_edits`, `bash` verify).
 - [docs/turns-and-follow.md](docs/turns-and-follow.md) — when
@@ -106,8 +105,8 @@ a one-dir-per-finding format:
 - [docs/configuration.md](docs/configuration.md) — `~/.kres/`
   layout, model selection, system-prompt overrides, semcode MCP
   integration, and kernel review-prompts setup.
-- [docs/commands.md](docs/commands.md) — slash-command templates
-  (`/review`, `/summary`, operator-authored additions).
+- [docs/commands.md](docs/commands.md) — command dispatch paths
+  and operator-authored prompt-template additions.
 - [docs/cli.md](docs/cli.md) — every CLI flag and REPL command.
 - [docs/development.md](docs/development.md) — workspace layout,
   build / test / lint, pre-commit hook.

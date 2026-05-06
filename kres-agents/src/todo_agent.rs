@@ -184,7 +184,6 @@ pub async fn update_todo_via_agent_with_logger(
     if let Some(lg) = &logger {
         lg.log_main("user", &request_text, None, None);
     }
-
     let resp_result = tc.client.messages_streaming(&cfg, &messages).await;
     let resp = match resp_result {
         Ok(r) => r,
@@ -210,7 +209,6 @@ pub async fn update_todo_via_agent_with_logger(
             None,
         );
     }
-
     // --- Parse response ------------------------------------------------
     // Try the combined (todo + plan) envelope first so the agent's
     // optional plan rewrite survives; fall back to the todo-only
@@ -340,7 +338,15 @@ pub async fn update_todo_via_agent_with_logger(
     // into one (their .o paths differ even though the surrounding
     // prose is near-identical).
     let mut ref_entries: Vec<DedupEntry> = Vec::new();
+    let mut completed_ids: HashSet<String> = HashSet::new();
+    let mut completed_names: HashSet<String> = HashSet::new();
     for d in done_final.iter().chain(preserved.iter()) {
+        if !d.id.is_empty() {
+            completed_ids.insert(d.id.clone());
+        }
+        if !d.name.is_empty() {
+            completed_names.insert(d.name.to_ascii_lowercase());
+        }
         let bag = format!("{} {} {}", d.name, d.reason, d.coverage);
         let entry = DedupEntry::from_bag(d.name.clone(), &bag);
         if !entry.is_empty() {
@@ -350,6 +356,10 @@ pub async fn update_todo_via_agent_with_logger(
     let mut filtered_pending: Vec<TodoItem> = Vec::new();
     let mut dropped: Vec<(String, String)> = Vec::new();
     for p in pending_from_agent.into_iter() {
+        if pending_matches_completed_exact(&p, &completed_ids, &completed_names) {
+            dropped.push((p.name.clone(), "completed item".to_string()));
+            continue;
+        }
         let bag = format!("{} {}", p.name, p.reason);
         let entry = DedupEntry::from_bag(p.name.clone(), &bag);
         if entry.is_empty() {
@@ -404,6 +414,16 @@ pub async fn update_todo_via_agent_with_logger(
         todo: result,
         plan: returned_plan,
     })
+}
+
+fn pending_matches_completed_exact(
+    pending: &TodoItem,
+    completed_ids: &HashSet<String>,
+    completed_names: &HashSet<String>,
+) -> bool {
+    (!pending.id.is_empty() && completed_ids.contains(&pending.id))
+        || (!pending.name.is_empty()
+            && completed_names.contains(&pending.name.to_ascii_lowercase()))
 }
 
 fn todo_to_payload(t: &TodoItem) -> Value {
@@ -889,9 +909,14 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          - 1-2 sentences naming the concrete files, symbols, and \
          line ranges the analysis examined for that item, plus the \
          bottom-line finding.\n\
-         - Example: 'Covered drivers/net/netkit.c:80-115 \
-         (netkit_run, netkit_xmit, scrub path). Finding: scrub is \
-         no-op when endpoints share netns (CVE-2020-8558 class).'\n\
+         - For plan steps that trace unchanged callers, callees, \
+         callbacks, readers, writers, shared helpers, or old-contract \
+         users, status=done requires concrete cited evidence from the \
+         analysis: source names, search results, caller/callee lists, \
+         or history. Do NOT mark such a step done from a bare statement \
+         like 'all paths checked', 'no remaining users', or 'old path \
+         unreachable'. Keep it pending or emit a narrow followup when \
+         evidence is missing.\n\
          - If a done item already has a non-empty coverage field, \
          keep it verbatim unless the new analysis meaningfully extends \
          what it covered — in which case append one sentence.\n\
@@ -1200,6 +1225,15 @@ mod tests {
     }
 
     #[test]
+    fn todo_instructions_keep_trace_steps_pending_without_evidence() {
+        let body = build_instructions(true, true);
+        assert!(body.contains("trace unchanged callers, callees"));
+        assert!(body.contains("status=done requires concrete cited evidence"));
+        assert!(body.contains("Do NOT mark such a step done"));
+        assert!(body.contains("no remaining users"));
+    }
+
+    #[test]
     fn assign_ids_populates_unique_ids() {
         let mut items = vec![
             TodoItem::new("investigate slab", "investigate"),
@@ -1210,6 +1244,37 @@ mod tests {
         assert!(!items[0].id.is_empty());
         assert_ne!(items[0].id, items[1].id);
         assert!(!items[2].id.is_empty());
+    }
+
+    #[test]
+    fn pending_exact_match_to_completed_is_duplicate() {
+        let completed = TodoItem {
+            name: "ID_REV_CHIP_ID_7800_ — enumerate all chipid-gated HW_CFG blocks".into(),
+            kind: "search".into(),
+            status: TodoStatus::Done,
+            reason: String::new(),
+            depends_on: Vec::new(),
+            coverage: "Covered lan78xx.c LED/HW_CFG sites.".into(),
+            id: "hw-cfg-led-save-restore-enum".into(),
+            step_id: String::new(),
+        };
+        let mut ids = HashSet::new();
+        ids.insert(completed.id.clone());
+        let mut names = HashSet::new();
+        names.insert(completed.name.to_ascii_lowercase());
+
+        let same_id = TodoItem {
+            status: TodoStatus::Pending,
+            ..completed.clone()
+        };
+        assert!(pending_matches_completed_exact(&same_id, &ids, &names));
+
+        let same_name = TodoItem {
+            id: "new-id".into(),
+            status: TodoStatus::Pending,
+            ..completed
+        };
+        assert!(pending_matches_completed_exact(&same_name, &ids, &names));
     }
 
     #[test]

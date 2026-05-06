@@ -749,12 +749,15 @@ impl TuiGuard {
         // would otherwise submit at the first Enter. Capture is
         // best-effort; terminals without support leave it off and
         // the old one-key-per-char behaviour keeps working.
-        execute!(
+        if let Err(e) = execute!(
             out,
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableBracketedPaste
-        )?;
+        ) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
         Ok(Self)
     }
 }
@@ -771,6 +774,27 @@ impl Drop for TuiGuard {
         let _ = disable_raw_mode();
         let _ = out.flush();
     }
+}
+
+/// Best-effort terminal restoration for paths that intentionally
+/// bypass Rust destructors, such as the second-Ctrl-C hard abort.
+///
+/// The normal TUI path relies on [`TuiGuard::drop`]. Calling
+/// `std::process::exit` skips that drop, which leaves crossterm raw
+/// mode enabled. Raw mode clears the terminal driver's ISIG bit, so
+/// the parent shell stops receiving SIGINT for Ctrl-C after kres exits.
+/// This function is deliberately idempotent and safe to call even when
+/// TUI mode was never entered.
+pub fn emergency_restore_terminal() {
+    let mut out = io::stdout();
+    let _ = execute!(
+        out,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
+    let _ = disable_raw_mode();
+    let _ = out.flush();
 }
 
 /// Suspend the TUI (leave alt screen + raw mode), run `$EDITOR` on
@@ -827,6 +851,7 @@ fn run_editor_handoff() -> Option<String> {
         return None;
     }
     if execute!(out, EnterAlternateScreen, EnableMouseCapture).is_err() {
+        let _ = disable_raw_mode();
         kres_core::async_eprintln!("/edit: re-entering alt screen failed");
         return None;
     }
@@ -1374,6 +1399,13 @@ pub fn run_tui(
                         }
                         terminal.clear()?;
                     }
+                    (KeyCode::Char('/'), _) => {
+                        // Some terminals report '/' with an
+                        // unexpected modifier in raw mode. Treat it
+                        // as literal input so slash commands survive
+                        // the TUI path.
+                        input.insert('/');
+                    }
                     (KeyCode::Up, _) => input.move_up(),
                     (KeyCode::Down, _) => input.move_down(),
                     (KeyCode::PageUp, _) => {
@@ -1438,15 +1470,13 @@ pub fn run_tui(
                     }
                     (KeyCode::Home, _) => input.cursor = 0,
                     (KeyCode::End, _) => input.cursor = input.char_len(),
-                    (KeyCode::Esc, _) => {
+                    (KeyCode::Esc, _) if input.hist_idx.is_some() => {
                         // Matches the convention "Esc drops out of
                         // history browse" — restore the stashed
-                        // draft. A no-op when not browsing.
-                        if input.hist_idx.is_some() {
-                            input.hist_idx = None;
-                            input.buf = std::mem::take(&mut input.draft);
-                            input.cursor = input.char_len();
-                        }
+                        // draft.
+                        input.hist_idx = None;
+                        input.buf = std::mem::take(&mut input.draft);
+                        input.cursor = input.char_len();
                     }
                     (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
                         input.insert(c);

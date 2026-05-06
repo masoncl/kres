@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Followup {
-    /// "source", "callers", "callees", "search", "file", "read",
-    /// "git", "question".
+    /// "source", "type", "callers", "callees", "search", "file",
+    /// "read", "git", "question".
     #[serde(rename = "type")]
     pub kind: String,
     /// What to fetch: a symbol name, a regex, a path, etc.
@@ -31,15 +31,6 @@ impl Followup {
         } else {
             format!("{}::{}", self.kind, self.name)
         }
-    }
-
-    /// Reason tag convention ([MISSING] / [EXTEND]) used by the todo
-    /// agent to determine "is this followup resolved?".
-    pub fn reason_tag(&self) -> Option<&str> {
-        ["[MISSING]", "[EXTEND]", "[FLAG]"]
-            .into_iter()
-            .find(|&tag| self.reason.contains(tag))
-            .map(|v| v as _)
     }
 }
 
@@ -72,23 +63,5 @@ mod tests {
         let mut f2 = f.clone();
         f2.path = None;
         assert_eq!(f2.cache_key(), "search::x");
-    }
-
-    #[test]
-    fn reason_tag_detection() {
-        let f = Followup {
-            kind: "source".into(),
-            name: "x".into(),
-            reason: "[MISSING] slow agent needs the def".into(),
-            path: None,
-        };
-        assert_eq!(f.reason_tag(), Some("[MISSING]"));
-        let g = Followup {
-            kind: "source".into(),
-            name: "x".into(),
-            reason: "just because".into(),
-            path: None,
-        };
-        assert_eq!(g.reason_tag(), None);
     }
 }

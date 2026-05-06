@@ -36,7 +36,11 @@ FINDINGS — only when a bug actually surfaces:
 - DELTA SEMANTICS — the findings array is applied as a delta keyed by 'id' by a deterministic Rust pass, not an LLM merger. NEW id appends; EXISTING id (matching a 'previous_findings' entry) updates the existing record in place (union relevant_symbols / relevant_file_sections / related_finding_ids / open_questions, non-empty prose fields overwrite, severity only rises); EXISTING id with "status": "invalidated" flips the existing record to invalidated — use this when new context you just saw makes a prior finding wrong (guard you missed, bound already enforced, ordering actually honoured). Emit ONLY entries you are adding, extending, or invalidating this turn, never the full list.
 
 Followup types (same schema the fast agent uses):
-- "source" / "callers" / "callees" — symbol name
+- "source" — function/macro definition. name = symbol name.
+- "type" — struct/union/typedef definition. name = type name,
+  preferably without a `struct` or `union` prefix. Use this instead
+  of `search` or `read` when you need a type definition.
+- "callers" / "callees" — symbol name
 - "search" — regex grep. name = pattern. add "path" to scope.
 - "file" — name = glob
 - "read" — name = "file.c:100+50"

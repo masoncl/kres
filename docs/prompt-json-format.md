@@ -50,7 +50,7 @@ Each entry in `symbols` describes a kernel code symbol.
 
 | Field        | Type    | Description                                                |
 |--------------|---------|------------------------------------------------------------|
-| `name`       | string  | Symbol name (e.g. `btrfs_reserve_extent`).                 |
+| `name`       | string  | Symbol name.                                               |
 | `type`       | string  | One of: `function`, `struct`, `union`, `enum`, `typedef`, `macro_function`, `define`. |
 | `filename`   | string  | Source file path relative to the kernel tree root.         |
 | `line`       | integer | Line number where the symbol starts (including leading comment). |

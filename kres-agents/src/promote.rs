@@ -15,21 +15,26 @@
 //!    translation at pipeline.rs handles RawText too, so this path
 //!    is a belt-and-braces catch.)
 //!
+//! It also closes the symmetric stale-truth gap: later prose can
+//! disprove or reactivate an existing finding, and that must update
+//! the store instead of leaving the old row active forever.
+//!
 //! This pass runs once per reaped Analysis/Generic task, after all
 //! the slow-agent and consolidator work is done, with the task's
 //! effective analysis prose + a prose-relevant narrowing of the
-//! current findings universe as input. It returns ONLY the
-//! net-new findings — the reaper extends the task's delta with
-//! these before handing it to `FindingsStore::apply_delta`.
+//! current findings universe as input. It returns finding deltas:
+//! new findings, same-id invalidations, and same-id reactivations.
+//! The reaper extends the task's delta with these before handing it
+//! to `FindingsStore::apply_delta`.
 //!
 //! Failure-mode hierarchy (best → worst):
 //!   - Network error, empty prose, parse failure → empty promotion
 //!     list, no bug added.
 //!   - Promoter hits a real prose-only bug but emits an id that
-//!     collides with an entry the search narrowing missed →
-//!     `filter_net_new` renames the id to `<id>__promoted_<n>` and
-//!     lets it through. Cost is a duplicate row in `findings.json`
-//!     that a human can reconcile.
+//!     collides with an active entry the search narrowing missed →
+//!     `filter_promoted_delta` renames the id to
+//!     `<id>__promoted_<n>` and lets it through. Cost is a
+//!     duplicate row in `findings.json` that a human can reconcile.
 //!   - Only empty ids are ever dropped — there's no useful record
 //!     to keep in that case.
 //!
@@ -91,9 +96,11 @@ struct PromoteRequest<'a> {
 ///   an empty extras list. Pass `None` from tests or call sites
 ///   that don't need operator-driven cancellation.
 ///
-/// Returns the NET-NEW findings discovered in the prose (with any
-/// colliding id renamed to `<id>__promoted_<n>`). Returns an empty
-/// list when cancelled — abandonment is a safe, non-fatal outcome.
+/// Returns finding deltas discovered in the prose. New active
+/// findings with colliding ids are renamed to `<id>__promoted_<n>`.
+/// Same-id invalidations and reactivations are preserved so the
+/// store can update the existing row. Returns an empty list when
+/// cancelled — abandonment is a safe, non-fatal outcome.
 #[allow(clippy::too_many_arguments)]
 pub async fn promote_prose_bugs_with_logger(
     client: Arc<Client>,
@@ -175,7 +182,6 @@ pub async fn promote_prose_bugs_with_logger(
             None,
         );
     }
-
     let parsed = parse_code_response(&text);
     // A RawText strategy on the promoter's OWN reply means the
     // dedicated PROMOTE_SYSTEM judge-mode prompt didn't hold — the
@@ -192,14 +198,18 @@ pub async fn promote_prose_bugs_with_logger(
             "promoter reply had no parseable JSON; PROMOTE_SYSTEM drift suspected, returning empty"
         );
     }
-    Ok(filter_net_new(parsed.findings, dedup_against))
+    Ok(filter_promoted_delta(parsed.findings, dedup_against))
 }
 
-/// Ensure every promoted Finding has an id distinct from both the
-/// `existing` set and every other entry in `promoted`. On a
-/// collision, RENAME the id by appending a `__promoted_<n>` suffix
-/// rather than dropping the record. Empty ids are still dropped —
-/// there's no useful bug to keep.
+/// Filter and normalize promoted finding deltas.
+///
+/// Same-id `status: invalidated` entries and `reactivate: true`
+/// entries are preserved: they intentionally update existing rows.
+/// New active findings must have ids distinct from both the
+/// `existing` set and every other entry in `promoted`; on collision,
+/// rename by appending a `__promoted_<n>` suffix rather than
+/// dropping the record. Empty ids are still dropped — there's no
+/// useful bug to keep.
 ///
 /// Policy rationale: it is much better to store a duplicate than to
 /// miss a finding. Once we start narrowing the `existing` universe
@@ -212,13 +222,21 @@ pub async fn promote_prose_bugs_with_logger(
 /// `apply_delta_to_list` matches ids against the full store, so a
 /// renamed id always lands as a fresh append; the original store
 /// entry is untouched.
-fn filter_net_new(promoted: Vec<Finding>, existing: &[Finding]) -> Vec<Finding> {
+fn filter_promoted_delta(promoted: Vec<Finding>, existing: &[Finding]) -> Vec<Finding> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<String> = existing.iter().map(|f| f.id.clone()).collect();
     let mut out = Vec::with_capacity(promoted.len());
     for mut p in promoted {
         if p.id.is_empty() {
             continue;
+        }
+        if let Some(prior) = existing.iter().find(|e| e.id == p.id) {
+            if p.status == kres_core::findings::Status::Invalidated
+                || (p.reactivate && prior.status == kres_core::findings::Status::Invalidated)
+            {
+                out.push(p);
+                continue;
+            }
         }
         if seen.contains(&p.id) {
             let original = p.id.clone();
@@ -283,7 +301,7 @@ mod tests {
         // collision gets a __promoted_<n> suffix, not a drop.
         let existing = vec![f("a"), f("b")];
         let promoted = vec![f("a"), f("c"), f("b"), f("d")];
-        let out = filter_net_new(promoted, &existing);
+        let out = filter_promoted_delta(promoted, &existing);
         let ids: Vec<&str> = out.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec!["a__promoted_2", "c", "b__promoted_2", "d"]);
     }
@@ -292,7 +310,7 @@ mod tests {
     fn filter_renames_within_promoted_output() {
         // Two promoted entries sharing an id also get renamed so
         // both records survive into the store.
-        let out = filter_net_new(vec![f("c"), f("c"), f("d")], &[]);
+        let out = filter_promoted_delta(vec![f("c"), f("c"), f("d")], &[]);
         let ids: Vec<&str> = out.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec!["c", "c__promoted_2", "d"]);
     }
@@ -305,7 +323,7 @@ mod tests {
         pre.title = "pre-existing renamed".into();
         let existing = vec![f("x"), pre];
         let promoted = vec![f("x")];
-        let out = filter_net_new(promoted, &existing);
+        let out = filter_promoted_delta(promoted, &existing);
         let ids: Vec<&str> = out.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec!["x__promoted_3"]);
     }
@@ -315,9 +333,28 @@ mod tests {
         // Empty id still drops — there's no useful record to keep.
         let mut weird = f("");
         weird.title = "no id".into();
-        let out = filter_net_new(vec![weird, f("legit")], &[]);
+        let out = filter_promoted_delta(vec![weird, f("legit")], &[]);
         let ids: Vec<&str> = out.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec!["legit"]);
+    }
+
+    #[test]
+    fn filter_preserves_same_id_invalidations_and_reactivations() {
+        let existing = vec![f("active"), {
+            let mut inv = f("invalidated");
+            inv.status = Status::Invalidated;
+            inv
+        }];
+        let mut invalidate = f("active");
+        invalidate.status = Status::Invalidated;
+        let mut reactivate = f("invalidated");
+        reactivate.reactivate = true;
+        let out = filter_promoted_delta(vec![invalidate, reactivate], &existing);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].id, "active");
+        assert_eq!(out[0].status, Status::Invalidated);
+        assert_eq!(out[1].id, "invalidated");
+        assert!(out[1].reactivate);
     }
 
     #[tokio::test]

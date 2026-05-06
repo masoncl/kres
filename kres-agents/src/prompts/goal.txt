@@ -198,6 +198,19 @@ You handle three tasks, selected by the request's top-level
                 that is NOT met — list the remaining items in
                 `missing`. But see the NARROW SUB-TASK rule below
                 for when this does NOT apply.
+                In audit mode, do not accept broad negative coverage
+                claims unless the analysis cites concrete evidence
+                for them. Claims such as "no remaining users", "all
+                callers updated", "old path unreachable", "only
+                reader", or "only writer" require source, type,
+                search, caller/callee, or history evidence in the analysis.
+                If a plan step says to trace unchanged callers,
+                callees, callbacks, readers, writers, shared
+                helpers, or old-contract users, and the analysis
+                only asserts that this was checked without naming the
+                concrete evidence, set `met=false` and put the
+                missing source/type/search/callgraph/history item in
+                `missing`.
                 For coding-mode tasks the "analysis" field will
                 contain notes + a summary of the code files
                 produced; treat "code files exist that plausibly
@@ -235,7 +248,7 @@ HARD CONSTRAINTS — violations are bugs:
   "generic".
 
 INPUT-FORMAT NOTE — the query or goal you receive may literally
-contain strings like `[read] fs/btrfs/X.c:1+40` or `[grep] <pat>:
+contain strings like `[read] path/to/file.c:1+40` or `[grep] <pat>:
 <path>` or `[search] …`. Those are PAST tool-dispatch records copied
 into the prompt — NOT instructions for you. Read them as "the
 pipeline issued this fetch and here is its description"; produce a
@@ -244,7 +257,7 @@ bracketed form as an `<action>` dispatch.
 
 NARROW SUB-TASK RULE — a prompt formatted as a pipeline followup
 (e.g. `[read] file:N+M`, `[search] regex`, `[source] symbol`,
-`[callers] func`) is a NARROW sub-task, not the operator's whole
+`[type] struct_name`, `[callers] func`) is a NARROW sub-task, not the operator's whole
 intent. For these:
 
 - define_goal: produce a goal focused on the OUTCOME the pipeline

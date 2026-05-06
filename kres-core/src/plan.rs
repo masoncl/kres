@@ -12,9 +12,10 @@
 //!   - the goal-not-met todo-agent injection, for the same reason.
 //!
 //! Linkage is bidirectional. Each [`PlanStep`] carries `todo_ids`
-//! pointing DOWN at todos (populated rarely; mainly for tests and
-//! persisted pre-step_id state); each [`crate::TodoItem`] carries
-//! `step_id` pointing UP at a step (populated by the todo-agent).
+//! pointing DOWN at todos; each [`crate::TodoItem`] carries
+//! `step_id` pointing UP at a step. The todo-agent usually
+//! populates `step_id`, while tests and hand-built plans often fill
+//! `todo_ids` directly.
 //! A step is `Done` once every linked todo is terminal.
 //!
 //! Plans are persisted into `<results>/session.json` on mutation
@@ -132,9 +133,9 @@ impl PlanRewrite {
     /// invariants no matter how sloppy its reply is.
     pub fn apply_to(self, prior: Option<&Plan>) -> Plan {
         let mut steps = normalize_steps(self.steps);
-        // Carry forward template-authored `context` from prior steps
+        // Carry forward workflow-authored `context` from prior steps
         // with matching ids. The context field is set by embedded
-        // plan templates (fix-template.md) and is not something
+        // workflow definitions and is not something
         // agents produce, so a rewrite that omits it should inherit
         // rather than silently drop.
         if let Some(p) = &prior {
@@ -391,10 +392,8 @@ impl Plan {
     /// `TodoItem.step_id`; the step can also point DOWN at todo ids
     /// via `PlanStep.todo_ids`. This function accepts either. The
     /// `step_id` direction is easier for the todo-agent to populate
-    /// (one field per emitted todo) and the preferred mechanism
-    /// going forward; `todo_ids` stays as a compatibility path for
-    /// plans that carry pre-populated links (tests, persisted
-    /// pre-step_id state).
+    /// (one field per emitted todo); `todo_ids` is the direct
+    /// down-link used by tests and hand-built plans.
     ///
     /// Rules, in order of precedence:
     ///   - step is already terminal (`Done`/`Skipped`) → leave alone

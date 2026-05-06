@@ -78,7 +78,7 @@ Rationale:
 |---|---|---|
 | `id` | string | Short snake_case slug, ≤40 chars. Stable across updates. |
 | `title` | string | One-line human title. |
-| `severity` | enum | `low` / `medium` / `high`. Scored by exploit potential, not textbook CVSS. Legacy `critical` values in pre-existing findings.json files are folded into `high` on load. |
+| `severity` | enum | `low` / `medium` / `high`. Scored by exploit potential, not textbook CVSS. |
 | `status` | enum | `active` or `invalidated`. Default `active`. |
 | `relevant_symbols` | array[object] | **Embedded** symbol records that the reader needs to understand the bug. Each: `{name, filename, line, definition}`. Pull only what's actually referenced in summary/reproducer_sketch — NOT the entire session's symbol list. At least one required. |
 | `relevant_file_sections` | array[object] | **Embedded** source slices that aren't whole symbols (headers, tables, assembly, macros). Each: `{filename, line_start, line_end, content}`. Optional if every cited region is captured via `relevant_symbols`. |
@@ -93,8 +93,8 @@ Rationale:
 | `first_seen_task` | string | `todo_item.name` of the task that produced this finding. |
 | `last_updated_task` | string | `todo_item.name` of the most recent task that extended the finding. |
 | `related_finding_ids` | array[string] | IDs of findings whose impact combines with, depends on, or amplifies this one. Used by the slow agent to build chains. |
-| `mechanism_detail` | string | Specifics that pin down HOW the bug becomes exploitable: which struct-field type/offset gets clobbered, which invariant-establishing ordering contract in adjacent code is violated, what the actual kernel object behind an OOB target is (e.g. `tx_ring[8]` lands on a `tx_int` function pointer). These are the facts a reproducer or patch author would otherwise re-derive. |
-| `fix_sketch` | string | 1-3 sentences describing a concrete patch the analysis identified (e.g. "cache the static-key result in a local bool at bnxt_xdp.c:353 and use it for both lock and unlock"). Omit entirely if no fix was analyzed — never fabricate. |
+| `mechanism_detail` | string | Specifics that pin down HOW the bug becomes exploitable: which struct-field type/offset gets clobbered, which invariant-establishing ordering contract in adjacent code is violated, or what the actual kernel object behind an OOB target is. These are the facts a reproducer or patch author would otherwise re-derive. |
+| `fix_sketch` | string | 1-3 sentences describing a concrete patch the analysis identified, with the file:line anchor for the change. Omit entirely if no fix was analyzed — never fabricate. |
 | `open_questions` | array[string] | Unresolved items that would settle or refine the finding: `[UNVERIFIED]` claims, call sites not yet confirmed, type-query followups, locking-order assumptions, etc. One sentence each. These accumulate across turns; the merger unions them. |
 | `details` | array[object] | Per-task narrative captured at apply_delta time. Each entry `{task, analysis}` pairs a provenance stamp with the task's effective_analysis prose verbatim. **Store-local only** — every site that hands findings to an agent must run them through `kres_core::redact_findings_for_agent` first. Consumed by `/summary` so the plain-text summary can reach the richer exposition that would otherwise only live in report.md. Never emitted by agents; the store populates this field. |
 

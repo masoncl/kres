@@ -7,14 +7,25 @@
 //! Followup types routed locally:
 //! - `read` — name = "file.c:100+50" or "file.c"; delegates to tools::read_file_range.
 //! - `search` / `grep` — name = regex; `path` = search root.
+//! - `source` — fallback grep for a symbol, plus bounded source reads
+//!   only when the match set is small, when no MCP-backed semcode fetcher
+//!   is configured or semcode is unavailable.
+//! - `callers` / `callees` — fallback grep for a symbol use when
+//!   no MCP-backed callgraph is available.
+//! - `type` — fallback grep for a type name when no MCP-backed
+//!   semcode fetcher is configured.
 //! - `git` — name = command string.
+//! - `make` — name = make arguments; dispatched as `make` argv
+//!   without a shell, with a 300s timeout.
 //! - `bash` — name = shell command; dispatched to tools::bash_run
 //!   with default timeout and workspace-root cwd. Mainly used by the
 //!   coding flow to compile and run emitted source.
 //! - `question` — no-op (answered by the LLM, not by data fetch).
 //!
-//! Types routed through a plugin in Phase 8: `source`, `callers`,
-//! `callees`, `file` (semcode / find).
+//! Types preferably routed through MCP when configured: `source`, `type`,
+//! `callers`, `callees`, `file` (semcode / find). This fetcher still handles
+//! source/callgraph requests with local grep so MCP indexing failures do not
+//! strand research.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,9 +38,14 @@ use crate::{
     followup::Followup,
     pipeline::{DataFetcher, FetchResult},
     tools::{
-        bash_run, find, git, grep, read_file_range, BashArgs, FindArgs, GitArgs, GrepArgs, ReadArgs,
+        bash_run, find, git, grep, make_run, read_file_range, BashArgs, FindArgs, GitArgs,
+        GrepArgs, ReadArgs,
     },
 };
+
+const SOURCE_FALLBACK_CONTEXT_BEFORE: u32 = 20;
+const SOURCE_FALLBACK_READ_LINES: u32 = 120;
+const SOURCE_FALLBACK_AUTO_READ_MAX_TARGETS: usize = 25;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceFetcher {
@@ -88,6 +104,39 @@ impl DataFetcher for WorkspaceFetcher {
                         })),
                     }
                 }
+                "type" => {
+                    let args = GrepArgs {
+                        pattern: type_definition_pattern(&fu.name),
+                        path: fu.path.clone(),
+                        limit: Some(500),
+                        glob: None,
+                    };
+                    match grep(&self.workspace, &args).await {
+                        Ok(content) => out.context.push(json!({
+                            "source": format!("type:{}", fu.name),
+                            "content": content,
+                        })),
+                        Err(e) => out.context.push(json!({
+                            "source": format!("type:{}", fu.name),
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
+                "source" => fetch_source_fallback(&self.workspace, fu, &mut out).await,
+                "callers" | "callees" => {
+                    let args = symbol_grep_args(&fu.name, fu.path.clone(), Some(4), Some("*.[chS]"));
+                    match grep(&self.workspace, &args).await {
+                        Ok(content) => out.context.push(json!({
+                            "source": format!("fallback:{}:{}", fu.kind, fu.name),
+                            "content": content,
+                            "note": "semcode callgraph lookup was unavailable or not configured; this is a local ripgrep fallback for symbol references",
+                        })),
+                        Err(e) => out.context.push(json!({
+                            "source": format!("fallback:{}:{}", fu.kind, fu.name),
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
                 "find" => {
                     // `find` accepts a single `name` value for
                     // `-name` and an optional `path`.
@@ -118,6 +167,18 @@ impl DataFetcher for WorkspaceFetcher {
                         })),
                         Err(e) => out.context.push(json!({
                             "source": format!("git:{}", fu.name),
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
+                "make" => {
+                    match make_run(&self.workspace, &fu.name, Some(300)).await {
+                        Ok(content) => out.context.push(json!({
+                            "source": format!("make:{}", fu.name),
+                            "content": content,
+                        })),
+                        Err(e) => out.context.push(json!({
+                            "source": format!("make:{}", fu.name),
                             "error": e.to_string(),
                         })),
                     }
@@ -156,6 +217,159 @@ impl DataFetcher for WorkspaceFetcher {
         }
         Ok(out)
     }
+}
+
+/// Escape regex metacharacters so a type name like `foo::bar<T>` can
+/// be passed to ripgrep without surprises.
+fn regex_escape_word(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\'
+            | '/' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn type_definition_pattern(name: &str) -> String {
+    let name = regex_escape_word(name);
+    format!(
+        r"^\s*(struct|union|enum)\s+{name}\b\s*(\{{|$)|^\s*typedef\b.*\b{name}\b|\}}\s*{name}\s*;"
+    )
+}
+
+fn symbol_reference_pattern(name: &str) -> String {
+    let name = regex_escape_word(name);
+    format!(r"\b{name}\b")
+}
+
+fn symbol_grep_args(
+    name: &str,
+    path: Option<String>,
+    per_file_limit: Option<u32>,
+    glob: Option<&str>,
+) -> GrepArgs {
+    GrepArgs {
+        pattern: symbol_reference_pattern(name),
+        path,
+        limit: per_file_limit,
+        glob: glob.map(str::to_string),
+    }
+}
+
+async fn fetch_source_fallback(workspace: &Path, fu: &Followup, out: &mut FetchResult) {
+    let args = symbol_grep_args(&fu.name, fu.path.clone(), None, Some("*.[chS]"));
+    match grep(workspace, &args).await {
+        Ok(content) => {
+            let read_targets = source_fallback_read_targets(&content);
+            let auto_read = read_targets.len() <= SOURCE_FALLBACK_AUTO_READ_MAX_TARGETS;
+            let note = if auto_read {
+                format!(
+                    "semcode source lookup was unavailable or not configured; this is a local ripgrep fallback. Grep matches are listed below, subject only to the visible shared tool-output truncation marker. Because there are {} parseable match(es), bounded read ranges follow.",
+                    read_targets.len()
+                )
+            } else {
+                format!(
+                    "semcode source lookup was unavailable or not configured; this is a local ripgrep fallback. Grep matches are listed below, subject only to the visible shared tool-output truncation marker. There are {} parseable matches, so bounded reads were not expanded automatically; request targeted read followups for the specific file:line ranges needed.",
+                    read_targets.len()
+                )
+            };
+            out.context.push(json!({
+                "source": format!("fallback:source:{}", fu.name),
+                "content": content,
+                "note": note,
+            }));
+            if !auto_read {
+                out.context.push(json!({
+                    "source": format!("fallback:source-read-skipped:{}", fu.name),
+                    "content": format!(
+                        "{} parseable grep matches for `{}` were listed in fallback:source:{}. Automatic {}-line source reads are skipped for broad fallback searches to preserve context budget. Request explicit read followups such as `path/to/file.c:123+80` for the matches that need full context.",
+                        read_targets.len(),
+                        fu.name,
+                        fu.name,
+                        SOURCE_FALLBACK_READ_LINES
+                    ),
+                    "note": "Broad local source fallback: grep match lines are provided above; detailed source must be requested with targeted read followups.",
+                }));
+                return;
+            }
+            for (file, line) in read_targets {
+                let start = line.saturating_sub(SOURCE_FALLBACK_CONTEXT_BEFORE).max(1);
+                let args = ReadArgs {
+                    file: file.clone(),
+                    line: Some(start),
+                    count: Some(SOURCE_FALLBACK_READ_LINES),
+                    end_line: None,
+                };
+                match read_file_range(workspace, &args) {
+                    Ok(read_content) => out.context.push(json!({
+                        "source": format!(
+                            "fallback:source-read:{}:{}+{}",
+                            file, start, SOURCE_FALLBACK_READ_LINES
+                        ),
+                        "content": read_content,
+                        "note": format!(
+                            "bounded read around local source fallback match for {} at {}:{}",
+                            fu.name, file, line
+                        ),
+                    })),
+                    Err(e) => out.context.push(json!({
+                        "source": format!("fallback:source-read:{}:{}", file, line),
+                        "error": e.to_string(),
+                    })),
+                }
+            }
+        }
+        Err(e) => out.context.push(json!({
+            "source": format!("fallback:source:{}", fu.name),
+            "error": e.to_string(),
+        })),
+    }
+}
+
+fn source_fallback_read_targets(grep_output: &str) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for line in grep_output.lines() {
+        if let Some((file, line_no, _text)) = parse_grep_match_line(line) {
+            let start = line_no
+                .saturating_sub(SOURCE_FALLBACK_CONTEXT_BEFORE)
+                .max(1);
+            if out.iter().any(|(seen_file, seen_line)| {
+                seen_file == file
+                    && seen_line
+                        .saturating_sub(SOURCE_FALLBACK_CONTEXT_BEFORE)
+                        .max(1)
+                        == start
+            }) {
+                continue;
+            }
+            out.push((file.to_string(), line_no));
+        }
+    }
+    out
+}
+
+fn parse_grep_match_line(line: &str) -> Option<(&str, u32, &str)> {
+    for (idx, _) in line.match_indices(':') {
+        let rest = &line[idx + 1..];
+        let Some((line_no, text)) = rest.split_once(':') else {
+            continue;
+        };
+        if line_no.is_empty() || !line_no.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let file = &line[..idx];
+        if file.is_empty() {
+            continue;
+        }
+        return Some((file, line_no.parse().ok()?, text));
+    }
+    None
 }
 
 /// Parse a `"file.c:100+50"` or `"file.c"` spec into ReadArgs.
@@ -235,13 +449,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn type_followup_fallback_searches_definitions_not_references() {
+        let dir = tmpdir("type");
+        let mut f = std::fs::File::create(dir.join("types.h")).unwrap();
+        f.write_all(
+            b"void use_bio(struct bio *bio);\n\
+              int bio_count;\n\
+              struct bio *member;\n\
+              struct bio {\n\
+                  unsigned int bi_opf;\n\
+              };\n\
+              typedef unsigned long sector_t;\n",
+        )
+        .unwrap();
+        let f = WorkspaceFetcher::new(&dir);
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "type".into(),
+                    name: "bio".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let content = r.context[0].get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("struct bio {"));
+        assert!(!content.contains("void use_bio"));
+        assert!(!content.contains("bio_count"));
+        assert!(!content.contains("struct bio *member"));
+
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "type".into(),
+                    name: "sector_t".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let content = r.context[0].get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("typedef unsigned long sector_t;"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn source_followup_falls_back_to_local_symbol_search_and_read() {
+        let dir = tmpdir("source-fallback");
+        std::fs::create_dir_all(dir.join("mm")).unwrap();
+        let mut src = std::fs::File::create(dir.join("mm/cma.c")).unwrap();
+        src.write_all(
+            b"static void helper(void) {}\n\
+              bool cma_release(void)\n\
+              {\n\
+                  helper();\n\
+                  return true;\n\
+              }\n",
+        )
+        .unwrap();
+        let f = WorkspaceFetcher::new(&dir);
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "source".into(),
+                    name: "cma_release".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.context.len(), 2);
+        assert_eq!(
+            r.context[0].get("source").and_then(|v| v.as_str()),
+            Some("fallback:source:cma_release")
+        );
+        let content = r.context[0].get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("mm/cma.c"));
+        assert!(content.contains("cma_release"));
+        assert!(r.context[1]
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .starts_with("fallback:source-read:"));
+        let content = r.context[1].get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("bool cma_release(void)"));
+        assert!(content.contains("helper();"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn broad_source_fallback_lists_matches_without_auto_reading_every_hit() {
+        let dir = tmpdir("source-fallback-broad");
+        std::fs::create_dir_all(dir.join("mm")).unwrap();
+        for idx in 0..=SOURCE_FALLBACK_AUTO_READ_MAX_TARGETS {
+            let mut src = std::fs::File::create(dir.join(format!("mm/file{idx}.c"))).unwrap();
+            writeln!(src, "void use_{idx}(struct page *page)").unwrap();
+            writeln!(src, "{{").unwrap();
+            writeln!(src, "\tstruct folio *folio = page_folio(page);").unwrap();
+            writeln!(src, "\t(void)folio;").unwrap();
+            writeln!(src, "}}").unwrap();
+        }
+        let f = WorkspaceFetcher::new(&dir);
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "source".into(),
+                    name: "page_folio".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.context.len(), 2);
+        assert_eq!(
+            r.context[0].get("source").and_then(|v| v.as_str()),
+            Some("fallback:source:page_folio")
+        );
+        let grep_content = r.context[0].get("content").unwrap().as_str().unwrap();
+        assert!(grep_content.contains("file0.c"));
+        assert!(grep_content.contains(&format!("file{}.c", SOURCE_FALLBACK_AUTO_READ_MAX_TARGETS)));
+        assert!(r.context[0]
+            .get("note")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .contains("request targeted read followups"));
+        assert_eq!(
+            r.context[1].get("source").and_then(|v| v.as_str()),
+            Some("fallback:source-read-skipped:page_folio")
+        );
+        assert!(r.context[1]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .contains("Automatic 120-line source reads are skipped"));
+        assert!(!r.context.iter().any(|item| item
+            .get("source")
+            .and_then(|v| v.as_str())
+            .is_some_and(|source| source.starts_with("fallback:source-read:"))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn source_fallback_does_not_apply_per_file_grep_cap() {
+        let dir = tmpdir("source-fallback-no-per-file-cap");
+        std::fs::create_dir_all(dir.join("mm")).unwrap();
+        let mut src = std::fs::File::create(dir.join("mm/many.c")).unwrap();
+        for idx in 0..505 {
+            writeln!(src, "void use_{idx}(struct page *page)").unwrap();
+            writeln!(src, "{{").unwrap();
+            writeln!(src, "\tstruct folio *folio = page_folio(page);").unwrap();
+            writeln!(src, "\t(void)folio;").unwrap();
+            writeln!(src, "}}").unwrap();
+        }
+        let f = WorkspaceFetcher::new(&dir);
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "source".into(),
+                    name: "page_folio".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let grep_content = r.context[0].get("content").unwrap().as_str().unwrap();
+        assert_eq!(grep_content.matches("page_folio(page)").count(), 505);
+        assert_eq!(
+            r.context[1].get("source").and_then(|v| v.as_str()),
+            Some("fallback:source-read-skipped:page_folio")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn source_fallback_targets_preserve_grep_order_and_all_ranges() {
+        let grep_output = "\
+/tmp/tree/mm/demo.c:4:bool cma_release(void);
+/tmp/tree/mm/demo.c:140:bool cma_release(void)
+/tmp/tree/include/linux/demo.h:9:bool cma_release(void);
+";
+        let targets = source_fallback_read_targets(grep_output);
+        assert_eq!(
+            targets,
+            vec![
+                ("/tmp/tree/mm/demo.c".to_string(), 4),
+                ("/tmp/tree/mm/demo.c".to_string(), 140),
+                ("/tmp/tree/include/linux/demo.h".to_string(), 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn source_fallback_targets_do_not_rank_macro_definitions() {
+        let grep_output = "\
+/tmp/tree/mm/demo.c:20:if (VM_BUG_ON_FOLIO(folio))
+/tmp/tree/include/linux/mmdebug.h:10:#define VM_BUG_ON_FOLIO(folio) do { } while (0)
+";
+        let targets = source_fallback_read_targets(grep_output);
+        assert_eq!(
+            targets,
+            vec![
+                ("/tmp/tree/mm/demo.c".to_string(), 20),
+                ("/tmp/tree/include/linux/mmdebug.h".to_string(), 10),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn unhandled_followup_kind_produces_explanatory_error() {
         let dir = tmpdir("unk");
         let f = WorkspaceFetcher::new(&dir);
         let r = f
             .fetch(
                 &[Followup {
-                    kind: "source".into(),
+                    kind: "widget".into(),
                     name: "some_func".into(),
                     reason: String::new(),
                     path: None,
@@ -252,7 +684,58 @@ mod tests {
             .unwrap();
         assert_eq!(r.context.len(), 1);
         let err = r.context[0].get("error").unwrap().as_str().unwrap();
-        assert!(err.contains("source"));
+        assert!(err.contains("widget"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetches_make_followup() {
+        let dir = tmpdir("make");
+        let mut f = std::fs::File::create(dir.join("Makefile")).unwrap();
+        f.write_all(b"check:\n\t@printf make-ok\n").unwrap();
+        let f = WorkspaceFetcher::new(&dir);
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "make".into(),
+                    name: "check".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.context.len(), 1);
+        let content = r.context[0].get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("make-ok"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn make_followup_does_not_shell_out() {
+        let dir = tmpdir("make-noshell");
+        let mut f = std::fs::File::create(dir.join("Makefile")).unwrap();
+        f.write_all(b"check:\n\t@printf make-ok\n").unwrap();
+        let f = WorkspaceFetcher::new(&dir);
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "make".into(),
+                    name: "check; touch owned".into(),
+                    reason: String::new(),
+                    path: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.context.len(), 1);
+        assert!(
+            r.context[0].get("error").is_some(),
+            "invalid make target should fail, not execute a shell"
+        );
+        assert!(!dir.join("owned").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

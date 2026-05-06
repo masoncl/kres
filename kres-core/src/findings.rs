@@ -8,7 +8,9 @@
 //! - Slow agents (and every other inference call that emits findings)
 //!   produce a `findings` array that is interpreted as a DELTA:
 //!   matching-id entries update an existing finding, new ids add,
-//!   and `status: invalidated` on an existing id marks it.
+//!   `status: invalidated` on an existing id marks it, and obvious
+//!   semantic duplicates with different ids merge into the existing
+//!   record.
 //! - The store applies the delta with deterministic Rust rules, no
 //!   LLM round-trip. See [`FindingsStore::apply_delta`].
 //! - Persistence is handed to the `jsondb` crate: every write guard
@@ -42,30 +44,12 @@ pub enum FindingsError {
     NoParent(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
     Medium,
     High,
-}
-
-/// Legacy findings.json files written before the `critical` tier was
-/// retired still carry `"severity": "critical"`. Map those into
-/// `High` on load so old stores keep working without a migration.
-/// New writes always serialize as `low` / `medium` / `high`.
-impl<'de> Deserialize<'de> for Severity {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        match s.as_str() {
-            "low" => Ok(Severity::Low),
-            "medium" => Ok(Severity::Medium),
-            "high" | "critical" => Ok(Severity::High),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown severity {other:?} (expected low / medium / high)"
-            ))),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -264,11 +248,7 @@ pub struct FindingsFile {
     pub task_prose: Vec<TaskProse>,
 }
 
-impl SchemaV0 for FindingsFile {
-    /// Legacy findings.json files were written by the pre-jsondb
-    /// store and have no top-level `version` field. Treat those as V0.
-    const VERSION_OPTIONAL: bool = true;
-}
+impl SchemaV0 for FindingsFile {}
 
 /// Delta-based findings store, backed by jsondb.
 ///
@@ -443,6 +423,17 @@ pub fn apply_delta_to_list(
                 }
             }
             None => {
+                if incoming.status != Status::Invalidated {
+                    if let Some(idx) = semantic_duplicate_index(current, incoming) {
+                        let changed = merge_into(&mut current[idx], incoming, task_id);
+                        record_detail(&mut current[idx], task_id, task_analysis);
+                        if changed {
+                            counts.updated += 1;
+                            counts.changed = true;
+                        }
+                        continue;
+                    }
+                }
                 let mut new_entry = incoming.clone();
                 // `reactivate` is a transient wire signal; don't let
                 // it persist on a newly-inserted record. Same for any
@@ -497,6 +488,99 @@ fn record_detail(finding: &mut Finding, task_id: Option<&str>, task_analysis: Op
         analysis: body.to_string(),
     });
 }
+
+fn semantic_duplicate_index(current: &[Finding], incoming: &Finding) -> Option<usize> {
+    current
+        .iter()
+        .position(|existing| is_semantic_duplicate(existing, incoming))
+}
+
+fn is_semantic_duplicate(existing: &Finding, incoming: &Finding) -> bool {
+    if existing.status == Status::Invalidated || incoming.status == Status::Invalidated {
+        return false;
+    }
+    if existing
+        .related_finding_ids
+        .iter()
+        .any(|id| id == &incoming.id)
+        || incoming
+            .related_finding_ids
+            .iter()
+            .any(|id| id == &existing.id)
+    {
+        return share_code_anchor(existing, incoming);
+    }
+    share_code_anchor(existing, incoming) && id_title_token_overlap(existing, incoming) >= 0.70
+}
+
+fn share_code_anchor(a: &Finding, b: &Finding) -> bool {
+    for asym in &a.relevant_symbols {
+        for bsym in &b.relevant_symbols {
+            if !asym.filename.is_empty()
+                && asym.filename == bsym.filename
+                && ((!asym.name.is_empty() && asym.name == bsym.name) || asym.line == bsym.line)
+            {
+                return true;
+            }
+        }
+    }
+    for asec in &a.relevant_file_sections {
+        for bsec in &b.relevant_file_sections {
+            if !asec.filename.is_empty()
+                && asec.filename == bsec.filename
+                && ranges_overlap(
+                    asec.line_start,
+                    asec.line_end,
+                    bsec.line_start,
+                    bsec.line_end,
+                )
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn ranges_overlap(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> bool {
+    let a_lo = a_start.min(a_end);
+    let a_hi = a_start.max(a_end);
+    let b_lo = b_start.min(b_end);
+    let b_hi = b_start.max(b_end);
+    a_lo <= b_hi && b_lo <= a_hi
+}
+
+fn id_title_token_overlap(a: &Finding, b: &Finding) -> f64 {
+    let a_tokens = finding_identity_tokens(a);
+    let b_tokens = finding_identity_tokens(b);
+    let denom = a_tokens.len().min(b_tokens.len());
+    if denom == 0 {
+        return 0.0;
+    }
+    let shared = a_tokens.intersection(&b_tokens).count();
+    shared as f64 / denom as f64
+}
+
+fn finding_identity_tokens(f: &Finding) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    collect_tokens(&f.id, &mut out);
+    collect_tokens(&f.title, &mut out);
+    out
+}
+
+fn collect_tokens(s: &str, out: &mut std::collections::BTreeSet<String>) {
+    for raw in s.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let token = raw.to_ascii_lowercase();
+        if token.len() < 2 || SEMANTIC_DUP_STOPWORDS.contains(&token.as_str()) {
+            continue;
+        }
+        out.insert(token);
+    }
+}
+
+const SEMANTIC_DUP_STOPWORDS: &[&str] = &[
+    "and", "are", "for", "from", "into", "that", "the", "this", "with", "without",
+];
 
 /// Merge `incoming` into `existing` in place. Returns true iff any
 /// field on `existing` changed.
@@ -1011,6 +1095,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantically_duplicate_active_findings_merge_by_anchor_and_identity() {
+        let dir = tmp_dir("semantic-dup");
+        let base = dir.join("findings.json");
+        let store = FindingsStore::new(&base).await.unwrap();
+
+        let mut first = sample_finding("geneve_xmit_skb_missing_tx_dstats");
+        first.title = "geneve_xmit_skb misses tx dstats accounting".into();
+        first.relevant_symbols.push(RelevantSymbol {
+            name: "geneve_xmit_skb".into(),
+            filename: "drivers/net/geneve.c".into(),
+            line: 920,
+            definition: "static netdev_tx_t geneve_xmit_skb(...)".into(),
+        });
+        store.apply_delta(&[first], Some("t1"), None).await.unwrap();
+
+        let mut second = sample_finding("geneve_xmit_skb_missing_tx_stats");
+        second.title = "geneve_xmit_skb misses tx stats accounting".into();
+        second.summary = "longer duplicate summary proving the same accounting bug".into();
+        second.relevant_symbols.push(RelevantSymbol {
+            name: "geneve_xmit_skb".into(),
+            filename: "drivers/net/geneve.c".into(),
+            line: 920,
+            definition: "static netdev_tx_t geneve_xmit_skb(...)".into(),
+        });
+        let rep = store
+            .apply_delta(&[second], Some("t2"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(rep.added, 0);
+        assert_eq!(rep.updated, 1);
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].id, "geneve_xmit_skb_missing_tx_dstats");
+        assert_eq!(
+            snap[0].summary,
+            "longer duplicate summary proving the same accounting bug"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn semantic_duplicate_check_does_not_merge_different_bugs_in_same_function() {
+        let dir = tmp_dir("semantic-distinct");
+        let base = dir.join("findings.json");
+        let store = FindingsStore::new(&base).await.unwrap();
+
+        let mut accounting = sample_finding("geneve_xmit_skb_missing_tx_dstats");
+        accounting.title = "geneve_xmit_skb misses tx dstats accounting".into();
+        accounting.relevant_symbols.push(RelevantSymbol {
+            name: "geneve_xmit_skb".into(),
+            filename: "drivers/net/geneve.c".into(),
+            line: 920,
+            definition: "static netdev_tx_t geneve_xmit_skb(...)".into(),
+        });
+        let mut leak = sample_finding("geneve_xmit_skb_dst_leak_on_build_fail");
+        leak.title = "geneve_xmit_skb leaks dst on build failure".into();
+        leak.relevant_symbols.push(RelevantSymbol {
+            name: "geneve_xmit_skb".into(),
+            filename: "drivers/net/geneve.c".into(),
+            line: 920,
+            definition: "static netdev_tx_t geneve_xmit_skb(...)".into(),
+        });
+
+        store
+            .apply_delta(&[accounting, leak], Some("t1"), None)
+            .await
+            .unwrap();
+        let snap = store.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn reactivate_flag_flips_invalidated_back_to_active() {
         let dir = tmp_dir("reactivate");
         let base = dir.join("findings.json");
@@ -1282,44 +1440,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_critical_severity_loads_as_high() {
-        // findings.json files written before Critical was retired
-        // still carry `"severity": "critical"`. The custom
-        // Deserialize impl must fold that into High so the store
-        // loads cleanly; subsequent writes round-trip as "high".
-        let dir = tmp_dir("legacy-critical");
-        let base = dir.join("findings.json");
-        std::fs::write(
-            &base,
-            r#"{"findings":[{"id":"old","title":"t","severity":"critical","summary":"s","reproducer_sketch":"r","impact":"i"}]}"#,
-        )
-        .unwrap();
-        let store = FindingsStore::new(&base).await.unwrap();
-        let snap = store.snapshot().await;
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].severity, Severity::High);
-        // Force a rewrite and confirm the on-disk payload no longer
-        // carries "critical" — jsondb decides whether to pretty-print
-        // or pack, so check via JSON parse instead of a byte grep.
-        store
-            .apply_delta(&[sample_finding("new")], Some("t1"), None)
-            .await
-            .unwrap();
-        store.db.flush().await;
-        let raw = std::fs::read_to_string(&base).unwrap();
-        assert!(!raw.contains("\"critical\""));
-        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let old = root["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|f| f["id"] == "old")
-            .unwrap();
-        assert_eq!(old["severity"], "high");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
     async fn reload_preserves_findings() {
         let dir = tmp_dir("reload");
         let base = dir.join("findings.json");
@@ -1359,27 +1479,6 @@ mod tests {
             .unwrap();
         assert!(r2.changed);
         assert_eq!(r2.tasks_since_change, 0);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn legacy_unversioned_file_loads() {
-        // A pre-jsondb findings.json has no `version` field. Because
-        // FindingsFile: SchemaV0 with VERSION_OPTIONAL = true, jsondb
-        // is supposed to accept it as V0.
-        let dir = tmp_dir("legacy");
-        let base = dir.join("findings.json");
-        std::fs::write(
-            &base,
-            r#"{"findings":[{"id":"old","title":"t","severity":"high","summary":"s","reproducer_sketch":"r","impact":"i"}],"tasks_since_change":2,"turn_n":7}"#,
-        )
-        .unwrap();
-        let store = FindingsStore::new(&base).await.unwrap();
-        let snap = store.snapshot().await;
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].id, "old");
-        assert_eq!(store.tasks_since_change().await, 2);
-        assert_eq!(store.last_turn().await, 7);
         std::fs::remove_dir_all(&dir).ok();
     }
 

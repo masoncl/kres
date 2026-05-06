@@ -48,6 +48,7 @@ impl Client {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             proxy: detect_proxy(),
+            no_proxy: false,
             timeout: None,
             user_agent: format!("kres/{}", env!("CARGO_PKG_VERSION")),
             rate_limiter: None,
@@ -108,13 +109,9 @@ impl Client {
     /// a 1M-tpm ceiling (observed in session
     /// bf0a7119-459b-519a-b7f4-a092fd9e6611, 8 retries were not).
     ///
-    /// Shrink rules:
-    /// - Always shrink when `count_tokens` exceeds `max_input_tokens`
-    ///   (a size problem).
-    /// - Proactively shrink after `SHRINK_AFTER_CONSECUTIVE_429S`
-    ///   same-size 429s even when under the limit, as a last-resort
-    ///   for workspace-level budget exhaustion we can't wait out
-    ///   (a pacing problem masquerading as a size problem).
+    /// Shrink rule: shrink only when `count_tokens` exceeds
+    /// `max_input_tokens` (a size problem). 429s for workspace-level
+    /// budget exhaustion are handled by waiting and retrying.
     ///
     /// Every 429 logs unconditionally to stderr (operator-visible) so
     /// the pacing story is never hidden behind tracing filters.
@@ -124,12 +121,7 @@ impl Client {
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
         const MAX_RETRIES: u32 = 20;
-        const SHRINK_AFTER_CONSECUTIVE_429S: u32 = 3;
-
         let mut working_messages: Vec<Message> = messages.to_vec();
-        // Count of 429s seen since the last shrink (or start of call).
-        // A successful shrink resets this so we give the smaller
-        // payload a fresh retry budget.
         let mut consecutive_429s: u32 = 0;
         for attempt in 0..=MAX_RETRIES {
             let body = MessagesRequest::from_config(cfg, &working_messages, false);
@@ -168,61 +160,32 @@ impl Client {
                     consecutive_429s += 1;
                     let base_wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
                     let wait = extended_wait(base_wait, consecutive_429s);
-                    // Count the payload exactly so we can decide
-                    // whether it's a size problem or a pacing
-                    // problem. `count_tokens` may itself 429 — None
-                    // means "unknown", treat as pacing.
+                    // Count the payload exactly so we only shrink for
+                    // a real size problem. `count_tokens` may itself
+                    // 429; None means "unknown", so wait and retry.
                     let exact = self.count_tokens_exact(cfg, &working_messages).await;
                     let limit = cfg.max_input_tokens;
                     let over_limit = match (exact, limit) {
                         (Some(e), Some(l)) => e > l as u64,
                         _ => false,
                     };
-                    let pacing_stuck = consecutive_429s >= SHRINK_AFTER_CONSECUTIVE_429S;
-                    let should_shrink = over_limit || pacing_stuck;
                     kres_core::async_eprintln!(
                         "[rate-limit] 429 attempt={}/{} consecutive={} exact_tokens={:?} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
-                        attempt, MAX_RETRIES, consecutive_429s, exact, limit, retry_after, wait, should_shrink,
-                        if over_limit { "over-limit" } else if pacing_stuck { "pacing-stuck" } else { "wait" },
+                        attempt, MAX_RETRIES, consecutive_429s, exact, limit, retry_after, wait, over_limit,
+                        if over_limit { "over-limit" } else { "wait" },
                     );
-                    if should_shrink {
-                        if let Some(last) = working_messages.last_mut() {
-                            if last.role == "user" {
-                                // Target size: for over-limit, aim at
-                                // 90% of the limit. For pacing-stuck,
-                                // aim at 70% of the CURRENT exact
-                                // count (don't know workspace budget,
-                                // just make the next request smaller
-                                // so it's more likely to fit under
-                                // whatever slice is left).
-                                let target_tokens: u64 = if over_limit {
-                                    (limit.unwrap() as u64 * 9) / 10
-                                } else {
-                                    let cur = exact
-                                        .unwrap_or_else(|| (last.content.len() as u64 / 4).max(1));
-                                    (cur * 7) / 10
-                                };
-                                let target_chars = (target_tokens as usize).saturating_mul(4);
-                                if let Some(new_content) =
-                                    kres_core::shrink::shrink_last_user_message(
-                                        &last.content,
-                                        target_chars,
-                                    )
-                                {
-                                    kres_core::async_eprintln!(
-                                        "[rate-limit] shrink applied before={}c after={}c target_tokens={} reason={}",
-                                        last.content.len(),
-                                        new_content.len(),
-                                        target_tokens,
-                                        if over_limit { "over-limit" } else { "pacing-stuck" },
-                                    );
-                                    last.content = new_content;
-                                    // Reset counter so the smaller
-                                    // payload gets a fresh retry
-                                    // budget.
-                                    consecutive_429s = 0;
-                                }
-                            }
+                    if over_limit {
+                        let target_tokens = (limit.unwrap() as u64 * 9) / 10;
+                        let target_chars = (target_tokens as usize).saturating_mul(4);
+                        if let Some((before, after)) =
+                            shrink_last_user_message_for_retry(&mut working_messages, target_chars)
+                        {
+                            kres_core::async_eprintln!(
+                                "[rate-limit] shrink applied before={}c after={}c target_tokens={} reason=over-limit",
+                                before,
+                                after,
+                                target_tokens,
+                            );
                         }
                     }
                     tokio::time::sleep(wait).await;
@@ -366,8 +329,6 @@ impl Client {
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
         const MAX_RETRIES: u32 = 20;
-        const SHRINK_AFTER_CONSECUTIVE_429S: u32 = 3;
-
         let mut working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
         // When the caller tagged this call with a stream_label,
@@ -448,41 +409,23 @@ impl Client {
                         (Some(e), Some(l)) => e > l as u64,
                         _ => false,
                     };
-                    let pacing_stuck = consecutive_429s >= SHRINK_AFTER_CONSECUTIVE_429S;
-                    let should_shrink = over_limit || pacing_stuck;
                     kres_core::async_eprintln!(
                         "[rate-limit] 429 (stream) attempt={}/{} consecutive={} exact_tokens={:?} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
-                        attempt, MAX_RETRIES, consecutive_429s, exact, limit, retry_after, wait, should_shrink,
-                        if over_limit { "over-limit" } else if pacing_stuck { "pacing-stuck" } else { "wait" },
+                        attempt, MAX_RETRIES, consecutive_429s, exact, limit, retry_after, wait, over_limit,
+                        if over_limit { "over-limit" } else { "wait" },
                     );
-                    if should_shrink {
-                        if let Some(last) = working_messages.last_mut() {
-                            if last.role == "user" {
-                                let target_tokens: u64 = if over_limit {
-                                    (limit.unwrap() as u64 * 9) / 10
-                                } else {
-                                    let cur = exact
-                                        .unwrap_or_else(|| (last.content.len() as u64 / 4).max(1));
-                                    (cur * 7) / 10
-                                };
-                                let target_chars = (target_tokens as usize).saturating_mul(4);
-                                if let Some(new_content) =
-                                    kres_core::shrink::shrink_last_user_message(
-                                        &last.content,
-                                        target_chars,
-                                    )
-                                {
-                                    kres_core::async_eprintln!(
-                                        "[rate-limit] shrink applied before={}c after={}c target_tokens={} reason={}",
-                                        last.content.len(),
-                                        new_content.len(),
-                                        target_tokens,
-                                        if over_limit { "over-limit" } else { "pacing-stuck" },
-                                    );
-                                    last.content = new_content;
-                                    consecutive_429s = 0;
-                                }
-                            }
+                    if over_limit {
+                        let target_tokens = (limit.unwrap() as u64 * 9) / 10;
+                        let target_chars = (target_tokens as usize).saturating_mul(4);
+                        if let Some((before, after)) =
+                            shrink_last_user_message_for_retry(&mut working_messages, target_chars)
+                        {
+                            kres_core::async_eprintln!(
+                                "[rate-limit] shrink applied before={}c after={}c target_tokens={} reason=over-limit",
+                                before,
+                                after,
+                                target_tokens,
+                            );
                         }
                     }
                     tokio::time::sleep(wait).await;
@@ -506,6 +449,26 @@ impl Client {
         }
         Err(LlmError::Other("exhausted retries".into()))
     }
+}
+
+fn shrink_last_user_message_for_retry(
+    messages: &mut [Message],
+    target_chars: usize,
+) -> Option<(usize, usize)> {
+    let last = messages.last_mut()?;
+    if last.role != "user" {
+        return None;
+    }
+    let visible_content = match &last.cached_prefix {
+        Some(prefix) => format!("{prefix}{}", last.content),
+        None => last.content.clone(),
+    };
+    let before = visible_content.len();
+    let new_content = kres_core::shrink::shrink_last_user_message(&visible_content, target_chars)?;
+    let after = new_content.len();
+    last.content = new_content;
+    last.cached_prefix = None;
+    Some((before, after))
 }
 
 /// Walk the SSE byte stream from an already-validated 200 response
@@ -844,6 +807,7 @@ pub struct ClientBuilder {
     api_key: String,
     base_url: String,
     proxy: Option<String>,
+    no_proxy: bool,
     timeout: Option<Duration>,
     user_agent: String,
     rate_limiter: Option<Arc<RateLimiter>>,
@@ -860,6 +824,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Disable proxy auto-detection. Use in tests against a local
+    /// mock server when the environment has `HTTP_PROXY` set —
+    /// reqwest otherwise routes the request through the proxy and
+    /// 127.0.0.1 endpoints get rejected as "private".
+    pub fn no_proxy(mut self) -> Self {
+        self.no_proxy = true;
+        self.proxy = None;
+        self
+    }
+
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = Some(t);
         self
@@ -872,7 +846,9 @@ impl ClientBuilder {
 
     pub fn build(self) -> Result<Client, LlmError> {
         let mut b = reqwest::Client::builder().user_agent(self.user_agent);
-        if let Some(proxy_url) = self.proxy.as_deref() {
+        if self.no_proxy {
+            b = b.no_proxy();
+        } else if let Some(proxy_url) = self.proxy.as_deref() {
             let p = reqwest::Proxy::all(proxy_url)
                 .map_err(|_| LlmError::BadProxy(proxy_url.to_string()))?;
             b = b.proxy(p);
@@ -940,6 +916,32 @@ mod tests {
         assert_eq!(extended_wait(base, 9), Duration::from_secs(90));
         assert_eq!(extended_wait(base, 10), Duration::from_secs(130));
         assert_eq!(extended_wait(base, 20), Duration::from_secs(130));
+    }
+
+    #[test]
+    fn retry_shrink_reconstructs_cached_prefix_prompt() {
+        let big = "x".repeat(5000);
+        let prefix = "{\n  \"skills\": [\"stable skill body\"],\n".to_string();
+        let suffix = format!(
+            "  \"question\": \"q\",\n  \"symbols\": [{{\"definition\": \"{big}\"}}, {{\"definition\": \"small\"}}]\n}}\n"
+        );
+        let mut messages = vec![Message {
+            role: "user".into(),
+            content: suffix,
+            cache: false,
+            cached_prefix: Some(prefix.clone()),
+        }];
+
+        let before = prefix.len() + messages[0].content.len();
+        let shrunk = shrink_last_user_message_for_retry(&mut messages, 1000).unwrap();
+
+        assert_eq!(shrunk.0, before);
+        assert!(shrunk.1 < before);
+        assert!(messages[0].cached_prefix.is_none());
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
+        assert_eq!(parsed["skills"][0], "stable skill body");
+        assert_eq!(parsed["symbols"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["symbols"][0]["definition"], "small");
     }
 
     #[test]

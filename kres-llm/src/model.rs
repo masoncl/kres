@@ -63,8 +63,8 @@ impl Model {
 /// How extended thinking is configured for a single call.
 ///
 /// Two API shapes are in use:
-/// - Legacy `{"thinking": {"type": "enabled", "budget_tokens": N}}` —
-///   older models (opus-4-6, sonnet-4-6).
+/// - Explicit budget `{"thinking": {"type": "enabled", "budget_tokens": N}}`
+///   for models that do not support adaptive thinking.
 /// - Adaptive `{"thinking": {"type": "adaptive"},
 ///              "output_config": {"effort": "low|medium|high"}}` —
 ///   opus-4-7 and newer.
@@ -76,9 +76,9 @@ impl Model {
 pub enum ThinkingBudget {
     /// No extended-thinking block.
     Disabled,
-    /// Legacy explicit-budget thinking. Clamped to leave ≥25% of
+    /// Explicit-budget thinking. Clamped to leave ≥25% of
     /// max_tokens available for output.
-    LegacyBudget(u32),
+    ExplicitBudget(u32),
     /// New adaptive thinking. The model chooses the budget; the
     /// operator picks an `effort` bias.
     Adaptive(Effort),
@@ -107,36 +107,35 @@ impl ThinkingBudget {
     ///
     /// - Models with "opus-4-7" (or later) in the id use adaptive
     ///   (medium).
-    /// - Everything else uses a legacy budget sized for the output cap.
+    /// - Everything else uses an explicit budget sized for the output cap.
     pub fn default_for_model(model_id: &str, max_tokens: u32) -> Self {
         // Model families that require adaptive schema. Keep this list
-        // conservative — when in doubt, fall back to legacy.
+        // conservative — when in doubt, use explicit-budget thinking.
         let adaptive = model_id.contains("opus-4-7") || model_id.contains("opus-4-8");
         if adaptive {
             ThinkingBudget::Adaptive(Effort::Medium)
         } else {
-            Self::default_legacy_for(max_tokens)
+            Self::default_explicit_for(max_tokens)
         }
     }
 
-    /// Default sane legacy budget: `min(max_tokens / 4, 32_000)`.
-    pub fn default_legacy_for(max_tokens: u32) -> Self {
+    /// Default sane explicit budget: `min(max_tokens / 4, 32_000)`.
+    pub fn default_explicit_for(max_tokens: u32) -> Self {
         let quarter = max_tokens / 4;
         let budget = quarter.min(32_000);
         if budget == 0 {
             ThinkingBudget::Disabled
         } else {
-            ThinkingBudget::LegacyBudget(budget)
+            ThinkingBudget::ExplicitBudget(budget)
         }
     }
 
-    /// Back-compat wrapper: treat "default" as the legacy default.
-    /// Used by code paths that are model-agnostic.
+    /// Model-agnostic default for callers that do not know the model id.
     pub fn default_for(max_tokens: u32) -> Self {
-        Self::default_legacy_for(max_tokens)
+        Self::default_explicit_for(max_tokens)
     }
 
-    /// Construct a legacy budget, clamping to leave at least 25% of
+    /// Construct an explicit budget, clamping to leave at least 25% of
     /// `max_tokens` for output. Returns `Disabled` if caller passes 0.
     pub fn enabled_clamped(requested: u32, max_tokens: u32) -> Self {
         if requested == 0 {
@@ -148,14 +147,14 @@ impl ThinkingBudget {
         if clamped == 0 {
             ThinkingBudget::Disabled
         } else {
-            ThinkingBudget::LegacyBudget(clamped)
+            ThinkingBudget::ExplicitBudget(clamped)
         }
     }
 
-    /// Legacy accessor — returns `Some(n)` only for LegacyBudget.
+    /// Return `Some(n)` only for explicit-budget thinking.
     pub fn as_budget_tokens(&self) -> Option<u32> {
         match self {
-            ThinkingBudget::LegacyBudget(n) => Some(*n),
+            ThinkingBudget::ExplicitBudget(n) => Some(*n),
             _ => None,
         }
     }
@@ -204,9 +203,9 @@ mod tests {
     fn default_thinking_budget_leaves_room_for_output() {
         // bugs.md#R2: with max_tokens=128000, the old code set
         // budget=127999, leaving 1 token for the answer. The new
-        // legacy default MUST leave at least 25% of max_tokens for
+        // explicit default MUST leave at least 25% of max_tokens for
         // output.
-        let b = ThinkingBudget::default_legacy_for(128_000);
+        let b = ThinkingBudget::default_explicit_for(128_000);
         let tokens = b.as_budget_tokens().unwrap();
         assert!(tokens <= 32_000, "default capped at 32000, got {tokens}");
         assert!(
@@ -217,7 +216,7 @@ mod tests {
 
     #[test]
     fn default_thinking_budget_small_max() {
-        let b = ThinkingBudget::default_legacy_for(4_000);
+        let b = ThinkingBudget::default_explicit_for(4_000);
         assert_eq!(b.as_budget_tokens(), Some(1_000));
     }
 
@@ -228,21 +227,21 @@ mod tests {
     }
 
     #[test]
-    fn default_for_model_picks_legacy_for_opus_46() {
+    fn default_for_model_picks_explicit_for_opus_46() {
         let b = ThinkingBudget::default_for_model("claude-opus-4-6", 128_000);
         match b {
-            ThinkingBudget::LegacyBudget(n) => {
+            ThinkingBudget::ExplicitBudget(n) => {
                 assert!(n <= 32_000);
                 assert!(128_000 - n >= 128_000 / 4);
             }
-            other => panic!("expected LegacyBudget, got {:?}", other),
+            other => panic!("expected ExplicitBudget, got {:?}", other),
         }
     }
 
     #[test]
-    fn default_for_model_unknown_defaults_to_legacy() {
+    fn default_for_model_unknown_defaults_to_explicit() {
         let b = ThinkingBudget::default_for_model("claude-sonnet-4-6", 64_000);
-        assert!(matches!(b, ThinkingBudget::LegacyBudget(_)));
+        assert!(matches!(b, ThinkingBudget::ExplicitBudget(_)));
     }
 
     #[test]
@@ -266,8 +265,8 @@ mod tests {
         let tokens = b.as_budget_tokens().unwrap();
         let reserved = 128_000_u32.div_ceil(4);
         assert!(tokens <= 128_000 - reserved);
-        // Legacy budget form, not adaptive.
-        assert!(matches!(b, ThinkingBudget::LegacyBudget(_)));
+        // Explicit budget form, not adaptive.
+        assert!(matches!(b, ThinkingBudget::ExplicitBudget(_)));
     }
 
     #[test]

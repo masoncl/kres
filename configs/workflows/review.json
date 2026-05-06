@@ -1,0 +1,271 @@
+{
+  "$schema_version": 1,
+  "$format": {
+    "why_this_block_exists": [
+      "$format documents the workflow format in the same file people edit.",
+      "The runner ignores this block; behavior is controlled by `inputs`, `globals`,",
+      "`defaults`, `steps`, `completion`, and `persistence`."
+    ],
+    "prompt_authoring": [
+      "Use prompt arrays for shipped workflows so prompts remain readable and diffable.",
+      "The loader joins array entries with newline characters.",
+      "`prompt_file` is supported for local/operator workflows and resolves relative to",
+      "the workflow JSON file. This shipped workflow keeps prompts inline on purpose."
+    ],
+    "globals": [
+      "`globals` is a reusable prompt-fragment namespace.",
+      "Each entry is included only when a step lists it in `include` using",
+      "`{{globals.<name>}}`.",
+      "This review workflow uses globals for the invariant review policy and the exact",
+      "Finding schema every lens must return, so all parallel calls share the same contract."
+    ],
+    "defaults": [
+      "`defaults` fills missing step fields. This workflow defaults to slow/review",
+      "with one eval attempt.",
+      "The single investigate step repeats the defaults explicitly where clarity matters.",
+      "Step fields override defaults; unset fields inherit them."
+    ],
+    "ordering_and_parallelism": [
+      "`depends_on` controls step ordering. This workflow has one logical step, so there",
+      "is no inter-step sequence to manage.",
+      "`lenses` is the parallelism primitive: the runner invokes the same prompt once per",
+      "lens concurrently, binding fields as `{{lens.id}}` and `{{lens.investigate}}`.",
+      "`aggregate: consolidate` runs an N+1 merge call after all lenses finish, using the",
+      "`consolidate.prompt` rules to deduplicate and rank findings."
+    ],
+    "failure_and_evals": [
+      "Review does not use workflow-local eval retry for followups.",
+      "A lensed review turn completes after gather, parallel slow-agent lenses, and",
+      "consolidation. Typed followups remain in the step output.",
+      "The outer kres task reaper then sends those followups to the todo agent, which",
+      "deduplicates and prioritizes them into the next review todo. That next todo runs",
+      "as a fresh review task through the same JSON-defined lenses.",
+      "This keeps context bounded and preserves the golden review loop: slow agents",
+      "produce Findings plus followups, the todo agent chooses the next frontier, and",
+      "the scheduler continues until the turn cap or followup exhaustion.",
+      "The only local eval guard is `analysis != ''`, which retries an empty/malformed",
+      "review response a few times. Followups never make that eval fail.",
+      "Completion fails only on explicit workflow exit_failure."
+    ],
+    "review_shape": [
+      "Each lens performs independent deep review for one class of bug.",
+      "The consolidator merges duplicate root causes and drops non-bugs.",
+      "Unresolved concrete suspicions become followups, not terminal workflow failures.",
+      "The output is the same Finding record shape used by the rest of kres, not ad hoc",
+      "review notes."
+    ]
+  },
+  "id": "review",
+  "title": "Deep bug review of a target",
+  "description": "Run independent slow-agent review lenses in parallel, then consolidate and rank concrete findings.",
+  "inputs": {
+    "target": {
+      "type": "string",
+      "required": true,
+      "derive": {
+        "target_is_commit": {
+          "type": "boolean",
+          "rule": "git_ref_or_range"
+        }
+      },
+      "description": "A file path, function name, commit ref (e.g. HEAD), diff, or code snippet supplied by the operator. Commit refs and ranges mean review the changes introduced by that ref/range, not the entire repository tree."
+    }
+  },
+  "skills": [
+    "kernel.md"
+  ],
+  "globals": {
+    "review_intro": "Find every concrete correctness bug you can involving the target. Focus on bugs that can be triggered by using that target, including chains of events that pass through unchanged callers, callees, callbacks, helpers, and setup/registration code. Do not stop after the first issue. Each lens must exhaustively enumerate its own class of defects: list every distinct defect or strong suspect it can support, and keep driving followups when more source/type/history/callers/API context would materially improve confidence. Do not report style issues or vague design concerns as findings. Missing context is not itself a finding, but it is normal review frontier: emit typed followups for the exact evidence needed. A concrete unresolved suspicion is not a clean result: either prove it as a Finding, keep it as a strong-suspect Finding with open_questions and matching followups, disprove it in analysis with cited evidence, or emit a followup for the missing source/type/history needed. A clean result is valid only when the lens is confident no bugs of its class remain in scope for this target.",
+    "contract_trace": "For commit/range reviews, the audit target is the semantic change, not just the edited lines. Identify what contract the patch changed: object layout, type/union interpretation, enum selector, ops table, callback target, helper family, allocation/freeing rule, lifetime/refcount rule, lock rule, accounting/visibility contract, or ordering guarantee. Then trace the unchanged code paths that use that contract: readers, writers, callers, callees, callbacks, registration/setup sites, shared helpers, and history when needed. Representation/API migrations are especially dangerous because the changed code may allocate, advertise, or update the new representation while unchanged paths still use the old representation. Negative coverage claims require concrete evidence: do not say no remaining users, all callers updated, old path unreachable, or sole reader/writer unless source/type/search/callgraph/history context proves it. Do not hardcode subsystem rules; follow the changed contract. If this context is missing, emit followups instead of declaring the lens clean.",
+    "finding_schema": "Return full Finding records using the tool schema, not simplified review notes. Required per finding: id, title, severity (low|medium|high), status (active), relevant_symbols [{name, filename, line, definition}], relevant_file_sections [{filename, line_start, line_end, content}] when needed, summary, reproducer_sketch, impact. Optional: mechanism_detail, fix_sketch, open_questions, related_finding_ids. Keep embedded source bodies minimal but sufficient to prove the bug. A strong suspect may be a Finding when it has a concrete code path, trigger, and impact; put remaining proof gaps in open_questions and also emit followups for the exact missing evidence. Return JSON as {\"analysis\": \"brief lens narrative\", \"findings\": [<Finding>, ...], \"followups\": [<Followup>, ...]}. Use {\"analysis\": \"what was checked\", \"findings\": [], \"followups\": []} when clean. Followups use {\"type\": \"read|source|type|git|grep|callers|question\", \"name\": \"specific request\", \"reason\": \"why this is needed to prove or disprove the concrete suspicion\"}."
+  },
+  "defaults": {
+    "agent": "slow",
+    "mode": "review",
+    "max_eval_attempts": 1
+  },
+  "steps": [
+    {
+      "id": "investigate",
+      "title": "Investigate the target through independent lenses",
+      "agent": "slow",
+      "mode": "review",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "git",
+        "grep",
+        "callers"
+      ],
+      "include": [
+        "{{globals.review_intro}}",
+        "{{globals.contract_trace}}",
+        "{{globals.finding_schema}}"
+      ],
+      "prompt": [
+        "Apply the {{lens.id}} lens to the target.",
+        "",
+        "TARGET: {{workflow.target}}",
+        "LENS: {{lens.id}}",
+        "",
+        "{{lens.investigate}}",
+        "",
+        "Gather the source, type definitions, callers, and history needed to make file:line-cited claims.",
+        "If TARGET is a git ref such as HEAD, a commit SHA, or a range, start from the",
+        "target diff/stat and changed files. Do not enumerate or audit the whole",
+        "repository unless the operator explicitly asks for a whole-tree audit.",
+        "",
+        "Find every bug you can involving the target. Do not stop after the first finding.",
+        "Each lens must exhaustively enumerate issues in its own bug class. A lens that",
+        "reports no finding is acceptable only when it is confident no bug of that class",
+        "remains in scope for the target. If that confidence depends on more source,",
+        "callers, history, or API semantics, emit typed followups instead of declaring",
+        "the pass clean. Followups are the normal next frontier for review turns.",
+        "",
+        "For commit/range reviews, trace the semantic contracts changed by the diff. Do not",
+        "only inspect edited callsites. If the target changes an object layout, type/union",
+        "interpretation, enum selector, ops table, callback target, helper family, allocation",
+        "or freeing rule, lifetime/refcount rule, lock rule, accounting/visibility contract,",
+        "or ordering guarantee, inspect the unchanged chains that can still use the old",
+        "contract. That means callers, callees, callbacks, shared helpers, registration/setup",
+        "sites, readers, writers, and git history when needed. A migration is not clean until",
+        "old-contract paths involving the same object or behavior have been checked or requested",
+        "as followups.",
+        "",
+        "Negative coverage claims require evidence. Do not write `no remaining users`, `all",
+        "callers updated`, `old path unreachable`, `only reader`, `only writer`, or equivalent",
+        "unless the gathered context includes concrete source, type, search, caller/callee, or history",
+        "results that prove the claim. If that evidence is missing, emit typed followups for the",
+        "exact missing proof instead of declaring the lens clean.",
+        "",
+        "For each concrete defect, emit one full Finding record using the schema in INCLUDES. The",
+        "parser drops partial findings, so do not emit simplified `{file, what, severity}`",
+        "objects.",
+        "",
+        "Do not leave a concrete bug only in analysis prose. If you describe a real bug or strong",
+        "suspect with a concrete code path, trigger, and impact, emit a Finding for it. If a",
+        "specific concern is plausible but still needs more source, type, callers, history, or API",
+        "semantics, either emit it as a strong-suspect Finding with open_questions plus matching",
+        "followups, or emit only the followup if the current evidence is too thin for a Finding.",
+        "If you disprove a concern, cite the evidence in analysis and keep it out of findings and",
+        "followups.",
+        "",
+        "Do not let `[UNVERIFIED]`, `[FLAG]`, `needs verification`, `not in scope`, `could",
+        "theoretically`, or equivalent unresolved-risk language disappear as prose. The same",
+        "concern must be represented by a Finding with open_questions or by a typed followup.",
+        "A clean review must have no unresolved concrete suspicions hiding in prose.",
+        "",
+        "If this lens finds no concrete bug, return an empty `findings` array with a brief",
+        "analysis of what was checked. Do not invent."
+      ],
+      "lenses": [
+        {
+          "id": "lifetime",
+          "investigate": "Object lifetime: pointer ownership, refcounts, RCU grace periods, free ordering, copied pointers, and shared object lifetime."
+        },
+        {
+          "id": "memory",
+          "investigate": "Memory safety: leaks, use-after-free, double-free, memory corruption, and allocator API misuse."
+        },
+        {
+          "id": "bounds",
+          "investigate": "Bounds and sizes: array/index correctness, trusted versus untrusted indexes, integer overflow, truncation, and size calculation mistakes."
+        },
+        {
+          "id": "races",
+          "investigate": "Concurrency: lock coverage, ordering, missed wakeups, shared-state races, and protection of accessed fields."
+        },
+        {
+          "id": "general",
+          "investigate": "General correctness: NULL dereferences, missing error checks, semantic bugs, and concrete defects not covered by the other lenses."
+        },
+        {
+          "id": "assertions",
+          "run_if": "workflow.target_is_commit == true",
+          "investigate": "Commit assertion audit: for commit/range reviews only, try to disprove every assertion and statement made by the commit message, by comments added or modified by the commit, and by existing declarations, kerneldoc, comments, or docs that describe any contract changed by the commit. Treat each factual sentence, causal claim, safety claim, scope claim, negative claim, and justification as a hypothesis that must be proven from source, diff, callers, history, or documented API behavior. If the commit changes accepted inputs, callback requirements, helper semantics, locking/lifetime rules, ordering, accounting, or any API contract, inspect unchanged documentation/comments for stale, misleading, incomplete, or overbroad claims. If any assertion is unsupported, contradicted, too broad, missing important conditions, unverifiable from gathered evidence, or made stale by the patch, report a Finding or emit the exact typed followup needed to prove or disprove it. A clean result requires cited evidence that the commit message, changed comments, and relevant unchanged contract documentation accurately describe the code and semantic change."
+        }
+      ],
+      "aggregate": "consolidate",
+      "consolidate": {
+        "agent": "fast",
+        "prompt": [
+          "Merge the per-lens outputs into one deduped, ranked findings list.",
+          "",
+          "Each lens output may contain both `findings` and `analysis`. First merge the structured",
+          "Finding records. Then audit the per-lens analysis text for prose-only concrete bug",
+          "claims that are not represented by a Finding.",
+          "",
+          "Promote a prose-only bug into a full Finding only when the lens analysis names a concrete",
+          "failure mode and enough file/function/location evidence to support summary,",
+          "reproducer_sketch, and impact without inventing facts. If the prose merely lists a",
+          "hypothesis, an area to check, or a disproved concern, do not promote it.",
+          "",
+          "However, a concrete unresolved suspicion is not droppable. If lens analysis contains",
+          "`[UNVERIFIED]`, `[FLAG]`, `needs verification`, `not in scope`, `could theoretically`,",
+          "`depends on`, or equivalent language tied to a specific code path, either preserve or",
+          "promote the strong-suspect Finding with open_questions, or convert it into a `followups`",
+          "entry naming the exact read/source/type/git/grep/callers/question request needed to prove or",
+          "disprove it. If the lens already provided a matching followup, preserve it. Only omit",
+          "followups for concerns that are explicitly disproved with cited evidence.",
+          "",
+          "Treat unsupported negative coverage claims as unresolved work. If a lens says no",
+          "remaining users, all callers updated, old path unreachable, only reader, only writer,",
+          "or equivalent without citing concrete source, type, search, caller/callee, or history",
+          "evidence, add a followup for the missing proof instead of carrying that claim into a",
+          "clean conclusion.",
+          "",
+          "DEDUP when findings have the same root cause, cite overlapping code for the same defect,",
+          "or describe the same failure mode in different words.",
+          "",
+          "For merged findings:",
+          "- keep the most specific id and title",
+          "- keep the highest severity",
+          "- union relevant_symbols, relevant_file_sections, open_questions, and related_finding_ids",
+          "- preserve the clearest summary, reproducer_sketch, impact, mechanism_detail, and fix_sketch",
+          "",
+          "Drop anything that is not a concrete bug. Sort high severity first, then medium, then",
+          "low. Return full Finding records using the tool schema; do not add ad hoc `file`, `what`, or `lenses`",
+          "fields. Return followups for unresolved concrete suspicions; do not return",
+          "`followups_empty: true` unless there are no followups and no unresolved-risk language",
+          "left in analysis."
+        ]
+      },
+      "outputs": {
+        "analysis": {
+          "type": "string",
+          "description": "Consolidated review narrative. Per-lens analysis is also preserved through fan-in so prose-only bug claims can be audited."
+        },
+        "findings": {
+          "type": "array<Finding>",
+          "description": "Deduped, ranked concrete Finding records."
+        },
+        "followups": {
+          "type": "array<Followup>",
+          "description": "Unresolved data requests from consolidation. A successful review should leave this empty."
+        },
+        "followups_empty": {
+          "type": "boolean",
+          "description": "Machine-populated summary bit for reports; true only when followups is empty. It must not drive workflow-local retry."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "analysis != ''",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 3,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    }
+  ],
+  "completion": {
+    "success_when_any": [
+      "investigate.completed"
+    ],
+    "failure_when_any": [
+      "any_step.exit_failure"
+    ]
+  }
+}

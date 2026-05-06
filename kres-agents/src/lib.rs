@@ -28,6 +28,9 @@ pub mod symbol;
 pub mod todo_agent;
 pub mod tools;
 pub mod user_commands;
+pub mod workflow;
+pub mod workflow_exec;
+pub mod workflow_runner;
 
 pub use config::{AgentConfig, AgentKind};
 pub use consolidate::{consolidate_lenses, ConsolidatedTask, LensOutput};
@@ -45,7 +48,7 @@ pub use pipeline::{
     TaskSummary,
 };
 pub use prompt_file::{parse as parse_prompt_file, PromptFile};
-pub use response::{parse_code_response, CodeEdit, CodeResponse};
+pub use response::{parse_code_response, CodeResponse};
 pub use skills::{InvocationPolicy, Skill, Skills};
 pub use symbol::{
     append_context, append_symbol, ctx_identity, parse_semcode_symbol, previously_fetched_manifest,

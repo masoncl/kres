@@ -65,7 +65,9 @@ pub struct GrepArgs {
     /// Search root (relative to workspace).
     #[serde(default)]
     pub path: Option<String>,
-    /// Max matches; protects against runaway output.
+    /// Optional max matches per file. When absent, grep relies on the
+    /// shared output cap and timeout rather than hiding matches with a
+    /// per-file limit.
     #[serde(default)]
     pub limit: Option<u32>,
     /// File glob to filter (e.g. "*.c").
@@ -134,9 +136,15 @@ pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentErro
     if let Some(g) = &args.glob {
         cmd.arg("-g").arg(g);
     }
+    if root.is_dir() {
+        for pat in KRES_ARTIFACT_EXCLUDE_GLOBS {
+            cmd.arg("-g").arg(pat);
+        }
+    }
     cmd.arg(&root);
-    let limit = args.limit.unwrap_or(500);
-    cmd.arg("--max-count").arg(limit.to_string());
+    if let Some(limit) = args.limit {
+        cmd.arg("--max-count").arg(limit.to_string());
+    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
@@ -148,7 +156,20 @@ pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentErro
     // the convention used by other tool outputs in the pipeline.
     let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
     let combined = if out.stderr.is_empty() {
-        stdout_text
+        if stdout_text.is_empty() {
+            let path = args.path.as_deref().unwrap_or(".");
+            let glob = args
+                .glob
+                .as_deref()
+                .map(|g| format!(", glob {g}"))
+                .unwrap_or_default();
+            format!(
+                "(no matches for pattern {:?} under {}{})\n",
+                args.pattern, path, glob
+            )
+        } else {
+            stdout_text
+        }
     } else {
         let err = String::from_utf8_lossy(&out.stderr).to_string();
         if stdout_text.is_empty() {
@@ -159,6 +180,21 @@ pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentErro
     };
     Ok(truncate_output(&combined, TOOL_OUTPUT_CAP_GREP_FIND))
 }
+
+/// Review/search followups are meant to inspect the target source
+/// tree, not kres' own prior run artifacts. Operators commonly use
+/// `--results new` inside the workspace, and older result dirs such as
+/// `kres-wed/` may contain stale reports with old findings. If grep
+/// searches those files, agents can mistake old analysis for source
+/// evidence or for an already-recorded current finding.
+const KRES_ARTIFACT_EXCLUDE_GLOBS: &[&str] = &[
+    "!**/.kres/**",
+    "!**/findings.json",
+    "!**/report.md",
+    "!**/session.json",
+    "!**/summary.md",
+    "!**/summary.txt",
+];
 
 /// Allowed git subcommands. The first tranche is the historical
 /// readonly surface used by review/analysis: `log`/`show`/`diff` for
@@ -199,13 +235,12 @@ pub const GIT_ALLOWED: &[&str] = &[
     "commit",
 ];
 
-/// Per-tool output caps. grep/find truncate at 20k chars and MCP at
-/// 50k chars with a `… (truncated at Nk chars)` tail. That stops one
-/// runaway
-/// `find /` from blowing the slow agent's input budget in a single
-/// round.
-pub const TOOL_OUTPUT_CAP_GREP_FIND: usize = 20_000;
-pub const TOOL_OUTPUT_CAP_MCP: usize = 50_000;
+/// Per-tool output caps. Both are sized to roughly 500k tokens using
+/// the same coarse 4 chars/token estimate used elsewhere in kres.
+/// Truncated output gets a `… (truncated at Nk chars)` tail so the
+/// agent can see the clip.
+pub const TOOL_OUTPUT_CAP_GREP_FIND: usize = 2_000_000;
+pub const TOOL_OUTPUT_CAP_MCP: usize = 2_000_000;
 
 /// Truncate `s` to `cap` chars (byte-indexed: works for ASCII-heavy
 /// tool output, which is what grep/find/MCP return), appending
@@ -287,6 +322,51 @@ pub const TOOL_OUTPUT_CAP_BASH: usize = 20_000;
 /// minutes.
 pub const BASH_DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const BASH_MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Run `make` directly via argv, not through a shell. `args` is
+/// tokenized with the same small shell-like splitter used for git so
+/// quoted values survive, but metacharacters such as `;` are never
+/// interpreted as command separators.
+pub async fn make_run(
+    workspace: &Path,
+    args: &str,
+    timeout_secs: Option<u64>,
+) -> Result<String, AgentError> {
+    let parts = shell_split(args)
+        .ok_or_else(|| AgentError::Other(format!("unparseable make arguments: {args}")))?;
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(300).clamp(1, BASH_MAX_TIMEOUT_SECS));
+    let mut cmd = tokio::process::Command::new("make");
+    cmd.current_dir(workspace);
+    cmd.args(&parts);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    let out = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| AgentError::Other(format!("make timed out after {}s", timeout.as_secs())))?
+        .map_err(|e| AgentError::Other(format!("make spawn: {e}")))?;
+    let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
+    let code_line = match out.status.code() {
+        Some(c) => format!("[exit {c}]"),
+        None => "[exit ?]".to_string(),
+    };
+    let mut body = String::new();
+    body.push_str(&code_line);
+    if !stdout_text.is_empty() {
+        body.push_str("\n[stdout]\n");
+        body.push_str(&stdout_text);
+    }
+    if !stderr_text.is_empty() {
+        body.push_str("\n[stderr]\n");
+        body.push_str(&stderr_text);
+    }
+    let body = truncate_output(&body, TOOL_OUTPUT_CAP_BASH);
+    if out.status.success() {
+        Ok(body)
+    } else {
+        Err(AgentError::Other(body))
+    }
+}
 
 pub async fn bash_run(workspace: &Path, args: &BashArgs) -> Result<String, AgentError> {
     if args.command.trim().is_empty() {
@@ -577,7 +657,7 @@ fn reject_risky_git_flag(arg: &str) -> Option<&'static str> {
 /// Shell split: honours single and double quotes plus backslash
 /// escapes inside double-quoted strings (`\"` → literal `"`).
 /// Needed for commit messages that contain inner quotes, e.g.
-/// `-m "Fixes: 659a2899a57d (\"tcp: add datapath...\")"`.
+/// `-m "Fixes: 659a2899a57d (\"subsystem: introduce feature...\")"`.
 fn shell_split(s: &str) -> Option<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -652,7 +732,7 @@ fn resolve_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, AgentError>
                 Ok(c)
             } else {
                 Err(AgentError::Other(format!(
-                    "path {} escapes workspace {} and no consent is on file — mention the containing directory in a prompt to grant this session read access",
+                    "path {} escapes workspace {} and no consent is on file — mention the containing directory in a prompt to grant this session access",
                     c.display(),
                     ws_canon.display()
                 )))
@@ -683,7 +763,7 @@ fn resolve_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, AgentError>
                 Ok(normalised)
             } else {
                 Err(AgentError::Other(format!(
-                    "path {} escapes workspace {} and no consent is on file — mention the containing directory in a prompt to grant this session read access",
+                    "path {} escapes workspace {} and no consent is on file — mention the containing directory in a prompt to grant this session access",
                     normalised.display(),
                     ws_canon.display()
                 )))
@@ -883,6 +963,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_outside_workspace_allowed_after_consent_grant() {
+        let workspace = tmpdir("edit-outside-ws");
+        let outside_dir = tmpdir("edit-outside-other");
+        let outside_file = outside_dir.join("finding.md");
+        std::fs::write(&outside_file, "status: active\n").unwrap();
+        let store = ensure_global_consent_store();
+        store
+            .grant_from_mention(&outside_dir)
+            .expect("grant existing outside dir");
+        let args = EditArgs {
+            file_path: outside_file.display().to_string(),
+            old_string: "active".into(),
+            new_string: "fixed".into(),
+            replace_all: false,
+        };
+
+        edit_file(&workspace, &args)
+            .await
+            .expect("edit should succeed via consent grant");
+
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).unwrap(),
+            "status: fixed\n"
+        );
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
+    }
+
+    #[tokio::test]
     async fn edit_rejects_empty_old_and_identity() {
         let dir = tmpdir("edit-empty");
         let path = dir.join("foo.c");
@@ -1078,9 +1187,7 @@ mod tests {
     /// own unique tmpdir, sharing the store is safe — no cross-test
     /// interference.
     fn ensure_global_consent_store() -> std::sync::Arc<kres_core::ConsentStore> {
-        let s = std::sync::Arc::new(kres_core::ConsentStore::new());
-        let _ = kres_core::consent::install(s.clone());
-        kres_core::consent::get().expect("store installed")
+        kres_core::consent::get_or_install()
     }
 
     #[test]
@@ -1131,6 +1238,70 @@ mod tests {
         let _ = granted; // keep around for debug asserts
         std::fs::remove_dir_all(&workspace).ok();
         std::fs::remove_dir_all(&outside_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn grep_marks_no_matches_as_context() {
+        let dir = tmpdir("grep-empty");
+        std::fs::write(dir.join("a.c"), "int present;\n").unwrap();
+        let args = GrepArgs {
+            pattern: "not_present".into(),
+            path: Some("a.c".into()),
+            limit: Some(20),
+            glob: None,
+        };
+        let text = grep(&dir, &args).await.unwrap();
+        assert!(
+            text.contains("(no matches for pattern"),
+            "expected no-match marker, got {text:?}"
+        );
+        assert!(text.contains("not_present"), "got {text:?}");
+        assert!(text.contains("a.c"), "got {text:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn grep_ignores_kres_result_artifacts_for_directory_searches() {
+        let dir = tmpdir("grep-artifacts");
+        std::fs::write(dir.join("driver.c"), "int real_source_symbol;\n").unwrap();
+        std::fs::create_dir_all(dir.join("new")).unwrap();
+        std::fs::write(
+            dir.join("new").join("findings.json"),
+            r#"{"findings":[{"id":"stale_bug","summary":"old_result_only_symbol"}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("kres-wed")).unwrap();
+        std::fs::write(
+            dir.join("kres-wed").join("report.md"),
+            "prior run mentioned old_result_only_symbol\n",
+        )
+        .unwrap();
+
+        let args = GrepArgs {
+            pattern: "old_result_only_symbol".into(),
+            path: Some(".".into()),
+            limit: Some(20),
+            glob: None,
+        };
+        let text = grep(&dir, &args).await.unwrap();
+        assert!(
+            text.contains("(no matches for pattern"),
+            "result artifacts leaked into grep output: {text}"
+        );
+        assert!(
+            !text.contains("stale_bug"),
+            "findings.json should not be searched: {text}"
+        );
+
+        let args = GrepArgs {
+            pattern: "real_source_symbol".into(),
+            path: Some(".".into()),
+            limit: Some(20),
+            glob: None,
+        };
+        let text = grep(&dir, &args).await.unwrap();
+        assert!(text.contains("driver.c"), "source grep failed: {text}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
@@ -1229,11 +1400,11 @@ mod tests {
     #[test]
     fn shell_split_escaped_quotes_in_double() {
         // Commit messages with Fixes: tags have inner quotes:
-        // -m "Fixes: 659a (\"tcp: add datapath\")"
+        // -m "Fixes: 659a (\"subsystem: introduce feature\")"
         // shell_split must treat \" inside double quotes as a
         // literal quote character, not as end-of-string.
         let parts = shell_split(
-            r#"commit -s -m "subject" -m "Fixes: 659a (\"tcp: add datapath\")" -m "Assisted-by: kres""#,
+            r#"commit -s -m "subject" -m "Fixes: 659a (\"subsystem: introduce feature\")" -m "Assisted-by: kres""#,
         )
         .unwrap();
         assert_eq!(parts[0], "commit");
@@ -1241,7 +1412,7 @@ mod tests {
         assert_eq!(parts[2], "-m");
         assert_eq!(parts[3], "subject");
         assert_eq!(parts[4], "-m");
-        assert_eq!(parts[5], r#"Fixes: 659a ("tcp: add datapath")"#);
+        assert_eq!(parts[5], r#"Fixes: 659a ("subsystem: introduce feature")"#);
         assert_eq!(parts[6], "-m");
         assert_eq!(parts[7], "Assisted-by: kres");
     }

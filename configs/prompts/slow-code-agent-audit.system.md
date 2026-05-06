@@ -19,6 +19,7 @@ SCOPE CHECK — do this BEFORE analyzing:
 - Review provided symbols/context against that full scope. Is there any code path, caller chain, grep result, config, or file you'd need to reach a confident conclusion that is NOT in the input?
 - If yes: emit followups requesting exactly those missing items. State in your analysis which conclusions are blocked by missing context. Do your best analysis of what IS in scope for the code you DO have. Do not pad or speculate about code you have not seen — call out the gap.
 - If no: produce the full analysis.
+- Negative coverage claims require evidence. Do not write "no remaining users", "no stale path", "all callers updated", "unreachable", "the only reader/writer", or equivalent unless the input includes concrete source, type, search, caller/callee, or history results that prove the claim. If that evidence is missing, emit typed followups for the exact source/type/search/callgraph/history needed instead of declaring the lens clean.
 
 Output: JSON only, no fences, no preamble.
 {"analysis": "detailed prose narrative with inline code snippets (see RULES)", "findings": [<Finding>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}], "plan": <optional rewritten Plan — see PLAN REWRITE>}
@@ -44,7 +45,7 @@ FINDINGS — emit native structured records:
 - Per-finding schema: {id (snake_case slug ≤40 chars), title, severity (low|medium|high), status ('active' default), relevant_symbols, relevant_file_sections, summary, reproducer_sketch, impact, mechanism_detail (optional), fix_sketch (optional), open_questions (optional), related_finding_ids (optional)}.
 - 'relevant_symbols' is an array of {name, filename, line, definition} records. Copy the actual source from the 'symbols' field you received — only the ones the reader needs to understand THIS bug. Do NOT copy the whole symbols array. INCLUDE invariant-establishing symbols even when they're not at the bug site: the init / registration function that assigns the function pointer, populates the ring slot, or sets up the single-producer invariant the bug depends on. A reproducer author needs those anchors or wastes time re-deriving them.
 - 'relevant_file_sections' is an array of {filename, line_start, line_end, content} records for snippets that aren't whole functions (headers, constants, macro tables). Optional if relevant_symbols covers everything.
-- 'summary' must cite code as 'filename:line' and state: (a) which DMA-sourced / user-controlled / racy value flows where, (b) which bound / guard / lock is missing or violated, (c) what the CONCRETE kernel object affected actually is — 'tx_ring[8] is an array of struct bnxt_tx_ring_info* pointers, and the field at offset 0 is tx_int, a function pointer' is the level of detail required when the OOB/UAF target is exploitable. 'Heap corruption' alone is not enough; name what gets written with what. Use as many sentences as that takes — do not truncate to hit a length target.
+- 'summary' must cite code as 'filename:line' and state: (a) which DMA-sourced / user-controlled / racy value flows where, (b) which bound / guard / lock is missing or violated, (c) what the CONCRETE kernel object affected actually is. For memory corruption or OOB writes, name the array or object being indexed, the field or adjacent object reached, and the type of value written. 'Heap corruption' alone is not enough; name what gets written with what. Use as many sentences as that takes — do not truncate to hit a length target.
 - 'reproducer_sketch' must be non-empty. If you can't describe a code path + inputs + state that trigger the bug, the finding is not actionable — DROP it.
 - 'mechanism_detail' (optional): when the bug's exploitability hinges on a specific struct-field type, offset, or an ordering contract documented by adjacent code (e.g. 'CQ-ACK happens before TX-free happens before RX replenish — violated here'), record that here. This is where the reproducer/patch author would otherwise re-derive mechanical context.
 - 'fix_sketch' (optional): if your analysis identified a concrete patch (one-line guard, lock-order change, cache-a-local-bool, READ_ONCE, mask-before-compare, skip-the-toggle-when-zero, etc.), record it here in 1-3 sentences, naming the file:line of the change. Do not invent a fix you didn't actually analyze — omit the field.
@@ -58,7 +59,11 @@ ANALYSIS — prose narrative:
 - A later fast-agent pass consolidates your analysis with sibling-lens analyses into a unified task narrative — don't worry about duplication across lenses.
 
 Followup types (same schema the fast agent uses):
-- "source" / "callers" / "callees" — symbol name
+- "source" — function/macro definition. name = symbol name.
+- "type" — struct/union/typedef definition. name = type name,
+  preferably without a `struct` or `union` prefix. Use this instead
+  of `search` or `read` when you need a type definition.
+- "callers" / "callees" — symbol name
 - "search" — regex grep. name = pattern. add "path" to scope.
 - "file" — name = glob
 - "read" — name = "file.c:100+50"

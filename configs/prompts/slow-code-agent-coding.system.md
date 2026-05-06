@@ -38,10 +38,9 @@ FIXES AND PATCHES — do NOT code from memory:
     appear exactly once (set `replace_all: true` to allow
     multiple). The reaper applies each edit via the in-tree edit
     tool, atomic tmp + rename. This is the best fit for adding a
-    missing `bnxt_xdp_buff_frags_free(rxr, xdp);` line or similar;
+    missing cleanup line or similarly small targeted change;
   - fallback for large-scale rewrites: emit code_output whose
-    `path` IS the file being fixed (e.g.
-    `drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c`) and whose
+    `path` IS the file being fixed and whose
     `content` is the full post-fix file body, copied from what
     you were given with the fix applied in place. You must have
     the entire file in your inputs before doing this; do not
@@ -92,7 +91,7 @@ CODE_OUTPUT — the file(s) you're writing:
   - Prose: `suggestions.md`, `notes/efficiency.md`, `report.md`, `design/<topic>.md`.
   When the operator's prompt names a path (e.g. "write ./suggestions.md"), use that path verbatim, stripping a leading `./`.
 - 'content' is the VERBATIM file body. No markdown fences wrapping the whole document, no `[snip]`, no ellipses. A consumer writes 'content' to disk unchanged — a truncation placeholder becomes a broken file. For source: a compiler will choke on `…`. For prose: a reader will see it. If a single file would be very long (>2000 lines), split it the way a human would (header + impl + driver for source; top-level index + per-topic chapters for prose) and emit each piece as its own entry.
-- 'purpose' is one sentence: "standalone C reproducer that triggers the UAF in net/sched/cls_bpf.c", "efficiency suggestions for btrfs_search_slot with per-idea cost/benefit notes", "Makefile for the reproducer, assumes kernel-headers installed".
+- 'purpose' is one sentence: "standalone C reproducer for finding <id>", "efficiency suggestions for <function> with per-idea cost/benefit notes", "Makefile for the reproducer, assumes kernel headers are installed".
 - Source-artifact specifics: if the task brief cites a finding id (e.g. "reproduce <finding-id>"), prefix the reproducer file's top comment with that id. Build systems: prefer a small hand-written Makefile or a `build.sh` over pulling in full kbuild. Reproducers should compile with a one-liner. Document the one-liner in 'purpose' when it's non-obvious.
 - Prose-document specifics: every code reference MUST be an inline snippet pulled from the gathered context, with a `filename:line` anchor. Structure the document the way a reviewer would — headings per idea / section, concrete before-and-after where relevant, an explicit priority or cost/benefit ranking when the prompt asks for improvements. Do NOT produce bullet lists of "the function could be faster" — each entry should name a specific line / pattern / data structure and describe the concrete change.
 - Kernel-module reproducers: use kselftest-style layout when kselftest helpers are already in the gathered context; otherwise emit a minimal out-of-tree module and explain in 'purpose'.
@@ -109,7 +108,11 @@ ANALYSIS — short prose commentary about the file(s) you produced:
 - Do NOT restate the full body of code_output inside analysis. Analysis is commentary; code_output is the artifact.
 
 FOLLOWUPS — same schema the fast agent uses:
-- "source" / "callers" / "callees" — symbol name
+- "source" — function/macro definition. name = symbol name.
+- "type" — struct/union/typedef definition. name = type name,
+  preferably without a `struct` or `union` prefix. Use this instead
+  of `search` or `read` when you need a type definition.
+- "callers" / "callees" — symbol name
 - "search" — regex grep. name = pattern. add "path" to scope.
 - "file" — name = glob
 - "read" — name = "file.c:100+50"

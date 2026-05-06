@@ -94,6 +94,26 @@ pub fn paint(rows: u16, cols: u16, text: &str) {
     let _ = out.flush();
 }
 
+/// Move the cursor back into the scroll region reserved for normal
+/// output. Foreground slash commands run between two rustyline
+/// prompts, so rustyline's ExternalPrinter writes directly at the
+/// current cursor position instead of going through its raw-mode
+/// prompt-aware path. After the operator presses Enter, that cursor
+/// can still be on the prompt row, outside the DECSTBM scroll region;
+/// park it at the scroll bottom before command output so newlines
+/// visibly scroll the transcript.
+pub fn park_scroll_region_bottom() {
+    let Some((rows, _)) = term_size() else {
+        return;
+    };
+    if rows < 3 {
+        return;
+    }
+    let mut out = std::io::stderr();
+    let _ = write!(out, "\x1b[{};1H", rows - 2);
+    let _ = out.flush();
+}
+
 /// Clear a specific terminal row (absolute row number, 1-indexed)
 /// and reset the scroll region to full-screen. Used on resize to
 /// wipe the previous status row at its old location before

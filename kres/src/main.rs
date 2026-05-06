@@ -35,6 +35,91 @@ enum Command {
     Test(TestArgs),
     /// One-shot large-context turn: JSON/stdin → streamed response file.
     Turn(TurnArgs),
+    /// Validate a workflow JSON file against the embedded schema +
+    /// cross-field invariants. Prints "ok: <n> steps" on success or
+    /// the first batch of validation errors and exits non-zero.
+    ValidateWorkflow(ValidateWorkflowArgs),
+    /// Run a workflow JSON file end-to-end. Loads agent configs from
+    /// `--kres-dir` (default `~/.kres/`), resolves workflow inputs,
+    /// drives the executor against the kres-llm client, and prints
+    /// the per-step trace as the run progresses. Final exit status:
+    /// 0 on Success / TerminalSuccess, non-zero on Failure /
+    /// IterationCap.
+    RunWorkflow(RunWorkflowArgs),
+}
+
+#[derive(Args, Debug)]
+struct ValidateWorkflowArgs {
+    /// Path to a workflow JSON (e.g. configs/workflows/fix.json).
+    path: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct RunWorkflowArgs {
+    /// Path to a workflow JSON (e.g. configs/workflows/fix.json).
+    path: PathBuf,
+    /// Workflow input as KEY=VALUE. Repeatable. Values are parsed
+    /// as JSON when possible (numbers, booleans, strings); plain
+    /// strings can be passed unquoted (e.g. `target=/abs/path`).
+    /// Bare KEY (no `=`) sets the input to `true`.
+    #[arg(long, value_name = "KEY=VAL")]
+    input: Vec<String>,
+    /// Workspace for git/make post-actions. Defaults to cwd.
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// Directory holding fast-code-agent.json / slow-code-agent-*.json
+    /// (the same set the REPL reads). Defaults to ~/.kres/.
+    #[arg(long, value_name = "DIR")]
+    kres_dir: Option<PathBuf>,
+    /// Slow agent tag (sonnet/opus/...) — picks
+    /// slow-code-agent-<tag>.json. Defaults to sonnet.
+    #[arg(long, default_value = "sonnet")]
+    slow: String,
+    /// Directory of skill .md files. Defaults to <kres-dir>/skills/.
+    /// Skill files named in workflow.skills are loaded eagerly and
+    /// prepended to every step prompt.
+    #[arg(long, value_name = "DIR")]
+    skills_dir: Option<PathBuf>,
+    /// Directory for code.jsonl / main.jsonl turn logs. When set,
+    /// every LLM call's user + assistant messages are appended.
+    /// Defaults to .kres/logs/<uuid>/ in the workspace, matching
+    /// the REPL's layout.
+    #[arg(long, value_name = "DIR")]
+    logs: Option<PathBuf>,
+    /// Persist a snapshot of workflow state to <DIR>/workflow-<id>.json
+    /// after every step settles, so a killed run can pick up where it
+    /// left off. Pair with --resume to load.
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+    /// Resume from <state-dir>/workflow-<id>.json instead of starting
+    /// clean. Requires --state-dir. Inputs from the snapshot override
+    /// any --input values supplied on the command line.
+    #[arg(long, default_value_t = false)]
+    resume: bool,
+    /// Cap on total step executions before the run aborts. Mostly a
+    /// safety net for authoring bugs; the FIX flow's own per-step
+    /// max_attempts and on_exhausted handlers should fire first.
+    #[arg(long, default_value_t = 200)]
+    iteration_cap: usize,
+    /// Directory for run artefacts: findings.json (every Finding
+    /// produced by the run) + report.md (markdown roll-up). Same
+    /// flag as the REPL's --results so /review and /fix from the
+    /// CLI's `--prompt` short-circuit honour it. When omitted, no
+    /// artefacts are written.
+    #[arg(long, value_name = "DIR")]
+    results: Option<PathBuf>,
+    /// Path to mcp.json (the same file the REPL consumes). When
+    /// present, the first MCP server in the registry is spawned and
+    /// wraps the workspace fetcher so `source` / `callers` /
+    /// `callees` followups have a real backend. Defaults to
+    /// <kres-dir>/mcp.json.
+    #[arg(long, value_name = "FILE")]
+    mcp_config: Option<PathBuf>,
+    /// Override the exact value used after `Assisted-by:` in
+    /// fix-workflow commit messages. Defaults to
+    /// `kres (<resolved-slow-model-id>)`.
+    #[arg(long, value_name = "TEXT")]
+    assisted_by: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -50,8 +135,8 @@ struct ReplArgs {
     /// known shorthand (sonnet/opus) the matching model id ALSO
     /// overrides settings.models.slow — pass --slow-model to
     /// override the model independently.
-    #[arg(long)]
-    slow: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    slow: Vec<String>,
     /// Explicit slow-agent config path (overrides --slow).
     #[arg(long)]
     slow_agent: Option<PathBuf>,
@@ -68,6 +153,11 @@ struct ReplArgs {
     /// Override the todo-agent model id. Beats settings.json.
     #[arg(long, value_name = "ID")]
     todo_model: Option<String>,
+    /// Override the exact value used after `Assisted-by:` in
+    /// fix-workflow commit messages. Defaults to
+    /// `kres (<resolved-slow-model-id>)`.
+    #[arg(long, value_name = "TEXT")]
+    assisted_by: Option<String>,
     /// Main agent config JSON file. Defaults to
     /// ~/.kres/main-agent.json.
     #[arg(long)]
@@ -312,7 +402,22 @@ fn main() -> Result<()> {
     let result = match cli.cmd {
         Some(Command::Test(args)) => rt.block_on(run_test(args)),
         Some(Command::Turn(args)) => rt.block_on(turn::run_turn(args)),
-        None => rt.block_on(run_repl(cli.repl)),
+        Some(Command::ValidateWorkflow(args)) => run_validate_workflow(args),
+        Some(Command::RunWorkflow(args)) => rt.block_on(run_workflow(args)),
+        None => {
+            // Workflow prompt invocations use their workflow-owned
+            // path. Fix/triage run through the workflow executor.
+            // Review is special because its workflow-owned semantics
+            // are the REPL task/todo loop: one lensed review turn
+            // emits followups, the reaper sends them through the todo
+            // agent, and --turns controls how many fresh review tasks
+            // run.
+            if let Some(short_circuit) = workflow_short_circuit_from_repl_args(&cli.repl) {
+                rt.block_on(run_workflow(short_circuit))
+            } else {
+                rt.block_on(run_repl(cli.repl))
+            }
+        }
     };
 
     // The REPL's stdin reader lives on a `tokio::task::spawn_blocking`
@@ -347,18 +452,13 @@ fn main() -> Result<()> {
 /// Recognised forms:
 ///   1. Path to an existing file → `(path.display(), file-contents)`.
 ///   2. `"word: extra"` or `"/word extra"` naming a slash-command
-///      template (embedded default plus optional override at
-///      `~/.kres/commands/<word>.md`) → `(source-label, extra +
-///      "\n\n" + command-body)`. Both forms are equivalent:
-///      `--prompt "review: fs/btrfs/ctree.c"` and
-///      `--prompt "/review fs/btrfs/ctree.c"` produce the same
-///      composed prompt.
-///   3. Legacy `~/.kres/prompts/<word>-template.md` lookup — kept
-///      as a back-compat fallback so operators with custom
-///      `<word>-template.md` files from before the slash-command
-///      refactor keep working without edits. The new location
-///      `~/.kres/commands/<word>.md` is preferred.
-///   4. Anything else → `("<inline>", raw)`.
+///      template that is not workflow-owned. `fix` and `triage` are
+///      handled before this function by
+///      `workflow_short_circuit_from_repl_args`; `review` is handled
+///      by `kres_repl::review_prompt_file_from_prompt` so it enters
+///      the task/todo loop. Summary commands use `--summary` /
+///      `/summary`.
+///   3. Anything else → `("<inline>", raw)`.
 fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
     // Form 1: existing file path wins outright, including when the
     // name happens to contain a colon.
@@ -388,34 +488,21 @@ fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
     };
     if let Some((head, rest)) = named {
         // Preferred: ~/.kres/commands/<word>.md via user_commands
-        // (disk-first + embedded fallback + name-validation). The
+        // (disk-first + embedded default + name-validation). The
         // validation inside compose covers the same character set
         // we'd enforce here, so there's no need to pre-filter.
+        if matches!(head, "fix" | "review" | "triage") {
+            return Err(anyhow::anyhow!(
+                "`{head}` is workflow-only; use `/{head} <target>` or `--prompt '{head}: <target>'`"
+            ));
+        }
+        if matches!(head, "summary" | "summary-markdown") {
+            return Err(anyhow::anyhow!(
+                "`{head}` is a report-rendering command; use `--{head}` or `/{head}`"
+            ));
+        }
         if let Some((src, composed)) = kres_agents::user_commands::compose(head, rest) {
             return Ok((src, composed));
-        }
-        // Legacy: ~/.kres/prompts/<word>-template.md. Kept for
-        // operators whose custom templates predate the slash-
-        // command refactor. New templates should go under
-        // ~/.kres/commands/<word>.md.
-        let is_word = !head.is_empty()
-            && head
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        if is_word {
-            if let Some(dir) = kres_dir() {
-                let tmpl = dir.join("prompts").join(format!("{}-template.md", head));
-                if tmpl.exists() {
-                    let body = std::fs::read_to_string(&tmpl)
-                        .with_context(|| format!("reading template {}", tmpl.display()))?;
-                    let composed = if rest.is_empty() {
-                        body
-                    } else {
-                        format!("{rest}\n\n{body}")
-                    };
-                    return Ok((tmpl.display().to_string(), composed));
-                }
-            }
         }
     }
     // Form 4: inline prompt text.
@@ -438,6 +525,33 @@ fn slow_tag_to_model_id(tag: &str) -> Option<&'static str> {
     }
 }
 
+fn assisted_by_from_model_id(model_id: &str) -> String {
+    format!("kres ({model_id})")
+}
+
+fn default_assisted_by_for_slow_agent(
+    slow_agent: Option<&PathBuf>,
+    settings: &kres_repl::Settings,
+) -> String {
+    let cfg_model = slow_agent
+        .and_then(|path| kres_agents::AgentConfig::load(path).ok())
+        .and_then(|cfg| cfg.model);
+    let model = kres_repl::pick_model(cfg_model.as_deref(), kres_repl::ModelRole::Slow, settings);
+    assisted_by_from_model_id(&model.id)
+}
+
+fn resolved_assisted_by(
+    override_value: Option<&String>,
+    slow_agent: Option<&PathBuf>,
+    settings: &kres_repl::Settings,
+) -> String {
+    override_value
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| default_assisted_by_for_slow_agent(slow_agent, settings))
+}
+
 /// Resolve an optional CLI path:
 /// - If the caller passed `--foo /abs/path`, use it verbatim.
 /// - Otherwise look in `~/.kres/<default_name>`. Return the path only
@@ -453,6 +567,22 @@ fn resolve_default(cli: Option<&PathBuf>, default_name: &str) -> Option<PathBuf>
     } else {
         None
     }
+}
+
+fn resolve_slow_agent_for_tag(tag: &str) -> Option<PathBuf> {
+    let name = format!("slow-code-agent-{tag}.json");
+    kres_dir()
+        .map(|d| d.join(&name))
+        .filter(|p| p.exists())
+        .or_else(|| {
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let candidates = [
+                manifest.join("../configs").join(&name),
+                manifest.join("configs").join(&name),
+                PathBuf::from("configs").join(&name),
+            ];
+            candidates.into_iter().find(|p| p.exists())
+        })
 }
 
 async fn run_repl(args: ReplArgs) -> Result<()> {
@@ -471,30 +601,29 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // When the operator didn't pass --slow at all, default the file
     // resolver to "sonnet" — the model id is left to settings.json
     // (see the override block below).
-    let slow_tag_for_file = args.slow.as_deref().unwrap_or("sonnet");
-    let slow_tag_name = format!("slow-code-agent-{}.json", slow_tag_for_file);
-    let slow_agent = args
-        .slow_agent
-        .clone()
-        .or_else(|| {
-            kres_dir()
-                .map(|d| d.join(&slow_tag_name))
-                .filter(|p| p.exists())
-        })
-        .or_else(|| {
-            // Shipped-config fallback: <repo>/configs/<name>.json.
-            // Anchor on the crate's manifest dir so this works no matter
-            // where the binary was invoked from; fall back to cwd-relative
-            // for installed binaries where CARGO_MANIFEST_DIR no longer
-            // points to the shipping repo.
-            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let candidates = [
-                manifest.join("../configs").join(&slow_tag_name),
-                manifest.join("configs").join(&slow_tag_name),
-                PathBuf::from("configs").join(&slow_tag_name),
-            ];
-            candidates.into_iter().find(|p| p.exists())
-        });
+    let requested_slow_tags = if args.slow.is_empty() {
+        vec!["sonnet".to_string()]
+    } else {
+        args.slow.clone()
+    };
+    let slow_agent_specs: Vec<(PathBuf, Option<String>)> = if let Some(p) = args.slow_agent.clone()
+    {
+        vec![(p, args.slow_model.clone())]
+    } else {
+        requested_slow_tags
+            .iter()
+            .filter_map(|tag| {
+                resolve_slow_agent_for_tag(tag).map(|p| {
+                    let model = args
+                        .slow_model
+                        .clone()
+                        .or_else(|| slow_tag_to_model_id(tag).map(str::to_string));
+                    (p, model)
+                })
+            })
+            .collect()
+    };
+    let slow_agent = slow_agent_specs.first().map(|(p, _)| p.clone());
 
     let main_agent = resolve_default(args.main_agent.as_ref(), "main-agent.json");
     let todo_agent = resolve_default(args.todo_agent.as_ref(), "todo-agent.json");
@@ -511,7 +640,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // precedence (highest → lowest) inside pick_model stays:
     //   1. agent config's `"model"` field
     //   2. settings.models.<role>  ← CLI overrides land here
-    //   3. Model::sonnet_4_6() fallback
+    //   3. Model::sonnet_4_6() default
     //
     // When --slow is passed as a known tag (sonnet/opus) we also map
     // it to a model id, so `--slow sonnet` actually switches the
@@ -521,7 +650,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // actually passed --slow. Without this gate the clap default
     // "sonnet" would unconditionally overwrite settings.models.slow
     // every run, masking whatever the operator set in
-    if let Some(tag) = args.slow.as_deref() {
+    if let Some(tag) = args.slow.first() {
         if let Some(id) = slow_tag_to_model_id(tag) {
             settings.set_model(kres_repl::ModelRole::Slow, Some(id.to_string()));
         }
@@ -530,6 +659,8 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     settings.set_model(kres_repl::ModelRole::Slow, args.slow_model.clone());
     settings.set_model(kres_repl::ModelRole::Main, args.main_model.clone());
     settings.set_model(kres_repl::ModelRole::Todo, args.todo_model.clone());
+    let assisted_by =
+        resolved_assisted_by(args.assisted_by.as_ref(), slow_agent.as_ref(), &settings);
 
     // --- Resolve artifact dir + per-file paths ---------------------
     // `--results DIR` sets the default dir for findings/report/todo.
@@ -773,6 +904,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             && (args.tui || std::io::IsTerminal::is_terminal(&std::io::stdout())),
         workspace: args.workspace.clone(),
         persist_path,
+        assisted_by,
         // Piped/redirected stdout has no operator on the other end,
         // so once the work-stop condition fires there is no one to
         // type the next prompt. Match the existing `--turns N` exit
@@ -1084,12 +1216,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         let built = build_orchestrator(
             fc,
             sc,
+            slow_agent_specs.iter().skip(1).cloned().collect(),
             workspace,
             fetcher,
             skills_value,
             usage.clone(),
             args.gather_turns,
             logger.clone(),
+            Some(results_dir.join("comparison.json")),
             &settings,
         )
         .await?;
@@ -1138,17 +1272,30 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                  use /continue to dispatch pending items"
             );
         } else {
-            match resolve_prompt_arg(raw_arg) {
-                Ok((source, body)) => {
-                    let pf = kres_agents::parse_prompt_file(&body);
+            let resolved_kres_dir = kres_dir();
+            match kres_repl::review_prompt_file_from_prompt(raw_arg, resolved_kres_dir.as_deref()) {
+                Ok(Some(cfg)) => {
                     kres_core::async_eprintln!(
                         "prompt: loaded {} lens(es) + {} chars of prose from {}",
-                        pf.lenses.len(),
-                        pf.prompt.len(),
-                        source,
+                        cfg.prompt_file.lenses.len(),
+                        cfg.prompt_file.prompt.len(),
+                        cfg.source,
                     );
-                    session = session.with_prompt_file(pf);
+                    session = session.with_review_prompt_config(cfg);
                 }
+                Ok(None) => match resolve_prompt_arg(raw_arg) {
+                    Ok((source, body)) => {
+                        let pf = kres_agents::parse_prompt_file(&body);
+                        kres_core::async_eprintln!(
+                            "prompt: loaded {} lens(es) + {} chars of prose from {}",
+                            pf.lenses.len(),
+                            pf.prompt.len(),
+                            source,
+                        );
+                        session = session.with_prompt_file(pf);
+                    }
+                    Err(e) => kres_core::async_eprintln!("prompt: {e}"),
+                },
                 Err(e) => kres_core::async_eprintln!("prompt: {e}"),
             }
         }
@@ -1187,6 +1334,315 @@ fn init_tracing(filter: Option<&str>) {
         .try_init();
 }
 
+/// Validate a workflow JSON file against the embedded JSON Schema
+/// and cross-field invariants. Prints `ok: <n> steps` on success;
+/// returns the first batch of errors otherwise. Synchronous — no
+/// network or I/O beyond reading the file.
+/// If `--prompt` looks like a workflow invocation
+/// (`<id>: <target>` or `/<id> <target>`) AND `<id>` resolves to an
+/// embedded or operator-overridden workflow, build a `RunWorkflowArgs`
+/// for executor-owned workflows. `review` deliberately returns None
+/// here because its JSON-owned execution path is the REPL task/todo
+/// loop, not the one-shot workflow executor.
+fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowArgs> {
+    use kres_agents::workflow::lookup_workflow;
+    let raw = repl.prompt.as_ref()?;
+    let (id, rest) = kres_repl::workflow_prompt_invocation(raw)?;
+    if id == "review" {
+        return None;
+    }
+    // Resolve via the workflow registry — disk override first, then
+    // embedded. If neither has it, the caller handles the prompt as a
+    // normal slash-command template or inline text.
+    let resolved_kres_dir: Option<PathBuf> = kres_dir();
+    let override_dir: Option<PathBuf> = resolved_kres_dir.as_ref().map(|d| d.join("workflows"));
+    let wf = match lookup_workflow(override_dir.as_deref(), id) {
+        Ok(w) => w,
+        Err(_) => return None,
+    };
+    let chosen_input_key = kres_repl::target_input_key(&wf);
+    let mut input = vec![format!("{chosen_input_key}={}", rest)];
+    // Path to the workflow file: the lookup is by id, but
+    // RunWorkflowArgs takes a path. Use a sentinel — the runner re-
+    // looks up via id when the path doesn't exist (handled in
+    // run_workflow below).
+    let stub_path: PathBuf = format!("workflow-id:{id}").into();
+    // The REPL's --workspace and --results carry through into the
+    // workflow run so `kres --results may6 --prompt '/review HEAD'`
+    // writes findings.json + report.md to may6/. Earlier the
+    // short-circuit silently dropped both flags.
+    let workspace = repl.workspace.clone();
+    let results = repl.results.clone();
+    Some(RunWorkflowArgs {
+        path: stub_path,
+        input: std::mem::take(&mut input),
+        workspace,
+        kres_dir: resolved_kres_dir,
+        slow: "sonnet".into(),
+        skills_dir: None,
+        logs: None,
+        state_dir: None,
+        resume: false,
+        results,
+        iteration_cap: if repl.turns > 0 {
+            repl.turns as usize
+        } else {
+            200
+        },
+        mcp_config: None,
+        assisted_by: repl.assisted_by.clone(),
+    })
+}
+
+fn run_validate_workflow(args: ValidateWorkflowArgs) -> Result<()> {
+    let wf = kres_agents::workflow::load_workflow(&args.path)?;
+    println!("ok: workflow '{}' — {} step(s)", wf.id, wf.steps.len());
+    Ok(())
+}
+
+/// Run a workflow end-to-end against the kres-llm client. Builds an
+/// `LlmDriver` with whichever agent configs are present in
+/// `--kres-dir`, applies derive rules to the input map, then drives
+/// the executor. Trace is printed line-by-line as events happen.
+async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
+    use std::sync::Arc;
+
+    use kres_agents::config::AgentConfig;
+    use kres_agents::workflow_runner::{derive_inputs, parse_input_kvs, AgentEnv, LlmDriver};
+    use kres_llm::client::Client;
+
+    let kres_dir = args
+        .kres_dir
+        .clone()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".kres")))
+        .ok_or_else(|| anyhow::anyhow!("could not resolve kres-dir (set --kres-dir)"))?;
+    let workflow = kres_repl::load_workflow_path_or_id(&args.path, Some(&kres_dir))?;
+    let fast_path = kres_dir.join("fast-code-agent.json");
+    let slow_path = kres_dir.join(format!("slow-code-agent-{}.json", args.slow));
+
+    let mut inputs_raw = parse_input_kvs(&args.input)?;
+    let settings = kres_repl::Settings::load_merged(&args.workspace);
+    if workflow.inputs.contains_key("assisted_by") {
+        if let Some(value) = args
+            .assisted_by
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            inputs_raw.insert(
+                "assisted_by".into(),
+                serde_json::Value::String(value.into()),
+            );
+        } else if !inputs_raw.contains_key("assisted_by") {
+            inputs_raw.insert(
+                "assisted_by".into(),
+                serde_json::Value::String(default_assisted_by_for_slow_agent(
+                    Some(&slow_path),
+                    &settings,
+                )),
+            );
+        }
+    }
+    let inputs = derive_inputs(&workflow, inputs_raw);
+
+    let mut driver = LlmDriver::new(args.workspace.clone(), workflow.clone());
+
+    // JSONL turn logging. TurnLogger::new appends `.kres/logs/<uuid>` itself, so
+    // pass a base directory (the workspace by default), matching the REPL.
+    let logs_base = args.logs.clone().unwrap_or_else(|| args.workspace.clone());
+    if let Err(e) = std::fs::create_dir_all(&logs_base) {
+        eprintln!(
+            "warning: could not create logs dir {}: {e}",
+            logs_base.display()
+        );
+    }
+    let logger: Option<Arc<kres_core::log::TurnLogger>> =
+        match kres_core::log::TurnLogger::new(&logs_base) {
+            Ok(lg) => {
+                eprintln!("logs: {}", lg.session_dir().display());
+                Some(Arc::new(lg))
+            }
+            Err(e) => {
+                eprintln!("warning: could not init turn logger: {e}");
+                None
+            }
+        };
+
+    // Keep the AgentEnv fallback path for workflows that do not need
+    // followup gathering, but use the same settings model selection as the REPL.
+    if fast_path.exists() {
+        let cfg = AgentConfig::load(&fast_path)?;
+        let client = Arc::new(Client::new(cfg.key.clone())?);
+        let model =
+            kres_repl::pick_model(cfg.model.as_deref(), kres_repl::ModelRole::Fast, &settings);
+        let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
+        let thinking = cfg
+            .thinking
+            .as_ref()
+            .map(|thinking| thinking.to_budget(max_tokens));
+        driver = driver.with_fast(AgentEnv::new_with_config(
+            client,
+            &model.id,
+            max_tokens,
+            cfg.system.clone(),
+            thinking,
+        ));
+    }
+    if slow_path.exists() {
+        let cfg = AgentConfig::load(&slow_path)?;
+        let client = Arc::new(Client::new(cfg.key.clone())?);
+        let model =
+            kres_repl::pick_model(cfg.model.as_deref(), kres_repl::ModelRole::Slow, &settings);
+        let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
+        let thinking = cfg
+            .thinking
+            .as_ref()
+            .map(|thinking| thinking.to_budget(max_tokens));
+        let slow_env = AgentEnv::new_with_config(
+            client.clone(),
+            &model.id,
+            max_tokens,
+            cfg.system.clone(),
+            thinking,
+        );
+        driver = driver.with_slow(slow_env);
+        let code_env =
+            AgentEnv::new_with_config(client, &model.id, max_tokens, cfg.system, thinking);
+        driver = driver.with_code(code_env);
+    }
+
+    if driver.fast.is_none() && driver.slow.is_none() {
+        return Err(anyhow::anyhow!(
+            "no agent configs found in {} — workflow can't run without at least one role wired",
+            kres_dir.display()
+        ));
+    }
+
+    // Build a full Orchestrator when both fast and slow agents are wired.
+    // This reuses the same builder the REPL uses, so model selection,
+    // prompt loading, rate-limit sharing, gather-turn handling, and lens
+    // consolidation setup stay in one place.
+    if fast_path.exists() && slow_path.exists() {
+        use kres_agents::WorkspaceFetcher;
+        let workspace_fetcher = WorkspaceFetcher::new(args.workspace.clone());
+        let mcp_path = args
+            .mcp_config
+            .clone()
+            .unwrap_or_else(|| kres_dir.join("mcp.json"));
+        let fetcher: Arc<dyn kres_agents::pipeline::DataFetcher> = if mcp_path.exists() {
+            match kres_mcp::ServerRegistry::load_from_file(&mcp_path) {
+                Ok(reg) => match reg.servers.iter().next() {
+                    Some((name, server_cfg)) => {
+                        // MCP wants its own log dir; reuse the
+                        // logger's session dir if we built one,
+                        // else fall back to the logs_base.
+                        let mcp_log_dir = logger
+                            .as_ref()
+                            .map(|lg| lg.session_dir().to_path_buf())
+                            .unwrap_or_else(|| logs_base.clone());
+                        match kres_mcp::McpClient::spawn(name, server_cfg, &mcp_log_dir).await {
+                            Ok(mcp) => {
+                                eprintln!(
+                                    "mcp: spawned '{name}' from {} ({} tool(s) advertised)",
+                                    mcp_path.display(),
+                                    mcp.tools().len()
+                                );
+                                kres_agents::McpFetcher::new(mcp, workspace_fetcher.clone())
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "mcp: spawn '{name}' failed ({e}); using workspace-only fetcher"
+                                );
+                                workspace_fetcher.clone()
+                            }
+                        }
+                    }
+                    None => workspace_fetcher.clone(),
+                },
+                Err(e) => {
+                    eprintln!(
+                        "mcp: read {} failed ({e}); using workspace-only fetcher",
+                        mcp_path.display()
+                    );
+                    workspace_fetcher.clone()
+                }
+            }
+        } else {
+            workspace_fetcher.clone()
+        };
+
+        let built = kres_repl::build_orchestrator(
+            &fast_path,
+            &slow_path,
+            Vec::new(),
+            args.workspace.clone(),
+            fetcher,
+            None,
+            None,
+            5,
+            logger.clone(),
+            args.results.as_ref().map(|d| d.join("comparison.json")),
+            &settings,
+        )
+        .await?;
+        driver = driver
+            .with_orchestrator(built.orchestrator)
+            .with_consolidator(built.consolidator);
+        eprintln!(
+            "orchestrator: wired via REPL builder (WorkspaceFetcher in {}; lens fan-out shares gather via run_with_lenses)",
+            args.workspace.display()
+        );
+    } else {
+        eprintln!(
+            "orchestrator: not wired (need both fast+slow agent configs); falling back to single-shot LLM calls — followups WILL NOT be gathered"
+        );
+    }
+
+    // Skills loading: respects --skills-dir, otherwise <kres-dir>/skills.
+    let skills_dir = args
+        .skills_dir
+        .clone()
+        .unwrap_or_else(|| kres_dir.join("skills"));
+    let (driver_with_skills, skill_warnings) = driver.with_skills_dir(&skills_dir)?;
+    driver = driver_with_skills;
+    for w in &skill_warnings {
+        eprintln!("warning: {w}");
+    }
+
+    // Hand the same logger to the LlmDriver so the AgentEnv-fallback
+    // path (used by tests) also writes to code.jsonl.
+    if let Some(lg) = logger.as_ref() {
+        driver = driver.with_logger(lg.clone());
+    }
+
+    eprintln!(
+        "running workflow '{}' from {} ({} steps, iteration cap {})",
+        workflow.id,
+        args.path.display(),
+        workflow.steps.len(),
+        args.iteration_cap
+    );
+
+    let run = kres_repl::run_workflow_driver(
+        &workflow,
+        &mut driver,
+        inputs,
+        kres_repl::WorkflowRunOptions {
+            iteration_cap: args.iteration_cap,
+            state_dir: args.state_dir.clone(),
+            resume: args.resume,
+            results_dir: args.results.clone(),
+            observer: None,
+        },
+    )
+    .await?;
+    print!("{}", run.trace.pretty());
+    for p in run.written_artifacts {
+        eprintln!("wrote {}", p.display());
+    }
+    kres_repl::workflow_status_result(&run.trace.status)
+}
+
 async fn run_test(args: TestArgs) -> Result<()> {
     use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
@@ -1200,7 +1656,7 @@ async fn run_test(args: TestArgs) -> Result<()> {
 
     let client = Client::new(api_key)?;
     // Defaults now pick the right thinking schema per model family
-    // (adaptive for opus-4-7+, legacy budget for older). Cap
+    // (adaptive for opus-4-7+, explicit budget for older). Cap
     // max_tokens to keep the smoke test small.
     let cfg = CallConfig::defaults_for(model.clone()).with_max_tokens(16_384);
     let messages = vec![Message {
@@ -1304,17 +1760,61 @@ mod tests {
 
     #[test]
     fn slow_tag_unset_when_not_passed() {
-        // --slow is now Option<String> with no clap default, so the
+        // --slow has no clap default, so the
         // settings.json slow model is not silently overridden when
         // the operator omits the flag (user report 2026-04-21).
         let c = Cli::try_parse_from(["kres"]).unwrap();
-        assert_eq!(c.repl.slow, None);
+        assert!(c.repl.slow.is_empty());
     }
 
     #[test]
     fn slow_tag_passes_through_when_set() {
         let c = Cli::try_parse_from(["kres", "--slow", "opus"]).unwrap();
-        assert_eq!(c.repl.slow.as_deref(), Some("opus"));
+        assert_eq!(c.repl.slow, vec!["opus"]);
+    }
+
+    #[test]
+    fn slow_tag_can_repeat_for_comparison() {
+        let c = Cli::try_parse_from(["kres", "--slow", "sonnet", "--slow", "opus"]).unwrap();
+        assert_eq!(c.repl.slow, vec!["sonnet", "opus"]);
+    }
+
+    #[test]
+    fn assisted_by_flag_parses_for_repl_and_workflow() {
+        let c = Cli::try_parse_from(["kres", "--assisted-by", "custom tool"]).unwrap();
+        assert_eq!(c.repl.assisted_by.as_deref(), Some("custom tool"));
+
+        let c = Cli::try_parse_from([
+            "kres",
+            "run-workflow",
+            "workflow-id:fix",
+            "--assisted-by",
+            "custom tool",
+        ])
+        .unwrap();
+        match c.cmd {
+            Some(Command::RunWorkflow(args)) => {
+                assert_eq!(args.assisted_by.as_deref(), Some("custom tool"));
+            }
+            other => panic!("expected run-workflow command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assisted_by_defaults_to_slow_model() {
+        let mut settings = kres_repl::Settings::default();
+        settings.set_model(
+            kres_repl::ModelRole::Slow,
+            Some("claude-test-model".to_string()),
+        );
+        assert_eq!(
+            resolved_assisted_by(None, None, &settings),
+            "kres (claude-test-model)"
+        );
+        assert_eq!(
+            resolved_assisted_by(Some(&"operator value".to_string()), None, &settings),
+            "operator value"
+        );
     }
 
     #[test]
@@ -1335,39 +1835,81 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prompt_arg_word_colon_form_hits_user_commands() {
-        // --prompt "review: target" resolves via user_commands to the
-        // embedded review template with the target prepended.
-        let (src, body) =
-            resolve_prompt_arg("review: fs/btrfs/ctree.c").expect("review: form should resolve");
-        assert!(src.contains("review"), "source label: {src}");
+    fn review_prompt_uses_task_loop_prompt_file() {
+        let c = Cli::try_parse_from([
+            "kres",
+            "--results",
+            "may6",
+            "--turns",
+            "20",
+            "--prompt",
+            "/review HEAD",
+        ])
+        .unwrap();
         assert!(
-            body.starts_with("fs/btrfs/ctree.c\n\n"),
-            "target must lead body: {body:?}"
+            workflow_short_circuit_from_repl_args(&c.repl).is_none(),
+            "batch review must enter the REPL task/todo loop, not one-shot run-workflow"
         );
-        assert!(body.contains("[investigate]"), "review body missing");
+        let cfg =
+            kres_repl::review_prompt_file_from_prompt(c.repl.prompt.as_deref().unwrap(), None)
+                .expect("review prompt conversion")
+                .expect("review prompt file");
+        assert_eq!(cfg.prompt_file.lenses.len(), 6);
+        assert!(cfg.prompt_file.lenses.iter().any(|l| l.id == "assertions"));
+        assert!(cfg.prompt_file.prompt.contains("TARGET: HEAD"));
+        assert!(cfg.prompt_file.prompt.contains("full Finding records"));
+        assert!(cfg.prompt_file.prompt.contains("target diff/stat"));
+        assert!(cfg.prompt_file.prompt.contains("Do not enumerate"));
+        assert!(!cfg.prompt_file.prompt.contains("Knot Resolver"));
+        assert!(cfg
+            .consolidate_rules
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Merge the per-lens outputs"));
     }
 
     #[test]
-    fn resolve_prompt_arg_slash_form_equivalent_to_colon_form() {
-        // The whole point of the CLI slash-form: --prompt "/review X"
-        // must produce the same composed prompt as --prompt "review: X".
-        let (_, colon_body) = resolve_prompt_arg("review: fs/btrfs/ctree.c").unwrap();
-        let (_, slash_body) = resolve_prompt_arg("/review fs/btrfs/ctree.c").unwrap();
-        assert_eq!(
-            colon_body, slash_body,
-            "slash form and colon form must compose identically"
+    fn resolve_prompt_arg_review_is_workflow_only() {
+        let err = resolve_prompt_arg("review: fs/btrfs/ctree.c")
+            .expect_err("review must not compose as a template");
+        assert!(
+            err.to_string().contains("workflow-only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_prompt_arg_summary_is_not_a_prompt_template() {
+        let err = resolve_prompt_arg("summary: out.txt")
+            .expect_err("summary must not compose as a prompt template");
+        assert!(
+            err.to_string().contains("report-rendering"),
+            "unexpected error: {err}"
         );
     }
 
     #[test]
     fn resolve_prompt_arg_slash_unknown_command_falls_to_inline() {
-        // A slash prefix with no matching command and no legacy
-        // template on disk must pass through as verbatim prompt
-        // text — NOT error, NOT be silently dropped.
+        // A slash prefix with no matching command must pass through
+        // as verbatim prompt text — NOT error, NOT be silently
+        // dropped.
         let (src, body) = resolve_prompt_arg("/no-such-cmd hello world").unwrap();
         assert_eq!(src, "<inline>");
         assert_eq!(body, "/no-such-cmd hello world");
+    }
+
+    #[test]
+    fn resolve_prompt_arg_fix_is_workflow_only() {
+        let err = resolve_prompt_arg("fix: /tmp/finding").expect_err("fix must not compose");
+        assert!(
+            err.to_string().contains("workflow-only"),
+            "unexpected error: {err}"
+        );
+        let err = resolve_prompt_arg("/fix /tmp/finding").expect_err("fix must not compose");
+        assert!(
+            err.to_string().contains("workflow-only"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

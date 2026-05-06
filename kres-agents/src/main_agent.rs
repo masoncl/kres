@@ -35,7 +35,9 @@ use kres_mcp::McpClient;
 
 use crate::{
     error::AgentError,
+    fetcher::WorkspaceFetcher,
     followup::Followup,
+    mcp_fetcher::mcp_text_unavailable,
     pipeline::{DataFetcher, FetchResult},
     symbol::{
         append_context, append_symbol, parse_semcode_symbol, propagate_tool_result, tool_source,
@@ -215,13 +217,6 @@ impl DataFetcher for MainAgent {
                 max = self.max_main_turns,
                 "main agent turn"
             );
-            kres_core::async_eprintln!(
-                "[main turn {}/{}] history={} messages ({}k chars total)",
-                turn + 1,
-                self.max_main_turns,
-                history.len(),
-                history.iter().map(|m| m.content.len()).sum::<usize>() / 1000,
-            );
             // §cache: keep BOTH the most-recent and the
             // second-most-recent user turn marked. Anthropic's
             // cache_read only fires at cache_control check points,
@@ -255,23 +250,28 @@ impl DataFetcher for MainAgent {
             }
             let text = extract_text(&resp);
             self.log_assistant(&text, &resp.usage);
+            let (actions, _display) = parse_actions(&text);
             history.push(Message {
                 role: "assistant".into(),
-                content: text.clone(),
+                content: assistant_history_content(&text, &actions),
                 cache: false,
                 cached_prefix: None,
             });
-            kres_core::async_eprintln!(
-                "[main turn {}/{}] reply: in={} out={} cache_read={} cache_create={} ({} chars)",
-                turn + 1,
-                self.max_main_turns,
-                resp.usage.input_tokens,
-                resp.usage.output_tokens,
-                resp.usage.cache_read_input_tokens,
-                resp.usage.cache_creation_input_tokens,
-                text.len(),
-            );
-            let (actions, _display) = parse_actions(&text);
+            if !actions.is_empty() {
+                let labels: Vec<String> = actions.iter().take(6).map(action_label).collect();
+                let tail = if actions.len() > labels.len() {
+                    format!(", +{} more", actions.len() - labels.len())
+                } else {
+                    String::new()
+                };
+                kres_core::async_eprintln!(
+                    "[main turn {}/{}] {} action(s): {}{tail}",
+                    turn + 1,
+                    self.max_main_turns,
+                    actions.len(),
+                    labels.join(", "),
+                );
+            }
             if actions.is_empty() {
                 kres_core::async_eprintln!(
                     "[main turn {}/{}] no <actions> — done; accumulated {} symbol(s), {} context item(s)",
@@ -384,7 +384,40 @@ impl MainAgent {
                     }
                 };
                 let source = format!("{server}/{tool}");
-                propagate_tool_result(&text, sym, &source, symbols, context);
+                let fallback = mcp_semcode_fallback_followup(tool, args, sym.is_none(), &text);
+                if matches!(tool.as_str(), "find_function" | "find_type") {
+                    append_context(
+                        context,
+                        json!({
+                            "source": source.clone(),
+                            "content": text.clone(),
+                            "note": "raw semcode output; agents must choose the relevant result when semcode returns multiple candidates",
+                        }),
+                    );
+                    if let Some(sym) = sym {
+                        append_symbol(symbols, sym);
+                    }
+                } else {
+                    propagate_tool_result(&text, sym, &source, symbols, context);
+                }
+                if let Some(fu) = fallback {
+                    let local = WorkspaceFetcher::new(self.workspace.clone());
+                    match local.fetch(&[fu], None).await {
+                        Ok(r) => {
+                            symbols.extend(r.symbols);
+                            context.extend(r.context);
+                        }
+                        Err(e) => {
+                            append_context(
+                                context,
+                                json!({
+                                    "source": format!("fallback:{source}"),
+                                    "error": e.to_string(),
+                                }),
+                            );
+                        }
+                    }
+                }
                 per_action.push((*idx, text));
             }
         }
@@ -431,6 +464,28 @@ impl MainAgent {
         }
         combined
     }
+}
+
+fn mcp_semcode_fallback_followup(
+    tool: &str,
+    args: &Value,
+    parse_or_symbol_miss: bool,
+    text: &str,
+) -> Option<Followup> {
+    let name = args.get("name").and_then(Value::as_str)?.to_string();
+    let kind = match tool {
+        "find_function" if parse_or_symbol_miss || mcp_text_unavailable(text) => "source",
+        "find_type" if parse_or_symbol_miss || mcp_text_unavailable(text) => "type",
+        "find_callers" if mcp_text_unavailable(text) => "callers",
+        "find_calls" if mcp_text_unavailable(text) => "callees",
+        _ => return None,
+    };
+    Some(Followup {
+        kind: kind.to_string(),
+        name,
+        reason: "MCP semcode lookup was unavailable, incomplete, or unparseable; using local grep/read fallback".into(),
+        path: None,
+    })
 }
 
 /// Dispatch a single non-MCP action. Returns (text_output, optional
@@ -794,6 +849,21 @@ pub fn parse_actions(text: &str) -> (Vec<Value>, String) {
     (Vec::new(), text.to_string())
 }
 
+/// Content retained in the main-agent conversation after parsing an
+/// assistant turn. If the model emitted valid action tags, only the
+/// parsed action JSON is allowed back into history. Any surrounding
+/// prose may contain invented "tool results"; real tool output is
+/// appended separately as the next user turn after dispatch.
+fn assistant_history_content(original: &str, actions: &[Value]) -> String {
+    if actions.is_empty() {
+        return original.to_string();
+    }
+    format!(
+        "<actions>{}</actions>",
+        serde_json::to_string(actions).unwrap_or_else(|_| "[]".to_string())
+    )
+}
+
 /// Find the outer `<tag>...</tag>` range in `text`. Returns the byte
 /// range of the ENTIRE match (outer-tag-inclusive) plus the inner body.
 fn find_tag_body<'a>(text: &'a str, tag: &str) -> Option<(usize, usize, &'a str)> {
@@ -840,6 +910,30 @@ mod tests {
         assert_eq!(a[0].get("type").unwrap(), "grep");
         assert_eq!(a[1].get("type").unwrap(), "read");
         assert_eq!(disp, "");
+    }
+
+    #[test]
+    fn action_turn_history_drops_fabricated_tool_results() {
+        let text = r#"<actions>[{"type":"git","command":"show HEAD"}]</actions>
+
+**git show HEAD**
+```
+commit deadbeef
+Author: Jane Developer <jane@example.com>
+```
+
+done"#;
+        let (actions, _) = parse_actions(text);
+        let kept = assistant_history_content(text, &actions);
+        assert!(kept.contains("\"show HEAD\""), "lost action: {kept}");
+        assert!(
+            !kept.contains("Jane Developer"),
+            "fabricated tool result leaked into history: {kept}"
+        );
+        assert!(
+            !kept.contains("commit deadbeef"),
+            "fabricated git output leaked into history: {kept}"
+        );
     }
 
     #[test]
@@ -1028,6 +1122,45 @@ mod tests {
             "unexpected allowlist error for malformed action: {out}"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn semcode_mcp_misses_route_to_local_fallback_followups() {
+        let source = mcp_semcode_fallback_followup(
+            "find_function",
+            &json!({"name": "VM_BUG_ON_FOLIO"}),
+            true,
+            "No function found",
+        )
+        .expect("source fallback");
+        assert_eq!(source.kind, "source");
+        assert_eq!(source.name, "VM_BUG_ON_FOLIO");
+
+        let ty = mcp_semcode_fallback_followup(
+            "find_type",
+            &json!({"name": "folio"}),
+            true,
+            "unparseable but non-empty output",
+        )
+        .expect("type fallback");
+        assert_eq!(ty.kind, "type");
+
+        let callers = mcp_semcode_fallback_followup(
+            "find_callers",
+            &json!({"name": "cma_release"}),
+            false,
+            "No callers found",
+        )
+        .expect("callers fallback");
+        assert_eq!(callers.kind, "callers");
+
+        assert!(mcp_semcode_fallback_followup(
+            "find_function",
+            &json!({"name": "cma_release"}),
+            false,
+            "Function: cma_release\nFile: mm/cma.c\nBody:\n...",
+        )
+        .is_none());
     }
 
     #[tokio::test]

@@ -49,24 +49,17 @@ pub enum Command {
     /// selects the `summary-markdown` slash-command template for
     /// the system prompt and defaults the filename to `summary.md`.
     SummaryMarkdown { filename: Option<String> },
-    /// `/review <target>` — submit a prompt equivalent to
-    /// `--prompt "review: <target>"`. Composes the `review`
-    /// slash-command template (disk override at
-    /// ~/.kres/commands/review.md wins over the embedded copy)
-    /// with the trailing target text and queues it as a new task.
+    /// `/review <target>` — dispatch the embedded `review`
+    /// workflow with the trailing target text.
     Review { target: String },
-    /// `/fix <target>` — submit a prompt equivalent to
-    /// `--prompt "fix: <target>"`. Composes the `fix` slash-command
-    /// template (disk override at ~/.kres/commands/fix.md wins over
-    /// the embedded copy) with the trailing target text and queues
-    /// it as a new task. `<target>` is either an absolute path to a
-    /// kres-exported finding directory or a freeform prose
-    /// description of the bug. Coding mode is selected by the goal
-    /// classifier; bash must be in the action allowlist for the
-    /// compile + fix-warnings steps to land — start kres with
-    /// `--allow bash` (or use `--prompt "fix: ..."` from the CLI,
-    /// which auto-enables bash for the run).
+    /// `/fix <target>` — dispatch the embedded `fix` workflow.
+    /// `<target>` is either an absolute path to a kres-exported
+    /// finding directory or a freeform prose description of the bug.
     Fix { target: String },
+    /// `/triage <finding-dir>` — dispatch the embedded `triage`
+    /// workflow (configs/workflows/triage.json) with `target` set
+    /// to the absolute path of a kres finding directory.
+    Triage { target: String },
     /// `/extract [--dir DIR] [--report F] [--todo F] [--findings F]`
     /// — copy session artifacts to operator-chosen destinations.
     Extract {
@@ -107,7 +100,11 @@ pub fn parse_command(line: &str) -> Command {
     if trimmed.is_empty() {
         return Command::Noop;
     }
+    if trimmed == "cost" {
+        return Command::Cost;
+    }
     if let Some(cmd) = trimmed.strip_prefix('/') {
+        let cmd = cmd.trim_start();
         let (head, rest) = match cmd.split_once(' ') {
             Some((h, r)) => (h, r.trim()),
             None => (cmd, ""),
@@ -160,6 +157,17 @@ pub fn parse_command(line: &str) -> Command {
                     )
                 } else {
                     Command::Fix { target }
+                }
+            }
+            "triage" => {
+                let target = rest.trim().to_string();
+                if target.is_empty() {
+                    Command::Unknown(
+                        "triage (expected: /triage <finding-dir>, e.g. /triage ~/local/kernel-bugs/findings/<id>)"
+                            .into(),
+                    )
+                } else {
+                    Command::Triage { target }
                 }
             }
             "extract" => Command::Extract {
@@ -251,6 +259,8 @@ mod tests {
     #[test]
     fn parses_cost() {
         assert_eq!(parse_command("/cost"), Command::Cost);
+        assert_eq!(parse_command("/ cost"), Command::Cost);
+        assert_eq!(parse_command("cost"), Command::Cost);
     }
 
     #[test]
@@ -349,6 +359,26 @@ mod tests {
         match parse_command("/fix") {
             Command::Unknown(s) => {
                 assert!(s.starts_with("fix"), "got {s}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_triage_with_target() {
+        match parse_command("/triage /tmp/finding-dir") {
+            Command::Triage { target } => {
+                assert_eq!(target, "/tmp/finding-dir");
+            }
+            other => panic!("expected Triage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triage_without_target_is_unknown() {
+        match parse_command("/triage") {
+            Command::Unknown(s) => {
+                assert!(s.starts_with("triage"), "got {s}");
             }
             other => panic!("expected Unknown, got {other:?}"),
         }

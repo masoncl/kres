@@ -26,7 +26,7 @@ Every round-trip is logged to `.kres/logs/<session-uuid>/`.
 
 ## Building up a larger review
 
-One `--prompt 'review: fs/btrfs/ctree.c'` seeds one task. Its
+One `--prompt 'review: path/to/file.c'` seeds one task. Its
 slow-agent response usually emits followup suggestions the todo
 agent converts into todo items. To work through them:
 

@@ -10,7 +10,7 @@ requests for additional data.
   "analysis": "string — the code agent's analysis and answer",
   "followups": [
     {
-      "type": "string — source|callers|callees|search|file|read|git|question",
+      "type": "string — source|type|callers|callees|search|file|read|git|question",
       "name": "string — symbol name, regex pattern, glob, file:line+count, or question text",
       "reason": "string — why this data is needed",
       "path": "string — optional directory scope for search/file types"
@@ -26,7 +26,8 @@ requests for additional data.
 
 | `type`     | `name` contains                  | What it fetches                               |
 |------------|----------------------------------|-----------------------------------------------|
-| `source`   | symbol name                      | Full source definition (function, struct, etc) |
+| `source`   | symbol name                      | Full source definition for a function or macro  |
+| `type`     | type name                        | Struct, union, or typedef definition            |
 | `callers`  | function name                    | All functions that call it                     |
 | `callees`  | function name                    | All functions it calls                         |
 | `search`   | regex pattern                    | Grep across the codebase                       |
@@ -43,6 +44,7 @@ The optional `path` field scopes `search` and `file` to a subdirectory.
   "analysis": "[NO SOURCE] Cannot verify UAF without source.",
   "followups": [
     {"type": "source", "name": "__mld_query_work", "reason": "need source to verify group pointer"},
+    {"type": "type", "name": "inet6_dev", "reason": "need struct fields used by the source"},
     {"type": "callers", "name": "__mld_query_work", "reason": "trace entry path"},
     {"type": "search", "name": "IP6SKB_ROUTERALERT", "path": "net/ipv6/", "reason": "find flag checks"},
     {"type": "file", "name": "mcast.c", "path": "net/", "reason": "locate the file"},

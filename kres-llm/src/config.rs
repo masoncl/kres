@@ -49,13 +49,14 @@ impl CallConfig {
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        // Re-derive legacy budget when max_tokens changes and the
+        // Re-derive explicit budget when max_tokens changes and the
         // caller hadn't overridden the default. Adaptive/Disabled
         // aren't sized against max_tokens, so they stay put.
-        let prev_default = ThinkingBudget::default_legacy_for(self.max_tokens);
-        if matches!(self.thinking, ThinkingBudget::LegacyBudget(_)) && self.thinking == prev_default
+        let prev_default = ThinkingBudget::default_explicit_for(self.max_tokens);
+        if matches!(self.thinking, ThinkingBudget::ExplicitBudget(_))
+            && self.thinking == prev_default
         {
-            self.thinking = ThinkingBudget::default_legacy_for(max_tokens);
+            self.thinking = ThinkingBudget::default_explicit_for(max_tokens);
         }
         self.max_tokens = max_tokens;
         self
@@ -102,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_for_sonnet_46_use_legacy_budget() {
+    fn defaults_for_sonnet_46_use_explicit_budget() {
         let c = CallConfig::defaults_for(Model::sonnet_4_6());
         let tb = c.thinking.as_budget_tokens().unwrap();
         // bugs.md#R2: quarter-reservation rule must still hold.

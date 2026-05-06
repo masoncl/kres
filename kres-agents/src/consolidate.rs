@@ -10,21 +10,24 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use kres_core::findings::Finding;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
-use crate::{error::AgentError, response::parse_code_response};
+use crate::{error::AgentError, followup::Followup, response::parse_code_response};
 
 pub const CONSOLIDATOR_INSTRUCTIONS: &str = include_str!("prompts/consolidator.txt");
 
 #[derive(Debug, Serialize)]
 pub struct LensOutput<'a> {
     pub lens: &'a Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_model: Option<&'a str>,
     pub analysis: &'a str,
     pub findings: &'a [Finding],
+    pub followups: &'a [Followup],
 }
 
 #[derive(Debug, Serialize)]
@@ -41,12 +44,20 @@ struct ConsolidatorResponse {
     analysis: String,
     #[serde(default)]
     findings: Vec<Finding>,
+    #[serde(default)]
+    followups: Vec<Followup>,
+    #[serde(default)]
+    comparison: Option<Value>,
+    #[serde(default)]
+    comparison_details: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConsolidatedTask {
     pub analysis: String,
     pub findings: Vec<Finding>,
+    pub followups: Vec<Followup>,
+    pub comparison: Option<Value>,
 }
 
 /// Run the consolidator against a configured fast-agent client.
@@ -70,6 +81,7 @@ pub async fn consolidate_lenses(
         task_brief,
         lens_outputs,
         None,
+        None,
     )
     .await
 }
@@ -85,12 +97,15 @@ pub async fn consolidate_lenses_with_logger(
     max_input_tokens: Option<u32>,
     task_brief: &str,
     lens_outputs: &[LensOutput<'_>],
+    workflow_rules: Option<&str>,
     logger: Option<Arc<TurnLogger>>,
 ) -> Result<ConsolidatedTask, AgentError> {
     if lens_outputs.is_empty() {
         return Ok(ConsolidatedTask {
             analysis: String::new(),
             findings: vec![],
+            followups: vec![],
+            comparison: None,
         });
     }
 
@@ -98,11 +113,12 @@ pub async fn consolidate_lenses_with_logger(
     // consolidator. This prevents a long operator prompt from
     // dominating every per-lens slow call's context window.
     let brief_capped: String = task_brief.chars().take(300).collect();
+    let instructions = consolidator_instructions(workflow_rules);
     let request = ConsolidatorRequest {
         task: "consolidate_lenses",
         task_brief: &brief_capped,
         lens_outputs,
-        instructions: CONSOLIDATOR_INSTRUCTIONS,
+        instructions: &instructions,
     };
     let request_text = serde_json::to_string(&request)?;
 
@@ -127,6 +143,10 @@ pub async fn consolidate_lenses_with_logger(
     if let Some(lg) = &logger {
         lg.log_code("user", &messages[0].content, None, None);
     }
+    kres_core::async_eprintln!(
+        "[consolidator] merging {} lens output(s)",
+        lens_outputs.len()
+    );
     let resp = client
         .messages_streaming(&cfg, &messages)
         .await
@@ -157,6 +177,7 @@ pub async fn consolidate_lenses_with_logger(
         );
     }
     let parsed = parse_code_response(&text);
+    let comparison = extract_comparison(&text);
     // §20g: when findings parsed OK but analysis is empty, fall back
     // to the naive-concat narrative while keeping the parsed
     // findings. Prevents the operator from seeing an empty prose block
@@ -166,22 +187,40 @@ pub async fn consolidate_lenses_with_logger(
         return Ok(ConsolidatedTask {
             analysis: naive.analysis,
             findings: parsed.findings,
+            followups: parsed.followups,
+            comparison: comparison.or(naive.comparison),
         });
     }
-    if !parsed.analysis.is_empty() || !parsed.findings.is_empty() {
+    if !parsed.analysis.is_empty() || !parsed.findings.is_empty() || !parsed.followups.is_empty() {
         return Ok(ConsolidatedTask {
             analysis: parsed.analysis,
             findings: parsed.findings,
+            followups: parsed.followups,
+            comparison,
         });
     }
     if let Ok(c) = serde_json::from_str::<ConsolidatorResponse>(&text) {
         return Ok(ConsolidatedTask {
             analysis: c.analysis,
             findings: c.findings,
+            followups: c.followups,
+            comparison: c.comparison.or(c.comparison_details),
         });
     }
     Ok(naive_fallback(lens_outputs))
 }
+
+fn consolidator_instructions(workflow_rules: Option<&str>) -> String {
+    match workflow_rules {
+        Some(rules) if !rules.trim().is_empty() => format!(
+            "{}\n\nWORKFLOW-SPECIFIC CONSOLIDATION RULES:\n{}",
+            CONSOLIDATOR_INSTRUCTIONS,
+            rules.trim()
+        ),
+        _ => CONSOLIDATOR_INSTRUCTIONS.to_string(),
+    }
+}
+
 /// Deterministic fallback: concat per-lens analyses with `## Lens:
 /// [type] name` headers, union findings by id (first-lens-wins).
 ///
@@ -201,7 +240,11 @@ pub fn naive_fallback(lens_outputs: &[LensOutput<'_>]) -> ConsolidatedTask {
                 .and_then(|v| v.as_str())
                 .unwrap_or("investigate");
             let name = out.lens.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            parts.push(format!("## Lens: [{kind}] {name}\n\n{}", out.analysis));
+            let model = out.slow_model.unwrap_or("unknown");
+            parts.push(format!(
+                "## Lens: [{kind}] {name} ({model})\n\n{}",
+                out.analysis
+            ));
         }
     }
     let mut seen_ids = std::collections::BTreeSet::new();
@@ -213,10 +256,48 @@ pub fn naive_fallback(lens_outputs: &[LensOutput<'_>]) -> ConsolidatedTask {
             }
         }
     }
+    let mut seen_followups = std::collections::BTreeSet::new();
+    let mut followups = Vec::new();
+    for out in lens_outputs {
+        for f in out.followups {
+            if seen_followups.insert(f.cache_key()) {
+                followups.push(f.clone());
+            }
+        }
+    }
     ConsolidatedTask {
         analysis: parts.join("\n\n---\n\n"),
         findings: unified,
+        followups,
+        comparison: Some(naive_comparison(lens_outputs)),
     }
+}
+
+fn extract_comparison(text: &str) -> Option<Value> {
+    let v = serde_json::from_str::<Value>(text.trim()).ok()?;
+    v.get("comparison")
+        .cloned()
+        .or_else(|| v.get("comparison_details").cloned())
+}
+
+fn naive_comparison(lens_outputs: &[LensOutput<'_>]) -> Value {
+    let per_output: Vec<Value> = lens_outputs
+        .iter()
+        .map(|out| {
+            json!({
+                "lens": out.lens,
+                "slow_model": out.slow_model.unwrap_or("unknown"),
+                "analysis_chars": out.analysis.len(),
+                "finding_count": out.findings.len(),
+                "followup_count": out.followups.len(),
+            })
+        })
+        .collect();
+    json!({
+        "mode": "deterministic_fallback",
+        "note": "LLM comparison unavailable; recorded structural output counts.",
+        "outputs": per_output,
+    })
 }
 
 fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
@@ -266,18 +347,23 @@ mod tests {
         let b2 = f("b");
         let lens1_findings = vec![a, b1];
         let lens2_findings = vec![b2, f("c")];
+        let no_followups = Vec::new();
         let lens1 = json!({"name": "memory"});
         let lens2 = json!({"name": "races"});
         let outs = vec![
             LensOutput {
                 lens: &lens1,
+                slow_model: Some("model-a"),
                 analysis: "A narrative",
                 findings: &lens1_findings,
+                followups: &no_followups,
             },
             LensOutput {
                 lens: &lens2,
+                slow_model: Some("model-b"),
                 analysis: "B narrative",
                 findings: &lens2_findings,
+                followups: &no_followups,
             },
         ];
         let ct = naive_fallback(&outs);
@@ -286,6 +372,59 @@ mod tests {
         assert_eq!(ids, vec!["a", "b", "c"]);
         assert!(ct.analysis.contains("A narrative"));
         assert!(ct.analysis.contains("B narrative"));
+    }
+
+    #[test]
+    fn fallback_unions_followups_by_cache_key() {
+        let f1 = Followup {
+            kind: "read".into(),
+            name: "kernel/a.c:1+20".into(),
+            reason: "needed by lens".into(),
+            path: None,
+        };
+        let f2 = f1.clone();
+        let f3 = Followup {
+            kind: "source".into(),
+            name: "foo".into(),
+            reason: "needed by lens".into(),
+            path: None,
+        };
+        let empty_findings = Vec::new();
+        let lens1_followups = vec![f1, f3.clone()];
+        let lens2_followups = vec![f2];
+        let lens1 = json!({"name": "memory"});
+        let lens2 = json!({"name": "bounds"});
+        let outs = vec![
+            LensOutput {
+                lens: &lens1,
+                slow_model: Some("model-a"),
+                analysis: "A",
+                findings: &empty_findings,
+                followups: &lens1_followups,
+            },
+            LensOutput {
+                lens: &lens2,
+                slow_model: Some("model-b"),
+                analysis: "B",
+                findings: &empty_findings,
+                followups: &lens2_followups,
+            },
+        ];
+
+        let ct = naive_fallback(&outs);
+        assert_eq!(ct.followups.len(), 2);
+        assert!(ct.followups.iter().any(|f| f.cache_key() == f3.cache_key()));
+    }
+
+    #[test]
+    fn workflow_rules_extend_consolidator_instructions() {
+        let rules = "Return full Finding records.";
+        let instructions = consolidator_instructions(Some(rules));
+
+        assert!(instructions.contains(CONSOLIDATOR_INSTRUCTIONS.trim()));
+        assert!(instructions.contains("WORKFLOW-SPECIFIC CONSOLIDATION RULES"));
+        assert!(instructions.contains(rules));
+        assert!(instructions.contains("unsupported negative coverage claims"));
     }
 
     #[test]

@@ -1,0 +1,1213 @@
+//! Workflow definitions: typed structs + JSON Schema validation
+//! for files like `configs/workflows/fix.json`.
+//!
+//! A workflow is a static, multi-step plan: research → write →
+//! compile → review → publish style pipelines, with typed
+//! inputs/outputs and conditional + iterative control flow. The
+//! file format is documented by `configs/workflows/schema.json`
+//! (JSON Schema 2020-12); this module embeds that schema and uses
+//! the `jsonschema` crate to validate workflow files at load time,
+//! then deserialises into the strongly-typed structs below.
+//!
+//! Validation is two-layered:
+//!
+//! 1. **JSON Schema** rejects malformed shapes — bad enum values,
+//!    missing required fields, conditional rules (a `reaper` step
+//!    must have an `action`; a non-reaper step must have a
+//!    `prompt`; an `on_fail.action == "branch_to"` requires a
+//!    `branch_to` field).
+//! 2. **Cross-field invariants** the schema cannot express: every
+//!    `depends_on` id resolves to a real step, every step id is
+//!    unique within the workflow, `branch_to` and
+//!    `eval.on_fail.rerun` ids resolve to a real step.
+//!
+//! The runtime executor is not implemented yet; this module exists
+//! so workflow files can be authored, schema-checked, and parsed
+//! into typed structs ahead of the executor work. `kres validate
+//! <path>` exercises the loader.
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
+
+/// Embedded JSON Schema. Consumers don't need
+/// `configs/workflows/schema.json` on disk — the schema is part of
+/// the binary so a single `kres` install validates workflow files
+/// against the version it was built with.
+const SCHEMA_JSON: &str = include_str!("../../configs/workflows/schema.json");
+
+/// Top-level workflow definition. Mirrors the schema 1:1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workflow {
+    #[serde(rename = "$schema_version")]
+    pub schema_version: u32,
+
+    #[serde(rename = "$schema", skip_serializing_if = "Option::is_none", default)]
+    pub schema_url: Option<String>,
+
+    /// Self-documentation block. Carried verbatim — this module
+    /// does not interpret its contents.
+    #[serde(rename = "$format", skip_serializing_if = "Option::is_none", default)]
+    pub format: Option<serde_json::Value>,
+
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub description: Option<String>,
+
+    #[serde(default)]
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+
+    #[serde(default)]
+    pub skills: Vec<String>,
+
+    #[serde(default)]
+    pub globals: serde_json::Map<String, serde_json::Value>,
+
+    #[serde(default)]
+    pub defaults: Defaults,
+
+    pub steps: Vec<Step>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub completion: Option<Completion>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub persistence: Option<Persistence>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Defaults {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent: Option<Agent>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mode: Option<Mode>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub actions: Option<Vec<ActionType>>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_eval_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub on_exhausted: Option<OnExhausted>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Step {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent: Option<Agent>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub mode: Option<Mode>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub actions: Option<Vec<ActionType>>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run_if: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skip_if: Option<String>,
+    #[serde(default)]
+    pub preserve_outputs_on_skip: bool,
+    #[serde(default)]
+    pub include: Vec<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_optional_prompt"
+    )]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub outputs: serde_json::Map<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub eval: Option<Eval>,
+    #[serde(default)]
+    pub post_actions: Vec<PostAction>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub action: Option<ReaperAction>,
+    #[serde(default)]
+    pub terminal_on_success: bool,
+    /// Lens fan-out: when present, the step's prompt runs once per
+    /// lens (concurrently). The lens-object's fields are bound as
+    /// `{{lens.<field>}}` for that call. Per-lens outputs are
+    /// aggregated per [`Self::aggregate`] before eval runs.
+    #[serde(default)]
+    pub lenses: Vec<Lens>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub aggregate: Option<Aggregate>,
+    /// When `aggregate == Aggregate::Consolidate`, configures the
+    /// N+1 LLM call that runs after the lens fan-out settles.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub consolidate: Option<ConsolidateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidateConfig {
+    /// Author-supplied dedup / merge / completeness rules. The
+    /// runner appends the per-lens outputs and an OUTPUT SCHEMA
+    /// tail before sending to the LLM.
+    #[serde(deserialize_with = "deserialize_prompt")]
+    pub prompt: String,
+    /// Optional agent override for the consolidate call.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent: Option<Agent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lens {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub run_if: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub skip_if: Option<String>,
+    /// Anything else the workflow author wants to bind. Resolved
+    /// via `{{lens.<key>}}` in the step prompt.
+    #[serde(flatten)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+pub fn lens_to_spec(lens: &Lens) -> kres_core::LensSpec {
+    kres_core::LensSpec {
+        id: lens.id.clone(),
+        kind: lens
+            .fields
+            .get("tag")
+            .or_else(|| lens.fields.get("kind"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("investigate")
+            .to_string(),
+        name: lens
+            .fields
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&lens.id)
+            .to_string(),
+        reason: lens
+            .fields
+            .get("investigate")
+            .or_else(|| lens.fields.get("reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Aggregate {
+    /// Default. Array-typed declared outputs concatenate across
+    /// lenses; scalar-typed outputs collect as
+    /// `[{lens, value}, ...]`.
+    #[default]
+    Concat,
+    /// Every declared output becomes a `{lens_id: value}` object.
+    ByLens,
+    /// After the lens fan-out settles, run an N+1 LLM call that
+    /// semantically merges duplicate findings via a consolidator
+    /// prompt. Replaces structural concatenation with a deduped,
+    /// merged result. Requires a `consolidate` config block.
+    Consolidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Agent {
+    Fast,
+    Slow,
+    Code,
+    Reaper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    Audit,
+    Coding,
+    Review,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionType {
+    Read,
+    Source,
+    Type,
+    Git,
+    Grep,
+    Callers,
+    Make,
+    Edit,
+    Bash,
+    #[serde(rename = "publish-fix")]
+    PublishFix,
+    #[serde(rename = "commit-fix")]
+    CommitFix,
+    #[serde(rename = "set-finding-status")]
+    SetFindingStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Eval {
+    #[serde(rename = "type")]
+    pub kind: EvalKind,
+    /// field_check expression. Required when kind=FieldCheck.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub expr: Option<String>,
+    /// judge_llm prompt. Required when kind=JudgeLlm.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_optional_prompt"
+    )]
+    pub judge_prompt: Option<String>,
+    /// judge_llm: optional agent override.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub agent: Option<Agent>,
+    pub on_fail: OnFail,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum PromptValue {
+    String(String),
+    Lines(Vec<String>),
+}
+
+impl PromptValue {
+    fn into_string(self) -> String {
+        match self {
+            PromptValue::String(s) => s,
+            PromptValue::Lines(lines) => lines.join("\n"),
+        }
+    }
+}
+
+fn deserialize_prompt<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    PromptValue::deserialize(deserializer).map(PromptValue::into_string)
+}
+
+fn deserialize_optional_prompt<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<PromptValue>::deserialize(deserializer).map(|v| v.map(PromptValue::into_string))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalKind {
+    /// Comparison expression evaluated locally.
+    FieldCheck,
+    /// LLM-judged. Sends step outputs + judge_prompt to an agent;
+    /// the judge replies `{"pass": bool, "reason": string}`.
+    JudgeLlm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnFail {
+    pub action: OnFailAction,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_attempts: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub on_exhausted: Option<OnExhausted>,
+    #[serde(default)]
+    pub rerun: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub branch_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub branch_to_output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub branch_to_doc: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnFailAction {
+    Repeat,
+    RerunChain,
+    BranchTo,
+    Continue,
+    ExitFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnExhausted {
+    ExitFailure,
+    Continue,
+    BranchTo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostAction {
+    #[serde(rename = "type")]
+    pub kind: ActionType,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub args: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReaperAction {
+    #[serde(rename = "type")]
+    pub kind: ActionType,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub args: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Completion {
+    #[serde(default)]
+    pub success_when_any: Vec<String>,
+    #[serde(default)]
+    pub failure_when_any: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Persistence {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resumable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub shape: Option<String>,
+}
+
+/// Parse + validate a workflow JSON. Returns the typed [`Workflow`]
+/// or an error explaining the first schema or cross-field violation.
+pub fn parse_workflow(body: &str) -> Result<Workflow> {
+    parse_workflow_with_base(body, None)
+}
+
+/// Parse + validate a workflow JSON, resolving any relative
+/// `prompt_file` references against `prompt_base` before
+/// deserialising into typed structs.
+fn parse_workflow_with_base(body: &str, prompt_base: Option<&Path>) -> Result<Workflow> {
+    let mut value: Value = serde_json::from_str(body).context("workflow body is not valid JSON")?;
+    validate_against_schema(&value)?;
+    resolve_prompt_files(&mut value, prompt_base)?;
+    validate_against_schema(&value)?;
+    let wf: Workflow = serde_json::from_value(value).context(
+        "workflow JSON validated against schema but failed to deserialise — schema/struct drift",
+    )?;
+    validate_cross_field(&wf)?;
+    Ok(wf)
+}
+
+/// Convenience wrapper: read `path`, parse + validate.
+pub fn load_workflow(path: &Path) -> Result<Workflow> {
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("reading workflow {}", path.display()))?;
+    parse_workflow_with_base(&body, path.parent())
+        .with_context(|| format!("validating workflow {}", path.display()))
+}
+
+/// Embedded workflow JSON, keyed by id. Carried in the binary via
+/// `include_str!` so a fresh install with no `~/.kres/workflows/`
+/// can still run `kres run-workflow fix --input target=...`.
+const EMBEDDED_WORKFLOWS: &[(&str, &str)] = &[
+    ("fix", include_str!("../../configs/workflows/fix.json")),
+    (
+        "review",
+        include_str!("../../configs/workflows/review.json"),
+    ),
+    (
+        "triage",
+        include_str!("../../configs/workflows/triage.json"),
+    ),
+];
+
+/// Iterator over every embedded workflow id. Useful for `/help` and
+/// for the user_commands dispatch that needs to know which slash
+/// names map to a workflow.
+pub fn embedded_workflow_ids() -> impl Iterator<Item = &'static str> {
+    EMBEDDED_WORKFLOWS.iter().map(|(k, _)| *k)
+}
+
+/// Resolve a workflow by id with operator-override layering.
+///
+/// Order:
+///   1. `<override_dir>/<id>.json` on disk (when override_dir is
+///      `Some` — typically `~/.kres/workflows`).
+///   2. Embedded copy bundled in the binary
+///      (`configs/workflows/<id>.json`).
+///   3. Error.
+///
+/// Names are validated with the same `[a-z0-9_-]+` rule as
+/// user_commands so a stray slash doesn't escape the override
+/// directory.
+pub fn lookup_workflow(override_dir: Option<&Path>, id: &str) -> Result<Workflow> {
+    if !is_valid_workflow_id(id) {
+        return Err(anyhow!("invalid workflow id '{id}'"));
+    }
+    if let Some(dir) = override_dir {
+        let p = dir.join(format!("{id}.json"));
+        if let Ok(body) = std::fs::read_to_string(&p) {
+            if !body.trim().is_empty() {
+                return parse_workflow_with_base(&body, p.parent())
+                    .with_context(|| format!("validating workflow {}", p.display()));
+            }
+        }
+    }
+    if let Some((_, body)) = EMBEDDED_WORKFLOWS.iter().find(|(k, _)| *k == id) {
+        let base = embedded_workflow_base();
+        return parse_workflow_with_base(body, Some(&base))
+            .with_context(|| format!("validating embedded workflow {id}"));
+    }
+    Err(anyhow!("no workflow named '{id}' found"))
+}
+
+fn embedded_workflow_base() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("configs/workflows")
+}
+
+fn is_valid_workflow_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Validate the on-disk JSON shape against the embedded JSON Schema.
+/// Returns the first batch of errors as a single anyhow error.
+fn validate_against_schema(value: &serde_json::Value) -> Result<()> {
+    // The embedded schema is parsed once per call. The crate's
+    // `validator_for` pre-compiles it. Caching the validator across
+    // calls is an obvious optimisation; defer it until validation
+    // shows up on a profile.
+    let schema_value: serde_json::Value =
+        serde_json::from_str(SCHEMA_JSON).context("embedded workflow schema is not valid JSON")?;
+    let validator = jsonschema::validator_for(&schema_value)
+        .context("embedded workflow schema failed to compile")?;
+    let errors: Vec<String> = validator
+        .iter_errors(value)
+        .take(10)
+        .map(|e| format!("at /{}: {}", e.instance_path, e))
+        .collect();
+    if !errors.is_empty() {
+        return Err(anyhow!(
+            "workflow schema validation failed:\n  {}",
+            errors.join("\n  ")
+        ));
+    }
+    Ok(())
+}
+
+/// Workflow authors may keep large prompts inline as editable JSON
+/// arrays or move them to a sibling file. The executor only knows
+/// about final prompt strings, so resolve file-backed prompts before
+/// serde deserialisation.
+fn resolve_prompt_files(value: &mut Value, base_dir: Option<&Path>) -> Result<()> {
+    let Some(root) = value.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(steps) = root.get_mut("steps").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for step in steps {
+        let Some(step) = step.as_object_mut() else {
+            continue;
+        };
+        resolve_prompt_file_key(step, "prompt_file", "prompt", base_dir)?;
+        if let Some(consolidate) = step.get_mut("consolidate").and_then(Value::as_object_mut) {
+            resolve_prompt_file_key(consolidate, "prompt_file", "prompt", base_dir)?;
+        }
+        if let Some(eval) = step.get_mut("eval").and_then(Value::as_object_mut) {
+            resolve_prompt_file_key(eval, "judge_prompt_file", "judge_prompt", base_dir)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_prompt_file_key(
+    map: &mut Map<String, Value>,
+    file_key: &str,
+    prompt_key: &str,
+    base_dir: Option<&Path>,
+) -> Result<()> {
+    let Some(file_value) = map.remove(file_key) else {
+        return Ok(());
+    };
+    if map.contains_key(prompt_key) {
+        return Err(anyhow!(
+            "workflow cannot set both '{prompt_key}' and '{file_key}' in the same object"
+        ));
+    }
+    let raw_path = file_value
+        .as_str()
+        .ok_or_else(|| anyhow!("workflow '{file_key}' must be a string"))?;
+    let path = resolve_prompt_path(raw_path, base_dir);
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading workflow prompt file {}", path.display()))?;
+    map.insert(prompt_key.to_owned(), Value::String(contents));
+    Ok(())
+}
+
+fn resolve_prompt_path(raw_path: &str, base_dir: Option<&Path>) -> PathBuf {
+    let path = Path::new(raw_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Some(base_dir) = base_dir {
+        base_dir.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Cross-field invariants the schema cannot express:
+/// - every step id is unique
+/// - every `depends_on` id resolves to a real step
+/// - every literal `eval.on_fail.branch_to` and every entry of
+///   `eval.on_fail.rerun` resolves to a real step
+fn validate_cross_field(wf: &Workflow) -> Result<()> {
+    let ids: BTreeSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+    if ids.len() != wf.steps.len() {
+        let mut seen = BTreeSet::new();
+        let dup = wf
+            .steps
+            .iter()
+            .find(|s| !seen.insert(s.id.as_str()))
+            .map(|s| s.id.clone())
+            .unwrap_or_default();
+        return Err(anyhow!("duplicate step id: {dup}"));
+    }
+    for step in &wf.steps {
+        for dep in &step.depends_on {
+            if !ids.contains(dep.as_str()) {
+                return Err(anyhow!(
+                    "step '{}' depends_on unknown step '{}'",
+                    step.id,
+                    dep
+                ));
+            }
+        }
+        // Lens ids unique within the step.
+        if !step.lenses.is_empty() {
+            let mut seen = BTreeSet::new();
+            for l in &step.lenses {
+                if !seen.insert(l.id.as_str()) {
+                    return Err(anyhow!(
+                        "step '{}' has duplicate lens id '{}'",
+                        step.id,
+                        l.id
+                    ));
+                }
+            }
+        }
+        if let Some(eval) = &step.eval {
+            if let Some(target) = &eval.on_fail.branch_to {
+                if !ids.contains(target.as_str()) {
+                    return Err(anyhow!(
+                        "step '{}' on_fail.branch_to references unknown step '{}'",
+                        step.id,
+                        target
+                    ));
+                }
+            }
+            if eval.on_fail.action == OnFailAction::BranchTo
+                && eval.on_fail.branch_to.is_none()
+                && eval.on_fail.branch_to_output.is_none()
+            {
+                return Err(anyhow!(
+                    "step '{}' on_fail.action branch_to requires branch_to or branch_to_output",
+                    step.id
+                ));
+            }
+            if matches!(eval.on_fail.on_exhausted, Some(OnExhausted::BranchTo))
+                && eval.on_fail.branch_to.is_none()
+                && eval.on_fail.branch_to_output.is_none()
+            {
+                return Err(anyhow!(
+                    "step '{}' on_fail.on_exhausted branch_to requires branch_to or branch_to_output",
+                    step.id
+                ));
+            }
+            for r in &eval.on_fail.rerun {
+                if !ids.contains(r.as_str()) {
+                    return Err(anyhow!(
+                        "step '{}' on_fail.rerun references unknown step '{}'",
+                        step.id,
+                        r
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped fix workflow is the canonical example. It must
+    /// validate against the embedded schema AND deserialise into
+    /// the typed structs.
+    #[test]
+    fn lookup_workflow_finds_embedded_fix() {
+        let wf = lookup_workflow(None, "fix").unwrap();
+        assert_eq!(wf.id, "fix");
+    }
+
+    #[test]
+    fn lookup_workflow_finds_embedded_review() {
+        let wf = lookup_workflow(None, "review").unwrap();
+        assert_eq!(wf.id, "review");
+    }
+
+    #[test]
+    fn review_workflow_loads_with_parallel_lenses() {
+        let body = include_str!("../../configs/workflows/review.json");
+        let wf = parse_workflow(body).expect("review.json must validate against schema");
+        assert_eq!(wf.id, "review");
+        assert_eq!(wf.steps.len(), 1);
+        let step = &wf.steps[0];
+        assert_eq!(step.id, "investigate");
+        assert_eq!(step.lenses.len(), 6);
+        let assertions = step
+            .lenses
+            .iter()
+            .find(|l| l.id == "assertions")
+            .expect("review workflow has commit assertion lens");
+        assert_eq!(
+            assertions.run_if.as_deref(),
+            Some("workflow.target_is_commit == true")
+        );
+        assert!(assertions
+            .fields
+            .get("investigate")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| {
+                s.contains("disprove every assertion")
+                    && s.contains("existing declarations, kerneldoc, comments, or docs")
+                    && s.contains("made stale by the patch")
+            }));
+        assert!(step.consolidate.is_some());
+        assert!(step.outputs.contains_key("analysis"));
+        assert!(step.outputs.contains_key("findings"));
+    }
+
+    #[test]
+    fn triage_workflow_preserves_golden_contract() {
+        let body = include_str!("../../configs/workflows/triage.json");
+        let wf = parse_workflow(body).expect("triage.json must validate against schema");
+        assert_eq!(wf.id, "triage");
+        assert_eq!(wf.steps.len(), 1);
+
+        let step = &wf.steps[0];
+        assert_eq!(step.id, "triage");
+        let actions = step.actions.as_ref().expect("triage actions");
+        for action in [
+            ActionType::Read,
+            ActionType::Source,
+            ActionType::Type,
+            ActionType::Grep,
+            ActionType::Git,
+            ActionType::Callers,
+            ActionType::Edit,
+        ] {
+            assert!(
+                actions.contains(&action),
+                "triage step should allow {action:?}"
+            );
+        }
+        assert!(step.include.iter().any(|i| i.contains("triage_rules")));
+        assert!(step.outputs.contains_key("verdict"));
+        assert!(step.outputs.contains_key("summary_written"));
+        assert!(step.outputs.contains_key("followups"));
+        assert!(step.outputs.contains_key("code_output"));
+        assert_eq!(
+            step.eval.as_ref().and_then(|e| e.expr.as_deref()),
+            Some("summary_written == true")
+        );
+    }
+
+    #[test]
+    fn prompt_arrays_join_to_runtime_strings() {
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt": ["line one", "", "line three"],
+                "consolidate": {"prompt": ["merge", "these"]},
+                "eval": {
+                    "type": "judge_llm",
+                    "judge_prompt": ["judge", "this"],
+                    "on_fail": {"action": "continue"}
+                }
+            }]
+        }"#;
+        let wf = parse_workflow(body).expect("prompt arrays should validate and parse");
+        let step = &wf.steps[0];
+        assert_eq!(step.prompt.as_deref(), Some("line one\n\nline three"));
+        assert_eq!(step.consolidate.as_ref().unwrap().prompt, "merge\nthese");
+        assert_eq!(
+            step.eval.as_ref().unwrap().judge_prompt.as_deref(),
+            Some("judge\nthis")
+        );
+    }
+
+    #[test]
+    fn prompt_files_load_relative_to_workflow_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("step.md"), "step prompt\n").unwrap();
+        std::fs::write(tmp.path().join("consolidate.md"), "merge prompt\n").unwrap();
+        std::fs::write(tmp.path().join("judge.md"), "judge prompt\n").unwrap();
+        let workflow = serde_json::json!({
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt_file": "step.md",
+                "consolidate": {"prompt_file": "consolidate.md"},
+                "eval": {
+                    "type": "judge_llm",
+                    "judge_prompt_file": "judge.md",
+                    "on_fail": {"action": "continue"}
+                }
+            }]
+        });
+        let workflow_path = tmp.path().join("x.json");
+        std::fs::write(&workflow_path, workflow.to_string()).unwrap();
+
+        let wf = load_workflow(&workflow_path).expect("prompt files should resolve");
+        let step = &wf.steps[0];
+        assert_eq!(step.prompt.as_deref(), Some("step prompt\n"));
+        assert_eq!(step.consolidate.as_ref().unwrap().prompt, "merge prompt\n");
+        assert_eq!(
+            step.eval.as_ref().unwrap().judge_prompt.as_deref(),
+            Some("judge prompt\n")
+        );
+    }
+
+    #[test]
+    fn prompt_file_rejects_inline_prompt_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("step.md"), "step prompt\n").unwrap();
+        let workflow = serde_json::json!({
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt": "inline",
+                "prompt_file": "step.md"
+            }]
+        });
+        let workflow_path = tmp.path().join("x.json");
+        std::fs::write(&workflow_path, workflow.to_string()).unwrap();
+
+        let err = load_workflow(&workflow_path).unwrap_err();
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("schema validation failed")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_file_resolution_does_not_rewrite_freeform_globals() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("step.md"), "step prompt\n").unwrap();
+        let workflow = serde_json::json!({
+            "$schema_version": 1,
+            "id": "x",
+            "globals": {
+                "example": {"prompt_file": "not-a-real-prompt.md"}
+            },
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt_file": "step.md"
+            }]
+        });
+        let workflow_path = tmp.path().join("x.json");
+        std::fs::write(&workflow_path, workflow.to_string()).unwrap();
+
+        let wf = load_workflow(&workflow_path).expect("step prompt_file should resolve");
+        assert_eq!(wf.steps[0].prompt.as_deref(), Some("step prompt\n"));
+        assert_eq!(
+            wf.globals["example"]["prompt_file"].as_str(),
+            Some("not-a-real-prompt.md")
+        );
+    }
+
+    #[test]
+    fn lookup_workflow_unknown_id_errors() {
+        let err = lookup_workflow(None, "no-such-thing")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no workflow named"), "got: {err}");
+    }
+
+    #[test]
+    fn lookup_workflow_rejects_bad_id() {
+        let err = lookup_workflow(None, "../etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid workflow id"), "got: {err}");
+    }
+
+    #[test]
+    fn lookup_workflow_disk_override_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Write a custom fix.json with a different title.
+        let custom = serde_json::json!({
+            "$schema_version": 1,
+            "id": "fix",
+            "title": "OPERATOR OVERRIDE",
+            "steps": [{"id": "s", "agent": "fast", "prompt": "p"}]
+        });
+        std::fs::write(tmp.path().join("fix.json"), custom.to_string()).unwrap();
+        let wf = lookup_workflow(Some(tmp.path()), "fix").unwrap();
+        assert_eq!(wf.title.as_deref(), Some("OPERATOR OVERRIDE"));
+    }
+
+    #[test]
+    fn lookup_workflow_falls_back_to_embedded_when_override_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty override dir — fallback to embedded.
+        let wf = lookup_workflow(Some(tmp.path()), "fix").unwrap();
+        assert_ne!(wf.title.as_deref(), Some("OPERATOR OVERRIDE"));
+    }
+
+    #[test]
+    fn fix_workflow_loads() {
+        let body = include_str!("../../configs/workflows/fix.json");
+        let wf = parse_workflow(body).expect("fix.json must validate against schema");
+        assert_eq!(wf.id, "fix");
+        assert_eq!(wf.schema_version, 1);
+        // Research plus deterministic status/commit/build/publish
+        // steps around the LLM-authored patch/provenance/message/review
+        // steps.
+        assert_eq!(wf.steps.len(), 11, "fix workflow has 11 steps");
+        let research = wf.steps.iter().find(|s| s.id == "research").unwrap();
+        let research_eval = research.eval.as_ref().expect("research eval");
+        assert_eq!(research_eval.kind, EvalKind::FieldCheck);
+        let research_expr = research_eval.expr.as_deref().unwrap_or("");
+        assert!(
+            research_expr.contains("research_status == 'confirmed'")
+                && research_expr.contains("valid == true")
+                && research_expr.contains("research.research_decision.bug_proven == true")
+                && research_expr.contains("research.research_decision.fix_contract_proven == true")
+                && research_expr.contains("research_status == 'invalid'")
+                && research_expr.contains("invalid_evidence != ''")
+                && research_expr.contains("research.research_decision.invalidity_proven == true")
+                && research_expr.contains("research_status == 'unconfirmed'"),
+            "research eval must enforce typed status consistency"
+        );
+        assert_eq!(research_eval.on_fail.action, OnFailAction::Repeat);
+        assert_eq!(research_eval.on_fail.max_attempts, Some(3));
+        let write_patch = wf.steps.iter().find(|s| s.id == "write-patch").unwrap();
+        assert!(
+            write_patch.outputs.contains_key("review_dispute"),
+            "write-patch must expose a typed review dispute path"
+        );
+        assert!(
+            write_patch.outputs.contains_key("review_dispute_allowed"),
+            "write-patch must expose the machine dispute gate"
+        );
+        let write_patch_expr = write_patch
+            .eval
+            .as_ref()
+            .and_then(|e| e.expr.as_deref())
+            .unwrap_or("");
+        assert!(
+            write_patch_expr.contains("review_dispute != ''")
+                && write_patch_expr.contains("review_dispute_allowed == true")
+                && write_patch_expr.contains("code_changes_emitted == false"),
+            "write-patch eval must allow only machine-gated review disputes without fake edits"
+        );
+        assert!(wf.steps.iter().any(|s| s.id == "unconfirm"));
+        assert!(wf.steps.iter().any(|s| s.id == "fixes-tag-search"));
+        assert!(wf.steps.iter().any(|s| s.id == "publish"));
+        let commit_template = include_str!("../../configs/prompts/commit-kernel-template.md");
+        assert!(
+            commit_template.contains("Write a kernel changelog, not an audit report")
+                && commit_template.contains("indented evidence")
+                && commit_template.contains("Prefer call chains and call graphs over prose")
+                && commit_template.contains("Simple ASCII art is allowed")
+                && commit_template.contains("Race timeline")
+                && commit_template.contains("Call chain with state transition")
+                && commit_template.contains("Call graph")
+                && commit_template.contains("Before/after state")
+                && commit_template.contains("Dense proof-memo paragraphs"),
+            "commit template must require readable kernel changelog prose with evidence blocks"
+        );
+        let fixes = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "fixes-tag-search")
+            .unwrap();
+        assert_eq!(fixes.depends_on, vec!["write-patch".to_string()]);
+        assert_eq!(
+            fixes.run_if.as_deref(),
+            Some("research.research_status == 'confirmed' && write-patch.code_changes_emitted == true"),
+            "fixes-tag-search must run only when the patch changed"
+        );
+        assert!(
+            fixes.preserve_outputs_on_skip,
+            "fixes-tag-search must preserve provenance across no-op review-dispute passes"
+        );
+        let fixes_prompt = fixes.prompt.as_deref().unwrap_or("");
+        assert!(
+            fixes_prompt.contains("git blame` is only a starting point")
+                || (fixes_prompt.contains("git blame` is only")
+                    && fixes_prompt.contains("starting point")),
+            "fixes-tag-search prompt must reject blame-only Fixes research"
+        );
+        assert!(
+            fixes_prompt.contains("prove the invariant changed across that commit"),
+            "fixes-tag-search prompt must require candidate-diff proof for Fixes"
+        );
+        assert!(
+            fixes_prompt.contains("git diff HEAD~1")
+                && fixes_prompt.contains("Do not base provenance")
+                && fixes_prompt.contains("incremental retry diff alone"),
+            "fixes-tag-search prompt must handle retry attempts with an existing committed patch"
+        );
+        assert!(
+            fixes.outputs.contains_key("unproven_fixes_candidates"),
+            "fixes-tag-search must preserve plausible unproven candidates"
+        );
+        // Invalidate is a terminal-on-success short-circuit.
+        let inv = wf.steps.iter().find(|s| s.id == "invalidate").unwrap();
+        assert!(inv.terminal_on_success);
+        let write_commit_message = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "write-commit-message")
+            .unwrap();
+        let commit_prompt = write_commit_message.prompt.as_deref().unwrap_or("");
+        assert!(
+            commit_prompt.contains("human-readable kernel changelog")
+                && commit_prompt.contains("dense proof memo")
+                && commit_prompt.contains("focused indented evidence blocks")
+                && commit_prompt.contains("Prefer call chains and ASCII call graphs")
+                && commit_prompt.contains("Do not inventory every caller"),
+            "write-commit-message prompt must reject wall-of-text commit messages"
+        );
+        // Review defects branch through the consolidated correction
+        // target; review itself does not edit or amend.
+        let review = wf.steps.iter().find(|s| s.id == "review").unwrap();
+        assert_eq!(
+            review.actions.as_deref(),
+            Some(
+                &[
+                    ActionType::Read,
+                    ActionType::Source,
+                    ActionType::Type,
+                    ActionType::Git,
+                    ActionType::Grep,
+                    ActionType::Callers,
+                ][..]
+            )
+        );
+        assert_eq!(review.lenses.len(), 7);
+        assert_eq!(review.aggregate, Some(Aggregate::Consolidate));
+        assert!(review.consolidate.is_some());
+        let review_prompt = review.prompt.as_deref().unwrap_or("");
+        assert!(
+            review_prompt.contains("{{lens.id}}") && review_prompt.contains("{{lens.investigate}}"),
+            "fix review must bind real JSON lenses into the prompt"
+        );
+        assert!(
+            !review_prompt.contains("Apply these lenses exhaustively"),
+            "fix review must not reintroduce a prompt-level lens checklist"
+        );
+        assert!(
+            review.lenses.iter().any(|l| l.id == "maintainer"
+                && l.fields
+                    .get("investigate")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| {
+                        s.contains("Antagonistic kernel-maintainer review")
+                            && s.contains("Expect at least one set of corrections")
+                            && s.contains("stale or contradicted documentation")
+                            && s.contains("human-readable kernel changelog")
+                            && s.contains("wall-of-text proof memo")
+                            && s.contains("focused indented evidence blocks")
+                            && s.contains("Prefer call chains and ASCII call graphs")
+                            && s.contains("set clean=false")
+                    })),
+            "fix review must include the antagonistic maintainer lens"
+        );
+        assert!(
+            review.lenses.iter().any(|l| l.id == "assertions"
+                && l.run_if.as_deref()
+                    == Some("write-patch.review_dispute != '' || commit.commit_sha != ''")
+                && l.fields
+                    .get("investigate")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| {
+                        s.contains("disprove every assertion")
+                            && s.contains("existing declarations, kerneldoc, comments, or docs")
+                            && s.contains("made stale by the patch")
+                            && s.contains("set clean=false")
+                    })),
+            "fix review must include the commit assertion lens"
+        );
+        let consolidate = review
+            .consolidate
+            .as_ref()
+            .map(|c| c.prompt.as_str())
+            .unwrap_or("");
+        assert!(
+            consolidate.contains("declarations, kerneldoc, comments, or docs are stale")
+                && consolidate.contains("contradicted, incomplete, or misleading")
+                && consolidate.contains("clean=false"),
+            "fix review consolidator must preserve stale-doc contract defects"
+        );
+        assert!(
+            consolidate.contains("Commit-message readability defects")
+                && consolidate.contains("wall-of-text proof memo")
+                && consolidate.contains("write-commit-message"),
+            "fix review consolidator must preserve maintainer readability defects"
+        );
+        let on_fail = &review.eval.as_ref().unwrap().on_fail;
+        assert_eq!(on_fail.action, OnFailAction::BranchTo);
+        assert_eq!(on_fail.branch_to.as_deref(), None);
+        assert_eq!(on_fail.branch_to_output.as_deref(), Some("correction_step"));
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_field() {
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{"id": "s", "agent": "fast", "prompt": "do thing"}],
+            "wat": "stray"
+        }"#;
+        let err = parse_workflow(body).unwrap_err().to_string();
+        assert!(
+            err.contains("schema validation failed"),
+            "expected schema error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_agent_value() {
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{"id": "s", "agent": "wizard", "prompt": "do"}]
+        }"#;
+        let err = parse_workflow(body).unwrap_err().to_string();
+        assert!(err.contains("schema validation failed"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_reaper_step_without_action() {
+        // A reaper step must have an `action` block — the schema's
+        // conditional `if reaper then required: [action]` guards
+        // this. The error message comes from JSON Schema; we only
+        // check that validation refuses the file.
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{"id": "s", "agent": "reaper", "prompt": "no action here"}]
+        }"#;
+        let err = parse_workflow(body).unwrap_err().to_string();
+        assert!(err.contains("schema validation failed"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_branch_to_without_target() {
+        // on_fail.action == "branch_to" requires the branch_to field.
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt": "p",
+                "eval": {
+                    "type": "field_check",
+                    "expr": "true",
+                    "on_fail": {"action": "branch_to"}
+                }
+            }]
+        }"#;
+        let err = parse_workflow(body).unwrap_err().to_string();
+        assert!(err.contains("schema validation failed"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_depends_on_id() {
+        // Schema-valid but cross-field invalid: depends_on points
+        // at a step that doesn't exist.
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt": "p",
+                "depends_on": ["ghost"]
+            }]
+        }"#;
+        let err = parse_workflow(body).unwrap_err().to_string();
+        assert!(
+            err.contains("depends_on unknown step 'ghost'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_step_id() {
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [
+                {"id": "s", "agent": "fast", "prompt": "a"},
+                {"id": "s", "agent": "fast", "prompt": "b"}
+            ]
+        }"#;
+        let err = parse_workflow(body).unwrap_err().to_string();
+        assert!(err.contains("duplicate step id: s"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_branch_to_unknown_step() {
+        // Schema-valid (branch_to has a value) but cross-field
+        // invalid: the value doesn't name any step.
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "fast",
+                "prompt": "p",
+                "eval": {
+                    "type": "field_check",
+                    "expr": "true",
+                    "on_fail": {"action": "branch_to", "branch_to": "ghost"}
+                }
+            }]
+        }"#;
+        let err = parse_workflow(body).unwrap_err().to_string();
+        assert!(
+            err.contains("branch_to references unknown step 'ghost'"),
+            "got: {err}"
+        );
+    }
+}

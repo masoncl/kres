@@ -211,7 +211,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
         .filter(|f| f.status != Status::Invalidated)
         .cloned()
         .collect();
-    active.sort_by(|a, b| severity_rank(b.severity).cmp(&severity_rank(a.severity)));
+    active.sort_by_key(|f| std::cmp::Reverse(severity_rank(f.severity)));
 
     kres_core::async_eprintln!(
         "summary: {} active finding(s) (filtered {} invalidated), {} task_prose entry(s)",
@@ -1024,7 +1024,7 @@ mod tests {
             f("e", Severity::High, Status::Active, vec![]),
         ];
         let mut got: Vec<Finding> = findings.to_vec();
-        got.sort_by(|a, b| severity_rank(b.severity).cmp(&severity_rank(a.severity)));
+        got.sort_by_key(|f| std::cmp::Reverse(severity_rank(f.severity)));
         let ids: Vec<&str> = got.iter().map(|x| x.id.as_str()).collect();
         // High (b, d, e) first in input order, then Medium (c), Low (a).
         assert_eq!(ids, vec!["b", "d", "e", "c", "a"]);

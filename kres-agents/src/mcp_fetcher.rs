@@ -2,10 +2,14 @@
 //! tool kinds an MCP server doesn't handle.
 //!
 //! Routes followups based on `kind`:
-//! - `source` → MCP `find_function`, falling back to grep+read if the
-//!   server returns empty or errors.
-//! - `callers` → MCP `find_callers`.
-//! - `callees` → MCP `find_calls`.
+//! - `source` → MCP `find_function`, falling back to local grep if the
+//!   server returns empty, indexing/unavailable text, or errors.
+//! - `type` → MCP `find_type`, falling back to grep+read if the server
+//!   returns empty, indexing/unavailable text, or errors.
+//! - `callers` → MCP `find_callers`, falling back to local grep when
+//!   the callgraph is unavailable.
+//! - `callees` → MCP `find_calls`, falling back to local grep when
+//!   the callgraph is unavailable.
 //! - `file` → MCP `find_files` if the server offers it; otherwise falls
 //!   back to the inner fetcher's `search` for the pattern.
 //! - Everything else → inner fetcher.
@@ -68,7 +72,7 @@ impl McpFetcher {
     /// Build an `McpFetcher` from an already-shared client handle —
     /// used when the caller (main.rs) has spawned a pool of MCP
     /// servers as `Arc<Mutex<McpClient>>` and wants a specific one
-    /// to back the rule-based source/callers/callees path.
+    /// to back the rule-based source/type/callers/callees path.
     pub fn from_shared(client: Arc<Mutex<McpClient>>, inner: Arc<WorkspaceFetcher>) -> Arc<Self> {
         Arc::new(Self {
             client,
@@ -96,6 +100,14 @@ impl DataFetcher for McpFetcher {
                         .await
                     {
                         Ok(text) => {
+                            crate::symbol::append_context(
+                                &mut out.context,
+                                json!({
+                                    "source": format!("mcp:source:{}", fu.name),
+                                    "content": text,
+                                    "note": "raw semcode source output; agents must choose the relevant result when semcode returns multiple candidates",
+                                }),
+                            );
                             // Parse the semcode output into a
                             // structured symbol when possible; if the
                             // parse fails (server returned an error
@@ -108,21 +120,63 @@ impl DataFetcher for McpFetcher {
                             ) {
                                 crate::symbol::append_symbol(&mut out.symbols, sym);
                             } else {
-                                crate::symbol::append_context(
-                                    &mut out.context,
-                                    json!({
-                                        "source": format!("mcp:source:{}", fu.name),
-                                        "content": text,
-                                    }),
-                                );
+                                passthrough.push(fu.clone());
                             }
                         }
                         Err(_) => {
                             // Fall back to grep so a dead or empty MCP
                             // server doesn't strand the agent.
+                            crate::symbol::append_context(
+                                &mut out.context,
+                                json!({
+                                    "source": format!("mcp:source:{}", fu.name),
+                                    "error": "semcode source lookup failed; local fallback requested",
+                                    "tool": self.methods.find_function,
+                                }),
+                            );
+                            passthrough.push(fu.clone());
+                        }
+                    }
+                }
+                "type" => {
+                    match self
+                        .try_call_mcp_text("type", self.methods.find_type, &fu.name)
+                        .await
+                    {
+                        Ok(text) => {
+                            crate::symbol::append_context(
+                                &mut out.context,
+                                json!({
+                                    "source": format!("mcp:type:{}", fu.name),
+                                    "content": text,
+                                    "note": "raw semcode type output; agents must choose the relevant result when semcode returns multiple candidates",
+                                }),
+                            );
+                            if let Some(sym) =
+                                crate::symbol::parse_semcode_symbol(&text, self.methods.find_type)
+                            {
+                                crate::symbol::append_symbol(&mut out.symbols, sym);
+                            } else {
+                                passthrough.push(Followup {
+                                    kind: "type".into(),
+                                    name: fu.name.clone(),
+                                    reason: fu.reason.clone(),
+                                    path: fu.path.clone(),
+                                });
+                            }
+                        }
+                        Err(_) => {
+                            crate::symbol::append_context(
+                                &mut out.context,
+                                json!({
+                                    "source": format!("mcp:type:{}", fu.name),
+                                    "error": "semcode type lookup failed; local fallback requested",
+                                    "tool": self.methods.find_type,
+                                }),
+                            );
                             passthrough.push(Followup {
-                                kind: "search".into(),
-                                name: format!(r"\b{}\b", regex_escape_word(&fu.name)),
+                                kind: "type".into(),
+                                name: fu.name.clone(),
                                 reason: fu.reason.clone(),
                                 path: fu.path.clone(),
                             });
@@ -134,8 +188,15 @@ impl DataFetcher for McpFetcher {
                         .try_call_mcp_result("callers", self.methods.find_callers, &fu.name)
                         .await
                     {
-                        Ok(v) => out.context.push(v),
-                        Err(err_ctx) => out.context.push(err_ctx),
+                        Ok(v) if !mcp_result_unavailable(&v) => out.context.push(v),
+                        Ok(v) => {
+                            out.context.push(v);
+                            passthrough.push(fu.clone());
+                        }
+                        Err(err_ctx) => {
+                            out.context.push(err_ctx);
+                            passthrough.push(fu.clone());
+                        }
                     }
                 }
                 "callees" => {
@@ -143,8 +204,15 @@ impl DataFetcher for McpFetcher {
                         .try_call_mcp_result("callees", self.methods.find_calls, &fu.name)
                         .await
                     {
-                        Ok(v) => out.context.push(v),
-                        Err(err_ctx) => out.context.push(err_ctx),
+                        Ok(v) if !mcp_result_unavailable(&v) => out.context.push(v),
+                        Ok(v) => {
+                            out.context.push(v);
+                            passthrough.push(fu.clone());
+                        }
+                        Err(err_ctx) => {
+                            out.context.push(err_ctx);
+                            passthrough.push(fu.clone());
+                        }
                     }
                 }
                 _ => passthrough.push(fu.clone()),
@@ -235,21 +303,35 @@ impl McpFetcher {
     }
 }
 
-/// Escape regex metacharacters so a symbol name like `foo::bar<T>` can
-/// be passed to ripgrep without surprises.
-fn regex_escape_word(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$' | '\\'
-            | '/' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
+pub(crate) fn mcp_result_unavailable(v: &Value) -> bool {
+    v.get("error")
+        .and_then(Value::as_str)
+        .map(mcp_text_unavailable)
+        .unwrap_or(false)
+        || v.get("result")
+            .and_then(Value::as_str)
+            .map(mcp_text_unavailable)
+            .unwrap_or(false)
+}
+
+pub(crate) fn mcp_text_unavailable(text: &str) -> bool {
+    let s = text.trim();
+    if s.is_empty() {
+        return true;
     }
-    out
+    let lower = s.to_ascii_lowercase();
+    lower.contains("database is currently being indexed")
+        || lower.contains("please wait for indexing")
+        || lower.contains("indexing_status")
+        || lower.contains("failed to get statistics for index")
+        || lower.contains("page_lookup.lance not found")
+        || lower.contains("cannot open index")
+        || lower.contains("mcp call failed")
+        || lower.contains("not found")
+        || lower.contains("no function")
+        || lower.contains("no type")
+        || lower.contains("no callers")
+        || lower.contains("no callees")
 }
 
 #[cfg(test)]
@@ -257,19 +339,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn regex_escapes_common_chars() {
-        assert_eq!(regex_escape_word("foo::bar"), "foo::bar");
-        assert_eq!(regex_escape_word("a(b)"), "a\\(b\\)");
-        assert_eq!(regex_escape_word("x.y"), "x\\.y");
-        assert_eq!(regex_escape_word("a|b"), "a\\|b");
-        assert_eq!(regex_escape_word("c[d]"), "c\\[d\\]");
-    }
-
-    #[test]
     fn method_map_defaults_match_semcode() {
         let m = McpMethodMap::default();
         assert_eq!(m.find_function, "find_function");
+        assert_eq!(m.find_type, "find_type");
         assert_eq!(m.find_callers, "find_callers");
         assert_eq!(m.find_calls, "find_calls");
+    }
+
+    #[test]
+    fn detects_semcode_indexing_as_unavailable() {
+        assert!(mcp_text_unavailable(
+            "Database is currently being indexed (Analyzing files). Please wait for indexing to complete."
+        ));
+        assert!(mcp_text_unavailable(
+            "LanceError(IO): Object at location .semcode.db/functions.lance/_indices/x/page_lookup.lance not found"
+        ));
+        assert!(mcp_text_unavailable(""));
+        assert!(!mcp_text_unavailable(
+            "Function: cma_release\nFile: mm/cma.c\nbool cma_release(...)"
+        ));
     }
 }

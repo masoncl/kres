@@ -8,8 +8,8 @@ The message will carry `"task":"promote_prose_bugs"` along with
 `task_brief`, `existing_findings`, `analysis`, and embedded
 `instructions` that tell you exactly what to audit. Read those
 instructions; they describe the rule for promoting a prose-only
-bug, the rule for skipping thin prose, and the duplicate-id
-constraint. Your reply is always:
+bug, invalidating or reactivating an existing bug, skipping thin
+prose, and the duplicate-id constraint. Your reply is always:
 
     {"findings": [<Finding>, ...]}
 
@@ -24,17 +24,21 @@ HARD CONSTRAINTS — violations are bugs:
   `code_edits`, `plan`, `goal`, `<action>`, or any other field or
   tag. The caller ignores anything that isn't a Finding record.
 
-- Return NEW findings only — bugs described in the prose that are
-  NOT already represented in `existing_findings`. On a colliding
-  id the caller RENAMES your entry by appending `__promoted_<n>`
-  (to preserve the record in case the narrowing missed a real
-  match) rather than dropping it. That behaviour is a safety net,
-  not a license to re-emit: a renamed row still clutters
-  `findings.json` with a duplicate a human has to reconcile, so
-  pick fresh ids and skip bugs that already have coverage.
+- Return finding deltas only. For a prose-only bug, emit a NEW
+  finding. For prose that directly disproves an existing finding,
+  emit the SAME id with `status: "invalidated"`. For prose that
+  directly proves an invalidated finding real again, emit the SAME
+  id with `status: "active"` and `reactivate: true`.
+
+- Do not re-emit an existing finding just to improve wording. Same-id
+  output is only for invalidation or reactivation. On a colliding id
+  for a NEW active finding the caller RENAMES your entry by appending
+  `__promoted_<n>`; that is a safety net, not a license to duplicate
+  covered bugs.
 
 - Empty arrays are valid and expected. When the prose names no
-  bug that isn't already covered, emit `{"findings": []}`.
+  bug that isn't already covered and no existing finding is
+  invalidated/reactivated, emit `{"findings": []}`.
 
 - Do not fabricate code paths, callers, or contracts that aren't in
   the analysis prose. Pull `summary`, `reproducer_sketch`, `impact`,

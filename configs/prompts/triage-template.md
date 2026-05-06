@@ -225,10 +225,9 @@ value so the two stay in sync. Do not touch any other part of
 - Requirements: answer each question with `yes`, `no`, `n/a`,
   or `unknown` before the explanatory paragraph. If FINDING.md
   doesn't say, write `unknown` — don't guess.
-- Subsystem is one sentence. Name the kernel area (e.g. "btrfs
-  extent allocator", "TCP input path", "mac80211 rx") plus the
-  file and function. Pull the file from metadata's `filename:`
-  when present.
+- Subsystem is one sentence. Name the kernel area plus the file and
+  function. Pull the file from metadata's `filename:` when present;
+  do not invent a subsystem from the bug title alone.
 
 ### AVOID
 

@@ -1,6 +1,7 @@
 //! REPL session loop.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,6 +85,10 @@ pub struct ReplConfig {
     /// invocation (`kres ... > out.txt`) terminates after the
     /// turns stop, matching the existing `--turns N` exit path.
     pub exit_on_idle: bool,
+    /// Exact value to use after `Assisted-by:` for fix-workflow
+    /// commit messages. Defaults to `kres (<slow-model-id>)`; the
+    /// CLI can override it with `--assisted-by`.
+    pub assisted_by: String,
 }
 
 impl Default for ReplConfig {
@@ -101,6 +106,7 @@ impl Default for ReplConfig {
             workspace: PathBuf::from("."),
             persist_path: None,
             exit_on_idle: false,
+            assisted_by: "kres (claude-sonnet-4-6)".to_string(),
         }
     }
 }
@@ -191,8 +197,10 @@ pub struct Session {
     goal_client: Option<Arc<kres_agents::GoalClient>>,
     findings_store: Option<Arc<FindingsStore>>,
     usage: Arc<UsageTracker>,
-    lenses: Vec<kres_core::LensSpec>,
+    lenses: Arc<tokio::sync::RwLock<Vec<kres_core::LensSpec>>>,
+    lens_consolidate_rules: Arc<tokio::sync::RwLock<Option<String>>>,
     initial_prompt: Option<String>,
+    initial_prompt_mode: Option<kres_agents::TaskMode>,
     /// Last reaped task's analysis — consumed by /reply.
     last_analysis: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Findings loaded from disk at Session::new time. Applied to
@@ -430,8 +438,10 @@ impl Session {
                 goal_client: None,
                 findings_store,
                 usage: Arc::new(UsageTracker::new()),
-                lenses: Vec::new(),
+                lenses: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                lens_consolidate_rules: Arc::new(tokio::sync::RwLock::new(None)),
                 initial_prompt: None,
+                initial_prompt_mode: None,
                 last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
                 pending_bootstrap: findings,
                 logger: None,
@@ -459,8 +469,10 @@ impl Session {
             goal_client: None,
             findings_store,
             usage: Arc::new(UsageTracker::new()),
-            lenses: Vec::new(),
+            lenses: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            lens_consolidate_rules: Arc::new(tokio::sync::RwLock::new(None)),
             initial_prompt: None,
+            initial_prompt_mode: None,
             last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
             pending_bootstrap: Vec::new(),
             logger: None,
@@ -621,11 +633,38 @@ impl Session {
     }
 
     pub fn with_prompt_file(mut self, pf: kres_agents::PromptFile) -> Self {
-        self.lenses = pf.lenses;
+        self.lenses = Arc::new(tokio::sync::RwLock::new(pf.lenses));
+        self.lens_consolidate_rules = Arc::new(tokio::sync::RwLock::new(None));
+        self.initial_prompt_mode = None;
         if !pf.prompt.is_empty() {
             self.initial_prompt = Some(pf.prompt);
         }
         self
+    }
+
+    pub fn with_review_prompt_config(mut self, cfg: crate::workflow::ReviewPromptConfig) -> Self {
+        self.lenses = Arc::new(tokio::sync::RwLock::new(cfg.prompt_file.lenses));
+        self.lens_consolidate_rules = Arc::new(tokio::sync::RwLock::new(cfg.consolidate_rules));
+        if !cfg.prompt_file.prompt.is_empty() {
+            self.initial_prompt = Some(cfg.prompt_file.prompt);
+            self.initial_prompt_mode = Some(kres_agents::TaskMode::Audit);
+        }
+        self
+    }
+
+    async fn install_review_config_and_submit(&self, cfg: crate::workflow::ReviewPromptConfig) {
+        *self.lenses.write().await = cfg.prompt_file.lenses;
+        *self.lens_consolidate_rules.write().await = cfg.consolidate_rules;
+        if !cfg.prompt_file.prompt.trim().is_empty() {
+            self.submit_prompt_inner(
+                cfg.prompt_file.prompt,
+                true,
+                None,
+                None,
+                Some(kres_agents::TaskMode::Audit),
+            )
+            .await;
+        }
     }
 
     pub fn usage_tracker(&self) -> Arc<UsageTracker> {
@@ -860,6 +899,8 @@ impl Session {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
                         kres_core::async_eprintln!("\n(second ctrl-c — aborting)");
+                        crate::tui::emergency_restore_terminal();
+                        crate::status::restore();
                         std::process::exit(130);
                     }
                     _ = tokio::time::sleep(Duration::from_secs(3)) => {}
@@ -888,6 +929,8 @@ impl Session {
         let promoter_for_reaper = self.consolidator.clone();
         let interrupted_for_reaper = self.interrupted_prompt.clone();
         let report_path_for_reaper = self.cfg.report_path.clone();
+        let turns_cap_reached = Arc::new(AtomicBool::new(false));
+        let turns_cap_reached_for_reaper = turns_cap_reached.clone();
         // Destination for coding-mode file output. Coding tasks emit
         // path-relative files; they land under the workspace (i.e.
         // the operator's cwd at kres-start time, or --workspace) so
@@ -933,8 +976,25 @@ impl Session {
         // as new pending/blocked todos appear, so a fresh prompt
         // re-arms the stop announcement.
         let mut turns0_stop_announced = false;
+        let mut turns_limit_announced = false;
+        let mut turns_limit_waiting_active: Option<usize> = None;
         let reaper_handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(250));
+            macro_rules! persist_reaper_tick {
+                () => {
+                    if let Some(ref p) = persist_path_for_reaper {
+                        let lp = last_prompt_for_reaper.lock().await.clone();
+                        persist_session_state_to(
+                            p,
+                            &mgr_for_reaper,
+                            &deferred_for_reaper,
+                            lp,
+                            Some(&persist_sig_for_reaper),
+                        )
+                        .await;
+                    }
+                };
+            }
             loop {
                 tokio::select! {
                     _ = reaper_shutdown.cancelled() => break,
@@ -1173,9 +1233,11 @@ impl Session {
                             // the prompt; a typical prose chunk only
                             // touches a handful of those. False
                             // negatives in this scan are handled
-                            // downstream: filter_net_new sees the
-                            // full `all_known` and RENAMES colliding
-                            // ids rather than dropping them.
+                            // downstream: filter_promoted_delta sees
+                            // the full `all_known`, preserves same-id
+                            // invalidations/reactivations, and RENAMES
+                            // colliding new active ids rather than
+                            // dropping them.
                             let prose_relevant =
                                 kres_core::relevant_subset(&effective_analysis, &all_known);
                             // Both slices go to the promoter's
@@ -1412,6 +1474,37 @@ impl Session {
                             quiescent,
                         );
                     }
+                    let followups_for_todo: Vec<_> =
+                        if matches!(r.mode, kres_core::TaskMode::Coding) {
+                            r.followups
+                                .iter()
+                                .filter(|f| reaper_followup_kind(f).is_none())
+                                .cloned()
+                                .collect()
+                        } else {
+                            r.followups.clone()
+                        };
+                    // If this task pushed us to/past --turns N, stop
+                    // before continuation LLMs. Findings/report/state
+                    // above are already published for the completed
+                    // task; todo-agent and goal-agent calls below are
+                    // only about deciding what to run next. Running
+                    // them after the cap can hang or create more
+                    // pending work before the cap check at the bottom
+                    // of the reaper tick gets a chance to drain.
+                    if turns_limit > 0 && mgr_for_reaper.completed_run_count().await >= turns_limit
+                    {
+                        turns_cap_reached_for_reaper.store(true, Ordering::Release);
+                        if !followups_for_todo.is_empty() {
+                            add_followups_as_pending(
+                                &mgr_for_reaper,
+                                &followups_for_todo,
+                                "turn-cap followup emitted by completed task",
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
                     // Update todo list via todo-agent when one is
                     // configured. Non-fatal on any failure — the todo
                     // list is maintained best-effort.
@@ -1437,15 +1530,6 @@ impl Session {
                         // executed directly (above). Only the rest
                         // go to the todo agent for promotion to
                         // pending tasks.
-                        let followups: Vec<_> = if matches!(r.mode, kres_core::TaskMode::Coding) {
-                            r.followups
-                                .iter()
-                                .filter(|f| reaper_followup_kind(f).is_none())
-                                .cloned()
-                                .collect()
-                        } else {
-                            r.followups.clone()
-                        };
                         kres_core::async_eprintln!(
                             "[todo update] before: {} item(s) ({} pending, {} done); {} new followup(s)",
                             current.len(),
@@ -1457,16 +1541,17 @@ impl Session {
                                 .iter()
                                 .filter(|t| t.status == kres_core::TodoStatus::Done)
                                 .count(),
-                            followups.len(),
+                            followups_for_todo.len(),
                         );
                         let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
+                        let lenses_snapshot = lenses_for_reaper.read().await.clone();
                         match kres_agents::update_todo_via_agent_with_logger(
                             tc,
                             &completed_query,
                             &analysis,
-                            &followups,
+                            &followups_for_todo,
                             &current,
-                            &lenses_for_reaper,
+                            &lenses_snapshot,
                             plan_for_todo.as_ref(),
                             logger_for_reaper.clone(),
                         )
@@ -1512,6 +1597,16 @@ impl Session {
                                 );
                             }
                         }
+                    }
+                    if matches!(r.mode, kres_core::TaskMode::Audit)
+                        && !lenses_for_reaper.read().await.is_empty()
+                        && !followups_for_todo.is_empty()
+                    {
+                        ensure_review_followups_remain_pending(
+                            &mgr_for_reaper,
+                            &followups_for_todo,
+                        )
+                        .await;
                     }
 
                     // §4 goal check: if a goal is set, ask the
@@ -1568,6 +1663,13 @@ impl Session {
                                 }
                                 combined.push_str(&format!("## {}\n\n{}", e.task, e.analysis));
                             }
+                            let recorded_findings = mgr_for_reaper.findings_snapshot().await;
+                            let recorded_findings_context =
+                                recorded_findings_goal_context(&recorded_findings);
+                            if !recorded_findings_context.is_empty() {
+                                combined.push_str("\n\n---\n\n");
+                                combined.push_str(&recorded_findings_context);
+                            }
                             let plan_for_check = mgr_for_reaper.plan_snapshot().await;
                             let check = kres_agents::check_goal(
                                 &gc,
@@ -1587,57 +1689,81 @@ impl Session {
                                     "[goal met: {}]",
                                     truncate(&check.reason, 200)
                                 );
-                                // Any lingering InProgress items belong
-                                // to tasks the reaper already handled;
-                                // flip them to Pending so they join the
-                                // deferred drain below instead of being
-                                // silently dropped.
-                                mgr_for_reaper.reset_in_progress_to_pending().await;
-                                // Drain pending todos into the deferred
-                                // ledger so /followup can list them.
-                                // Done/Skipped items stay on the todo
-                                // list so their step_id linkage survives
-                                // — the next sync_plan_from_todo tick
-                                // can then flip any fully-covered plan
-                                // step to Done.
-                                let drained = mgr_for_reaper.drain_pending_blocked().await;
-                                let carry = drained.len();
-                                let mut deferred = deferred_for_reaper.lock().await;
-                                deferred.extend(drained);
-                                drop(deferred);
-                                if carry > 0 {
-                                    if follow_followups && turns_limit > 0 {
-                                        // --follow + --turns N: pull the
-                                        // deferred items right back into
-                                        // the todo list so auto-continue
-                                        // dispatches them. Without this,
-                                        // goal-met drains to deferred,
-                                        // followups_drained fires, and
-                                        // the session exits with turns
-                                        // still remaining.
-                                        let mut def = deferred_for_reaper.lock().await;
-                                        let mut items = mgr_for_reaper.todo_snapshot().await;
-                                        let existing: std::collections::BTreeSet<String> =
-                                            items.iter().map(|i| i.name.clone()).collect();
-                                        let mut pulled = 0usize;
-                                        for mut d in def.drain(..) {
-                                            if existing.contains(&d.name) {
-                                                continue;
+                                let pending_or_blocked = mgr_for_reaper
+                                    .todo_snapshot()
+                                    .await
+                                    .iter()
+                                    .filter(|t| {
+                                        matches!(
+                                            t.status,
+                                            kres_core::TodoStatus::Pending
+                                                | kres_core::TodoStatus::Blocked
+                                        )
+                                    })
+                                    .count();
+                                let lensed_review = review_followups_drive_next_turn(
+                                    r.mode,
+                                    !lenses_for_reaper.read().await.is_empty(),
+                                    pending_or_blocked,
+                                    followups_for_todo.len(),
+                                );
+                                if lensed_review {
+                                    kres_core::async_eprintln!(
+                                        "[goal met, review followups remain: keeping {pending_or_blocked} pending/blocked item(s) as next-turn review work]"
+                                    );
+                                } else {
+                                    // Any lingering InProgress items belong
+                                    // to tasks the reaper already handled;
+                                    // flip them to Pending so they join the
+                                    // deferred drain below instead of being
+                                    // silently dropped.
+                                    mgr_for_reaper.reset_in_progress_to_pending().await;
+                                    // Drain pending todos into the deferred
+                                    // ledger so /followup can list them.
+                                    // Done/Skipped items stay on the todo
+                                    // list so their step_id linkage survives
+                                    // — the next sync_plan_from_todo tick
+                                    // can then flip any fully-covered plan
+                                    // step to Done.
+                                    let drained = mgr_for_reaper.drain_pending_blocked().await;
+                                    let carry = drained.len();
+                                    let mut deferred = deferred_for_reaper.lock().await;
+                                    deferred.extend(drained);
+                                    drop(deferred);
+                                    if carry > 0 {
+                                        if follow_followups && turns_limit > 0 {
+                                            // --follow + --turns N: pull the
+                                            // deferred items right back into
+                                            // the todo list so auto-continue
+                                            // dispatches them. Without this,
+                                            // goal-met drains to deferred,
+                                            // followups_drained fires, and
+                                            // the session exits with turns
+                                            // still remaining.
+                                            let mut def = deferred_for_reaper.lock().await;
+                                            let mut items = mgr_for_reaper.todo_snapshot().await;
+                                            let existing: std::collections::BTreeSet<String> =
+                                                items.iter().map(|i| i.name.clone()).collect();
+                                            let mut pulled = 0usize;
+                                            for mut d in def.drain(..) {
+                                                if existing.contains(&d.name) {
+                                                    continue;
+                                                }
+                                                d.status = kres_core::TodoStatus::Pending;
+                                                items.push(d);
+                                                pulled += 1;
                                             }
-                                            d.status = kres_core::TodoStatus::Pending;
-                                            items.push(d);
-                                            pulled += 1;
+                                            drop(def);
+                                            mgr_for_reaper.replace_todo(items).await;
+                                            kres_core::async_eprintln!(
+                                                "[goal met, --follow: pulled {pulled} deferred item(s) back into todo list ({} turns remaining)]",
+                                                turns_limit.saturating_sub(mgr_for_reaper.completed_run_count().await)
+                                            );
+                                        } else {
+                                            kres_core::async_eprintln!(
+                                                "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
+                                            );
                                         }
-                                        drop(def);
-                                        mgr_for_reaper.replace_todo(items).await;
-                                        kres_core::async_eprintln!(
-                                            "[goal met, --follow: pulled {pulled} deferred item(s) back into todo list ({} turns remaining)]",
-                                            turns_limit.saturating_sub(mgr_for_reaper.completed_run_count().await)
-                                        );
-                                    } else {
-                                        kres_core::async_eprintln!(
-                                            "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
-                                        );
                                     }
                                 }
                                 // Per-task goal already removed at the
@@ -1657,65 +1783,70 @@ impl Session {
                                 // them through the todo agent so they get
                                 // deduped against existing items and
                                 // appended as new todos.
-                                if let Some(ref tc) = todo_client {
-                                    let reason_prefix = format!(
-                                        "goal not met: {}",
-                                        check.reason.chars().take(100).collect::<String>()
-                                    );
-                                    let missing_fus: Vec<serde_json::Value> = check
-                                        .missing
-                                        .iter()
-                                        .map(|m| {
-                                            serde_json::json!({
-                                                "type": "question",
-                                                "name": m,
-                                                "reason": reason_prefix,
+                                if !check.missing.is_empty() {
+                                    if let Some(ref tc) = todo_client {
+                                        let reason_prefix = format!(
+                                            "goal not met: {}",
+                                            check.reason.chars().take(100).collect::<String>()
+                                        );
+                                        let missing_fus: Vec<serde_json::Value> = check
+                                            .missing
+                                            .iter()
+                                            .map(|m| {
+                                                serde_json::json!({
+                                                    "type": "question",
+                                                    "name": m,
+                                                    "reason": reason_prefix,
+                                                })
                                             })
-                                        })
-                                        .collect();
-                                    let current = mgr_for_reaper.todo_snapshot().await;
-                                    let completed_query = r.name.clone();
-                                    kres_core::async_eprintln!(
+                                            .collect();
+                                        let current = mgr_for_reaper.todo_snapshot().await;
+                                        let completed_query = r.name.clone();
+                                        kres_core::async_eprintln!(
                                     "[goal-not-met → todo update] injecting {} missing item(s) as question followups",
                                     missing_fus.len()
                                 );
-                                    let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
-                                    match kres_agents::update_todo_via_agent_with_logger(
-                                        tc,
-                                        &completed_query,
-                                        "",
-                                        &missing_fus,
-                                        &current,
-                                        &lenses_for_reaper,
-                                        plan_for_todo.as_ref(),
-                                        logger_for_reaper.clone(),
-                                    )
-                                    .await
-                                    {
-                                        Ok(updated) => {
-                                            kres_core::async_eprintln!(
+                                        let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
+                                        let lenses_snapshot =
+                                            lenses_for_reaper.read().await.clone();
+                                        match kres_agents::update_todo_via_agent_with_logger(
+                                            tc,
+                                            &completed_query,
+                                            "",
+                                            &missing_fus,
+                                            &current,
+                                            &lenses_snapshot,
+                                            plan_for_todo.as_ref(),
+                                            logger_for_reaper.clone(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(updated) => {
+                                                kres_core::async_eprintln!(
                                             "[goal-not-met → todo update] after: {} item(s) ({} pending, {} done)",
                                             updated.todo.len(),
                                             updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Pending).count(),
                                             updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Done).count(),
                                         );
-                                            if let Some(rewrite) = updated.plan {
-                                                let prior = mgr_for_reaper.plan_snapshot().await;
-                                                let new_plan = rewrite.apply_to(prior.as_ref());
-                                                log_plan_change(
-                                                    "todo agent: plan rewrite (goal-not-met)",
-                                                    prior.as_ref(),
-                                                    &new_plan,
-                                                );
-                                                mgr_for_reaper.set_plan(Some(new_plan)).await;
+                                                if let Some(rewrite) = updated.plan {
+                                                    let prior =
+                                                        mgr_for_reaper.plan_snapshot().await;
+                                                    let new_plan = rewrite.apply_to(prior.as_ref());
+                                                    log_plan_change(
+                                                        "todo agent: plan rewrite (goal-not-met)",
+                                                        prior.as_ref(),
+                                                        &new_plan,
+                                                    );
+                                                    mgr_for_reaper.set_plan(Some(new_plan)).await;
+                                                }
+                                                mgr_for_reaper.replace_todo(updated.todo).await;
                                             }
-                                            mgr_for_reaper.replace_todo(updated.todo).await;
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                target: "kres_repl",
-                                                "todo-agent update (missing items) failed: {e}"
-                                            );
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    target: "kres_repl",
+                                                    "todo-agent update (missing items) failed: {e}"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1757,22 +1888,31 @@ impl Session {
                             );
                         }
                         if exit_on_idle {
+                            persist_reaper_tick!();
                             mgr_for_reaper.root_shutdown().cancel();
                             break;
                         }
                     }
                 }
                 // --turns N limit: once the slow-agent run count hits
-                // the configured cap, broadcast cancel so the REPL
-                // exits. Matches 's "stop after N completed task
-                // runs" behaviour.
+                // the configured cap, stop launching new work and
+                // defer not-yet-started followups. Do not reset or
+                // cancel active tasks here: completed_run_count is
+                // bumped as tasks finish, before the reaper has
+                // necessarily merged every concurrently completed
+                // result into findings.json/report.md. Active tasks
+                // must be allowed to finish and be reaped, otherwise
+                // their LLM output can exist only in code.jsonl.
                 if turns_limit > 0 {
                     let done = mgr_for_reaper.completed_run_count().await;
                     if done >= turns_limit {
-                        kres_core::async_eprintln!(
-                            "\n=== --turns {turns_limit} reached — {done} task run(s) completed ==="
-                        );
-                        mgr_for_reaper.reset_in_progress_to_pending().await;
+                        turns_cap_reached_for_reaper.store(true, Ordering::Release);
+                        if !turns_limit_announced {
+                            kres_core::async_eprintln!(
+                                "\n=== --turns {turns_limit} reached — {done} task run(s) completed ==="
+                            );
+                            turns_limit_announced = true;
+                        }
                         let drained = mgr_for_reaper.drain_pending_blocked().await;
                         let carry = drained.len();
                         let mut deferred = deferred_for_reaper.lock().await;
@@ -1783,9 +1923,26 @@ impl Session {
                                 "[{carry} pending item(s) deferred — see /followup]"
                             );
                         }
-                        kres_core::async_eprintln!("exiting REPL.");
-                        mgr_for_reaper.root_shutdown().cancel();
-                        break;
+                        let active = mgr_for_reaper.active_count().await;
+                        match turns_cap_action(done, turns_limit, active) {
+                            TurnsCapAction::Continue => {}
+                            TurnsCapAction::DrainAndWait => {
+                                if turns_limit_waiting_active != Some(active) {
+                                    kres_core::async_eprintln!(
+                                        "[--turns cap reached; waiting for {active} active task(s) to finish and publish results]"
+                                    );
+                                    turns_limit_waiting_active = Some(active);
+                                }
+                                persist_reaper_tick!();
+                                continue;
+                            }
+                            TurnsCapAction::DrainAndExit => {
+                                kres_core::async_eprintln!("exiting REPL.");
+                                persist_reaper_tick!();
+                                mgr_for_reaper.root_shutdown().cancel();
+                                break;
+                            }
+                        }
                     }
                     // Goal met before --turns N reached: the goal-met
                     // branch above (line ~1556) drained pending todos
@@ -1810,6 +1967,7 @@ impl Session {
                             kres_core::async_eprintln!(
                                 "\n=== goal met, todo list drained ({done} run(s)) — exiting ==="
                             );
+                            persist_reaper_tick!();
                             mgr_for_reaper.root_shutdown().cancel();
                             break;
                         }
@@ -1929,6 +2087,7 @@ impl Session {
                         // root_shutdown to break the REPL select on
                         // root_shutdown.cancelled().
                         if exit_on_idle {
+                            persist_reaper_tick!();
                             mgr_for_reaper.root_shutdown().cancel();
                             break;
                         }
@@ -1941,21 +2100,11 @@ impl Session {
                 // across every callsite. The content-hash latch in
                 // persist_session_state_to makes idle ticks a no-op
                 // so the 250ms cadence does not pound the disk.
-                if let Some(ref p) = persist_path_for_reaper {
-                    let lp = last_prompt_for_reaper.lock().await.clone();
-                    persist_session_state_to(
-                        p,
-                        &mgr_for_reaper,
-                        &deferred_for_reaper,
-                        lp,
-                        Some(&persist_sig_for_reaper),
-                    )
-                    .await;
-                }
+                persist_reaper_tick!();
             }
         });
 
-        // Install a session-scoped consent store so reads outside
+        // Install a session-scoped consent store so access outside
         // --workspace can be auto-granted by mention in the
         // operator's prompt (see consent::grant_paths_from_text in
         // submit_prompt).  install() returns Err when the slot was
@@ -1964,20 +2113,23 @@ impl Session {
         // store, which is acceptable for the unit-test surface.
         let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
         print_banner();
-        if !self.lenses.is_empty() {
+        let installed_lenses = self.lenses.read().await.clone();
+        if !installed_lenses.is_empty() {
             kres_core::async_eprintln!(
                 "installed {} session-wide slow-agent lens(es):",
-                self.lenses.len()
+                installed_lenses.len()
             );
-            for l in &self.lenses {
+            for l in &installed_lenses {
                 kres_core::async_eprintln!("  [{}] {}", l.kind, l.name);
             }
         }
         if let Some(ref p) = self.initial_prompt {
             kres_core::async_eprintln!("submitting initial prompt from --prompt");
-            self.submit_prompt(p.clone()).await;
+            self.submit_prompt_inner(p.clone(), true, None, None, self.initial_prompt_mode)
+                .await;
         }
         let root_shutdown = self.mgr.root_shutdown().clone();
+        let turns_cap_reached_for_loop = turns_cap_reached.clone();
         let mut auto_continue_idle_since: Option<std::time::Instant> = None;
         loop {
             // rustyline prints its own "> " prompt when attached to
@@ -2014,7 +2166,9 @@ impl Session {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if self.should_auto_continue().await {
+                    if turns_cap_reached_for_loop.load(Ordering::Acquire) {
+                        auto_continue_idle_since = None;
+                    } else if self.should_auto_continue().await {
                         let since = auto_continue_idle_since.get_or_insert_with(std::time::Instant::now);
                         if since.elapsed() >= AUTO_CONTINUE_IDLE {
                             kres_core::async_eprintln!("[auto-continue: dispatching next batch (hit enter to cancel)]");
@@ -2050,6 +2204,7 @@ impl Session {
                 Command::SummaryMarkdown { filename } => self.cmd_summary(filename, true).await,
                 Command::Review { target } => self.cmd_review(target).await,
                 Command::Fix { target } => self.cmd_fix(target).await,
+                Command::Triage { target } => self.cmd_triage(target).await,
                 Command::Extract {
                     dir,
                     report,
@@ -2199,7 +2354,7 @@ impl Session {
     /// Prepends the accumulated-analysis ledger as "Recent context"
     /// so a follow-up operator prompt doesn't start cold.
     async fn submit_prompt(&self, text: String) {
-        self.submit_prompt_inner(text, true, None, None).await
+        self.submit_prompt_inner(text, true, None, None, None).await
     }
 
     /// Pipeline-driven submission (cmd_next / cmd_continue's
@@ -2232,7 +2387,7 @@ impl Session {
         todo_tag: Option<String>,
         step_id: Option<String>,
     ) {
-        self.submit_prompt_inner(text, false, todo_tag, step_id)
+        self.submit_prompt_inner(text, false, todo_tag, step_id, None)
             .await
     }
 
@@ -2242,6 +2397,7 @@ impl Session {
         include_recent_context: bool,
         todo_tag: Option<String>,
         step_id: Option<String>,
+        forced_mode: Option<kres_agents::TaskMode>,
     ) {
         let Some(orc) = self.orchestrator.clone() else {
             kres_core::async_eprintln!("(no orchestrator configured — prompt dropped)");
@@ -2254,7 +2410,7 @@ impl Session {
         // works again after this task completes.
         self.stop_latched
             .store(false, std::sync::atomic::Ordering::Release);
-        // Auto-grant read consent for any file or directory the
+        // Auto-grant access consent for any file or directory the
         // operator just named in their prompt. Only fires for
         // operator-typed submissions; pipeline-driven submits
         // (cmd_next / cmd_continue) skip this — the model can't
@@ -2268,7 +2424,7 @@ impl Session {
                     let label: Vec<String> =
                         added.iter().map(|g| g.dir.display().to_string()).collect();
                     kres_core::async_eprintln!(
-                        "consent: granted read access to {} dir(s) named in the prompt: {}",
+                        "consent: granted access to {} dir(s) named in the prompt: {}",
                         added.len(),
                         truncate(&label.join(", "), 200)
                     );
@@ -2368,6 +2524,16 @@ impl Session {
                 let r = self
                     .derive_goal(&text, existing_plan.as_ref(), "fresh")
                     .await;
+                let r = if let Some(mode) = forced_mode {
+                    kres_core::async_eprintln!(
+                        "goal mode forced by command: {} -> {}",
+                        r.1.as_str(),
+                        mode.as_str()
+                    );
+                    (r.0, mode)
+                } else {
+                    r
+                };
                 if let Some(g) = r.0.as_ref() {
                     *self.session_goal.lock().await = Some((g.clone(), r.1));
                 }
@@ -2465,7 +2631,8 @@ impl Session {
         let previous_findings = self.mgr.findings_snapshot().await;
         let task_brief = format!("prompt: {}", truncate(&text, 60));
         let task_brief_clone = task_brief.clone();
-        let lenses = self.lenses.clone();
+        let lenses = self.lenses.read().await.clone();
+        let lens_consolidate_rules = self.lens_consolidate_rules.read().await.clone();
         let consolidator = self.consolidator.clone();
         let original_prompt = text.clone();
         let prompt_for_park = text.clone();
@@ -2555,7 +2722,14 @@ impl Session {
                                 .await
                         } else if let Some(c) = consolidator {
                             orc_task
-                                .run_with_lenses(&text, &lenses, &c, &ctx, &handle.shutdown)
+                                .run_with_lenses(
+                                    &text,
+                                    &lenses,
+                                    &c,
+                                    lens_consolidate_rules.as_deref(),
+                                    &ctx,
+                                    &handle.shutdown,
+                                )
                                 .await
                         } else {
                             orc_task
@@ -3269,56 +3443,161 @@ impl Session {
         }
     }
 
-    /// `/fix <target>` — compose the embedded `fix` slash-command
-    /// template with the operator's target string and submit the
-    /// result as a new prompt. Uses the same user_commands::compose
-    /// path as `--prompt "fix: ..."` so the CLI and REPL share one
-    /// code path for the fix flow.
+    /// `/fix <target>` — dispatch the embedded `fix` workflow with
+    /// the operator's target string. `/fix` is workflow-only.
     async fn cmd_fix(&self, target: String) {
-        let target = target.trim();
-        if target.is_empty() {
-            async_println(
-                "/fix: expected a target, e.g. /fix ~/local/kernel-bugs/findings/<id> or \
-                 /fix race in net/sched/cls_bpf.c free path",
-            );
-            return;
-        }
-        let Some((src, body)) = kres_agents::user_commands::compose("fix", target) else {
-            async_println(
-                "/fix: `fix` template missing from the embedded table — this is a build bug",
-            );
-            return;
-        };
-        async_println(format!(
-            "/fix: composed prompt from {src} ({} chars)",
-            body.len()
-        ));
-        self.submit_prompt(body).await;
+        self.dispatch_workflow("fix", target).await;
     }
 
-    /// `/review <target>` — compose the embedded `review`
-    /// slash-command template with the operator's target string
-    /// and submit the result as a new prompt. Uses the same
-    /// user_commands::compose path as `--prompt "review: ..."` so
-    /// the CLI and REPL share exactly one code path for the
-    /// review flow.
     async fn cmd_review(&self, target: String) {
-        let target = target.trim();
-        if target.is_empty() {
-            async_println("/review: expected a target, e.g. /review fs/btrfs/ctree.c");
+        let target_trimmed = target.trim();
+        if target_trimmed.is_empty() {
+            async_println("/review: expected a target, e.g. /review <path or diff>".to_string());
             return;
         }
-        let Some((src, body)) = kres_agents::user_commands::compose("review", target) else {
-            async_println(
-                "/review: `review` template missing from the embedded table — this is a build bug",
-            );
+        let override_dir = dirs::home_dir().map(|h| h.join(".kres"));
+        match crate::workflow::review_prompt_file_from_target(
+            target_trimmed,
+            override_dir.as_deref(),
+        ) {
+            Ok(cfg) => {
+                async_println(format!(
+                    "/review: loaded {} lens(es) + {} chars of prose from {}",
+                    cfg.prompt_file.lenses.len(),
+                    cfg.prompt_file.prompt.len(),
+                    cfg.source,
+                ));
+                self.install_review_config_and_submit(cfg).await;
+            }
+            Err(e) => {
+                async_println(format!("/review: failed to load review workflow — {e:#}"));
+            }
+        }
+    }
+
+    async fn cmd_triage(&self, target: String) {
+        self.dispatch_workflow("triage", target).await;
+    }
+
+    /// Shared backend for `/fix`, `/review`, `/triage`. When a
+    /// workflow with id `<name>` exists (operator override at
+    /// `~/.kres/workflows/<name>.json` wins; otherwise the
+    /// embedded copy), build an [`LlmDriver`] with the session's
+    /// orchestrator and run the workflow with `target=<target>`
+    /// as the input. Trace events stream to the REPL via
+    /// async_println.
+    ///
+    async fn dispatch_workflow(&self, name: &str, target: String) {
+        let target_trimmed = target.trim();
+        if target_trimmed.is_empty() {
+            async_println(format!(
+                "/{name}: expected a target, e.g. /{name} <path or freeform text>"
+            ));
+            return;
+        }
+        // Operator override > embedded.
+        let override_dir = dirs::home_dir().map(|h| h.join(".kres").join("workflows"));
+        let workflow = match kres_agents::workflow::lookup_workflow(override_dir.as_deref(), name) {
+            Ok(wf) => wf,
+            Err(_) => {
+                async_println(format!("/{name}: no workflow named '{name}'"));
+                return;
+            }
+        };
+
+        let Some(orch) = self.orchestrator.clone() else {
+            async_println(format!(
+                "/{name}: workflow '{name}' is loaded but the REPL has no orchestrator wired. \
+                 Restart kres with --fast-agent <path> AND --slow-agent <path> (or --slow <tag>) \
+                 to enable workflow dispatch.",
+            ));
             return;
         };
+
+        let mut inputs = crate::workflow::inputs_for_target(&workflow, target_trimmed);
+        if workflow.inputs.contains_key("assisted_by") {
+            inputs.insert(
+                "assisted_by".into(),
+                serde_json::Value::String(self.cfg.assisted_by.clone()),
+            );
+        }
+
         async_println(format!(
-            "/review: composed prompt from {src} ({} chars)",
-            body.len()
+            "/{name}: dispatching to workflow '{}' ({} step(s))",
+            workflow.id,
+            workflow.steps.len()
         ));
-        self.submit_prompt(body).await;
+
+        // Build a fresh LlmDriver against the session's
+        // orchestrator + workspace. Skills are loaded on a
+        // best-effort basis from ~/.kres/skills.
+        // Fix #8: thread the session's root shutdown into the
+        // workflow runner so ctrl-C in the REPL cancels the
+        // in-flight LLM calls. We pass a child token so cancelling
+        // the workflow doesn't kill the rest of the REPL.
+        let workflow_shutdown = self.mgr.root_shutdown().child();
+        let driver_init = kres_agents::workflow_runner::LlmDriver::new(
+            self.cfg.workspace.clone(),
+            workflow.clone(),
+        )
+        .with_orchestrator(orch)
+        .with_shutdown(workflow_shutdown);
+        let skills_dir = dirs::home_dir().map(|h| h.join(".kres").join("skills"));
+        let mut driver = match skills_dir.as_ref() {
+            Some(dir) => match driver_init.with_skills_dir(dir) {
+                Ok((d, warnings)) => {
+                    for w in &warnings {
+                        async_println(format!("/{name}: skill warning: {w}"));
+                    }
+                    d
+                }
+                Err(e) => {
+                    async_println(format!("/{name}: skill loading failed: {e}"));
+                    kres_agents::workflow_runner::LlmDriver::new(
+                        self.cfg.workspace.clone(),
+                        workflow.clone(),
+                    )
+                }
+            },
+            None => driver_init,
+        };
+
+        // Fix #9: stream trace events as they happen so the
+        // operator sees fast-round counters / fan-out / lens
+        // results live, not just after the run finishes.
+        let observer: kres_agents::workflow_exec::EventObserver = Box::new(move |ev| {
+            async_println(
+                kres_agents::workflow_exec::format_event(ev)
+                    .trim_end_matches('\n')
+                    .to_string(),
+            );
+        });
+        let run = crate::workflow::run_workflow_driver(
+            &workflow,
+            &mut driver,
+            inputs,
+            crate::workflow::WorkflowRunOptions {
+                iteration_cap: 200,
+                results_dir: self.cfg.results_dir.clone(),
+                observer: Some(observer),
+                ..Default::default()
+            },
+        )
+        .await;
+        match run {
+            Ok(result) => {
+                async_println(format!(
+                    "/{name}: workflow {}",
+                    crate::workflow::workflow_status_label(&result.trace.status)
+                ));
+                for path in result.written_artifacts {
+                    async_println(format!("/{name}: wrote {}", path.display()));
+                }
+            }
+            Err(e) => {
+                async_println(format!("/{name}: workflow failed before execution — {e:#}"));
+            }
+        }
     }
 
     /// `/extract [--dir D] [--report F] [--todo F] [--findings F]` —
@@ -3502,16 +3781,19 @@ impl Session {
     fn print_cost(&self) {
         let snap = self.usage.snapshot();
         if snap.is_empty() {
+            if !self.cfg.stdio && !self.cfg.tui {
+                crate::status::park_scroll_region_bottom();
+            }
             kres_core::async_eprintln!("(no API usage recorded yet)");
             return;
         }
         let total = self.usage.totals();
         // Show per-row input/output and cache-create/cache-read,
         // plus a total line.
-        kres_core::async_eprintln!("usage ({} call(s) total):", total.calls);
+        let mut out = format!("usage ({} call(s) total):", total.calls);
         for (k, e) in &snap {
-            kres_core::async_eprintln!(
-                "  {:>4}/{:<24}  {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+            out.push_str(&format!(
+                "\n  {:>4}/{:<24}  {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
                 k.role,
                 k.model,
                 e.calls,
@@ -3519,16 +3801,20 @@ impl Session {
                 fmt_k(e.output_tokens),
                 fmt_k(e.cache_creation_input_tokens),
                 fmt_k(e.cache_read_input_tokens),
-            );
+            ));
         }
-        kres_core::async_eprintln!(
-            "  total         {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+        out.push_str(&format!(
+            "\n  total         {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
             total.calls,
             fmt_k(total.input_tokens),
             fmt_k(total.output_tokens),
             fmt_k(total.cache_creation_input_tokens),
             fmt_k(total.cache_read_input_tokens),
-        );
+        ));
+        if !self.cfg.stdio && !self.cfg.tui {
+            crate::status::park_scroll_region_bottom();
+        }
+        kres_core::async_eprintln!("{out}");
     }
 
     async fn cmd_clear(&self) {
@@ -3548,7 +3834,7 @@ impl Session {
         // inherit the prior topic's goal — exactly the
         // cross-topic bleed /clear exists to prevent.
         *self.session_goal.lock().await = None;
-        // Drop every outside-workspace read consent. The store is
+        // Drop every outside-workspace consent. The store is
         // global (OnceLock); without this a /clear would leave
         // grants from the prior topic in place and a follow-up
         // prompt on a different topic could quietly read paths the
@@ -3791,12 +4077,14 @@ pub struct BuiltAgents {
 pub async fn build_orchestrator(
     fast_cfg_path: &Path,
     slow_cfg_path: &Path,
+    extra_slow_cfgs: Vec<(PathBuf, Option<String>)>,
     workspace: impl Into<PathBuf>,
     fetcher: Arc<dyn DataFetcher>,
     skills: Option<serde_json::Value>,
     usage: Option<Arc<UsageTracker>>,
     gather_turns: u8,
     logger: Option<Arc<TurnLogger>>,
+    comparison_path: Option<PathBuf>,
     settings: &crate::settings::Settings,
 ) -> Result<BuiltAgents> {
     let fast_cfg = AgentConfig::load(fast_cfg_path)
@@ -3817,6 +4105,16 @@ pub async fn build_orchestrator(
         crate::settings::ModelRole::Slow,
         settings,
     );
+    let fast_max_tokens = fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens);
+    let slow_max_tokens = slow_cfg.max_tokens.unwrap_or(slow_model.max_output_tokens);
+    let fast_thinking = fast_cfg
+        .thinking
+        .as_ref()
+        .map(|thinking| thinking.to_budget(fast_max_tokens));
+    let slow_thinking = slow_cfg
+        .thinking
+        .as_ref()
+        .map(|thinking| thinking.to_budget(slow_max_tokens));
 
     // Shared rate limiter keyed by API-key string: agents using the
     // same key share a bucket so they can't collectively burst past
@@ -3843,18 +4141,66 @@ pub async fn build_orchestrator(
                 limiters.insert(slow_key.clone(), r.clone());
             })
     };
-    let _ = limiters;
-
     let fast_client = Arc::new(
-        Client::builder(fast_key)
-            .rate_limiter(fast_limiter)
+        Client::builder(fast_key.clone())
+            .rate_limiter(fast_limiter.clone())
             .build()?,
     );
     let slow_client = Arc::new(
-        Client::builder(slow_key)
-            .rate_limiter(slow_limiter)
+        Client::builder(slow_key.clone())
+            .rate_limiter(slow_limiter.clone())
             .build()?,
     );
+    let mut slow_variants = vec![kres_agents::pipeline::SlowAgentVariant {
+        client: slow_client.clone(),
+        model: slow_model.clone(),
+        system: slow_cfg.system.clone(),
+        max_tokens: slow_max_tokens,
+        max_input_tokens: slow_cfg.max_input_tokens,
+        thinking: slow_thinking,
+        label: slow_model.id.clone(),
+    }];
+    for (cfg_path, model_override) in extra_slow_cfgs {
+        if cfg_path == slow_cfg_path {
+            continue;
+        }
+        let cfg = AgentConfig::load(&cfg_path)
+            .with_context(|| format!("loading slow agent config {}", cfg_path.display()))?;
+        let mut variant_settings = settings.clone();
+        if let Some(id) = model_override {
+            variant_settings.set_model(crate::settings::ModelRole::Slow, Some(id));
+        }
+        let model = crate::settings::pick_model(
+            cfg.model.as_deref(),
+            crate::settings::ModelRole::Slow,
+            &variant_settings,
+        );
+        let key = cfg.key.clone();
+        let limiter = if let Some(existing) = limiters.get(&key) {
+            Some(existing.clone())
+        } else {
+            let limiter = cfg.rate_limit.and_then(|c| RateLimiter::new(c as u64));
+            if let Some(ref r) = limiter {
+                limiters.insert(key.clone(), r.clone());
+            }
+            limiter
+        };
+        let client = Arc::new(Client::builder(key).rate_limiter(limiter).build()?);
+        let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
+        let thinking = cfg
+            .thinking
+            .as_ref()
+            .map(|thinking| thinking.to_budget(max_tokens));
+        slow_variants.push(kres_agents::pipeline::SlowAgentVariant {
+            client,
+            model: model.clone(),
+            system: cfg.system.clone(),
+            max_tokens,
+            max_input_tokens: cfg.max_input_tokens,
+            thinking,
+            label: model.id.clone(),
+        });
+    }
 
     let _workspace = workspace.into(); // retained by caller; fetcher already knows.
 
@@ -3875,13 +4221,18 @@ pub async fn build_orchestrator(
         fast_client,
         fast_model: fast_model.clone(),
         fast_system: fast_cfg.system,
-        fast_max_tokens: fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens),
+        fast_max_tokens,
         fast_max_input_tokens: fast_cfg.max_input_tokens,
+        fast_thinking,
         slow_client,
         slow_model: slow_model.clone(),
         slow_system: slow_cfg.system,
-        slow_max_tokens: slow_cfg.max_tokens.unwrap_or(slow_model.max_output_tokens),
+        slow_max_tokens,
         slow_max_input_tokens: slow_cfg.max_input_tokens,
+        slow_thinking,
+        slow_variants,
+        comparison_path,
+        comparison_lock: Arc::new(std::sync::Mutex::new(())),
         slow_coding_system,
         slow_generic_system,
         fetcher,
@@ -4057,7 +4408,7 @@ async fn persist_code_output(workspace: &Path, task_name: &str, files: &[kres_co
                     .unwrap_or(false);
             if !allowed {
                 kres_core::async_eprintln!(
-                    "[coding] rejecting absolute path '{}' (outside workspace and no consent on file — mention the containing directory in a prompt to grant write access)",
+                    "[coding] rejecting absolute path '{}' (outside workspace and no consent on file — mention the containing directory in a prompt to grant this session access)",
                     f.path
                 );
                 continue;
@@ -4329,11 +4680,9 @@ fn print_help() {
         "  /edit                  open $EDITOR on a scratch file, submit on save"
     );
     kres_core::async_eprintln!("  /followup              list items deferred by goal/--turns");
+    kres_core::async_eprintln!("  /review <target>       run the embedded `review` workflow");
     kres_core::async_eprintln!(
-        "  /review <target>       compose the embedded `review` template with <target> and submit"
-    );
-    kres_core::async_eprintln!(
-        "  /fix <target>          compose the embedded `fix` template (finding dir or prose) and submit"
+        "  /fix <target>          run the embedded `fix` workflow (finding dir or prose)"
     );
     kres_core::async_eprintln!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
     kres_core::async_eprintln!(
@@ -4402,6 +4751,110 @@ fn done_id_set(items: &[kres_core::TodoItem]) -> std::collections::BTreeSet<Stri
             }
         })
         .collect()
+}
+
+fn review_followups_drive_next_turn(
+    mode: kres_core::TaskMode,
+    lenses_installed: bool,
+    pending_or_blocked: usize,
+    new_followups: usize,
+) -> bool {
+    matches!(mode, kres_core::TaskMode::Audit)
+        && lenses_installed
+        && (pending_or_blocked > 0 || new_followups > 0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnsCapAction {
+    Continue,
+    DrainAndWait,
+    DrainAndExit,
+}
+
+fn turns_cap_action(done: u32, limit: u32, active: usize) -> TurnsCapAction {
+    if limit == 0 || done < limit {
+        TurnsCapAction::Continue
+    } else if active > 0 {
+        TurnsCapAction::DrainAndWait
+    } else {
+        TurnsCapAction::DrainAndExit
+    }
+}
+
+async fn ensure_review_followups_remain_pending(
+    mgr: &Arc<TaskManager>,
+    followups: &[serde_json::Value],
+) {
+    if mgr.todo_snapshot().await.iter().any(|t| {
+        matches!(
+            t.status,
+            kres_core::TodoStatus::Pending | kres_core::TodoStatus::Blocked
+        )
+    }) {
+        return;
+    }
+
+    let added =
+        add_followups_as_pending(mgr, followups, "review followup emitted by slow agent").await;
+    if added > 0 {
+        kres_core::async_eprintln!(
+            "[todo update] restored {added} review followup(s) as pending next-turn work"
+        );
+    }
+}
+
+async fn add_followups_as_pending(
+    mgr: &Arc<TaskManager>,
+    followups: &[serde_json::Value],
+    default_reason: &str,
+) -> usize {
+    let mut items = mgr.todo_snapshot().await;
+    let mut existing: std::collections::BTreeSet<(String, String)> = items
+        .iter()
+        .map(|t| (t.kind.clone(), t.name.clone()))
+        .collect();
+    let mut added = 0usize;
+    for fu in followups {
+        let kind = fu
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("question")
+            .to_string();
+        let name = fu
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let reason = fu
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.trim().is_empty() {
+            continue;
+        }
+        let key = (kind.clone(), name.clone());
+        if !existing.insert(key) {
+            continue;
+        }
+        let mut item = kres_core::TodoItem::new(name, kind);
+        item.reason = if reason.is_empty() {
+            default_reason.to_string()
+        } else {
+            reason
+        };
+        if let Some(path) = fu.get("path").and_then(|v| v.as_str()) {
+            if !path.is_empty() {
+                item.coverage = format!("path: {path}");
+            }
+        }
+        items.push(item);
+        added += 1;
+    }
+    if added > 0 {
+        mgr.replace_todo(items).await;
+    }
+    added
 }
 
 /// Execute a git followup from the reaper.
@@ -4927,6 +5380,48 @@ pub(crate) fn findings_signature(
     out
 }
 
+fn recorded_findings_goal_context(findings: &[kres_core::Finding]) -> String {
+    let active: Vec<_> = findings
+        .iter()
+        .filter(|f| f.status == kres_core::findings::Status::Active)
+        .collect();
+    if active.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("## Recorded findings in findings.json\n\n");
+    for f in active.iter().take(50) {
+        let locs = f
+            .relevant_symbols
+            .iter()
+            .map(|s| format!("{}:{}", s.filename, s.line))
+            .chain(
+                f.relevant_file_sections
+                    .iter()
+                    .map(|s| format!("{}:{}-{}", s.filename, s.line_start, s.line_end)),
+            )
+            .take(8)
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "- id: `{}`; title: {}; severity: {:?}; status: {:?}; locations: {}; summary: {}\n",
+            f.id,
+            truncate(&f.title, 160),
+            f.severity,
+            f.status,
+            if locs.is_empty() { "(none)" } else { &locs },
+            truncate(&f.summary, 500)
+        ));
+    }
+    if active.len() > 50 {
+        out.push_str(&format!(
+            "- ... {} additional active finding(s) omitted from goal context\n",
+            active.len() - 50
+        ));
+    }
+    out
+}
+
 /// §44: expand every `/load <path>` occurrence in `text` with the
 /// contents of `<path>`, wrapped in
 /// `\n--- <path> ---\n<content>\n--- end <path> ---\n`. Matches
@@ -4998,6 +5493,162 @@ mod tests {
         // without stdin plumbing, but we can assert construction
         // leaves `orchestrator` unset.
         assert!(s.orchestrator.is_none());
+    }
+
+    #[tokio::test]
+    async fn review_prompt_config_forces_initial_audit_mode() {
+        let mgr = TaskManager::new();
+        let cfg = crate::workflow::ReviewPromptConfig {
+            source: "test".to_string(),
+            prompt_file: kres_agents::PromptFile {
+                prompt: "review this".to_string(),
+                lenses: vec![kres_core::LensSpec {
+                    id: "lifetime".to_string(),
+                    kind: "review".to_string(),
+                    name: "Lifetime".to_string(),
+                    reason: "check lifetime".to_string(),
+                }],
+            },
+            consolidate_rules: Some("merge carefully".to_string()),
+        };
+        let s = Session::new(mgr, ReplConfig::default())
+            .await
+            .with_review_prompt_config(cfg);
+
+        assert_eq!(s.initial_prompt.as_deref(), Some("review this"));
+        assert_eq!(s.initial_prompt_mode, Some(kres_agents::TaskMode::Audit));
+    }
+
+    #[test]
+    fn lensed_review_keeps_pending_followups_after_goal_met() {
+        assert!(review_followups_drive_next_turn(
+            kres_core::TaskMode::Audit,
+            true,
+            1,
+            0
+        ));
+        assert!(review_followups_drive_next_turn(
+            kres_core::TaskMode::Audit,
+            true,
+            0,
+            1
+        ));
+        assert!(!review_followups_drive_next_turn(
+            kres_core::TaskMode::Audit,
+            true,
+            0,
+            0
+        ));
+        assert!(!review_followups_drive_next_turn(
+            kres_core::TaskMode::Generic,
+            true,
+            1,
+            1
+        ));
+        assert!(!review_followups_drive_next_turn(
+            kres_core::TaskMode::Audit,
+            false,
+            1,
+            1
+        ));
+    }
+
+    #[test]
+    fn turns_cap_waits_for_active_tasks_before_exit() {
+        assert_eq!(turns_cap_action(9, 10, 0), TurnsCapAction::Continue);
+        assert_eq!(turns_cap_action(10, 10, 2), TurnsCapAction::DrainAndWait);
+        assert_eq!(turns_cap_action(11, 10, 1), TurnsCapAction::DrainAndWait);
+        assert_eq!(turns_cap_action(10, 10, 0), TurnsCapAction::DrainAndExit);
+    }
+
+    #[tokio::test]
+    async fn lensed_review_restores_dropped_followups_as_pending_todos() {
+        let mgr = TaskManager::new();
+        let followups = vec![serde_json::json!({
+            "type": "source",
+            "name": "iptunnel_xmit_stats",
+            "reason": "[MISSING] trace unchanged accounting helper"
+        })];
+
+        ensure_review_followups_remain_pending(&mgr, &followups).await;
+
+        let todo = mgr.todo_snapshot().await;
+        assert_eq!(todo.len(), 1);
+        assert_eq!(todo[0].kind, "source");
+        assert_eq!(todo[0].name, "iptunnel_xmit_stats");
+        assert_eq!(todo[0].status, kres_core::TodoStatus::Pending);
+
+        ensure_review_followups_remain_pending(&mgr, &followups).await;
+        assert_eq!(
+            mgr.todo_snapshot().await.len(),
+            1,
+            "restoring same followup twice must not duplicate it"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_cap_followups_are_recorded_without_todo_agent() {
+        let mgr = TaskManager::new();
+        let followups = vec![
+            serde_json::json!({
+                "type": "source",
+                "name": "iptunnel_xmit_stats",
+                "reason": "[EXTEND] preserve frontier at turns cap"
+            }),
+            serde_json::json!({
+                "type": "source",
+                "name": "iptunnel_xmit_stats",
+                "reason": "duplicate"
+            }),
+        ];
+
+        let added = add_followups_as_pending(&mgr, &followups, "turn cap").await;
+        assert_eq!(added, 1);
+
+        let todo = mgr.todo_snapshot().await;
+        assert_eq!(todo.len(), 1);
+        assert_eq!(todo[0].status, kres_core::TodoStatus::Pending);
+        assert_eq!(todo[0].kind, "source");
+        assert_eq!(todo[0].name, "iptunnel_xmit_stats");
+
+        let drained = mgr.drain_pending_blocked().await;
+        assert_eq!(drained.len(), 1);
+        assert_eq!(mgr.todo_snapshot().await.len(), 0);
+    }
+
+    #[test]
+    fn goal_context_lists_recorded_findings() {
+        let findings = vec![kres_core::Finding {
+            id: "lan78xx_eeprom_hw_cfg_led_restore_skipped".into(),
+            title: "lan78xx restore skipped".into(),
+            severity: kres_core::findings::Severity::Medium,
+            status: kres_core::findings::Status::Active,
+            relevant_symbols: vec![kres_core::findings::RelevantSymbol {
+                name: "lan78xx_read_raw_eeprom".into(),
+                filename: "drivers/net/usb/lan78xx.c".into(),
+                line: 1041,
+                definition: "fn body".into(),
+            }],
+            relevant_file_sections: Vec::new(),
+            summary: "bare return skips HW_CFG restore".into(),
+            reproducer_sketch: "fault USB".into(),
+            impact: "LEDs remain disabled".into(),
+            mechanism_detail: None,
+            fix_sketch: None,
+            open_questions: Vec::new(),
+            first_seen_task: None,
+            last_updated_task: None,
+            first_seen_at: None,
+            related_finding_ids: Vec::new(),
+            details: Vec::new(),
+            reactivate: false,
+            introduced_by: None,
+        }];
+
+        let ctx = recorded_findings_goal_context(&findings);
+        assert!(ctx.contains("Recorded findings"));
+        assert!(ctx.contains("lan78xx_eeprom_hw_cfg_led_restore_skipped"));
+        assert!(ctx.contains("drivers/net/usb/lan78xx.c:1041"));
     }
 
     #[test]

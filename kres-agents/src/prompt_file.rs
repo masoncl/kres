@@ -9,8 +9,6 @@
 //! - Indented sub-bullets immediately following a todo bullet are
 //!   folded into that item's `reason` (joined with `"; "`).
 //! - Lines beginning with `- [x]` are treated as *done* and skipped.
-//! - Legacy `[kind] name[: reason]` lines still work for the simpler
-//!   prompt files that pre-dated the markdown format.
 //!
 //! Port of
 
@@ -20,8 +18,7 @@ use kres_core::lens::LensSpec;
 pub struct PromptFile {
     /// Prose portion, with lens-definition lines stripped.
     pub prompt: String,
-    /// Session-wide lenses parsed out of the markdown todo bullets or
-    /// the legacy bracket form.
+    /// Session-wide lenses parsed out of the markdown todo bullets.
     pub lenses: Vec<LensSpec>,
 }
 
@@ -45,15 +42,6 @@ pub fn parse(raw: &str) -> PromptFile {
             if !b.done {
                 current = Some(b);
             }
-            continue;
-        }
-
-        // Legacy `[kind] name[: reason]` bare bullet.
-        if let Some(b) = parse_legacy_bracket(stripped) {
-            if let Some(prev) = current.take() {
-                push_lens(&mut lenses, prev);
-            }
-            current = Some(b);
             continue;
         }
 
@@ -150,32 +138,6 @@ fn parse_todo_bullet(line: &str) -> Option<ParsedBullet> {
     })
 }
 
-/// Match the legacy `[kind] name[: reason]` bare bracket line.
-fn parse_legacy_bracket(line: &str) -> Option<ParsedBullet> {
-    let line = line.strip_prefix('[')?;
-    let (kind, rest) = line.split_once(']')?;
-    let kind = kind.trim();
-    if kind.is_empty() || !is_known_kind(kind) {
-        return None;
-    }
-    let rest = rest.trim_start();
-    let (name, reason) = match rest.split_once(':') {
-        Some((n, r)) => (n.trim().to_string(), r.trim().to_string()),
-        None => (rest.trim().to_string(), String::new()),
-    };
-    if name.is_empty() {
-        return None;
-    }
-    Some(ParsedBullet {
-        done: false,
-        kind: kind.to_string(),
-        name,
-        reason,
-        id: None,
-        depends_on: Vec::new(),
-    })
-}
-
 fn extract_kind(s: &str) -> Option<(&str, &str)> {
     if let Some(rest) = s.strip_prefix("**[") {
         let (kind, tail) = rest.split_once("]**")?;
@@ -194,21 +156,6 @@ fn extract_kind(s: &str) -> Option<(&str, &str)> {
         return Some((kind, tail));
     }
     None
-}
-
-fn is_known_kind(k: &str) -> bool {
-    matches!(
-        k,
-        "investigate"
-            | "question"
-            | "read"
-            | "search"
-            | "source"
-            | "callers"
-            | "callees"
-            | "find"
-            | "git"
-    )
 }
 
 /// Split out the optional `` `#id` `` or bare `#id` suffix.
@@ -351,16 +298,6 @@ Analyse io_uring.
     }
 
     #[test]
-    fn parses_legacy_bracket_form() {
-        let raw = "\
-[investigate] memory allocations
-[investigate] races: check spinlocks";
-        let pf = parse(raw);
-        assert_eq!(pf.lenses.len(), 2);
-        assert_eq!(pf.lenses[1].reason, "check spinlocks");
-    }
-
-    #[test]
     fn extracts_backticked_id() {
         let raw = "- [ ] **[investigate]** memory — something `#mem-alloc`";
         let pf = parse(raw);
@@ -408,16 +345,19 @@ Analyse io_uring.
     }
 
     #[test]
-    fn unknown_kinds_stay_in_prose() {
-        let raw = "[note] this is not a lens\n[investigate] real lens";
+    fn bracket_lines_stay_in_prose() {
+        let raw = "[note] this is not a lens\n[investigate] not a markdown todo";
         let pf = parse(raw);
-        assert_eq!(pf.lenses.len(), 1);
+        assert_eq!(pf.lenses.len(), 0);
         assert!(pf.prompt.contains("[note]"));
+        assert!(pf.prompt.contains("[investigate]"));
     }
 
     #[test]
     fn lens_ids_are_unique_slugs() {
-        let raw = "[investigate] memory allocations\n[investigate] memory leaks";
+        let raw = "\
+- [ ] **[investigate]** memory allocations
+- [ ] **[investigate]** memory leaks";
         let pf = parse(raw);
         assert_eq!(pf.lenses.len(), 2);
         assert_ne!(pf.lenses[0].id, pf.lenses[1].id);
@@ -431,8 +371,8 @@ Analyse io_uring.
     }
 
     #[test]
-    fn leading_whitespace_on_bracket_line_ok() {
-        let pf = parse("    [investigate] memory");
+    fn leading_whitespace_on_markdown_todo_ok() {
+        let pf = parse("    - [ ] **[investigate]** memory");
         assert_eq!(pf.lenses.len(), 1);
         assert_eq!(pf.lenses[0].name, "memory");
     }

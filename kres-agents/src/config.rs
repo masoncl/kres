@@ -1,8 +1,9 @@
 //! Agent config files.
 //!
 //! Shape of each per-agent JSON file: `key`, `model`, `max_tokens`,
-//! `max_input_tokens`, `rate_limit`, `system` (or `system_file`), plus
-//! agent-specific fields like `concurrency` (main).
+//! `max_input_tokens`, `rate_limit`, `thinking`, `system` (or
+//! `system_file`), plus agent-specific fields like `concurrency`
+//! (main).
 //!
 //! The `key` field carries the literal API key string. Shipped
 //! configs in the repo carry `@FAST_KEY@` / `@SLOW_KEY@` placeholders
@@ -15,6 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AgentError;
+use kres_llm::model::{Effort, ThinkingBudget};
 
 /// Which agent role this config describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,16 @@ pub struct AgentConfig {
     /// Rate-limit bucket in tokens-per-minute.
     #[serde(default)]
     pub rate_limit: Option<u32>,
+    /// Optional request-level thinking override.
+    ///
+    /// Shape:
+    ///   {"type":"adaptive","effort":"medium"}
+    ///   {"type":"enabled","budget_tokens":32000}
+    ///   {"type":"disabled"}
+    ///
+    /// When omitted, kres uses model-aware defaults.
+    #[serde(default)]
+    pub thinking: Option<AgentThinkingConfig>,
     /// Max concurrent service workers, only meaningful for the main
     /// agent.
     #[serde(default)]
@@ -68,6 +80,54 @@ pub struct AgentConfig {
     /// rather than as escaped JSON strings.
     #[serde(default)]
     pub system_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentThinkingConfig {
+    Disabled,
+    Enabled {
+        #[serde(default)]
+        budget_tokens: Option<u32>,
+    },
+    Adaptive {
+        #[serde(default)]
+        effort: Option<AgentThinkingEffort>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentThinkingEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl AgentThinkingConfig {
+    pub fn to_budget(&self, max_tokens: u32) -> ThinkingBudget {
+        match self {
+            AgentThinkingConfig::Disabled => ThinkingBudget::Disabled,
+            AgentThinkingConfig::Enabled { budget_tokens } => budget_tokens
+                .map(|n| ThinkingBudget::enabled_clamped(n, max_tokens))
+                .unwrap_or_else(|| ThinkingBudget::default_explicit_for(max_tokens)),
+            AgentThinkingConfig::Adaptive { effort } => ThinkingBudget::Adaptive(
+                effort
+                    .map(Into::into)
+                    .unwrap_or(kres_llm::model::Effort::Medium),
+            ),
+        }
+    }
+}
+
+impl From<AgentThinkingEffort> for Effort {
+    fn from(value: AgentThinkingEffort) -> Self {
+        match value {
+            AgentThinkingEffort::Low => Effort::Low,
+            AgentThinkingEffort::Medium => Effort::Medium,
+            AgentThinkingEffort::High => Effort::High,
+        }
+    }
 }
 
 impl AgentConfig {
@@ -183,6 +243,7 @@ mod tests {
                 "max_tokens": 128000,
                 "max_input_tokens": 900000,
                 "rate_limit": 800000,
+                "thinking": {"type": "adaptive", "effort": "high"},
                 "concurrency": 3,
                 "system": "you are a fast agent"
             }"#,
@@ -192,6 +253,10 @@ mod tests {
         assert_eq!(c.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(c.max_tokens, Some(128000));
         assert_eq!(c.concurrency, Some(3));
+        assert_eq!(
+            c.thinking.as_ref().map(|t| t.to_budget(128000)),
+            Some(ThinkingBudget::Adaptive(Effort::High))
+        );
         assert!(c.system.as_deref().unwrap().contains("fast agent"));
         std::fs::remove_file(&p).ok();
     }
@@ -203,7 +268,24 @@ mod tests {
         assert_eq!(c.key, "sk-abc");
         assert_eq!(c.model, None);
         assert_eq!(c.max_tokens, None);
+        assert_eq!(c.thinking, None);
         assert_eq!(c.system, None);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn thinking_enabled_clamps_budget() {
+        let p = write_tmp(
+            r#"{
+                "key": "sk-abc",
+                "thinking": {"type": "enabled", "budget_tokens": 99000}
+            }"#,
+        );
+        let c = AgentConfig::load(&p).unwrap();
+        assert_eq!(
+            c.thinking.as_ref().map(|t| t.to_budget(1000)),
+            Some(ThinkingBudget::ExplicitBudget(750))
+        );
         std::fs::remove_file(&p).ok();
     }
 

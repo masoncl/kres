@@ -5,17 +5,28 @@
 ```
 kres test <key_file> [--prompt ...] [--model ...]
 kres turn <key_file> -o <output.md> [-i <input.json>] [other flags]
-kres [--fast-agent ...] [--slow TAG | --slow-agent ...] [--main-agent ...]
+kres [--fast-agent ...] [--slow TAG ... | --slow-agent ...] [--main-agent ...]
      [--todo-agent ...] [--mcp-config ...] [--skills DIR]
      [--results DIR] [--findings PATH] [--report PATH] [--todo PATH]
      [--prompt PROMPT] [--template PATH] [--turns N]
      [--follow] [--resume]
      [--gather-turns N] [--stop-grace-ms MS] [--stdio]
-     [--allow ACTION]... [--summary | --summary-markdown]
+     [--allow ACTION]... [--assisted-by TEXT]
+     [--summary | --summary-markdown]
 ```
 
 Pass `kres --help` for the full list with argument-by-argument
 descriptions.
+
+`--assisted-by TEXT` overrides the exact value used after
+`Assisted-by:` by the fix workflow's generated commit message. When
+omitted, kres derives `kres (<slow-model-id>)` from the resolved slow
+agent model.
+
+`--slow TAG` is repeatable for `/review` comparison mode, for example
+`--slow sonnet --slow opus`. Review sends every slow-agent lens prompt
+to all configured slow models, tags their outputs by model, and writes
+the consolidator's per-turn comparison to `<results>/comparison.json`.
 
 Related docs:
 

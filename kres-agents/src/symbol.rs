@@ -58,10 +58,10 @@ pub fn previously_fetched_manifest(symbols: &[Value], context: &[Value]) -> Valu
 /// isn't lost.
 pub fn parse_semcode_symbol(output: &str, tool_name: &str) -> Option<Value> {
     let mut lines: Vec<&str> = output.split('\n').collect();
-    let sym_type = if tool_name == "find_function" {
-        "function"
+    let mut sym_type = if tool_name == "find_function" {
+        "function".to_string()
     } else {
-        "struct"
+        "struct".to_string()
     };
     let mut name: Option<String> = None;
     let mut filename: Option<String> = None;
@@ -72,19 +72,28 @@ pub fn parse_semcode_symbol(output: &str, tool_name: &str) -> Option<Value> {
 
     for i in 0..lines.len() {
         let l = lines[i];
-        if let Some(rest) = l
-            .strip_prefix("Function: ")
-            .or_else(|| l.strip_prefix("Type: "))
-        {
-            // splits on `:` then on space; take the first token
-            // before any whitespace.
+        if let Some(rest) = l.strip_prefix("Function: ") {
             let head = rest.split_whitespace().next().unwrap_or("").to_string();
+            if !head.is_empty() {
+                name = Some(head);
+            }
+        } else if let Some(rest) = l.strip_prefix("Type: ") {
+            let (kind, head) = parse_type_header(rest);
+            if !kind.is_empty() {
+                sym_type = kind;
+            }
             if !head.is_empty() {
                 name = Some(head);
             }
         } else if let Some(rest) = l.strip_prefix("File: ") {
             if let Some((file_part, line_part)) = rest.rsplit_once(':') {
-                if let Ok(n) = line_part.trim().parse::<i64>() {
+                let start_line = line_part
+                    .trim()
+                    .split_once('-')
+                    .map(|(start, _)| start)
+                    .unwrap_or_else(|| line_part.trim())
+                    .trim();
+                if let Ok(n) = start_line.parse::<i64>() {
                     filename = Some(file_part.to_string());
                     line_num = Some(n);
                 }
@@ -124,6 +133,25 @@ pub fn parse_semcode_symbol(output: &str, tool_name: &str) -> Option<Value> {
         obj.insert("called_by_count".into(), json!(c));
     }
     Some(Value::Object(obj))
+}
+
+fn parse_type_header(rest: &str) -> (String, String) {
+    let tokens: Vec<&str> = rest
+        .split_whitespace()
+        .map(|s| s.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    match tokens.as_slice() {
+        ["struct", name, ..] => ("struct".to_string(), (*name).to_string()),
+        ["union", name, ..] => ("union".to_string(), (*name).to_string()),
+        ["enum", name, ..] => ("enum".to_string(), (*name).to_string()),
+        ["typedef", rest @ ..] => (
+            "typedef".to_string(),
+            rest.last().copied().unwrap_or("").to_string(),
+        ),
+        [name, ..] => ("struct".to_string(), (*name).to_string()),
+        [] => (String::new(), String::new()),
+    }
 }
 
 /// Key used for exact-tuple dedup of non-range (function/type) symbols.
@@ -394,11 +422,64 @@ mod tests {
     }
 
     #[test]
+    fn parse_function_output_accepts_file_line_range() {
+        let raw = "Function: example_init\n\
+                   File: drivers/example/example.c:234-282\n\
+                   Return Type: void\n\
+                   Body:\n\
+                   void example_init(struct example *ex) {}\n";
+        let s = parse_semcode_symbol(raw, "find_function").unwrap();
+        assert_eq!(s.get("name").unwrap(), "example_init");
+        assert_eq!(s.get("type").unwrap(), "function");
+        assert_eq!(s.get("filename").unwrap(), "drivers/example/example.c");
+        assert_eq!(s.get("line").unwrap(), 234);
+    }
+
+    #[test]
     fn parse_type_output() {
         let raw = "Type: struct foo\nFile: include/foo.h:10\nBody:\nstruct foo { int x; };\n";
         let s = parse_semcode_symbol(raw, "find_type").unwrap();
         assert_eq!(s.get("type").unwrap(), "struct");
-        assert_eq!(s.get("name").unwrap(), "struct");
+        assert_eq!(s.get("name").unwrap(), "foo");
+    }
+
+    #[test]
+    fn parse_type_output_accepts_file_line_range() {
+        let raw = "Type: struct bio\n\
+                   File: include/linux/bio.h:509-552\n\
+                   Body:\n\
+                   struct bio { unsigned int bi_opf; };\n";
+        let s = parse_semcode_symbol(raw, "find_type").unwrap();
+        assert_eq!(s.get("type").unwrap(), "struct");
+        assert_eq!(s.get("name").unwrap(), "bio");
+        assert_eq!(s.get("filename").unwrap(), "include/linux/bio.h");
+        assert_eq!(s.get("line").unwrap(), 509);
+    }
+
+    #[test]
+    fn parse_type_output_accepts_union_and_typedef_names() {
+        let raw = "Type: union bpf_attr\nFile: include/uapi/linux/bpf.h:1317\nBody:\nunion bpf_attr { int x; };\n";
+        let s = parse_semcode_symbol(raw, "find_type").unwrap();
+        assert_eq!(s.get("type").unwrap(), "union");
+        assert_eq!(s.get("name").unwrap(), "bpf_attr");
+
+        let raw = "Type: typedef u64\nFile: include/linux/types.h:1\nBody:\ntypedef __u64 u64;\n";
+        let s = parse_semcode_symbol(raw, "find_type").unwrap();
+        assert_eq!(s.get("type").unwrap(), "typedef");
+        assert_eq!(s.get("name").unwrap(), "u64");
+    }
+
+    #[test]
+    fn parse_type_output_accepts_enum_and_typedef_struct_headers() {
+        let raw = "Type: enum pageflags\nFile: include/linux/page-flags.h:1\nBody:\nenum pageflags { PG_locked };\n";
+        let s = parse_semcode_symbol(raw, "find_type").unwrap();
+        assert_eq!(s.get("type").unwrap(), "enum");
+        assert_eq!(s.get("name").unwrap(), "pageflags");
+
+        let raw = "Type: typedef struct folio_ref\nFile: include/linux/mm_types.h:1\nBody:\ntypedef struct folio_ref folio_ref;\n";
+        let s = parse_semcode_symbol(raw, "find_type").unwrap();
+        assert_eq!(s.get("type").unwrap(), "typedef");
+        assert_eq!(s.get("name").unwrap(), "folio_ref");
     }
 
     #[test]

@@ -2,13 +2,10 @@
 //!
 //! Three flows:
 //!
-//! `Audit` — the defect-review flow. The fast+main loop gathers
-//! context, the slow agent fans out across session-wide lenses
-//! (from the review-template), and the consolidator + cross-task
-//! merger fold per-lens findings into the cumulative list. Picked
-//! when the operator asked to "review", "audit", or "find bugs
-//! in" a target. Degrades to a single slow call when no lenses
-//! are configured.
+//! `Audit` — the defect-review flow. Workflow `/review` uses the
+//! review workflow's lensed step, shared gather, parallel slow
+//! calls, and consolidator. Non-workflow audit tasks use the same
+//! orchestrator primitives when explicitly configured with lenses.
 //!
 //! `Generic` — just the main/fast/slow/goal loop, no lens fan-out.
 //! One slow call per task, findings still merge into the cumulative
@@ -61,7 +58,7 @@ pub struct CodeFile {
 /// `kres_agents::tools::edit_file`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CodeEdit {
-    #[serde(alias = "path")]
+    #[serde(alias = "path", alias = "filename")]
     pub file_path: String,
     pub old_string: String,
     pub new_string: String,

@@ -4,7 +4,7 @@
 Two modes, picked by mutually exclusive flags:
 
   findings-index.py --generate
-      Walk every `<tag>/metadata.yaml` under the current directory and
+      Walk every `findings/<tag>/metadata.yaml` under the current directory and
       write:
         * INDEX.md            — section-per-finding markdown covering
                                 all findings.
@@ -266,21 +266,17 @@ def load_impact(dir_path):
 def collect_rows(root):
     """Walk `<root>/findings/<tag>/metadata.yaml` for every finding.
 
-    Prefers the modern `<root>/findings/<tag>/` layout. Falls back to
-    the pre-`findings/` flat layout (`<root>/<tag>/`) when the
-    `findings/` subdir doesn't exist, so legacy export trees and
-    operator-curated bug roots still produce an index. The per-row
-    `tag_path` field records which relative subdirectory the metadata
-    came from so the markdown / html row-link form points at the
+    The per-row `tag_path` field records the relative finding
+    subdirectory so the markdown / html row-link form points at the
     correct FINDING.md path.
     """
     findings_root = os.path.join(root, "findings")
-    if os.path.isdir(findings_root):
-        scan_root = findings_root
-        tag_prefix = "findings/"
-    else:
-        scan_root = root
-        tag_prefix = ""
+    if not os.path.isdir(findings_root):
+        raise ValueError(
+            "expected export root with a findings/ subdirectory: {}".format(root)
+        )
+    scan_root = findings_root
+    tag_prefix = "findings/"
 
     rows = []
     for name in sorted(os.listdir(scan_root)):
@@ -987,7 +983,11 @@ def main():
     args = parser.parse_args()
 
     root = os.getcwd()
-    rows = collect_rows(root)
+    try:
+        rows = collect_rows(root)
+    except ValueError as exc:
+        print("findings-index: {}".format(exc), file=sys.stderr)
+        return 2
     sort_rows(rows)
 
     if args.generate:
@@ -1026,8 +1026,6 @@ def main():
         return 2
     if args.o == "dirs":
         findings_root = os.path.join(root, "findings")
-        if not os.path.isdir(findings_root):
-            findings_root = root
         for r in filtered:
             sys.stdout.write(
                 os.path.join(findings_root, r["tag"]) + "\n"

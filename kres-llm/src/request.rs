@@ -237,13 +237,13 @@ mod cache_helpers_tests {
 }
 
 /// Serialised thinking block. Two shapes:
-/// - `{"type": "enabled", "budget_tokens": N}` — legacy.
+/// - `{"type": "enabled", "budget_tokens": N}` — explicit budget.
 /// - `{"type": "adaptive"}` — adaptive (effort rides separately in
 ///   `output_config.effort`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ThinkingRequest {
-    Legacy {
+    Explicit {
         #[serde(rename = "type")]
         kind: &'static str, // "enabled"
         budget_tokens: u32,
@@ -302,8 +302,8 @@ impl<'a> MessagesRequest<'a> {
     pub fn from_config(cfg: &'a CallConfig, messages: &'a [Message], stream: bool) -> Self {
         let (thinking, output_config) = match cfg.thinking {
             ThinkingBudget::Disabled => (None, None),
-            ThinkingBudget::LegacyBudget(n) => (
-                Some(ThinkingRequest::Legacy {
+            ThinkingBudget::ExplicitBudget(n) => (
+                Some(ThinkingRequest::Explicit {
                     kind: "enabled",
                     budget_tokens: n,
                 }),
@@ -432,9 +432,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_request_serialises_with_budget_tokens() {
+    fn explicit_budget_request_serialises_with_budget_tokens() {
         let cfg = CallConfig::defaults_for(Model::sonnet_4_6())
-            .with_thinking(ThinkingBudget::LegacyBudget(5_000));
+            .with_thinking(ThinkingBudget::ExplicitBudget(5_000));
         let msgs = vec![Message {
             role: "user".into(),
             content: "hi".into(),

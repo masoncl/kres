@@ -13,7 +13,8 @@
 //!   depending on kres-mcp.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -25,7 +26,9 @@ use kres_core::lens::LensSpec;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::shrink::{shrink_findings_to_budget, shrink_json_list_to_budget};
 use kres_core::shutdown::Shutdown;
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{
+    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+};
 
 use crate::{
     consolidate::{consolidate_lenses_with_logger, LensOutput},
@@ -44,7 +47,7 @@ use crate::{
 /// `previous_findings` list that grows as the session progresses,
 /// the per-task `parallel_lenses`) forces every task to write a
 /// fresh prefix cache that nothing else will ever read. Session
-/// `0204e154…` (fs/btrfs/inode.c review) burned 14.5M tokens of
+/// A large historical review run burned 14.5M tokens of
 /// cache_creation on code.jsonl for only 2.25M tokens of
 /// cache_read because `question` + `previous_findings` sat in the
 /// prefix and mutated per task.
@@ -120,12 +123,25 @@ pub struct Orchestrator {
     pub fast_system: Option<String>,
     pub fast_max_tokens: u32,
     pub fast_max_input_tokens: Option<u32>,
+    pub fast_thinking: Option<ThinkingBudget>,
 
     pub slow_client: Arc<Client>,
     pub slow_model: Model,
     pub slow_system: Option<String>,
     pub slow_max_tokens: u32,
     pub slow_max_input_tokens: Option<u32>,
+    pub slow_thinking: Option<ThinkingBudget>,
+
+    /// Additional slow-agent variants used by review comparison
+    /// mode. The primary slow_* fields above are kept for the
+    /// historical single-model path; this list contains all variants,
+    /// including the primary one, when comparison is enabled.
+    pub slow_variants: Vec<SlowAgentVariant>,
+
+    /// Optional `<results>/comparison.json` destination. Review
+    /// comparison appends one entry per completed lensed task.
+    pub comparison_path: Option<PathBuf>,
+    pub comparison_lock: Arc<Mutex<()>>,
 
     /// Slow-agent system prompt used when a task runs in
     /// `TaskMode::Coding`. The session loads
@@ -165,6 +181,17 @@ pub struct Orchestrator {
     /// Optional per-session turn logger. When set, every fast/slow
     /// round-trip appends a user+assistant entry to code.jsonl.
     pub logger: Option<Arc<TurnLogger>>,
+}
+
+#[derive(Clone)]
+pub struct SlowAgentVariant {
+    pub client: Arc<Client>,
+    pub model: Model,
+    pub system: Option<String>,
+    pub max_tokens: u32,
+    pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
+    pub label: String,
 }
 
 /// Inputs to one run that vary per-task. Separated from Orchestrator
@@ -248,6 +275,11 @@ fn extract_thinking(resp: &kres_llm::request::MessagesResponse) -> Option<String
 
 #[derive(Debug, Clone)]
 pub struct TaskSummary {
+    /// Raw slow-agent text before parsing into the standard kres
+    /// response envelope. Workflow steps may declare typed outputs that are
+    /// valid JSON but are not `analysis`/`findings`/`followups`; the
+    /// workflow runner needs this text to extract those fields.
+    pub raw_response: String,
     pub analysis: String,
     pub findings: Vec<Finding>,
     pub followups: Vec<Followup>,
@@ -371,6 +403,9 @@ impl Orchestrator {
             let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
                 .with_max_tokens(self.fast_max_tokens)
                 .with_stream_label(format!("fast round {fast_rounds}"));
+            if let Some(thinking) = self.fast_thinking {
+                cfg = cfg.with_thinking(thinking);
+            }
             if let Some(s) = &self.fast_system {
                 cfg = cfg.with_system(s.clone());
             }
@@ -381,16 +416,14 @@ impl Orchestrator {
             if let Some(lg) = &self.logger {
                 lg.log_code("user", &logged_content, None, None);
             }
-            kres_core::async_eprintln!(
-                "[fast round {}/{}] sending {}k chars ({}k cached prefix + {}k volatile; +{} syms, +{} ctx vs prev)",
-                fast_rounds,
-                self.max_fast_rounds,
-                (prefix.len() + suffix.len()) / 1000,
-                prefix.len() / 1000,
-                suffix.len() / 1000,
-                new_syms.len(),
-                new_ctx.len(),
-            );
+            if !new_syms.is_empty() || !new_ctx.is_empty() {
+                kres_core::async_eprintln!(
+                    "[fast round {fast_rounds}/{}] gathered +{} symbol(s), +{} context item(s)",
+                    self.max_fast_rounds,
+                    new_syms.len(),
+                    new_ctx.len(),
+                );
+            }
             let text = tokio::select! {
                 _ = shutdown.cancelled() => {
                     return Err(AgentError::Other("cancelled during fast call".into()));
@@ -408,14 +441,6 @@ impl Orchestrator {
                             thinking.as_deref(),
                         );
                     }
-                    kres_core::async_eprintln!(
-                        "[fast round {}] reply: in={} out={} cache_read={} cache_create={}",
-                        fast_rounds,
-                        resp.usage.input_tokens,
-                        resp.usage.output_tokens,
-                        resp.usage.cache_read_input_tokens,
-                        resp.usage.cache_creation_input_tokens,
-                    );
                     t
                 }
             };
@@ -440,16 +465,12 @@ impl Orchestrator {
                 && !parsed.ready_for_slow
                 && !parsed.skill_reads.is_empty();
             if parsed.ready_for_slow {
-                kres_core::async_eprintln!(
-                    "[fast round {}] ready_for_slow (analysis: {}k chars)",
-                    fast_rounds,
-                    parsed.analysis.len() / 1000
-                );
+                kres_core::async_eprintln!("[fast round {fast_rounds}] ready for slow analysis");
                 break;
             }
             if parsed.followups.is_empty() && !only_skill_reads {
                 kres_core::async_eprintln!(
-                    "[fast round {}] no followups, no skill_reads — proceeding to slow",
+                    "[fast round {}] no more fetches; proceeding to slow analysis",
                     fast_rounds
                 );
                 break;
@@ -618,6 +639,9 @@ impl Orchestrator {
                 kres_core::TaskMode::Generic => "slow (generic)",
                 kres_core::TaskMode::Coding => "slow (coding)",
             });
+        if let Some(thinking) = self.slow_thinking {
+            cfg = cfg.with_thinking(thinking);
+        }
         // Coding-mode tasks want a different system prompt: one that
         // tells the slow agent to emit `code_output` rather than
         // findings. Fall back to slow_system if the coding prompt
@@ -661,10 +685,7 @@ impl Orchestrator {
             lg.log_code("user", &slow_logged, None, None);
         }
         kres_core::async_eprintln!(
-            "[slow] sending payload: {}k chars ({}k cached prefix + {}k volatile; {} symbols, {} context, {} prev findings)",
-            slow_logged.len() / 1000,
-            slow_prefix.len() / 1000,
-            slow_suffix.len() / 1000,
+            "[slow] analyzing with {} symbol(s), {} context item(s), {} previous finding(s)",
             trimmed_symbols.len(),
             trimmed_context.len(),
             trimmed_prev.len(),
@@ -683,19 +704,11 @@ impl Orchestrator {
                         "assistant",
                         &t,
                         Some(log_usage(&resp.usage)),
-                        thinking.as_deref(),
-                    );
+                            thinking.as_deref(),
+                        );
+                    }
+                    t
                 }
-                kres_core::async_eprintln!(
-                    "[slow] reply: in={} out={} cache_read={} cache_create={} ({} chars)",
-                    resp.usage.input_tokens,
-                    resp.usage.output_tokens,
-                    resp.usage.cache_read_input_tokens,
-                    resp.usage.cache_creation_input_tokens,
-                    t.len(),
-                );
-                t
-            }
         };
         let mut slow_parsed = parse_code_response(&text);
         // bugs.md#M3: surface the non-JSON case instead of letting it
@@ -738,11 +751,9 @@ impl Orchestrator {
             }
         }
         kres_core::async_eprintln!(
-            "[slow] parsed: analysis {}k chars, {} finding(s), {} followup(s), strategy={:?}",
-            slow_parsed.analysis.len() / 1000,
+            "[slow] complete: {} finding(s), {} followup(s)",
             slow_parsed.findings.len(),
             slow_parsed.followups.len(),
-            slow_parsed.strategy,
         );
         if !slow_parsed.followups.is_empty() {
             let fus: Vec<String> = slow_parsed
@@ -789,6 +800,7 @@ impl Orchestrator {
             None
         };
         Ok(TaskSummary {
+            raw_response: text,
             analysis: slow_parsed.analysis,
             findings: findings_out,
             followups: slow_parsed.followups,
@@ -854,12 +866,16 @@ impl Orchestrator {
         let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
             .with_max_tokens(self.fast_max_tokens)
             .with_stream_label("fast translate raw slow");
+        if let Some(thinking) = self.fast_thinking {
+            cfg = cfg.with_thinking(thinking);
+        }
         if let Some(n) = self.fast_max_input_tokens {
             cfg = cfg.with_max_input_tokens(n);
         }
         if let Some(lg) = &self.logger {
             lg.log_code("user", &user_content, None, None);
         }
+        kres_core::async_eprintln!("[fast translate] structuring raw slow-agent prose");
         let text = tokio::select! {
             _ = shutdown.cancelled() => return None,
             r = self.fast_client.messages_streaming(&cfg, &messages) => {
@@ -901,6 +917,77 @@ impl Orchestrator {
 }
 
 impl Orchestrator {
+    fn append_comparison_entry(
+        &self,
+        task_brief: &str,
+        slow_variants: &[SlowAgentVariant],
+        lens_outputs: &[LensOutput<'_>],
+        comparison: Option<Value>,
+    ) {
+        let Some(path) = self.comparison_path.as_ref() else {
+            return;
+        };
+        let _guard = match self.comparison_lock.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(
+                    target: "kres_agents",
+                    "comparison: create {} failed: {e}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+        let mut existing = match std::fs::read_to_string(path) {
+            Ok(s) if !s.trim().is_empty() => {
+                serde_json::from_str::<Value>(&s).unwrap_or_else(|_| json!([]))
+            }
+            _ => json!([]),
+        };
+        if !existing.is_array() {
+            existing = json!([]);
+        }
+        let outputs: Vec<Value> = lens_outputs
+            .iter()
+            .map(|out| {
+                json!({
+                    "lens": out.lens,
+                    "slow_model": out.slow_model.unwrap_or("unknown"),
+                    "analysis_chars": out.analysis.len(),
+                    "finding_count": out.findings.len(),
+                    "followup_count": out.followups.len(),
+                    "finding_ids": out.findings.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let entry = json!({
+            "turn": existing.as_array().map(|a| a.len() + 1).unwrap_or(1),
+            "created_at": chrono::Utc::now().to_rfc3339(),
+            "task_brief": task_brief,
+            "slow_models": slow_variants.iter().map(|v| v.label.clone()).collect::<Vec<_>>(),
+            "outputs": outputs,
+            "comparison": comparison,
+        });
+        if let Some(arr) = existing.as_array_mut() {
+            arr.push(entry);
+        }
+        match serde_json::to_vec_pretty(&existing) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    tracing::warn!(
+                        target: "kres_agents",
+                        "comparison: write {} failed: {e}",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(target: "kres_agents", "comparison: encode failed: {e}"),
+        }
+    }
+
     /// Run a task with N parallel slow-agent lens calls over the
     /// same gathered symbols/context, then consolidate.
     ///
@@ -913,6 +1000,7 @@ impl Orchestrator {
         prompt: &str,
         lenses: &[LensSpec],
         consolidator: &ConsolidatorClient,
+        consolidate_rules: Option<&str>,
         ctx: &RunContext,
         shutdown: &Shutdown,
     ) -> Result<TaskSummary, AgentError> {
@@ -926,11 +1014,27 @@ impl Orchestrator {
         let (symbols, context, fast_rounds, live_skills) =
             self.gather(prompt, ctx.plan.as_ref(), shutdown).await?;
 
-        // Fan out N slow-agent calls in parallel.
-        let mut futures = Vec::with_capacity(lenses.len());
+        // Fan out N slow-agent calls in parallel. Slow-agent
+        // followups are returned to the workflow layer; they are not
+        // consumed inside this task. Review workflows use them as the
+        // next-turn frontier.
+        let slow_variants = if self.slow_variants.is_empty() {
+            vec![SlowAgentVariant {
+                client: self.slow_client.clone(),
+                model: self.slow_model.clone(),
+                system: self.slow_system.clone(),
+                max_tokens: self.slow_max_tokens,
+                max_input_tokens: self.slow_max_input_tokens,
+                thinking: self.slow_thinking,
+                label: self.slow_model.id.clone(),
+            }]
+        } else {
+            self.slow_variants.clone()
+        };
+        let mut futures = Vec::with_capacity(lenses.len() * slow_variants.len());
         for (idx, lens) in lenses.iter().enumerate() {
             // §20b: send identity-only lens descriptors to the slow
-            // agent. Matches
+            // agent.
             let parallel_lenses = json!({
                 "your_lens": lens_identity(lens),
                 "other_lenses": lenses
@@ -963,9 +1067,9 @@ impl Orchestrator {
                 .with_parallel_lenses(&parallel_lenses);
             // §cache: include skills in the lens prompt — same
             // rationale as the single slow call above. Use the
-            // post-gather `live_skills` so any skill files the
-            // fast agent pulled in mid-gather reach the lens slow
-            // agents too.
+            // post-gather `live_skills` so any skill files the fast
+            // agent pulled in mid-gather reach the lens slow agents
+            // too.
             if let Some(sk) = &live_skills {
                 lens_cp = lens_cp.with_skills(sk);
             }
@@ -973,90 +1077,118 @@ impl Orchestrator {
                 lens_cp = lens_cp.with_plan(p);
             }
             let (lens_prefix, lens_suffix) = lens_cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
-            let client = self.slow_client.clone();
-            let model = self.slow_model.clone();
-            let system = self.slow_system.clone();
-            let max_tokens = self.slow_max_tokens;
-            let max_input_tokens = self.slow_max_input_tokens;
-            let shutdown_c = shutdown.clone();
-            let usage = self.usage.clone();
-            let logger = self.logger.clone();
-            let lens_label = format!("lens {}", lens.name);
-            futures.push(async move {
-                // Each lens fan-out is a one-shot slow call. Same
-                // reasoning as the single slow path above: skip the
-                // tail cache tax, keep the prefix cache for skills.
-                let messages = vec![Message {
-                    role: "user".into(),
-                    content: lens_suffix,
-                    cache: false,
-                    cached_prefix: if lens_prefix.is_empty() {
-                        None
-                    } else {
-                        Some(lens_prefix)
-                    },
-                }];
-                let mut cfg = CallConfig::defaults_for(model.clone())
-                    .with_max_tokens(max_tokens)
-                    .with_stream_label(lens_label);
-                if let Some(s) = system {
-                    cfg = cfg.with_system(s);
-                }
-                if let Some(n) = max_input_tokens {
-                    cfg = cfg.with_max_input_tokens(n);
-                }
-                if let Some(lg) = &logger {
-                    lg.log_code("user", &messages[0].content, None, None);
-                }
-                tokio::select! {
-                    _ = shutdown_c.cancelled() => None,
-                    r = client.messages_streaming(&cfg, &messages) => match r {
-                        Ok(resp) => {
-                            record_usage(&usage, "slow", &model, &resp.usage);
-                            let t = extract_text(&resp);
-                            if let Some(lg) = &logger {
-                                let th = extract_thinking(&resp);
-                                lg.log_code(
-                                    "assistant",
-                                    &t,
-                                    Some(log_usage(&resp.usage)),
-                                    th.as_deref(),
-                                );
-                            }
-                            Some(parse_code_response(&t))
-                        }
-                        Err(e) => {
-                            tracing::warn!(target: "kres_agents", "lens call failed: {e}");
+            let lens_logged = format!("{lens_prefix}{lens_suffix}");
+            for variant in slow_variants.iter().cloned() {
+                let client = variant.client.clone();
+                let model = variant.model.clone();
+                let system = variant.system.clone();
+                let max_tokens = variant.max_tokens;
+                let max_input_tokens = variant.max_input_tokens;
+                let thinking = variant.thinking;
+                let model_label = variant.label.clone();
+                let shutdown_c = shutdown.clone();
+                let usage = self.usage.clone();
+                let logger = self.logger.clone();
+                let lens_label = format!("lens {} ({model_label})", lens.name);
+                let lens_prefix = lens_prefix.clone();
+                let lens_suffix = lens_suffix.clone();
+                let lens_logged = lens_logged.clone();
+                futures.push(async move {
+                    // Each lens fan-out is a one-shot slow call. Same
+                    // reasoning as the single slow path above: skip the
+                    // tail cache tax, keep the prefix cache for skills.
+                    let messages = vec![Message {
+                        role: "user".into(),
+                        content: lens_suffix,
+                        cache: false,
+                        cached_prefix: if lens_prefix.is_empty() {
                             None
+                        } else {
+                            Some(lens_prefix)
+                        },
+                    }];
+                    let mut cfg = CallConfig::defaults_for(model.clone())
+                        .with_max_tokens(max_tokens)
+                        .with_stream_label(lens_label);
+                    if let Some(thinking) = thinking {
+                        cfg = cfg.with_thinking(thinking);
+                    }
+                    if let Some(s) = system {
+                        cfg = cfg.with_system(s);
+                    }
+                    if let Some(n) = max_input_tokens {
+                        cfg = cfg.with_max_input_tokens(n);
+                    }
+                    if let Some(lg) = &logger {
+                        lg.log_code("user", &lens_logged, None, None);
+                    }
+                    tokio::select! {
+                        _ = shutdown_c.cancelled() => None,
+                        r = client.messages_streaming(&cfg, &messages) => match r {
+                            Ok(resp) => {
+                                record_usage(&usage, "slow", &model, &resp.usage);
+                                let t = extract_text(&resp);
+                                if let Some(lg) = &logger {
+                                    let th = extract_thinking(&resp);
+                                    lg.log_code(
+                                        "assistant",
+                                        &t,
+                                        Some(log_usage(&resp.usage)),
+                                        th.as_deref(),
+                                    );
+                                }
+                                Some((idx, model_label, parse_code_response(&t)))
+                            }
+                            Err(e) => {
+                                tracing::warn!(target: "kres_agents", "lens call failed: {e}");
+                                None
+                            }
                         }
                     }
-                }
-            });
+                });
+            }
         }
-        let raws: Vec<Option<CodeResponse>> = join_all(futures).await;
+        let raws: Vec<Option<(usize, String, CodeResponse)>> = join_all(futures).await;
 
         // Build LensOutputs for the consolidator. Preserve only
         // non-None results; a failed lens contributes nothing.
-        // §20c: filter lenses that produced neither analysis nor
-        // findings so the consolidator doesn't have to handle noise.
+        // §20c: filter lenses that produced no analysis, findings, or
+        // followups so the consolidator doesn't have to handle noise.
         // §20e: per-lens descriptor is the reduced identity form, not
         // the full LensSpec.
         let lens_json: Vec<Value> = lenses.iter().map(lens_identity).collect();
         let mut outs: Vec<LensOutput<'_>> = Vec::new();
         let mut all_followups: Vec<Followup> = Vec::new();
-        for (i, raw) in raws.iter().enumerate() {
-            if let Some(parsed) = raw {
-                if parsed.analysis.is_empty() && parsed.findings.is_empty() {
-                    continue;
-                }
-                outs.push(LensOutput {
-                    lens: &lens_json[i],
-                    analysis: &parsed.analysis,
-                    findings: &parsed.findings,
-                });
-                all_followups.extend(parsed.followups.iter().cloned());
+        for (i, model_label, parsed) in raws.iter().flatten() {
+            if parsed.analysis.is_empty()
+                && parsed.findings.is_empty()
+                && parsed.followups.is_empty()
+            {
+                continue;
             }
+            outs.push(LensOutput {
+                lens: &lens_json[*i],
+                slow_model: Some(model_label.as_str()),
+                analysis: &parsed.analysis,
+                findings: &parsed.findings,
+                followups: &parsed.followups,
+            });
+            all_followups.extend(parsed.followups.iter().cloned());
         }
+
+        let finished = raws.iter().flatten().count();
+        let findings: usize = raws
+            .iter()
+            .filter_map(|raw| raw.as_ref().map(|(_, _, parsed)| parsed.findings.len()))
+            .sum();
+        kres_core::async_eprintln!(
+            "[review lenses] {} of {} complete across {} slow model(s), {} raw finding(s), {} followup(s)",
+            finished,
+            lenses.len() * slow_variants.len(),
+            slow_variants.len(),
+            findings,
+            all_followups.len(),
+        );
 
         let consolidated = consolidate_lenses_with_logger(
             consolidator.client.clone(),
@@ -1066,10 +1198,19 @@ impl Orchestrator {
             consolidator.max_input_tokens,
             &ctx.task_brief,
             &outs,
+            consolidate_rules,
             self.logger.clone(),
         )
         .await?;
+        self.append_comparison_entry(
+            &ctx.task_brief,
+            &slow_variants,
+            &outs,
+            consolidated.comparison.clone(),
+        );
+        merge_followups(&mut all_followups, consolidated.followups);
         Ok(TaskSummary {
+            raw_response: consolidated.analysis.clone(),
             analysis: consolidated.analysis,
             findings: consolidated.findings,
             followups: all_followups,
@@ -1079,11 +1220,11 @@ impl Orchestrator {
             code_output: Vec::new(),
             code_edits: Vec::new(),
             // Lens fan-out runs N parallel slow calls; merging N
-            // plan rewrites would churn step ids. Audit-mode
-            // plan rewrites flow through the todo-agent's per-turn
-            // reevaluation path (a97bff2) instead. Single-slow
-            // analysis tasks (lens count 0) still get plan rewrite
-            // via run_once_with_ctx above.
+            // plan rewrites would churn step ids. Audit-mode plan
+            // rewrites flow through the todo-agent's per-turn
+            // reevaluation path instead. Single-slow analysis tasks
+            // (lens count 0) still get plan rewrite via
+            // run_once_with_ctx above.
             plan: None,
         })
     }
@@ -1148,6 +1289,7 @@ impl Orchestrator {
             let (gp_prefix, gp_suffix) = cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
             prev_n_syms = symbols.len();
             prev_n_ctx = context.len();
+            let logged_content = format!("{gp_prefix}{gp_suffix}");
             let messages = vec![Message {
                 role: "user".into(),
                 content: gp_suffix,
@@ -1161,6 +1303,9 @@ impl Orchestrator {
             let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
                 .with_max_tokens(self.fast_max_tokens)
                 .with_stream_label("fast (lens gather)");
+            if let Some(thinking) = self.fast_thinking {
+                cfg = cfg.with_thinking(thinking);
+            }
             if let Some(s) = &self.fast_system {
                 cfg = cfg.with_system(s.clone());
             }
@@ -1168,7 +1313,7 @@ impl Orchestrator {
                 cfg = cfg.with_max_input_tokens(n);
             }
             if let Some(lg) = &self.logger {
-                lg.log_code("user", &messages[0].content, None, None);
+                lg.log_code("user", &logged_content, None, None);
             }
             let text = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fast call".into())),
@@ -1424,6 +1569,15 @@ pub fn prepend_original_prompt(prompt: &str, original_prompt: &str) -> String {
         "Original user prompt: {}\nCurrent task: {}",
         original_prompt, prompt
     )
+}
+
+fn merge_followups(dst: &mut Vec<Followup>, src: Vec<Followup>) {
+    let mut seen: HashSet<String> = dst.iter().map(Followup::cache_key).collect();
+    for fu in src {
+        if seen.insert(fu.cache_key()) {
+            dst.push(fu);
+        }
+    }
 }
 
 /// Cut a string to `n` chars with an ellipsis. Used by the verbose

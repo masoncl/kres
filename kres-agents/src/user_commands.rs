@@ -1,4 +1,4 @@
-//! Slash-command templates: `/review`, `/summary`, `/summary-markdown`.
+//! Slash-command templates used by non-workflow commands.
 //!
 //! Each name maps to an `.md` body that is compiled into the kres
 //! binary via `include_str!`. An operator who wants to override a
@@ -8,10 +8,8 @@
 //!
 //! Two code paths feed this table:
 //!
-//! - CLI `--prompt "word: extra"` and `--prompt "/word extra"` both
-//!   resolve via `lookup(word)` and prepend `extra` to the body.
-//! - REPL slash commands `/review <target>`, `/summary`, and
-//!   `/summary-markdown` read the body through the same lookup.
+//! - Summary rendering uses the `summary` and `summary-markdown`
+//!   bodies directly.
 //!
 //! Distinct from `kres_agents::embedded_prompts`: that module
 //! bundles the agent `*.system.md` prompts (fast/slow/main/todo
@@ -25,10 +23,6 @@
 /// `configs/prompts/`.
 const TABLE: &[(&str, &str)] = &[
     (
-        "review",
-        include_str!("../../configs/prompts/review-template.md"),
-    ),
-    (
         "summary",
         include_str!("../../configs/prompts/bug-summary.md"),
     ),
@@ -36,11 +30,6 @@ const TABLE: &[(&str, &str)] = &[
         "summary-markdown",
         include_str!("../../configs/prompts/bug-summary-markdown.md"),
     ),
-    (
-        "triage",
-        include_str!("../../configs/prompts/triage-template.md"),
-    ),
-    ("fix", include_str!("../../configs/prompts/fix-template.md")),
     (
         "commit-kernel",
         include_str!("../../configs/prompts/commit-kernel-template.md"),
@@ -59,6 +48,10 @@ const TABLE: &[(&str, &str)] = &[
 /// character set) will never hit the reject path, but keeping the
 /// guard here means a future caller that forgets to sanitize
 /// still can't escape the directory.
+///
+/// Workflow-owned commands are intentionally not slash templates.
+/// `/fix`, `/review`, and `/triage` dispatch through the workflow
+/// runner only.
 pub fn lookup(name: &str) -> Option<String> {
     lookup_with_root(
         dirs::home_dir().map(|h| h.join(".kres").join("commands")),
@@ -69,10 +62,13 @@ pub fn lookup(name: &str) -> Option<String> {
 /// Testable core of `lookup`. `commands_dir` is the directory to
 /// consult for disk overrides (pass `None` to skip the disk step
 /// entirely — useful in tests that want to pin the embedded
-/// fallback). `name` is validated against the same character set
+/// default). `name` is validated against the same character set
 /// as the public `lookup`.
 pub fn lookup_with_root(commands_dir: Option<std::path::PathBuf>, name: &str) -> Option<String> {
     if !is_valid_name(name) {
+        return None;
+    }
+    if matches!(name, "fix" | "review" | "triage") {
         return None;
     }
     if let Some(dir) = commands_dir {
@@ -107,41 +103,27 @@ pub fn embedded_names() -> impl Iterator<Item = &'static str> {
     TABLE.iter().map(|(k, _)| *k)
 }
 
-/// Compose a full prompt from a command name and trailing extra
-/// text — used by both the CLI (`--prompt "name: extra"` /
-/// `--prompt "/name extra"`) and the REPL (`/review target` etc).
+/// Compose a full prompt from a command-template name and trailing
+/// extra text.
+///
+/// This is intentionally not used for workflow-owned commands
+/// (`fix`, `review`, `triage`) or summary rendering
+/// (`summary`, `summary-markdown`). Those have dedicated command
+/// paths; treating them as prompt templates would create a second
+/// execution model.
 /// Returns `Some((source-label, body))` when `name` resolves to
 /// a known command, `None` when the lookup fails.
 ///
-/// Special-case for `fix`: the FIX flow tells the slow agent to
-/// emit a `git commit -s` once the patch is applied, but leaves
-/// "kernel-style commit message" to the model's training prior.
-/// To make the rules concrete, append the body of the
-/// `commit-kernel` template (75-col wrap, 70-75 char subject,
-/// Assisted-by trailer, etc.) under a `COMMIT MESSAGE STYLE`
-/// header so a single prompt carries both flows. The two bodies
-/// are kept DRY in `configs/prompts/`; this function is the only
-/// place they meet.
 pub fn compose(name: &str, extra: &str) -> Option<(String, String)> {
+    if matches!(name, "summary" | "summary-markdown") {
+        return None;
+    }
     let body = lookup(name)?;
     let extra = extra.trim();
     let composed = if extra.is_empty() {
         body
     } else {
         format!("{extra}\n\n{body}")
-    };
-    let composed = if name == "fix" {
-        match lookup("commit-kernel") {
-            Some(commit_body) => format!(
-                "{composed}\n\n---\n\n# COMMIT MESSAGE STYLE (appended by /fix)\n\n{commit_body}"
-            ),
-            // Defensive: commit-kernel has been in the embedded
-            // table since 43361ca; if it ever goes missing the FIX
-            // flow still works, just without the explicit rules.
-            None => composed,
-        }
-    } else {
-        composed
     };
     Some((format!("/{name} (user_commands)"), composed))
 }
@@ -160,14 +142,7 @@ mod tests {
 
     #[test]
     fn all_expected_commands_are_present() {
-        for expected in [
-            "review",
-            "summary",
-            "summary-markdown",
-            "triage",
-            "fix",
-            "commit-kernel",
-        ] {
+        for expected in ["summary", "summary-markdown", "commit-kernel"] {
             assert!(
                 lookup(expected).is_some(),
                 "expected embedded command {expected} not found"
@@ -195,70 +170,17 @@ mod tests {
     }
 
     #[test]
-    fn fix_body_contains_template_markers() {
-        // The fix template is the patch+review iteration prompt for
-        // the coding-mode slow agent. If include_str! stops pointing
-        // at fix-template.md, a different body would silently load
-        // and the run would not iterate through compile/review.
-        // Anchor on the unique GOAL line + the [INVALID] escape
-        // hatch — these are load-bearing for the iteration semantics
-        // the operator wired up.
-        let body = lookup("fix").unwrap();
-        assert!(
-            body.contains("kres FIX flow"),
-            "fix body missing FIX-flow header"
-        );
-        assert!(
-            body.contains("[INVALID]"),
-            "fix body missing the bug-invalidated escape hatch"
-        );
-    }
-
-    #[test]
-    fn triage_body_contains_template_markers() {
-        // Sanity check — same shape as the review marker test.
-        // If the include_str stops pointing at triage-template.md
-        // this catches it.
-        let body = lookup("triage").unwrap();
-        assert!(
-            body.contains("# Subject:"),
-            "triage body missing `# Subject:` heading"
-        );
-        assert!(
-            body.contains("triage summary"),
-            "triage body missing the code_output `purpose` example"
-        );
-    }
-
-    #[test]
     fn unknown_name_returns_none() {
         assert!(lookup("no-such-command").is_none());
     }
 
     #[test]
-    fn review_body_contains_template_markers() {
-        // Sanity check — the review template is the lens-bullet
-        // markdown file, which the prompt-file parser keys on
-        // `[investigate]` bullets. If the include_str stops pointing
-        // at the right file this would silently pick up a different
-        // body; asserting a literal marker catches that.
-        let body = lookup("review").unwrap();
-        assert!(
-            body.contains("[investigate]"),
-            "review body missing [investigate] marker"
-        );
-    }
-
-    #[test]
     fn disk_override_wins_over_embedded() {
-        // Drop a file at <tmp>/commands/review.md and assert
-        // lookup_with_root returns its contents, not the embedded
-        // review template.
         let dir = std::env::temp_dir().join(format!("kres-cmd-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("review.md"), "OPERATOR REVIEW OVERRIDE").unwrap();
-        let got = lookup_with_root(Some(dir.clone()), "review").expect("override should resolve");
-        assert_eq!(got, "OPERATOR REVIEW OVERRIDE");
+        std::fs::write(dir.join("summary.md"), "OPERATOR SUMMARY OVERRIDE").unwrap();
+        let got = lookup_with_root(Some(dir.clone()), "summary").expect("override should resolve");
+        assert_eq!(got, "OPERATOR SUMMARY OVERRIDE");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -271,10 +193,10 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("kres-cmd-empty-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("review.md"), "   \n\t\n").unwrap();
-        let got =
-            lookup_with_root(Some(dir.clone()), "review").expect("should fall through to embedded");
-        assert!(got.contains("[investigate]"), "got {got:?}");
+        std::fs::write(dir.join("summary.md"), "   \n\t\n").unwrap();
+        let got = lookup_with_root(Some(dir.clone()), "summary")
+            .expect("should fall through to embedded");
+        assert!(got.contains("Subject:"), "got {got:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -296,17 +218,17 @@ mod tests {
 
     #[test]
     fn compose_prepends_extra_to_body() {
-        let (src, body) = compose("review", "fs/btrfs/ctree.c").unwrap();
+        let (src, body) = compose("commit-kernel", "describe the change").unwrap();
         assert!(
-            src.contains("review"),
+            src.contains("commit-kernel"),
             "source label should name the command: {src}"
         );
         assert!(
-            body.starts_with("fs/btrfs/ctree.c\n\n"),
+            body.starts_with("describe the change\n\n"),
             "extra text must lead the composed body: {body:?}"
         );
         assert!(
-            body.contains("[investigate]"),
+            body.contains("Rule 0"),
             "template body must follow: {body:?}"
         );
     }
@@ -315,11 +237,9 @@ mod tests {
     fn compose_empty_extra_returns_bare_body() {
         // Unique job of this test: an empty `extra` argument must
         // not prepend a blank `extra\n\n` block to the body. The
-        // body itself is already covered by
-        // review_body_contains_template_markers.
-        let (_, body_empty) = compose("review", "").unwrap();
-        let (_, body_ws) = compose("review", "  \n\t ").unwrap();
-        let expected = lookup("review").unwrap();
+        let (_, body_empty) = compose("commit-kernel", "").unwrap();
+        let (_, body_ws) = compose("commit-kernel", "  \n\t ").unwrap();
+        let expected = lookup("commit-kernel").unwrap();
         assert_eq!(
             body_empty, expected,
             "empty extra must yield the bare template body"
@@ -333,42 +253,26 @@ mod tests {
     #[test]
     fn compose_unknown_name_returns_none() {
         assert!(compose("no-such-command", "target").is_none());
+        assert!(compose("summary", "target").is_none());
+        assert!(compose("summary-markdown", "target").is_none());
     }
 
     #[test]
-    fn compose_fix_appends_commit_kernel_body() {
-        // The FIX flow needs the commit-kernel rules in front of the
-        // slow agent at git-commit time. compose("fix", ...) auto-
-        // appends commit-kernel under a COMMIT MESSAGE STYLE header
-        // so the slow agent doesn't fall back to its training prior
-        // (per-file bullets, "[PATCH]" prefix, etc.).
-        let (_, body) = compose("fix", "/path/to/finding").unwrap();
-        // Sanity: the FIX body is still present in front.
-        assert!(body.contains("kres FIX flow"), "fix body missing: {body:?}");
-        // The commit-kernel rules land after a separator + header.
-        assert!(
-            body.contains("# COMMIT MESSAGE STYLE (appended by /fix)"),
-            "missing append marker: {body:?}"
-        );
-        // Anchor a few load-bearing rules from commit-kernel so a
-        // future drift in either template gets caught.
-        assert!(body.contains("Rule 0"), "commit-kernel missing in fix body");
-        assert!(
-            body.contains("Assisted-by:"),
-            "commit-kernel Assisted-by trailer missing in fix body"
-        );
-    }
-
-    #[test]
-    fn compose_review_does_not_append_commit_kernel() {
-        // Only fix gets the commit-kernel append. Other commands
-        // (review, summary, triage, commit-kernel itself) must NOT
-        // pick up the appendix.
-        let (_, body) = compose("review", "fs/btrfs/ctree.c").unwrap();
-        assert!(
-            !body.contains("# COMMIT MESSAGE STYLE (appended by /fix)"),
-            "review body unexpectedly carries the fix appendix"
-        );
+    fn workflow_commands_are_not_templates() {
+        let dir =
+            std::env::temp_dir().join(format!("kres-workflow-override-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["fix", "review", "triage"] {
+            std::fs::write(dir.join(format!("{name}.md")), "operator override").unwrap();
+            assert!(lookup(name).is_none());
+            assert!(lookup_with_root(None, name).is_none());
+            assert!(
+                lookup_with_root(Some(dir.clone()), name).is_none(),
+                "disk commands/{name}.md overrides must not resurrect workflow commands"
+            );
+            assert!(compose(name, "/path/to/target").is_none());
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

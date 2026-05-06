@@ -1,0 +1,930 @@
+{
+  "$schema_version": 1,
+  "$format": {
+    "why_this_block_exists": [
+      "$format is documentation for workflow authors. The loader carries it through as JSON",
+      "but the runner does not execute it. Keep operational behavior in the real workflow",
+      "fields below; keep explanations here so the JSON stays editable without external docs."
+    ],
+    "prompt_authoring": [
+      "Prompts may be a string, an array of strings, or `prompt_file`.",
+      "This file intentionally uses arrays so long prompts are readable in the workflow JSON.",
+      "The loader joins prompt arrays with newline characters. Use an empty string for a blank line.",
+      "`prompt_file` is available for operator workflows; relative paths resolve against this JSON file.",
+      "Do not convert the shipped workflows to prompt_file unless the prompt is meant to live outside",
+      "the workflow definition."
+    ],
+    "globals": [
+      "`globals` holds reusable prompt fragments or include descriptors.",
+      "Steps opt in with `include`: `{{globals.name}}` is interpolated before the agent call.",
+      "An object like `{include, header}` means: load that file into the prompt context and label it",
+      "with the optional header. A string global is inlined as literal text.",
+      "Use globals for cross-step invariants that must stay consistent, such as commit message style",
+      "and the rule that deterministic workflow steps own git/make/publish."
+    ],
+    "defaults": [
+      "`defaults` supplies step fields when a step omits them.",
+      "Here the default agent is slow, the default mode is coding, each eval gets three attempts,",
+      "and exhausting those attempts fails the workflow.",
+      "Step-local `agent`, `mode`, `actions`, `eval.on_fail.max_attempts`, and",
+      "`eval.on_fail.on_exhausted` override the defaults for that step only."
+    ],
+    "ordering_and_parallelism": [
+      "The runner dispatches a step only after every id in `depends_on` has completed.",
+      "`run_if` and `skip_if` are evaluated after dependencies complete; skipped steps do not run.",
+      "Normal fix steps are sequential because each step depends on a concrete prior artifact.",
+      "Parallelism is represented by `lenses`: one step prompt runs once per lens concurrently,",
+      "then the lens outputs are merged according to `aggregate`. The fix review step uses",
+      "parallel lenses so each reviewer gets an independent context window.",
+      "Do not add prompt-level reviewer checklists or alternate review steps to fix.json.",
+      "The only supported fix-review shape is this JSON `review` step with `lenses`,",
+      "`aggregate: consolidate`, and a `consolidate.prompt` producing clean/defects/analysis."
+    ],
+    "failure_and_retries": [
+      "A step with `eval` first produces outputs, then the eval decides whether those outputs are",
+      "acceptable. Passing eval marks the step done and then runs deterministic `post_actions`.",
+      "Failing eval follows `eval.on_fail.action`: `repeat` reruns the same step, `branch_to` moves",
+      "control back to another step and invalidates dependent work, `continue` keeps going, and",
+      "`exit_failure` terminates.",
+      "`max_attempts` limits eval failures for that step. When it is exhausted, `on_exhausted`",
+      "chooses the final control action, otherwise the workflow default applies.",
+      "Driver errors before usable outputs are produced use the step eval retry budget when an",
+      "eval block is configured; otherwise they fail immediately unless the driver owns a retry path."
+    ],
+    "eval_control_flow": [
+      "Evals are the bridge between JSON outputs and workflow control flow.",
+      "`field_check` evaluates an expression over workflow outputs, for example",
+      "`write-patch.affected_files_changed == true`.",
+      "`judge_llm` sends the step outputs plus `judge_prompt` to an agent and expects",
+      "`{pass: bool, reason: string}`.",
+      "Branching evals are how compile/review failures send the workflow back to `write-patch`",
+      "without letting the model mutate git directly."
+    ],
+    "fix_shape": [
+      "Research decides whether the bug is real. Invalid finding_dir inputs terminally update",
+      "the finding metadata via a reaper step.",
+      "When valid, write-patch changes files, fixes-tag-search proves provenance,",
+      "write-commit-message writes .kres-commit-msg.tmp, commit creates/amends the git commit,",
+      "build compiles the target, triage decides whether compile failures are patch errors,",
+      "review proves the patch and commit message claims, and publish exports the final diff."
+    ]
+  },
+  "id": "fix",
+  "title": "Fix a kernel bug",
+  "description": "Research the bug, write a patch, commit it, build it, review it, and publish it. Deterministic reaper steps handle status edits, git, make, and patch export.",
+  "inputs": {
+    "target": {
+      "type": "string",
+      "required": true,
+      "description": "Absolute path to a kres finding directory, or freeform bug prose.",
+      "derive": {
+        "target_kind": {
+          "type": "enum",
+          "values": [
+            "finding_dir",
+            "prose"
+          ],
+          "rule": "finding_dir when target is an existing dir containing metadata.yaml AND FINDING.md, else prose"
+        }
+      }
+    },
+    "assisted_by": {
+      "type": "string",
+      "required": false,
+      "description": "Exact value for the Assisted-by trailer after `Assisted-by:`. Defaults to `kres (<slow-model-id>)`; override with --assisted-by."
+    }
+  },
+  "skills": [
+    "kernel.md"
+  ],
+  "globals": {
+    "commit_message_style": {
+      "include": "@configs/prompts/commit-kernel-template.md",
+      "header": "COMMIT MESSAGE STYLE"
+    },
+    "output_rules": "Never paste a unified diff or .patch as code_output content. Edits go through code_edits (or code_output rewriting the same file). Diffs are produced by `git diff HEAD~1` after the commit lands. Deterministic workflow steps own git add, git commit, git commit --amend, make, and publish; do not emit mutating git/make/publish followups from LLM steps. Keep analysis tight; the artifacts are the diff and the commit message.",
+    "self_fix_trap": "Once code_edits or a git commit have landed, the files on disk contain YOUR work. Reading them back and seeing the fix in place is not evidence of upstream prior art. [INVALID] requires a file:line or commit ref that existed BEFORE this run started."
+  },
+  "defaults": {
+    "agent": "slow",
+    "mode": "coding",
+    "max_eval_attempts": 3,
+    "on_exhausted": "exit_failure"
+  },
+  "steps": [
+    {
+      "id": "research",
+      "title": "Research the bug",
+      "agent": "fast",
+      "mode": "audit",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "git",
+        "grep",
+        "callers"
+      ],
+      "include": [
+        "{{globals.self_fix_trap}}"
+      ],
+      "prompt": [
+        "You are running the kres FIX flow, step 1: RESEARCH.",
+        "",
+        "BUG INPUT: {{workflow.target}}",
+        "KIND: {{workflow.target_kind}}",
+        "",
+        "If KIND is finding_dir, read FINDING.md, summary.md, and metadata.yaml from the target",
+        "before doing anything else. metadata.yaml.git.sha is the audit's HEAD; the workspace",
+        "HEAD may differ. If the affected symbols changed since that sha, verify the bug still",
+        "exists. If those files cannot be read, do not declare the bug invalid; request the",
+        "missing read access/context instead.",
+        "",
+        "If KIND is prose, treat the target text as the problem description and gather code",
+        "context yourself via source/read/git followups.",
+        "",
+        "semcode-backed source/type/callgraph lookups are helpers, not proof of absence.",
+        "They can be unavailable while indexing and can miss macros, globals, and complex",
+        "definitions. If semcode cannot find or parse a symbol, use read/search/grep against",
+        "the worktree before treating required source as missing or a symbol/path as absent.",
+        "For finding_dir inputs, affected file paths from metadata/FINDING/summary are direct",
+        "read targets; do not wait for semcode before reading those files.",
+        "",
+        "Always set research_status, valid, invalid_evidence, invalid_evidence_kind,",
+        "and research_decision.",
+        "Use research_status=confirmed and valid=true only when gathered source proves a",
+        "concrete bug exists at workspace HEAD and analysis contains a specific fix contract.",
+        "Use research_status=invalid and valid=false only with source/commit proof that the",
+        "bug is wrong. Use research_status=unconfirmed and valid=false when the bug may be",
+        "real but gathered evidence does not prove it, when required source is unavailable",
+        "after direct read/search fallback has also failed,",
+        "or when the finding needs more audit work before patching. Do not route unconfirmed",
+        "research to write-patch.",
+        "",
+        "Use invalid_evidence=\"\" and invalid_evidence_kind=none when research_status is",
+        "confirmed or unconfirmed, or whenever you do not have source/commit proof that the",
+        "bug is invalid.",
+        "",
+        "research_decision is the structured rationale for routing. Keep it consistent with",
+        "research_status:",
+        "- confirmed: bug_proven=true, fix_contract_proven=true, invalidity_proven=false, needs_more_audit=false.",
+        "- invalid: bug_proven=false, fix_contract_proven=false, invalidity_proven=true, needs_more_audit=false.",
+        "- unconfirmed: invalidity_proven=false and at least one of bug_proven/fix_contract_proven is false or needs_more_audit=true.",
+        "Do not use words like confirmed, verified, proved, or definitely in analysis for an",
+        "unconfirmed result; say evidence suggests or not proven instead. Rust routes only",
+        "from structured fields, but the prose should not contradict them.",
+        "",
+        "Pull every file the bug touches, every caller of the affected symbols, and enough local",
+        "history to understand whether the bug is real and how to fix it. Do not do an exhaustive",
+        "Fixes: tag search in this step; a dedicated fixes-tag-search step owns provenance after",
+        "the patch exists.",
+        "",
+        "If the bug is invalid (already fixed by a different commit, unreachable path, misread",
+        "semantics), set research_status=invalid, valid=false,",
+        "invalid_evidence_kind=source_or_commit_evidence, and put the evidence in",
+        "invalid_evidence. Cite a file:line or commit ref that existed",
+        "BEFORE this run started. Read/access/context failures are not invalid_evidence; do not",
+        "mark them invalid."
+      ],
+      "outputs": {
+        "research_status": {
+          "type": "enum",
+          "values": [
+            "confirmed",
+            "invalid",
+            "unconfirmed"
+          ],
+          "description": "confirmed means a concrete bug and fix contract were proven; invalid means source/commit evidence disproves the bug; unconfirmed means do not patch yet."
+        },
+        "valid": {
+          "type": "boolean",
+          "description": "Compatibility mirror: true only when research_status=confirmed."
+        },
+        "invalid_evidence": {
+          "type": "string",
+          "description": "file:line or commit ref proving the bug is wrong; empty when valid=true."
+        },
+        "invalid_evidence_kind": {
+          "type": "enum",
+          "values": [
+            "none",
+            "source_or_commit_evidence"
+          ],
+          "description": "source_or_commit_evidence means invalid_evidence is actionable proof, not an access or context failure; none otherwise."
+        },
+        "affected_files": {
+          "type": "array<string>",
+          "description": "Paths the patch will touch."
+        },
+        "affected_symbols": {
+          "type": "array<string>"
+        },
+        "research_decision": {
+          "type": "object",
+          "schema": {
+            "bug_proven": "boolean",
+            "fix_contract_proven": "boolean",
+            "invalidity_proven": "boolean",
+            "needs_more_audit": "boolean"
+          },
+          "description": "Structured routing rationale. Must agree with research_status and valid; do not rely on analysis prose for routing."
+        },
+        "analysis": {
+          "type": "string",
+          "optional": true,
+          "description": "Research narrative and fix sketch."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "(research_status == 'confirmed' && valid == true && invalid_evidence == '' && invalid_evidence_kind == 'none' && research.research_decision.bug_proven == true && research.research_decision.fix_contract_proven == true && research.research_decision.invalidity_proven == false && research.research_decision.needs_more_audit == false) || (research_status == 'invalid' && valid == false && invalid_evidence != '' && invalid_evidence_kind == 'source_or_commit_evidence' && research.research_decision.bug_proven == false && research.research_decision.fix_contract_proven == false && research.research_decision.invalidity_proven == true && research.research_decision.needs_more_audit == false) || (research_status == 'unconfirmed' && valid == false && invalid_evidence == '' && invalid_evidence_kind == 'none' && research.research_decision.invalidity_proven == false && (research.research_decision.bug_proven == false || research.research_decision.fix_contract_proven == false || research.research_decision.needs_more_audit == true))",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 3,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "invalidate",
+      "title": "Record invalid determination",
+      "depends_on": [
+        "research"
+      ],
+      "run_if": "research.research_status == 'invalid' && workflow.target_kind == 'finding_dir' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
+      "agent": "reaper",
+      "action": {
+        "type": "set-finding-status",
+        "args": {
+          "finding_dir": "{{workflow.target}}",
+          "status": "invalidated"
+        }
+      },
+      "outputs": {
+        "files_updated": {
+          "type": "array<string>"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "terminal_on_success": true
+    },
+    {
+      "id": "unconfirm",
+      "title": "Record unconfirmed determination",
+      "depends_on": [
+        "research"
+      ],
+      "run_if": "research.research_status == 'unconfirmed' && workflow.target_kind == 'finding_dir'",
+      "agent": "reaper",
+      "action": {
+        "type": "set-finding-status",
+        "args": {
+          "finding_dir": "{{workflow.target}}",
+          "status": "unconfirmed"
+        }
+      },
+      "outputs": {
+        "files_updated": {
+          "type": "array<string>"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "terminal_on_success": true
+    },
+    {
+      "id": "write-patch",
+      "title": "Write the patch",
+      "depends_on": [
+        "research"
+      ],
+      "run_if": "research.research_status == 'confirmed'",
+      "agent": "code",
+      "mode": "coding",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "grep",
+        "edit",
+        "git"
+      ],
+      "include": [
+        "{{globals.output_rules}}"
+      ],
+      "prompt": [
+        "Step 2: WRITE PATCH ONLY.",
+        "",
+        "RESEARCH RESULT:",
+        "- affected files: {{research.affected_files}}",
+        "- affected symbols: {{research.affected_symbols}}",
+        "",
+        "RESEARCH ANALYSIS / FIX SKETCH:",
+        "{{research.analysis || ''}}",
+        "",
+        "PATCH FEEDBACK FROM PRIOR BUILD OR REVIEW ATTEMPT, IF ANY:",
+        "{{compile-triage.analysis || ''}}",
+        "{{review.source_defects || ''}}",
+        "",
+        "This step receives only source/build/behavior defects. Commit-message-only review",
+        "defects are routed to write-commit-message and are intentionally not included here.",
+        "If no concrete source/build/behavior defect is present, do not invent one.",
+        "If prior review source_defects are present but the current patch already satisfies them,",
+        "do not emit fake edits. Emit no code_edits/code_output, set review_dispute to a concise",
+        "evidence-based explanation of why the review defect is invalid, and cite the current",
+        "source/control-flow facts the review should re-check. Only use review_dispute to answer",
+        "a prior review defect; do not use it for build failures or fresh patch writing.",
+        "",
+        "Before editing, fetch the verbatim current contents of every function you will change.",
+        "Use read followups for affected files; do not rely on source for affected files after",
+        "any edit/commit because symbol indexes can be stale. On retry after build or review",
+        "feedback, inspect git diff HEAD~1 and read the current worktree bytes before emitting",
+        "code_edits. Every old_string in code_edits must come from the file as it actually is on",
+        "disk.",
+        "",
+        "Emit code_edits for the kernel patch. Each code_edits item must use this shape:",
+        "{\"file_path\": \"path/to/file.c\", \"old_string\": \"...\", \"new_string\": \"...\"}. Do not use",
+        "source-symbol field names such as `filename` in code_edits. Do not write",
+        ".kres-commit-msg.tmp here. Do not run git commit. If you know the primary object file,",
+        "return it as build_target. Otherwise the runner derives it from the changed .c/.S paths.",
+        "The reaper will add all other changed .c objects from the actual git diff and skip targets",
+        "disabled by the current Kconfig."
+      ],
+      "outputs": {
+        "build_target": {
+          "type": "string",
+          "description": "Object file path for the make step, e.g. path/to/file.o. Machine-filled from changed source paths when omitted."
+        },
+        "changed_files": {
+          "type": "array<string>",
+          "description": "Machine-populated non-message paths emitted by this write-patch attempt."
+        },
+        "code_changes_emitted": {
+          "type": "boolean",
+          "description": "Machine-populated true when this attempt emitted code_edits or non-message code_output for at least one path."
+        },
+        "affected_files_changed": {
+          "type": "boolean",
+          "description": "Machine-populated true when the non-message paths emitted by this attempt have an unstaged diff after code_edits/code_output are applied."
+        },
+        "review_dispute": {
+          "type": "string",
+          "description": "Empty for normal patch writes. Non-empty only when prior review source_defects are incorrect and no source change is needed; include evidence for review adjudication."
+        },
+        "review_dispute_allowed": {
+          "type": "boolean",
+          "description": "Machine-populated true only when this write-patch attempt is correcting prior review source_defects and not a compile-triage patch error."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "(build_target != '' && code_changes_emitted == true && affected_files_changed == true && review_dispute == '') || (review_dispute_allowed == true && review_dispute != '' && code_changes_emitted == false && affected_files_changed == false)",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 6,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "fixes-tag-search",
+      "title": "Search for the introducing commit",
+      "depends_on": [
+        "write-patch"
+      ],
+      "run_if": "research.research_status == 'confirmed' && write-patch.code_changes_emitted == true",
+      "preserve_outputs_on_skip": true,
+      "agent": "fast",
+      "mode": "audit",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "git",
+        "grep",
+        "callers"
+      ],
+      "prompt": [
+        "Step 3: FIXES TAG SEARCH ONLY.",
+        "",
+        "Your only job is to search for the commit that introduced the bug fixed by the current",
+        "patch. Do not edit files. Do not write a commit message. Do not review patch correctness",
+        "except as needed to understand the buggy invariant.",
+        "",
+        "BUG INPUT:",
+        "{{workflow.target}}",
+        "",
+        "RESEARCH ANALYSIS:",
+        "{{research.analysis || ''}}",
+        "",
+        "AFFECTED FILES:",
+        "{{research.affected_files}}",
+        "",
+        "AFFECTED SYMBOLS:",
+        "{{research.affected_symbols}}",
+        "",
+        "PATCH UNDER CONSTRUCTION:",
+        "Use readonly git followups to inspect the full patch under construction, plus the",
+        "affected functions and their callers. On the first patch attempt, `git diff` shows the",
+        "uncommitted patch. On retry after build or review feedback, a prior attempt may already",
+        "be committed and the worktree diff may show only the incremental correction; in that",
+        "case inspect `git diff HEAD~1` as the full patch relative to the original base, and also",
+        "inspect `git diff` for the latest uncommitted correction. Do not base provenance on the",
+        "incremental retry diff alone.",
+        "",
+        "FIXES TAG RESEARCH IS CAREFUL HISTORY RESEARCH. The goal is the commit that introduced",
+        "the bug, not the last commit that touched or moved the current line. `git blame` is only",
+        "a starting point. Kernel code is often renamed, folio-converted, split, moved, or",
+        "mechanically rewritten; do not use blame alone as fixes_sha.",
+        "",
+        "Try hard before giving up:",
+        "- Inspect the full patch to identify the exact buggy invariant fixed by this patch.",
+        "- Run blame for the affected lines, but treat blame results as candidates only.",
+        "- Inspect candidate diffs with `git show`.",
+        "- Follow moved or renamed code with `git log --follow -- <path>` where useful.",
+        "- Use pickaxe searches (`git log -S` / `git log -G`) for the affected function names, helper calls, field names, missing cleanup call, and distinctive surrounding code.",
+        "- For each plausible candidate, prove the invariant changed across that commit: the preimage must lack the bug or lack the affected path, and the postimage must contain the buggy state.",
+        "- If multiple functions have different introducing commits, choose the earliest commit that introduced a real instance fixed by this patch and explain why.",
+        "",
+        "Set fixes_sha and fixes_subject only when the evidence is concrete enough for a kernel",
+        "Fixes: trailer. If no candidate is proven with certainty, leave fixes_sha empty and fill",
+        "unproven_fixes_candidates with the best plausible commits you checked. A wrong Fixes:",
+        "tag is worse than no Fixes: trailer.",
+        "",
+        "Return concise analysis describing what history searches you ran, what candidate diffs",
+        "you inspected, and why the proven commit is correct or why each candidate remains",
+        "unproven."
+      ],
+      "outputs": {
+        "fixes_sha": {
+          "type": "string",
+          "optional": true,
+          "description": "12+ char SHA of the proven introducing commit, empty when unproven."
+        },
+        "fixes_subject": {
+          "type": "string",
+          "optional": true,
+          "description": "Exact subject line of the proven introducing commit."
+        },
+        "fixes_evidence": {
+          "type": "string",
+          "optional": true,
+          "description": "Concise proof that the chosen commit introduced the buggy invariant."
+        },
+        "unproven_fixes_candidates": {
+          "type": "array<string>",
+          "optional": true,
+          "description": "Plausible but unproven commits, formatted as '<sha> (\"<subject>\") - <why unproven>'."
+        },
+        "analysis": {
+          "type": "string",
+          "description": "History search narrative and candidate evaluation."
+        }
+      },
+      "eval": null
+    },
+    {
+      "id": "write-commit-message",
+      "title": "Write the commit message",
+      "depends_on": [
+        "fixes-tag-search"
+      ],
+      "run_if": "research.research_status == 'confirmed' && (write-patch.review_dispute == '' || review.correction_step == 'write-commit-message')",
+      "agent": "code",
+      "mode": "coding",
+      "actions": [
+        "read",
+        "git",
+        "edit"
+      ],
+      "include": [
+        "{{globals.commit_message_style}}"
+      ],
+      "prompt": [
+        "Step 4: WRITE COMMIT MESSAGE ONLY.",
+        "",
+        "Use readonly git diff/show/log followups if you need to inspect the patch. Write",
+        ".kres-commit-msg.tmp via code_output in this turn. Do not edit kernel source in this",
+        "step. Do not emit git add, git commit, git commit --amend, make, or publish followups;",
+        "deterministic reaper steps own those actions.",
+        "",
+        "RESEARCH ANALYSIS:",
+        "{{research.analysis || ''}}",
+        "",
+        "FIXES TAG SEARCH RESULT:",
+        "- proven fixes sha: {{fixes-tag-search.fixes_sha || ''}}",
+        "- proven fixes subject: {{fixes-tag-search.fixes_subject || ''}}",
+        "- proof: {{fixes-tag-search.fixes_evidence || ''}}",
+        "- potential but unproven candidates: {{fixes-tag-search.unproven_fixes_candidates || ''}}",
+        "- search analysis: {{fixes-tag-search.analysis || ''}}",
+        "",
+        "COMMIT-MESSAGE FEEDBACK FROM PRIOR REVIEW ATTEMPT, IF ANY:",
+        "{{review.commit_message_defects || ''}}",
+        "",
+        "ASSISTED-BY TRAILER:",
+        "- The commit message MUST include exactly this trailer line:",
+        "  `Assisted-by: {{workflow.assisted_by}}`",
+        "- Do not emit any other Assisted-by value.",
+        "",
+        "COMMIT MESSAGE RULES:",
+        "- Subject and body follow COMMIT MESSAGE STYLE.",
+        "- The raw git commit subject MUST be <=55 chars including the subsystem prefix, so the full generated `Subject: [PATCH] <subject>` line is <=72 chars including the literal word `Subject`.",
+        "- HARD WRAP prose at 75 columns. Trailers and indented code are exempt.",
+        "- No paragraph >5 prose lines.",
+        "- Write a human-readable kernel changelog, not a dense proof memo. Prefer 2-4 short paragraphs that state the failing path, the consequence, the key mechanism, and the fix.",
+        "- If the bug depends on non-obvious ordering, callbacks, nested calls, state transitions, or racing CPUs, use focused indented evidence blocks as described in COMMIT MESSAGE STYLE instead of a wall-of-text explanation. Prefer call chains and ASCII call graphs over prose for multi-function control flow.",
+        "- Do not inventory every caller, export, fallback, or negative case unless it is needed to understand the bug or justify the fix.",
+        "- MUST NOT contain: attacker, exploit, malicious, vulnerability, privilege escalation, arbitrary code execution, security, payload.",
+        "- Every factual claim must be provable from the patch or gathered source. Be precise about mitigations and fallback cleanup paths; do not claim a leak or crash unless the code proves it.",
+        "- Assisted-by trailer is REQUIRED.",
+        "- Add a Fixes: trailer only when proven fixes sha is non-empty. Format: `Fixes: <sha> (\"<subject>\")`.",
+        "- If proven fixes sha is empty, do not add a Fixes: trailer and do not mention unproven Fixes candidates in the changelog. Unproven history belongs in workflow analysis, not in the kernel commit message.",
+        "- On retry after review, fix the specific commit-message defects. Do not introduce new mechanism claims, extra caller inventories, or proof-memo prose to compensate for a review objection."
+      ],
+      "outputs": {
+        "commit_message_written": {
+          "type": "boolean",
+          "description": "Machine-populated true when this attempt wrote .kres-commit-msg.tmp via code_output."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "commit_message_written == true",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 6,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "commit",
+      "title": "Commit the patch",
+      "depends_on": [
+        "write-commit-message"
+      ],
+      "run_if": "research.research_status == 'confirmed' && (write-patch.review_dispute == '' || review.correction_step == 'write-commit-message')",
+      "agent": "reaper",
+      "action": {
+        "type": "commit-fix",
+        "args": {
+          "files": "{{write-patch.changed_files || research.affected_files}}",
+          "message_path": ".kres-commit-msg.tmp",
+          "amend_from_attempt": 2
+        }
+      },
+      "outputs": {
+        "commit_sha": {
+          "type": "string"
+        },
+        "commit_message": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "id": "build",
+      "title": "Build the patched object",
+      "depends_on": [
+        "commit"
+      ],
+      "run_if": "research.research_status == 'confirmed' && write-patch.review_dispute == ''",
+      "agent": "reaper",
+      "action": {
+        "type": "make",
+        "args": {
+          "target": "{{write-patch.build_target}}"
+        }
+      },
+      "outputs": {
+        "result": {
+          "type": "enum",
+          "values": [
+            "clean",
+            "failed"
+          ]
+        },
+        "build_target": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "id": "compile-triage",
+      "title": "Triage build failures",
+      "depends_on": [
+        "build"
+      ],
+      "run_if": "write-patch.review_dispute == '' && research.research_status == 'confirmed' && build.result == 'failed'",
+      "agent": "fast",
+      "mode": "audit",
+      "actions": [
+        "read",
+        "git",
+        "grep"
+      ],
+      "prompt": [
+        "Step 7: COMPILE TRIAGE ONLY.",
+        "",
+        "The deterministic build step failed for `make -j$(nproc) {{build.build_target}}`.",
+        "",
+        "STDOUT:",
+        "{{build.stdout}}",
+        "",
+        "STDERR:",
+        "{{build.stderr}}",
+        "",
+        "Your ONLY job is to classify the failure. Inspect git diff HEAD~1 and relevant",
+        "Kbuild/.config context before blaming the patch.",
+        "",
+        "- result=patch_error only when the compiler error is caused by the actual patch hunks in git diff HEAD~1.",
+        "- result=preexisting_error when the failure is environmental, pre-existing, unrelated Kconfig fallout, or from forcing a target that is not enabled by the current .config.",
+        "",
+        "Do not emit code_edits. Do not amend commits. Put concise evidence in analysis."
+      ],
+      "outputs": {
+        "result": {
+          "type": "enum",
+          "values": [
+            "patch_error",
+            "preexisting_error"
+          ]
+        },
+        "analysis": {
+          "type": "string"
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "result == 'preexisting_error'",
+        "on_fail": {
+          "action": "branch_to",
+          "branch_to": "write-patch",
+          "max_attempts": 10,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "review",
+      "title": "Review the committed patch",
+      "depends_on": [
+        "build",
+        "compile-triage"
+      ],
+      "run_if": "research.research_status == 'confirmed'",
+      "agent": "slow",
+      "mode": "review",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "git",
+        "grep",
+        "callers"
+      ],
+      "prompt": [
+        "Step 8: REVIEW ONLY.",
+        "",
+        "Apply the {{lens.id}} review lens to `git diff HEAD~1`.",
+        "",
+        "LENS: {{lens.id}}",
+        "{{lens.investigate}}",
+        "",
+        "Review `git diff HEAD~1` with callee source for the changed lines. Read the current",
+        "worktree hunks/functions for every changed file with `read`; do not rely on `source` for",
+        "changed functions because symbol indexes can be stale after the patch is applied. Do not",
+        "emit code_edits. Do not amend commits. If the patch is defective, set clean=false and",
+        "return defects; the workflow will branch back to write-patch.",
+        "",
+        "Build result: {{build.result || 'not rerun for review dispute'}}",
+        "Build targets: {{build.build_target || ''}}",
+        "Compile triage: {{compile-triage.result || 'not needed'}}",
+        "{{compile-triage.analysis || ''}}",
+        "",
+        "Commit SHA: {{commit.commit_sha || 'current HEAD'}}",
+        "Commit message:",
+        "{{commit.commit_message || ''}}",
+        "",
+        "PATCH AUTHOR DISPUTE OF PRIOR REVIEW, IF ANY:",
+        "{{write-patch.review_dispute || ''}}",
+        "",
+        "If review_dispute is non-empty, this pass is adjudicating a prior source review",
+        "defect that the patch author says is already satisfied. The runner also provides",
+        "read-only context containing the current `git diff HEAD~1`, the previous review",
+        "output, and the patch author's dispute reasoning. Re-check the exact defect against",
+        "source. If the dispute is correct, do not repeat that defect; if it is wrong, set",
+        "clean=false and return a more precise source_defect with the missing evidence or",
+        "required correction.",
+        "",
+        "Review this lens exhaustively and cite file:line from gathered source for every claim.",
+        "Do not stop after the first defect. If this lens finds any defect, set clean=false and",
+        "populate defects[]. If this lens is clean, set clean=true and explain what evidence made",
+        "the lens confident.",
+        "",
+        "When classifying defects, put each source/build/behavior/documentation/test defect in",
+        "source_defects[] and each commit-message/trailer-only defect in commit_message_defects[].",
+        "The generic defects[] field must mirror those split defects for schema compatibility;",
+        "do not add a generic defect that is absent from the split arrays.",
+        "",
+        "Commit-message proof requirement: prove every factual claim in the commit message",
+        "against the patch and source. If the message claims a leak, crash, refcount pin, race,",
+        "missing cleanup, or contract violation, trace the relevant cleanup/fallback path and",
+        "verify the exact wording. If a claim is overstated, incomplete, or contradicted by code,",
+        "report it as a defect even when the patch itself is correct.",
+        "",
+        "Changed-contract documentation requirement: if the patch changes accepted inputs,",
+        "callback requirements, helper semantics, locking/lifetime rules, ordering, accounting,",
+        "or any API contract, audit the existing declarations, kerneldoc, comments, and docs that",
+        "describe that contract, even when the patch did not edit them. If any such documentation",
+        "or comment is now stale, contradicted, incomplete, or likely to mislead future callers,",
+        "set clean=false and return a defect. Do not accept a patch that fixes runtime behavior",
+        "while leaving the changed contract documented incorrectly.",
+        "",
+        "Also review the commit message for banned words and paragraph-length rules. If it is",
+        "bad, report it as a defect rather than editing it.",
+        "",
+        "If review is clean, set clean=true. Otherwise set clean=false and populate defects[]."
+      ],
+      "lenses": [
+        {
+          "id": "lifetime",
+          "investigate": "Object lifetime: pointer ownership, refcounting, RCU grace periods, free ordering, copied pointers, and shared object lifetime."
+        },
+        {
+          "id": "memory",
+          "investigate": "Memory safety: leaks, use-after-free, double-free, memory corruption, and allocator API misuse."
+        },
+        {
+          "id": "bounds",
+          "investigate": "Bounds and sizes: array/index correctness, trusted versus untrusted indexes, integer overflow, truncation, and size calculation mistakes."
+        },
+        {
+          "id": "races",
+          "investigate": "Concurrency: lock coverage, ordering, missed wakeups, shared-state races, and protection of accessed fields."
+        },
+        {
+          "id": "general",
+          "investigate": "General correctness: NULL dereferences, missing error checks, semantic bugs, and concrete defects not covered by the other lenses."
+        },
+        {
+          "id": "assertions",
+          "run_if": "write-patch.review_dispute != '' || commit.commit_sha != ''",
+          "investigate": "Commit assertion audit: try to disprove every assertion and statement made by the commit message, by comments added or modified by the commit, and by existing declarations, kerneldoc, comments, or docs that describe any contract changed by the commit. Treat each factual sentence, causal claim, safety claim, scope claim, negative claim, and justification as a hypothesis that must be proven from source, diff, callers, history, or documented API behavior. If the patch changes accepted inputs, callback requirements, helper semantics, locking/lifetime rules, ordering, accounting, or any API contract, inspect unchanged documentation/comments for stale, misleading, incomplete, or overbroad claims. If any assertion is unsupported, contradicted, too broad, missing important conditions, unverifiable from gathered evidence, or made stale by the patch, set clean=false and return a defect describing the exact correction or evidence needed. A clean result requires cited evidence that the commit message, changed comments, and relevant unchanged contract documentation accurately describe the code and semantic change."
+        },
+        {
+          "id": "maintainer",
+          "investigate": "Antagonistic kernel-maintainer review: aggressively challenge whether this patch is acceptable for the kernel code base. Look for regressions, unnecessary churn, brittle assumptions, weak fixes, overbroad changes, hidden ABI or behavior changes, incomplete backportability, missing tests or validation, stale or contradicted documentation, and any place where the code agent failed to justify why this exact change is the minimal correct fix. Expect at least one set of corrections for every patch unless the gathered evidence proves the patch is already publication-ready. Do not accept a patch just because it builds or fixes the reported symptom. Force the patch to justify changed semantics, unchanged callers, locking and lifetime assumptions, error paths, commit-message claims, and the documentation/comments that describe changed contracts. Also enforce commit-message readability as a publication gate: the message must read like a human-readable kernel changelog, not a wall-of-text proof memo or review transcript. If the message buries the problem/fix in dense paragraphs, over-inventories callers or negative cases, or explains non-obvious ordering, callbacks, nested calls, state transitions, or racing CPUs without focused indented evidence blocks when they would be clearer, set clean=false and return a commit-message defect. Prefer call chains and ASCII call graphs over prose for multi-function control flow. If the patch changes accepted inputs, callback requirements, helper semantics, locking/lifetime rules, ordering, accounting, or any API contract without updating now-stale matching docs/comments, set clean=false and return a defect. If required proof is missing, set clean=false and return a defect describing the exact correction or evidence needed."
+        }
+      ],
+      "aggregate": "consolidate",
+      "consolidate": {
+        "agent": "fast",
+        "prompt": [
+          "Merge the parallel fix-review lens outputs into one workflow review result.",
+          "",
+          "Each lens output may contain `clean`, `defects`, and `analysis`. The consolidated",
+          "result is clean when every lens reports clean=true and every authoritative defect",
+          "bucket is empty. If a lens has a concrete unresolved concern, it must report",
+          "clean=false with a typed defect. Prose in analysis is preserved for humans but is",
+          "not interpreted by the runner as a routing or retry signal.",
+          "",
+          "Deduplicate defects that describe the same root cause. Preserve the lens name for",
+          "each defect, or merge multiple lens names into the `lens` string when several lenses",
+          "found the same issue. Keep `where` and `what` concrete and actionable so the next",
+          "correction attempt knows exactly what to correct or what evidence to gather.",
+          "",
+          "If a lens emits source_defects[] or commit_message_defects[], treat those split arrays",
+          "as authoritative for routing. The generic defects[] copy is schema compatibility only",
+          "and must not be reinterpreted into a different correction bucket.",
+          "",
+          "Treat the maintainer lens as a hard quality gate. Do not discard maintainer objections",
+          "as style concerns when they identify regression risk, missing justification, behavior",
+          "changes, incomplete error-path/lifetime/locking proof, inadequate commit-message proof,",
+          "stale or contradicted documentation for a changed contract, or correction requests",
+          "needed before publication.",
+          "",
+          "Commit-message readability defects from the maintainer lens are also hard defects.",
+          "If the message is a wall-of-text proof memo, hides the problem/fix in dense prose,",
+          "over-inventories callers or negative cases, or should use focused indented evidence",
+          "blocks to explain non-obvious ordering, callbacks, nested calls, state transitions,",
+          "or racing CPUs, keep clean=false and classify it as",
+          "correction_step=\"write-commit-message\" unless another defect also requires source",
+          "changes.",
+          "",
+          "If any lens reports that declarations, kerneldoc, comments, or docs are stale,",
+          "contradicted, incomplete, or misleading because the patch changed a contract, the",
+          "consolidated result must be clean=false. Do not downgrade this to analysis-only just",
+          "because the runtime bug is fixed.",
+          "",
+          "Classify the correction target:",
+          "- correction_step=\"write-commit-message\" only when every defect is solely about the",
+          "  commit message/trailers and no source, build, runtime behavior, or test/validation",
+          "  change is requested.",
+          "- correction_step=\"write-patch\" for any source-code defect, build defect, behavioral",
+          "  regression, missing validation that requires changing the patch, or mixed source +",
+          "  commit-message defect set.",
+          "",
+          "If all lenses are clean, return clean=true, defects=[], and an analysis summarizing the",
+          "evidence checked by the lenses and correction_step=\"write-patch\". Otherwise return",
+          "clean=false with the deduped defects and the correction_step classification."
+        ]
+      },
+      "outputs": {
+        "clean": {
+          "type": "boolean"
+        },
+        "defects": {
+          "type": "array<object>",
+          "schema": {
+            "lens": "string",
+            "where": "string",
+            "what": "string"
+          }
+        },
+        "source_defects": {
+          "type": "array<object>",
+          "optional": true,
+          "description": "Review defects requiring source, build, behavior, documentation, comment, test, or validation changes."
+        },
+        "commit_message_defects": {
+          "type": "array<object>",
+          "optional": true,
+          "description": "Review defects that are solely about the commit message or trailers."
+        },
+        "analysis": {
+          "type": "string"
+        },
+        "correction_step": {
+          "type": "enum",
+          "values": [
+            "write-patch",
+            "write-commit-message"
+          ],
+          "description": "write-patch for source/build/behavior defects; write-commit-message for commit-message-only defects."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "clean == true",
+        "on_fail": {
+          "action": "branch_to",
+          "branch_to_output": "correction_step",
+          "max_attempts": 10,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "publish",
+      "title": "Publish the fix",
+      "depends_on": [
+        "review"
+      ],
+      "run_if": "research.research_status == 'confirmed' && review.clean == true && workflow.target_kind == 'finding_dir'",
+      "agent": "reaper",
+      "action": {
+        "type": "publish-fix",
+        "args": {
+          "finding_dir": "{{workflow.target}}"
+        }
+      },
+      "outputs": {
+        "patch_path": {
+          "type": "string",
+          "description": "Absolute path to auto-generated-fix.diff"
+        }
+      }
+    }
+  ],
+  "completion": {
+    "success_when_any": [
+      "invalidate.terminal_success",
+      "unconfirm.terminal_success",
+      "research.research_status == 'invalid' && workflow.target_kind == 'prose' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
+      "research.research_status == 'unconfirmed' && workflow.target_kind == 'prose'",
+      "publish.completed",
+      "review.clean == true && workflow.target_kind == 'prose'"
+    ],
+    "failure_when_any": [
+      "research.research_status == 'invalid' && (research.invalid_evidence_kind != 'source_or_commit_evidence' || research.invalid_evidence == '')"
+    ]
+  },
+  "persistence": {
+    "session_key": "workflow.fix",
+    "resumable": true,
+    "shape": "Each step's outputs are written under session.json:workflow.steps.<id>.outputs after the eval pass. Resume re-enters at the first non-completed step whose depends_on are satisfied; in-flight (InProgress) steps are reset to Pending."
+  }
+}

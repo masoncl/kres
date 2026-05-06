@@ -66,12 +66,16 @@ cancellable by `/stop` via `tokio::sync::Notify`.
   passing can't clobber a detailed earlier body. Severity escalates
   only. `reactivate: true` beats contradictory
   `status: invalidated` on the same delta.
-- **Add (new id):** append with stamps; strip any wire-level
-  `reactivate` / `details` fields the agent tried to send.
-- **Collision at the promoter:** `filter_net_new` sees the full
-  store ∪ delta universe. A colliding id is **renamed** to
-  `<id>__promoted_<n>`, never dropped — losing a record is worse
-  than storing a duplicate.
+- **Add (new id):** append with stamps unless the entry is a
+  conservative semantic duplicate of an active existing finding;
+  strip any wire-level `reactivate` / `details` fields the agent
+  tried to send.
+- **Collision at the promoter:** `filter_promoted_delta` sees the
+  full store ∪ delta universe. A colliding new active id is
+  **renamed** to `<id>__promoted_<n>`, never dropped — losing a
+  record is worse than storing a duplicate. Same-id invalidation and
+  reactivation deltas are preserved so the store can update the
+  existing row.
 
 ## Provenance
 
@@ -99,8 +103,7 @@ is stripped at add-time.
 `FindingsStore` wraps `JsonDb<FindingsFile>`. Every write-guard
 drop atomically rewrites `<results>/findings.json` (tmp + fsync +
 rename). One canonical file, no snapshots, no LLM round-trip on
-apply. Legacy unversioned `findings.json` files load via
-`SchemaV0::VERSION_OPTIONAL = true`.
+apply. Files must use the jsondb versioned schema.
 
 ## Observability
 

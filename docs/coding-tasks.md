@@ -1,8 +1,8 @@
 # Coding tasks — reproducers and in-place fixes
 
-Prompts like `--prompt 'write a reproducer for the UAF in
-net/sched/cls_bpf.c'` or `--prompt 'fix the missing frag-free
-in bnxt_xdp_redirect'` get classified as **coding mode** by the
+Prompts like `--prompt 'write a reproducer for finding <id>'` or
+`--prompt 'fix the missing cleanup in <function>'` get classified as
+**coding mode** by the
 goal agent. Coding mode replaces the lens fan-out and findings
 consolidator with a single slow-agent call producing source
 code on two channels:

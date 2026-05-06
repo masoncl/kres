@@ -121,7 +121,7 @@ def expand_template(cmd_template, arg, line_no):
                 for per-input output dirs: `--results runs/{#}`.
 
     If neither placeholder is present, `arg` is appended to the end of
-    the template with a single space — the legacy append form.
+    the template with a single space.
     """
     has_arg = PLACEHOLDER_ARG in cmd_template
     has_num = PLACEHOLDER_NUM in cmd_template

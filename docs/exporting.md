@@ -60,7 +60,7 @@ Fields:
   shifted by later merges. When the source findings.json predates
   the field and a record has no stamp, the export falls back to
   wall-clock now so the row still carries a date — note that a
-  re-export of that legacy record will show a different timestamp
+  re-export of that unstamped record will show a different timestamp
   each time, while freshly-discovered findings keep a stable one.
 - `git:` — workspace HEAD `sha` and commit `subject` at export
   time.
@@ -126,7 +126,7 @@ next run.
 ## Typical flow
 
 ```
-kres --results run1 --prompt 'review: fs/btrfs/ctree.c' --turns 5
+kres --results run1 --prompt 'review: path/to/file.c' --turns 5
 kres --results run1 --export kres-bugs --workspace .
 less kres-bugs/INDEX.md
 less kres-bugs/<tag>/FINDING.md

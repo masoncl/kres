@@ -213,12 +213,12 @@ say "slow model:   ${SLOW_MODEL}"
 say "model:        ${MODEL}"
 
 echo "system prompts and agent configs:"
-# Every prompt/template the shipped kres binary uses is embedded
-# via include_str!: agent `*.system.md` prompts go through
-# kres-agents::embedded_prompts, slash-command templates
-# (/review, /summary, /summary-markdown) go through
-# kres-agents::user_commands. None of these files are installed
-# on disk by default — rebuilding kres refreshes the lot.
+# Every shipped prompt/template is embedded via include_str!:
+# agent `*.system.md` prompts go through
+# kres-agents::embedded_prompts, summary templates go through
+# kres-agents::user_commands, and review/triage/fix live in
+# configs/workflows/*.json. None of these files are installed on
+# disk by default — rebuilding kres refreshes the lot.
 #
 # Override directories (both empty on a fresh install, both
 # honoured by the respective loaders when populated):
@@ -228,10 +228,12 @@ echo "system prompts and agent configs:"
 #       this ahead of the embedded copy.
 #
 #   ~/.kres/commands/<name>.md
-#     → override (or add) a slash-command template. Consulted by
-#       user_commands::lookup, which drives --prompt "word: extra",
-#       --prompt "/word extra", and the /review / /summary /
-#       /summary-markdown REPL paths.
+#     → override (or add) a non-workflow slash-command template.
+#       Summary rendering consults summary / summary-markdown here.
+#       Workflow-owned commands (/fix, /review, /triage) do not.
+#
+#   ~/.kres/workflows/<name>.json
+#     → override a shipped workflow such as review, triage, or fix.
 #
 # Both override directories are new; older installs populated
 # ~/.kres/prompts/ directly. The rename prevents stale files
@@ -239,15 +241,12 @@ echo "system prompts and agent configs:"
 # upgrade — leftover files under ~/.kres/prompts/ are safe to
 # delete.
 #
-# The only files that still install to ~/.kres/prompts/ are
-# operator-authored `<word>-template.md` templates used by the
-# legacy --prompt "word: extra" lookup. Those are user content,
-# not kres-shipped content.
+# No shipped command templates are installed to ~/.kres/prompts/.
 mkdir -p "${DEST}/prompts"
 shopt -s nullglob
 for src in "${CONFIGS_SRC}/prompts"/*.md; do
   case "$(basename "$src")" in
-    *.system.md | bug-summary.md | bug-summary-markdown.md | review-template.md | triage-template.md)
+    *.system.md | bug-summary.md | bug-summary-markdown.md | commit-kernel-template.md | triage-template.md)
       # Embedded in the binary; skip.
       ;;
     *)

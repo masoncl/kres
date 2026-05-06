@@ -1,0 +1,408 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kres.local/schemas/workflow.schema.json",
+  "title": "kres workflow",
+  "description": "A multi-step kres workflow: research → write → compile → review → publish style pipelines, with typed inputs/outputs and conditional + iterative control flow.",
+  "type": "object",
+
+  "required": ["$schema_version", "id", "steps"],
+  "additionalProperties": false,
+
+  "properties": {
+    "$schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "$schema": {
+      "type": "string",
+      "description": "Optional pointer at the schema URL for editor support."
+    },
+    "$format": {
+      "type": "object",
+      "description": "Self-documentation block. Free-form; carried verbatim. Will move to a separate spec file once a parser exists in code.",
+      "additionalProperties": true
+    },
+
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "Workflow id — lowercase, alphanumeric, dashes/underscores. Used as the slash-command name and as the persistence key."
+    },
+    "title": {"type": "string"},
+    "description": {"type": "string"},
+
+    "inputs": {
+      "type": "object",
+      "description": "Typed user-supplied parameters. Keyed by parameter name.",
+      "additionalProperties": {"$ref": "#/$defs/input_def"}
+    },
+
+    "skills": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Skill files (basenames under ~/.kres/skills/) preloaded for every step's prompt context."
+    },
+
+    "globals": {
+      "type": "object",
+      "description": "Reusable context fragments (e.g. commit-message style) referenced by step.include via {{globals.<key>}}.",
+      "additionalProperties": true
+    },
+
+    "defaults": {
+      "type": "object",
+      "description": "Per-step defaults. Each step may override individual fields.",
+      "additionalProperties": false,
+      "properties": {
+        "agent": {"$ref": "#/$defs/agent_value"},
+        "mode": {"$ref": "#/$defs/mode_value"},
+        "actions": {"$ref": "#/$defs/action_list"},
+        "max_eval_attempts": {"type": "integer", "minimum": 1},
+        "on_exhausted": {"$ref": "#/$defs/on_exhausted_value"}
+      }
+    },
+
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/step"}
+    },
+
+    "completion": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "success_when_any": {"type": "array", "items": {"type": "string"}},
+        "failure_when_any": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+
+    "persistence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "session_key": {"type": "string"},
+        "resumable": {"type": "boolean"},
+        "shape": {"type": "string"}
+      }
+    }
+  },
+
+  "$defs": {
+    "agent_value": {
+      "type": "string",
+      "enum": ["fast", "slow", "code", "reaper"]
+    },
+    "mode_value": {
+      "type": "string",
+      "enum": ["audit", "coding", "review", "generic"]
+    },
+    "action_value": {
+      "type": "string",
+      "enum": ["read", "source", "type", "git", "grep", "callers", "make", "edit", "bash", "publish-fix", "commit-fix", "set-finding-status"]
+    },
+    "action_list": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/action_value"},
+      "uniqueItems": true
+    },
+    "on_fail_action_value": {
+      "type": "string",
+      "enum": ["repeat", "rerun_chain", "branch_to", "continue", "exit_failure"]
+    },
+    "on_exhausted_value": {
+      "type": "string",
+      "enum": ["exit_failure", "continue", "branch_to"]
+    },
+
+    "lens": {
+      "type": "object",
+      "required": ["id"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "description": "Lens identifier — must be unique within the step."
+        },
+        "run_if": {
+          "type": "string",
+          "description": "Optional expression evaluated against the same context as step run_if. The lens runs only when this expression is true."
+        },
+        "skip_if": {
+          "type": "string",
+          "description": "Optional expression evaluated against the same context as step skip_if. The lens is omitted when this expression is true."
+        }
+      },
+      "description": "A single lens variant. Any properties beyond `id` are arbitrary and become available as `{{lens.<field>}}` inside the step's prompt — typical fields are `investigate` (the lens-specific question) and `tag` (a hashtag for grouping)."
+    },
+
+    "aggregate_value": {
+      "type": "string",
+      "enum": ["concat", "by_lens", "consolidate"],
+      "description": "How a lensed step's per-lens outputs combine. `concat` (default): array-typed declared outputs concatenate across lenses, each item tagged with its source `lens`. `by_lens`: every declared output is wrapped in a `{lens_id: value}` map. `consolidate`: after the lens fan-out settles, run an N+1 LLM call that semantically merges duplicate findings, runs a completeness check, and emits the step's declared outputs once. The author supplies the dedup rules via `consolidate.prompt`. Mirrors the orchestrator's `consolidate_lenses` flow (kres-agents/src/consolidate.rs)."
+    },
+
+    "prompt_text": {
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Prompt text as a single string. Use arrays for long editable prompts."
+        },
+        {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Prompt text as editable lines. The loader joins entries with newline characters; use an empty string element for a blank line."
+        }
+      ]
+    },
+
+    "consolidate_config": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prompt": {
+          "$ref": "#/$defs/prompt_text",
+          "description": "Instructions for the consolidator — typically dedup-by-semantic-equivalence rules, severity ordering, completeness checks. The runner appends the per-lens outputs and the step's OUTPUT SCHEMA tail before sending."
+        },
+        "prompt_file": {
+          "type": "string",
+          "description": "Path to a file containing the consolidator prompt. Relative paths resolve against the workflow JSON file's directory. Mutually exclusive with `prompt`; the loader reads the file and passes the contents to the runtime as `prompt`."
+        },
+        "agent": {
+          "$ref": "#/$defs/agent_value",
+          "description": "Optional override for which agent runs the consolidate call. Defaults to the step's own `agent`. A common pattern is to fan out with `slow` and consolidate with `fast`."
+        }
+      },
+      "oneOf": [
+        {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
+        {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
+      ]
+    },
+
+    "input_def": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {"type": "string"},
+        "required": {"type": "boolean"},
+        "description": {"type": "string"},
+        "derive": {
+          "type": "object",
+          "description": "Auto-derived flags (e.g. target_kind from a path-or-prose check). Keyed by derived-field name.",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "type": {"type": "string"},
+              "values": {"type": "array"},
+              "rule": {"type": "string"}
+            }
+          }
+        }
+      },
+      "required": ["type"]
+    },
+
+    "output_def": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {"type": "string"},
+        "values": {"type": "array"},
+        "schema": {"type": "object", "additionalProperties": true},
+        "optional": {"type": "boolean"},
+        "default": {},
+        "required_when": {"type": "string"},
+        "description": {"type": "string"}
+      },
+      "required": ["type"]
+    },
+
+    "post_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {"$ref": "#/$defs/action_value"},
+        "name": {"type": "string"},
+        "args": {"type": "object", "additionalProperties": true}
+      },
+      "required": ["type"]
+    },
+
+    "reaper_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {"$ref": "#/$defs/action_value"},
+        "args": {"type": "object", "additionalProperties": true}
+      }
+    },
+
+    "eval": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "on_fail"],
+          "properties": {
+            "type": {"type": "string", "enum": ["field_check", "judge_llm"]},
+            "expr": {"type": "string", "description": "field_check: comparison expression."},
+            "judge_prompt": {"$ref": "#/$defs/prompt_text", "description": "judge_llm: instructions for the judge — the runner appends step outputs as JSON and asks for {pass: bool, reason: string}."},
+            "judge_prompt_file": {
+              "type": "string",
+              "description": "Path to a file containing the judge_llm prompt. Relative paths resolve against the workflow JSON file's directory. Mutually exclusive with `judge_prompt`."
+            },
+            "agent": {"$ref": "#/$defs/agent_value", "description": "judge_llm: which agent runs the judge call. Defaults to step.agent."},
+            "on_fail": {"$ref": "#/$defs/on_fail"}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"type": {"const": "field_check"}}},
+              "then": {"required": ["expr"]}
+            },
+            {
+              "if": {"properties": {"type": {"const": "judge_llm"}}},
+              "then": {
+                "oneOf": [
+                  {"required": ["judge_prompt"], "not": {"required": ["judge_prompt_file"]}},
+                  {"required": ["judge_prompt_file"], "not": {"required": ["judge_prompt"]}}
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+
+    "on_fail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action"],
+      "properties": {
+        "action": {"$ref": "#/$defs/on_fail_action_value"},
+        "max_attempts": {"type": "integer", "minimum": 1},
+        "on_exhausted": {"$ref": "#/$defs/on_exhausted_value"},
+        "rerun": {"type": "array", "items": {"type": "string"}},
+        "branch_to": {"type": "string"},
+        "branch_to_output": {"type": "string"},
+        "branch_to_doc": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["action"], "properties": {"action": {"const": "rerun_chain"}}},
+          "then": {"required": ["rerun"]}
+        },
+        {
+          "if": {"required": ["action"], "properties": {"action": {"const": "branch_to"}}},
+          "then": {
+            "oneOf": [
+              {"required": ["branch_to"], "not": {"required": ["branch_to_output"]}},
+              {"required": ["branch_to_output"], "not": {"required": ["branch_to"]}}
+            ]
+          }
+        },
+        {
+          "if": {"required": ["on_exhausted"], "properties": {"on_exhausted": {"const": "branch_to"}}},
+          "then": {
+            "oneOf": [
+              {"required": ["branch_to"], "not": {"required": ["branch_to_output"]}},
+              {"required": ["branch_to_output"], "not": {"required": ["branch_to"]}}
+            ]
+          }
+        }
+      ]
+    },
+
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*$"
+        },
+        "title": {"type": "string"},
+        "agent": {"$ref": "#/$defs/agent_value"},
+        "mode": {"$ref": "#/$defs/mode_value"},
+        "actions": {"$ref": "#/$defs/action_list"},
+        "depends_on": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "run_if": {"type": "string"},
+        "skip_if": {"type": "string"},
+        "preserve_outputs_on_skip": {
+          "type": "boolean",
+          "description": "When true, a step that is reset for re-entry and then skipped keeps its previous outputs. Use only for read-only advisory steps whose prior output remains valid when the new upstream step produced no artifact changes."
+        },
+        "include": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "prompt": {"$ref": "#/$defs/prompt_text"},
+        "prompt_file": {
+          "type": "string",
+          "description": "Path to a file containing this step's prompt. Relative paths resolve against the workflow JSON file's directory. Mutually exclusive with `prompt`; useful for very large prompts, but shipped workflows keep prompts inline so they remain directly editable in one file."
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "outputs": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/output_def"}
+        },
+        "eval": {"$ref": "#/$defs/eval"},
+        "post_actions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/post_action"}
+        },
+        "action": {"$ref": "#/$defs/reaper_action"},
+        "terminal_on_success": {"type": "boolean"},
+        "lenses": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/lens"},
+          "description": "Fan-out: run this step's prompt once per lens, in parallel. Each lens object's fields are bound as `{{lens.<field>}}` during interpolation. Outputs from every lens are aggregated per the step's `aggregate` strategy."
+        },
+        "aggregate": {"$ref": "#/$defs/aggregate_value"},
+        "consolidate": {"$ref": "#/$defs/consolidate_config"}
+      },
+      "allOf": [
+        {
+          "description": "aggregate: consolidate requires a `consolidate` config block with at least a prompt.",
+          "if": {
+            "required": ["aggregate"],
+            "properties": {"aggregate": {"const": "consolidate"}}
+          },
+          "then": {"required": ["consolidate"]}
+        },
+        {
+          "description": "Reaper steps use 'action' instead of a prompt.",
+          "if": {"properties": {"agent": {"const": "reaper"}}, "required": ["agent"]},
+          "then": {"required": ["action"]}
+        },
+        {
+          "description": "Non-reaper steps need a prompt.",
+          "if": {
+            "anyOf": [
+              {"properties": {"agent": {"enum": ["fast", "slow", "code"]}}, "required": ["agent"]},
+              {"not": {"required": ["agent"]}}
+            ]
+          },
+          "then": {
+            "oneOf": [
+              {"required": ["prompt"], "not": {"required": ["prompt_file"]}},
+              {"required": ["prompt_file"], "not": {"required": ["prompt"]}}
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

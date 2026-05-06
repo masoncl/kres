@@ -22,6 +22,7 @@ pub mod lens;
 pub mod log;
 pub mod mode;
 pub mod plan;
+pub mod preview;
 pub mod session_state;
 pub mod shrink;
 pub mod shutdown;

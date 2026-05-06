@@ -71,14 +71,13 @@ To customise, drop the edited file at
 `~/.kres/system-prompts/<basename>`. A default install has no
 files there; the embedded copies do all the work.
 
-Slash-command templates (`/review`, `/summary`,
-`/summary-markdown`) live in a separate module
-(`kres-agents/src/user_commands.rs`) with their own override
-directory at `~/.kres/commands/` — see
-[commands.md](commands.md). The two directories are distinct so
-that leftover files from older installs under
-`~/.kres/prompts/` never shadow the embedded defaults; stale
-files there are safe to delete.
+Non-workflow prompt templates live in
+`kres-agents/src/user_commands.rs` with their own override directory
+at `~/.kres/commands/` — see [commands.md](commands.md). Workflow
+commands such as `/review`, `/triage`, and `/fix` are configured via
+`~/.kres/workflows/<name>.json` overrides instead. The prompt and
+workflow override directories are distinct so command dispatch has one
+path per shipped command.
 
 ## semcode MCP integration
 
@@ -101,6 +100,20 @@ function/type/callchain-aware index so the agent can ask
 whole-program questions directly instead of deriving them from
 raw regex.
 
+semcode is not authoritative. It can be unavailable while indexing,
+and it can miss macros, global symbols, or complex definitions. When a
+semcode `source`, `type`, `callers`, or `callees` lookup fails, returns
+no match, or returns output that cannot be parsed as a symbol, kres
+falls back to local grep/read-style evidence from the workspace. A
+missing semcode result must not be used by itself to conclude that
+source is unavailable, a symbol is absent, or a review is clean.
+For broad source fallbacks, kres returns the grep match list without
+adding a special per-file cap and without automatically reading full
+source context around every hit. If the shared tool-output cap truncates
+the list, the truncation marker is visible to the agent. The agent should
+request targeted `read` followups for the specific file:line ranges it
+needs to inspect.
+
 Tools the main agent will call when wired up:
 
 - Symbols: `find_function`, `find_type`, `find_callers`,
@@ -117,7 +130,7 @@ reaching the fast/slow agents.
 ### When it helps
 
 Whole-program questions that read/grep can only approximate —
-"who calls `btrfs_search_slot`", "what does `struct inode` look
+"who calls `<function>`", "what does `<type>` look
 like on this branch", "show me every change to this function
 over the last 1000 commits". Without semcode the main agent
 still answers, just via more grep round-trips and more false

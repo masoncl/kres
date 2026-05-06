@@ -1,4 +1,4 @@
-//! Session-scoped read-consent store.
+//! Session-scoped outside-workspace access consent store.
 //!
 //! Reads that escape kres's `--workspace DIR` are rejected by
 //! `resolve_workspace` unless the requested path sits under a
@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 /// Runtime consent store. Holds a set of directories the session has
-/// granted read access to, plus the workspace root (which is always
-/// allowed without needing to be named).
+/// granted read/write access to. The workspace root is handled by
+/// each caller directly and is always allowed without needing to be
+/// named.
 pub struct ConsentStore {
     granted: RwLock<BTreeSet<PathBuf>>,
 }
@@ -38,7 +39,7 @@ impl ConsentStore {
         g.iter().any(|dir| candidate.starts_with(dir))
     }
 
-    /// Grant read access for a path the operator just mentioned.
+    /// Grant read/write access for a path the operator just mentioned.
     /// If the path is a file, the parent directory is granted (so
     /// naming one file in a project implies reading siblings too —
     /// that matches operator intent in practice). If the path is a
@@ -103,6 +104,10 @@ pub fn install(store: Arc<ConsentStore>) -> Result<(), Arc<ConsentStore>> {
 
 pub fn get() -> Option<Arc<ConsentStore>> {
     GLOBAL.get().cloned()
+}
+
+pub fn get_or_install() -> Arc<ConsentStore> {
+    GLOBAL.get_or_init(|| Arc::new(ConsentStore::new())).clone()
 }
 
 /// One newly-granted directory plus a suspicion flag the caller
@@ -277,6 +282,12 @@ mod tests {
         assert!(s.is_allowed(&file));
         assert!(s.is_allowed(&file.parent().unwrap().join("other.txt")));
         std::fs::remove_file(&file).ok();
+    }
+
+    #[test]
+    fn get_or_install_returns_a_store() {
+        let store = get_or_install();
+        assert!(Arc::ptr_eq(&store, &get_or_install()));
     }
 
     #[test]

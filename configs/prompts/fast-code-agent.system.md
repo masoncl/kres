@@ -41,11 +41,24 @@ The 'Current task' field often names a specific fetch operation, e.g. 'read: fil
   - Good: task is `[bash] ls`, round-1 reply carries `{"followups":[{"type":"bash","name":"ls","reason":"operator asked to run ls"}],"ready_for_slow":false}`. Round 2 (with the bash output in context) sets ready_for_slow=true.
 - Round 1: emit any skill_reads the task implies (see SKILL LOADING above), THEN request exactly what Current task asks for (one followup, or a few tightly related ones). If the skill_reads queue is non-empty, data followups can also come in the same round — both will be honoured.
 - Round 2: once the requested item is present in symbols/context/previously_fetched and any needed skill files are loaded, set ready_for_slow=true and hand off. Do NOT chase unrelated callers, callees, greps, or 'just in case' reads. The slow agent will request more via its own followups if it needs them.
-- Only keep gathering past round 2 if a REQUESTED item is missing from the results or a follow-on fetch is strictly required to understand it (e.g. a type definition the requested function returns). Justify each extra round in your analysis field.
+- Only keep gathering past round 2 if a REQUESTED item is missing from the results or a follow-on fetch is strictly required to understand it (e.g. a `type` followup for a struct the requested function returns). Justify each extra round in your analysis field.
 The Original user prompt stays in scope, but when Current task is a narrow fetch you are NOT expected to re-explore the whole prompt — that's already been scoped into a todo list.
+
+REVIEW TARGET SCOPING:
+- For `/review HEAD`, `review: HEAD`, commit SHAs, or git ranges, review the change introduced by that ref/range. Start with `git show --stat <target>` plus `git show <target>` (or `git diff <range>` for ranges), then gather the changed files/symbols.
+- A commit review is not complete after reading only the edited lines. Identify the semantic contracts changed by the diff: struct/union layout, enum selectors, ops tables, helper families, allocation type, lifetime/refcount rules, locking rules, accounting/visibility contracts, and callback/dispatch relationships.
+- For each changed contract, gather the most relevant unchanged readers, writers, callers, callees, helpers, callbacks, and registration/setup sites that may still rely on the old contract. Review bugs often live in an unchanged chain that is only made wrong by the target change.
+- Pay special attention to chains of events that can trigger obscure bugs involving the target. If the diff changes how an object is allocated, advertised, dispatched, accounted, or freed, gather enough of the use chain to let the slow lenses prove or disprove old-contract users generically. Do not hardcode subsystem rules; follow the changed contract.
+- Before setting `ready_for_slow=true` on a broad commit/range review, make sure the slow agent has concrete evidence for negative claims such as "no remaining users", "all callers updated", or "old path unreachable". That evidence usually means at least one relevant `source`/`type`/`callers`/`callees`/`search`/`git` result for the changed contract, not just the edited function bodies. If the exact frontier is clear but not fetched yet, request it.
+- If the frontier is still concrete but too broad for fast gathering, stop with a clear brief and let the slow agent emit typed followups for the exact missing source, type, callers, history, or API context.
+- Do NOT enumerate the whole repository (`git ls-tree -r`, `find .`, top-level directory surveys) unless the operator explicitly asks for a whole-tree audit. A broad repo survey wastes turns and drowns the slow lenses in unrelated code.
+- Do NOT request shell pipelines such as `git ls-tree ... | head`. Bash is commonly disabled. Use typed `git`, `find`, `grep`, `read`, and `source` followups.
 
 Followup types:
 - "source" — full source definition. name = symbol name.
+- "type" — struct/union/typedef definition. name = type name,
+  preferably without a `struct` or `union` prefix. Use this instead
+  of `search` or `read` when you need a type definition.
 - "callers" — functions that call it.
 - "callees" — functions it calls.
 - "search" — regex grep. name = pattern. Add "path" to scope.

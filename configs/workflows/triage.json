@@ -1,0 +1,124 @@
+{
+  "$schema_version": 1,
+  "$format": {
+    "why_this_block_exists": [
+      "$format is non-executable workflow documentation.",
+      "It explains the fields below without relying on JSON comments, which are not valid JSON."
+    ],
+    "prompt_authoring": [
+      "Prompts may be string, string array, or prompt_file.",
+      "This shipped workflow keeps the prompt inline as an array; the long reusable policy",
+      "lives in `globals.triage_rules` as a file include."
+    ],
+    "globals": [
+      "`globals.triage_rules` is an include descriptor for the shared triage template.",
+      "The step pulls it in with `include: [\"{{globals.triage_rules}}\"]`.",
+      "This avoids duplicating the template text inside the operational prompt."
+    ],
+    "defaults": [
+      "Defaults make omitted step fields slow/coding with read/source/type/grep/git/callers+edit actions.",
+      "The step repeats those fields to make this one-step workflow explicit."
+    ],
+    "ordering_parallelism_failure": [
+      "There is one step, so no depends_on ordering or lens parallelism is used.",
+      "The eval requires `summary_written == true`; a verdict without summary.md",
+      "is retried rather than reported as success.",
+      "Driver, edit, or repeated missing-summary errors fail the workflow directly."
+    ]
+  },
+  "id": "triage",
+  "title": "Triage a kres finding into summary.md",
+  "description": "Read a kres finding directory (FINDING.md + metadata.yaml), classify the status, write summary.md, and sync metadata.yaml + FINDING.md status. One slow-agent call; the bulk of the prompt body is the embedded triage-template.md.",
+  "inputs": {
+    "target": {
+      "type": "string",
+      "required": true,
+      "description": "Absolute path to a kres finding directory (the kres --export shape — must contain FINDING.md and metadata.yaml)."
+    }
+  },
+  "skills": [],
+  "globals": {
+    "triage_rules": {
+      "include": "@configs/prompts/triage-template.md"
+    }
+  },
+  "defaults": {
+    "agent": "slow",
+    "mode": "coding",
+    "actions": [
+      "read",
+      "source",
+      "type",
+      "grep",
+      "git",
+      "callers",
+      "edit"
+    ]
+  },
+  "steps": [
+    {
+      "id": "triage",
+      "title": "Classify the finding and emit summary.md",
+      "agent": "slow",
+      "mode": "coding",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "grep",
+        "git",
+        "callers",
+        "edit"
+      ],
+      "include": [
+        "{{globals.triage_rules}}"
+      ],
+      "prompt": [
+        "{{workflow.target}}",
+        "",
+        "Triage the kres finding at the absolute path above. Apply the rules in the embedded",
+        "triage template (see INCLUDES). Emit `summary.md` (and, if status changed,",
+        "`metadata.yaml` + `FINDING.md`) as `code_output` entries with absolute paths under that",
+        "directory.",
+        "",
+        "Return a `verdict` field in your structured outputs naming the chosen status (one of:",
+        "Fixed | Plausible | Unconfirmed | Unknown | Invalid)."
+      ],
+      "outputs": {
+        "verdict": {
+          "type": "enum",
+          "values": [
+            "Fixed",
+            "Plausible",
+            "Unconfirmed",
+            "Unknown",
+            "Invalid"
+          ],
+          "description": "Status the agent assigned to the finding."
+        },
+        "summary_written": {
+          "type": "boolean",
+          "description": "Machine-populated. True only when this step emitted and wrote a non-empty summary.md."
+        },
+        "followups": {
+          "type": "array<Followup>",
+          "description": "Typed requests for missing source/type/history/context if the finding cannot be triaged from the supplied files alone."
+        },
+        "code_output": {
+          "type": "array<CodeFile>",
+          "optional": true,
+          "description": "Files emitted by the triage step, normally absolute DIR/summary.md and optional metadata/FINDING status updates."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "summary_written == true",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 3,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    }
+  ]
+}

@@ -3,11 +3,22 @@ unified analysis narrative and a deduplicated findings list. See
 findings-json-format.md for the per-Finding schema.
 
 The input 'lens_outputs' is a list of {lens: {type, name, id, reason},
-analysis: str, findings: [Finding, ...]}. 'task_brief' names the todo
-item this task was started for.
+slow_model: str, analysis: str, findings: [Finding, ...], followups: [Followup, ...]}.
+'task_brief' names the todo item this task was started for.
 
 Return JSON only, no fences, no preamble:
-{"analysis": "unified prose narrative", "findings": [<Finding>, ...]}
+{"analysis": "unified prose narrative", "findings": [<Finding>, ...], "followups": [<Followup>, ...], "comparison": {"summary": "...", "per_model": [{"slow_model": "...", "quality": "...", "depth": "...", "unique_contributions": ["..."], "weaknesses": ["..."]}], "selection_notes": ["..."]}}
+
+MODEL COMPARISON:
+- When multiple slow_model values are present for the same lens,
+  compare those sibling outputs for quality and depth before merging.
+- Prefer the output that gives the most concrete trigger path,
+  code-backed evidence, and complete Finding records. Preserve unique
+  useful evidence or followups from weaker siblings instead of dropping
+  it solely because the overall output was weaker.
+- Attribute useful contributions by slow_model in comparison.per_model.
+  Keep this concise but specific enough to explain which models found
+  deeper bugs, which were shallow, and which evidence was selected.
 
 DEDUP ACROSS LENSES:
 - If multiple lens outputs emit findings describing the same bug
@@ -43,6 +54,27 @@ COMPLETENESS CHECK — promote prose-only bugs:
   array. Prose-only bugs are lost forever after this step. Promote
   or demote — never silently drop.
 
+FRONTIER CHECK — preserve unresolved concrete work:
+- Union the input followups and keep only concrete typed requests
+  that would fetch source/types, callers, history, grep results, or a
+  narrow question needed to prove or disprove a suspicion.
+- Treat unsupported negative coverage claims as unresolved work.
+  If a lens says "no remaining users", "all callers updated", "old
+  path unreachable", "only reader", "only writer", or equivalent
+  without citing concrete source, type, search, caller/callee, or history
+  evidence, add a followup for the missing proof instead of carrying
+  that claim into a clean conclusion.
+- If a lens analysis describes a concrete unresolved suspicion
+  tied to a code path but did not emit a Finding or followup, add a
+  followup for the exact missing evidence. Use the narrowest useful
+  request: source:<symbol>, type:<type>, callers:<symbol>,
+  read:<file:line+count>, git:<readonly command>,
+  grep/search:<pattern>, or question:<specific blocker>.
+- Do not add followups for vague design concerns, generic "more
+  review", or areas explicitly disproved by cited evidence.
+- A clean consolidated review has no findings and no followups only
+  when all concrete suspicions raised by the lenses were resolved.
+
 UNIFIED ANALYSIS — prose for the human reader:
 - ONE prose narrative covering the task as a whole, not a
   concatenation of per-lens sections. Reference Findings by id.
@@ -64,5 +96,4 @@ UNIFIED ANALYSIS — prose for the human reader:
   'filename:line' citations plus embedded relevant_symbols). The
   inline-snippets rule is for the prose analysis ONLY.
 
-Emit only the unified {analysis, findings} pair. Followups are
-already being handled by the caller.
+Emit the unified {analysis, findings, followups} object.

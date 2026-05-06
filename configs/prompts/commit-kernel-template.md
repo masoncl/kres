@@ -38,21 +38,30 @@ necessary (submitting-patches.rst:708-709). "fix foo" is not enough;
 "fix foo to release X on Y" tells the reviewer the change is worth
 reading past the first line.
 
-- `<subsystem>` is a lowercase nested path matching the file tree:
-  `btrfs:`, `tcp:`, `ice:`, `sched_ext:`, `bpf:`, `mm/sparse:`,
-  `mm/hugetlb:`, `userfaultfd:`, `zram:`, `drm/i915/gem:`,
-  `KVM: x86:`, `ASoC: SOF:`. KVM and ASoC keep their historical
-  capitalisation; everything else stays lowercase.
+- `<subsystem>` is the prefix used by nearby commits for the touched
+  files. Prefer the shortest specific nested path that matches the file
+  tree, and preserve historical capitalization when local history uses
+  it. Do not invent a new prefix from the bug description alone.
 - Imperative mood: "fix", "add", "drop", "reject", "release",
   "split". Not "fixes", "fixing", "fixed", "[This patch] fixes".
 - One clause. No trailing period.
-- The whole subject (subsystem prefix included) must not exceed
-  75 chars. Shorter is better — most good subjects are 40-60.
+- The whole git commit subject (subsystem prefix included) must not
+  exceed 55 chars. Default `git format-patch` prepends the literal
+  `Subject: [PATCH] ` header prefix (17 chars), so 55 is the largest
+  raw commit subject that keeps the full mail header line at or under
+  72 chars. Count the generated header too: `Subject: [PATCH] ` plus
+  your subject must be <= 72 chars.
 - Do NOT include `[PATCH]` or `[PATCH vN]` — those prefixes are for
   the email Subject line that `git format-patch` produces, not for
   the git commit message itself.
 
 ## Body
+
+Write a kernel changelog, not an audit report. Recent `mm/` commits
+favor a short causal explanation that a maintainer can read quickly:
+what goes wrong, the relevant mechanism, and what the patch changes.
+Use concrete identifiers, but do not turn the body into an exhaustive
+proof of every path that was checked.
 
 ```
 <Problem paragraph: observed bad behaviour, invariant violated, or
@@ -68,6 +77,74 @@ Cite code as filename:function or filename:line.>
 <Fix paragraph: "Fix by <verb> <object>." For a refactor with no
 behaviour change append "No functional change intended.">
 ```
+
+Preferred shape:
+
+- 2-4 short prose paragraphs, normally 1-4 wrapped lines each.
+- Start with the failing path and consequence in plain language.
+- If the bug depends on ordering, callbacks, nested calls, state
+  transitions, or two CPUs racing, use indented evidence blocks instead
+  of dense prose. Prefer call chains and call graphs over prose for
+  multi-function control flow. Choose the structure that makes each
+  causal step clearest: a call chain, ASCII call graph, CPU timeline,
+  before/after state block, short case analysis, numeric example, or a
+  source snippet when the decisive fact is the local branch or
+  expression itself. Keep each evidence block focused, normally 4-14
+  lines. Multiple evidence blocks are fine when they replace paragraphs
+  of compact prose and each block carries a different part of the bug.
+- Simple ASCII art is allowed in indented evidence blocks. Use only
+  ASCII characters such as `|`, `-`, `+`, `<`, `>`, and `->`; do not
+  use Unicode arrows, box drawing, or other non-ASCII diagram glyphs.
+- Keep scope/proof paragraphs narrow: say only what matters to explain
+  why the patch is needed and why this fix is valid.
+- End with one short "Fix by ..." paragraph.
+
+Evidence block examples to follow:
+
+Race timeline:
+
+    CPU 0                         CPU 1
+    -----                         -----
+    show_state()
+    obj = container->obj;         mutex_lock(&container->lock);
+                                  replace_object(container, NULL);
+                                  free_object(obj);
+                                  mutex_unlock(&container->lock);
+    use_object(obj);              /* obj is freed */
+
+Call chain with state transition:
+
+    handle_event()
+      mark_object_unavailable()
+      split_object()
+        remap_entries()
+          inspect_unused_entry()
+            read_object_data()    /* reads unavailable state again */
+
+Call graph:
+
+    fault path
+      handle_fault()
+        lookup_cached_object()
+          batch_install_entries()
+            uses stale index
+
+    teardown path
+      replace_object()
+        clears slot
+        frees old object
+
+Before/after state:
+
+    before: slot points at old owner
+            callers take old_owner->lock and mutate the object
+    clear:  slot becomes NULL before the object is moved
+    after:  callers fall back to new_owner->lock while the object is
+            still linked under old_owner->lock
+
+Use evidence blocks to carry the mechanics, then keep prose short.
+After the blocks, add one short consequence paragraph and one short
+"Fix by ..." paragraph. Do not restate every line of a block in prose.
 
 Choose the right body shape for the change:
 
@@ -176,6 +253,12 @@ body (one per co-author, immediately after their Co-developed-by).
 - Bullet lists used as a substitute for prose. The kernel body is
   prose paragraphs; lists are reserved for the enumerated-breakage
   shape.
+- Dense proof-memo paragraphs. If a paragraph reads like a review
+  transcript, split it, delete non-essential proof, or quote the
+  decisive code snippet.
+- Exhaustive inventories of callers, exports, fallback paths, or
+  negative cases unless each item is needed to understand the bug or
+  justify the fix.
 - Per-file change breakdowns ("modified foo.c, modified bar.c").
   The diff already enumerates files.
 - Test enumeration: don't list new test names, don't cite passing
@@ -225,7 +308,8 @@ never `git add -A` or `git add .` (sweeps in stray files).
 ## Self-check before emitting
 
 1. Did every prose line stay at or under 75 columns? (Tags exempt.)
-2. Subject at most 75 chars including the subsystem prefix?
+2. Subject at most 55 chars including the subsystem prefix, so
+   `Subject: [PATCH] <subject>` is at most 72 chars?
 3. Subject describes BOTH what the change does AND why?
 4. No period on the subject? No `[PATCH]` prefix?
 5. Body in imperative mood with no `I`/`we`?

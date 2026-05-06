@@ -22,9 +22,15 @@ filter the set.
 ```
 
 `<tag>` is the finding's `id` from kres, sanitised so it is safe as
-a directory name. `INDEX.md` and `index.html` link each row to
-`summary.md` when one exists, falling back to `FINDING.md` for
-findings that have not been triaged yet.
+a directory name. `INDEX.md` is rendered as one `### Subject: …`
+section per finding with a YAML-style bulleted list of severity,
+subsystem, date, status, and an id link, plus up to four lines of
+impact text wrapped at 78 columns: `summary.md`'s `# Impact` body
+when triage has run, otherwise `FINDING.md`'s `## Impact`. Longer
+text is tail-truncated with `…`. `index.html` keeps the wide table
+shape so the in-browser filters stay usable. Both link each
+finding to `summary.md` when one exists, falling back to
+`FINDING.md` for findings that have not been triaged yet.
 
 ## File meanings
 
@@ -78,8 +84,8 @@ rewrites `INDEX.md` and `index.html` in place. Run it after
 ./findings-index.py --search "<query>"
 ```
 
-Prints a markdown table — same shape as `INDEX.md` — covering only
-the rows that match the query.
+Prints section-per-finding markdown — same shape as `INDEX.md` —
+covering only the rows that match the query.
 
 `<query>` is a boolean expression over `key:value` clauses:
 
@@ -109,6 +115,9 @@ Recognised keys (every value is a case-insensitive regex except
   |             | cites in its `Relevant symbols` block)           |
   | `regex`     | the joined row text (sev + subsys + date +       |
   |             | status + id + title)                             |
+  | `has`       | finding directory contains the named file        |
+  |             | (e.g. `has:summary.md` selects only triaged      |
+  |             | findings)                                        |
   | `since`     | YYYY-MM-DD; row's date must be ≥ this           |
 
 Examples:
@@ -138,17 +147,31 @@ Examples:
 
 # touched workqueue.c AND high severity
 ./findings-index.py --search "file:workqueue.c -a severity:high"
+
+# only triaged findings (those with a summary.md)
+./findings-index.py --search "has:summary.md"
 ```
 
-`file:` and `function:` both look beyond the visible table cells —
-`file:` searches the union of every filename FINDING.md cites (the
-primary `filename:` plus everything under `relevant_symbols:` and
-`relevant_file_sections:`), and `function:` searches every symbol
-name under `relevant_symbols:`. Use anchors (`^foo$`) for exact
-matches, `^foo` for prefix, plain `foo` for substring.
+### Output format (`-o dirs`)
+
+By default `--search` prints a markdown table. Pass `-o dirs` to
+print one absolute finding-directory path per line instead — handy
+for piping into `xargs`, `grep -r`, or another tool:
+
+```
+./findings-index.py --search "severity:high" -o dirs
+```
+
+`file:` and `function:` both look beyond the visible section
+fields — `file:` searches the union of every filename FINDING.md
+cites (the primary `filename:` plus everything under
+`relevant_symbols:` and `relevant_file_sections:`), and
+`function:` searches every symbol name under `relevant_symbols:`.
+Use anchors (`^foo$`) for exact matches, `^foo` for prefix, plain
+`foo` for substring.
 
 A bad regex or a malformed expression exits 2 with a one-line
-diagnostic on stderr; the table is not printed.
+diagnostic on stderr; nothing is printed.
 
 ### Saved subset indexes (`index-config.yaml`)
 
@@ -185,6 +208,8 @@ Rules:
 - Lines starting with `#` and blank lines are skipped.
 - The umbrella `INDEX.md` and `index.html` are always written; the
   config adds files on top.
+- `INDEX-<custom>.md` files share the section-per-finding shape
+  used by `INDEX.md` and `--search`.
 - A bad regex or malformed query reports a one-line error to
   stderr, skips that file, and continues with the rest. The script
   exits 1 if any entry errored.

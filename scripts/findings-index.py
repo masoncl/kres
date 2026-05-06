@@ -6,18 +6,22 @@ Two modes, picked by mutually exclusive flags:
   findings-index.py --generate
       Walk every `<tag>/metadata.yaml` under the current directory and
       write:
-        * INDEX.md            — markdown table covering all findings.
-        * index.html          — same table with client-side filters
-                                for browser / GitHub Pages viewing.
+        * INDEX.md            — section-per-finding markdown covering
+                                all findings.
+        * index.html          — table view of the same rows with
+                                client-side filters for browser /
+                                GitHub Pages viewing.
         * INDEX-<custom>.md   — one per `{file, query}` entry in
-                                `index-config.yaml`, if present.
+                                `index-config.yaml`, if present (same
+                                section-per-finding shape as INDEX.md).
       Use `--search subsystem:<regex>` for ad-hoc pivots that don't
       need a saved file.
 
   findings-index.py --search "<query>"
-      Print a markdown table — same format as INDEX.md — covering only
-      the rows the query matches. The query is a boolean expression
-      over `key:value` clauses:
+      Print section-per-finding markdown — same format as INDEX.md —
+      covering only the rows the query matches. Pass `-o dirs` to
+      print absolute finding-directory paths instead. The query is a
+      boolean expression over `key:value` clauses:
 
         clause     := KEY ':' REGEX
         and-expr   := clause ( ('-a')? clause )*
@@ -66,6 +70,7 @@ import html
 import os
 import re
 import sys
+import textwrap
 
 
 SEV_RANK = {"high": 3, "medium": 2, "low": 1}
@@ -173,6 +178,91 @@ def all_function_names(yaml_text):
     return sorted(out)
 
 
+def _extract_section(text, heading_prefix, stop_prefix):
+    """Return the body of the first markdown section whose heading
+    line starts with `heading_prefix`, up to the next line beginning
+    with `stop_prefix` (or EOF). Leading/trailing blank lines are
+    stripped from the returned body. Returns "" if not found.
+    """
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith(heading_prefix):
+            i += 1
+            body = []
+            while i < len(lines) and not lines[i].startswith(stop_prefix):
+                body.append(lines[i])
+                i += 1
+            while body and body[0].strip() == "":
+                body.pop(0)
+            while body and body[-1].strip() == "":
+                body.pop()
+            return "\n".join(body)
+        i += 1
+    return ""
+
+
+IMPACT_WRAP_WIDTH = 78
+IMPACT_MAX_LINES = 4
+
+
+def _format_impact(text):
+    """Reflow `text` to a list of at most IMPACT_MAX_LINES lines
+    wrapped at IMPACT_WRAP_WIDTH columns. The source paragraph wrap
+    is intentionally discarded so the rendered block is consistent
+    across findings. Trailing truncation is signalled with `…`.
+    """
+    if not text:
+        return []
+    # Collapse the paragraph into a single logical line first so
+    # textwrap can do the wrapping; the source's own wrap may sit
+    # at any width and intermixing breaks rendering.
+    flat = " ".join(text.split())
+    if not flat:
+        return []
+    wrapped = textwrap.wrap(flat, width=IMPACT_WRAP_WIDTH)
+    if len(wrapped) > IMPACT_MAX_LINES:
+        kept = wrapped[:IMPACT_MAX_LINES]
+        # Tail-truncate the last kept line so the caller sees an
+        # ellipsis without exceeding the wrap width.
+        last = kept[-1]
+        if len(last) + 1 > IMPACT_WRAP_WIDTH:
+            last = last[: IMPACT_WRAP_WIDTH - 1].rstrip()
+        kept[-1] = last + "…"
+        return kept
+    return wrapped
+
+
+def load_impact(dir_path):
+    """Return up to IMPACT_MAX_LINES of impact text, wrapped at
+    IMPACT_WRAP_WIDTH. Prefer summary.md's `# Impact` body
+    (operator-curated, plain language); fall back to FINDING.md's
+    `## Impact` body. Empty list when neither is readable or both
+    sections are empty.
+    """
+    summary_path = os.path.join(dir_path, "summary.md")
+    if os.path.isfile(summary_path):
+        try:
+            with open(summary_path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        body = _extract_section(text, "# Impact", "# ")
+        if body:
+            return _format_impact(body)
+    finding_path = os.path.join(dir_path, "FINDING.md")
+    if os.path.isfile(finding_path):
+        try:
+            with open(finding_path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            text = ""
+        body = _extract_section(text, "## Impact", "## ")
+        if body:
+            return _format_impact(body)
+    return []
+
+
 def collect_rows(root):
     """Walk `<root>/findings/<tag>/metadata.yaml` for every finding.
 
@@ -222,6 +312,7 @@ def collect_rows(root):
             "subsystem": subsystem if subsystem else None,
             "filenames": all_filenames(yaml_text),
             "functions": all_function_names(yaml_text),
+            "impact": load_impact(path),
         })
     return rows
 
@@ -235,60 +326,6 @@ def sort_rows(rows):
         r["date"] or "",
         r["id"],
     ))
-
-
-def md_escape_cell(s):
-    """Pipes break GFM table cells; newlines break the row.
-
-    Mirror the kres Rust escape_md_table_cell helper so INDEX.md keeps
-    its earlier structure exactly: a `|` becomes `\\|` and any newline
-    is collapsed to a single space.
-    """
-    return s.replace("|", "\\|").replace("\n", " ")
-
-
-def build_markdown(rows):
-    parts = []
-    parts.append("# kres findings index")
-    parts.append("")
-    ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    parts.append("_generated: {}_".format(ts))
-    parts.append("")
-    if not rows:
-        parts.append("(no findings)")
-        return "\n".join(parts) + "\n"
-
-    counts = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
-    for r in rows:
-        sev = r["severity"]
-        counts[sev if sev in counts else "unknown"] += 1
-    summary = "{} finding(s): {} high, {} medium, {} low".format(
-        len(rows), counts["high"], counts["medium"], counts["low"]
-    )
-    if counts["unknown"]:
-        summary += ", {} unknown-severity".format(counts["unknown"])
-    parts.append(summary)
-    parts.append("")
-    parts.append("| Severity | Subsystem | Date | Status | ID | Title |")
-    parts.append("|---|---|---|---|---|---|")
-    for r in rows:
-        sev = r["severity"] if r["severity"] in SEV_RANK else "?"
-        date_display = r["date"] or "—"
-        subsystem = r["subsystem"] if r["subsystem"] else "—"
-        parts.append(
-            "| {sev} | {subsys} | {date} | {status} | "
-            "[`{id}`]({tag_path}/{link}) | {title} |".format(
-                sev=sev,
-                subsys=md_escape_cell(subsystem),
-                date=date_display,
-                status=r["status"],
-                id=r["id"],
-                tag_path=r["tag_path"],
-                link=r["link_file"],
-                title=md_escape_cell(r["title"]),
-            )
-        )
-    return "\n".join(parts) + "\n"
 
 
 FILTER_SCRIPT = """<script>
@@ -503,6 +540,69 @@ def build_html(rows):
     parts.append("</tbody></table>")
     parts.append(FILTER_SCRIPT)
     parts.append("</body></html>")
+    return "\n".join(parts) + "\n"
+
+
+def build_sections_markdown(rows):
+    """Section-per-finding markdown layout.
+
+    Each finding gets a `### Subject: …` heading followed by a
+    YAML-style bulleted list of severity, subsystem, date, status,
+    and a link to its directory. `INDEX.md`, `--search` output, and
+    every `INDEX-<custom>.md` use this shape — the wide markdown
+    table the indexes used to ship as didn't fit a typical viewer
+    once subsystem + title + id all sat on one row.
+    """
+    parts = []
+    parts.append("# kres findings index")
+    parts.append("")
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    parts.append("_generated: {}_".format(ts))
+    parts.append("")
+    if not rows:
+        parts.append("(no findings)")
+        return "\n".join(parts) + "\n"
+
+    counts = {"high": 0, "medium": 0, "low": 0, "unknown": 0}
+    for r in rows:
+        sev = r["severity"]
+        counts[sev if sev in counts else "unknown"] += 1
+    summary = "{} finding(s): {} high, {} medium, {} low".format(
+        len(rows), counts["high"], counts["medium"], counts["low"]
+    )
+    if counts["unknown"]:
+        summary += ", {} unknown-severity".format(counts["unknown"])
+    parts.append(summary)
+    parts.append("")
+
+    for r in rows:
+        sev = r["severity"] if r["severity"] in SEV_RANK else "?"
+        date_display = r["date"] or "—"
+        subsystem = r["subsystem"] if r["subsystem"] else "—"
+        title = r["title"] or ""
+        # Cap the heading text at 72 chars so the section title fits
+        # in a narrow viewer; the full title is still in metadata.yaml
+        # and in the linked FINDING.md / summary.md.
+        if len(title) > 72:
+            subject = title[:71] + "…"
+        else:
+            subject = title
+        parts.append("### Subject: {}".format(subject))
+        parts.append("- severity: {}".format(sev))
+        parts.append("- subsystem: {}".format(subsystem))
+        parts.append("- date: {}".format(date_display))
+        parts.append("- status: {}".format(r["status"]))
+        parts.append(
+            "- id: [`{id}`]({tag_path}/{link})".format(
+                id=r["id"], tag_path=r["tag_path"], link=r["link_file"]
+            )
+        )
+        impact = r.get("impact") or []
+        if impact:
+            parts.append("")
+            for line in impact:
+                parts.append(line)
+        parts.append("")
     return "\n".join(parts) + "\n"
 
 
@@ -727,8 +827,8 @@ def filter_rows(rows, expr):
 #
 # Filenames must be plain basenames inside the export dir — no `..`,
 # no slashes, no absolute paths. Each query goes through the same
-# parser as `--search QUERY` and produces a markdown table identical
-# in shape to INDEX.md.
+# parser as `--search QUERY` and produces section-per-finding
+# markdown identical in shape to INDEX.md.
 
 CONFIG_FILENAME = "index-config.yaml"
 
@@ -849,7 +949,7 @@ def write_custom_indexes(rows, root, config_path):
         filtered = filter_rows(rows, expr)
         out_path = os.path.join(root, filename)
         with open(out_path, "w", encoding="utf-8") as f:
-            f.write(build_markdown(filtered))
+            f.write(build_sections_markdown(filtered))
         print(
             "  custom: {} ({} row(s))".format(out_path, len(filtered)),
             file=sys.stderr,
@@ -893,7 +993,7 @@ def main():
     if args.generate:
         md_path = os.path.join(root, "INDEX.md")
         with open(md_path, "w", encoding="utf-8") as f:
-            f.write(build_markdown(rows))
+            f.write(build_sections_markdown(rows))
         html_path = os.path.join(root, "index.html")
         with open(html_path, "w", encoding="utf-8") as f:
             f.write(build_html(rows))
@@ -933,7 +1033,7 @@ def main():
                 os.path.join(findings_root, r["tag"]) + "\n"
             )
     else:
-        sys.stdout.write(build_markdown(filtered))
+        sys.stdout.write(build_sections_markdown(filtered))
     return 0
 
 

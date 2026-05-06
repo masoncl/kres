@@ -982,10 +982,10 @@ mod tests {
     }
 
     #[test]
-    fn export_index_renders_subsystem_column() {
-        // Two findings with subsystem set, one without — the column
-        // should appear in the header, populated rows show the value,
-        // and a missing/blank value renders as `—`.
+    fn export_index_renders_subsystem_field() {
+        // Two findings with subsystem set, one without — the section
+        // body should carry the value when set, and render `—` for a
+        // blank or missing value.
         let dir = tmp_dir("export-index-subsystem");
         let write = |tag: &str, body: &str| {
             let d = dir.join("findings").join(tag);
@@ -1007,24 +1007,16 @@ mod tests {
         let out = run_export_index(&dir).unwrap();
         let body = std::fs::read_to_string(&out).unwrap();
         assert!(
-            body.contains("| Severity | Subsystem | Date | Status | ID | Title |"),
-            "header missing Subsystem column: {body}"
+            body.contains("- subsystem: mm/folio"),
+            "populated subsystem field missing: {body}"
         );
-        assert!(
-            body.contains("| high | mm/folio |"),
-            "populated subsystem cell missing: {body}"
-        );
-        // Both blank and absent subsystem render as the em-dash
-        // placeholder. Two rows × one em-dash each = 2 occurrences in
-        // the subsystem column.  Each row also has a `—` for date,
-        // so any cell-level grep is brittle; check the row prefix.
-        assert!(
-            body.contains("| medium | — |"),
-            "blank subsystem should render as em-dash: {body}"
-        );
-        assert!(
-            body.contains("| low | — |"),
-            "missing subsystem should render as em-dash: {body}"
+        // Blank and absent subsystem both render as the em-dash
+        // placeholder. There are two such rows in this fixture; both
+        // should pair their severity bullet with `subsystem: —`.
+        let em_dash_subsys = body.matches("- subsystem: —").count();
+        assert_eq!(
+            em_dash_subsys, 2,
+            "expected 2 em-dash subsystem fields, body was: {body}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

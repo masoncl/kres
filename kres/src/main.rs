@@ -1373,6 +1373,10 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
     // short-circuit silently dropped both flags.
     let workspace = repl.workspace.clone();
     let results = repl.results.clone();
+    grant_prompt_path_mentions(&workspace, raw);
+    if rest != raw {
+        grant_prompt_path_mentions(&workspace, rest);
+    }
     Some(RunWorkflowArgs {
         path: stub_path,
         input: std::mem::take(&mut input),
@@ -1392,6 +1396,33 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
         mcp_config: None,
         assisted_by: repl.assisted_by.clone(),
     })
+}
+
+fn grant_prompt_path_mentions(workspace: &std::path::Path, prompt: &str) {
+    let store = kres_core::consent::get_or_install();
+    let added = kres_core::consent::grant_paths_from_text(&store, workspace, prompt);
+    if added.is_empty() {
+        return;
+    }
+
+    let label: Vec<String> = added.iter().map(|g| g.dir.display().to_string()).collect();
+    eprintln!(
+        "consent: granted access to {} dir(s) named in --prompt: {}",
+        added.len(),
+        truncate(&label.join(", "), 200)
+    );
+
+    let wide: Vec<String> = added
+        .iter()
+        .filter(|g| g.suspicious)
+        .map(|g| g.dir.display().to_string())
+        .collect();
+    if !wide.is_empty() {
+        eprintln!(
+            "consent: WARNING wide grant(s) for top-level system dir(s): {} — narrow the path in --prompt or restart kres if accidental",
+            truncate(&wide.join(", "), 200)
+        );
+    }
 }
 
 fn run_validate_workflow(args: ValidateWorkflowArgs) -> Result<()> {
@@ -1443,6 +1474,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
             );
         }
     }
+    kres_repl::apply_results_artifact_dir(&workflow, &mut inputs_raw, args.results.as_deref());
     let inputs = derive_inputs(&workflow, inputs_raw);
 
     let mut driver = LlmDriver::new(args.workspace.clone(), workflow.clone());
@@ -1748,6 +1780,66 @@ mod tests {
         assert!(c.cmd.is_none());
         assert_eq!(c.repl.prompt.as_deref(), Some("file.md"));
         assert_eq!(c.repl.turns, 3);
+    }
+
+    #[test]
+    fn workflow_prompt_short_circuit_grants_prompt_path_mentions() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-prompt-consent-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = base.join("workspace");
+        let bug_dir = base.join("bugs");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&bug_dir).unwrap();
+        let bug_file = bug_dir.join("psp-uaf-assoc-get.bug");
+        std::fs::write(&bug_file, "bug prose\n").unwrap();
+
+        let store = kres_core::consent::get_or_install();
+        store.clear();
+        let prompt = format!("fix: {}", bug_file.display());
+        let c = Cli::try_parse_from([
+            "kres",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--prompt",
+            &prompt,
+        ])
+        .unwrap();
+
+        let args = workflow_short_circuit_from_repl_args(&c.repl)
+            .expect("fix prompt should short-circuit");
+        assert_eq!(args.workspace, workspace);
+        assert!(
+            store.is_allowed(&bug_file.canonicalize().unwrap()),
+            "--prompt path mentions should grant the containing directory before workflow launch"
+        );
+
+        store.clear();
+        let prompt = format!("fix:{}", bug_file.display());
+        let c = Cli::try_parse_from([
+            "kres",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--prompt",
+            &prompt,
+        ])
+        .unwrap();
+
+        let args = workflow_short_circuit_from_repl_args(&c.repl)
+            .expect("fix prompt without a post-colon space should short-circuit");
+        assert_eq!(args.workspace, workspace);
+        assert!(
+            store.is_allowed(&bug_file.canonicalize().unwrap()),
+            "--prompt workflow rest should grant paths even when written as fix:/path"
+        );
+
+        store.clear();
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

@@ -63,6 +63,53 @@ pub fn inputs_for_target(workflow: &Workflow, target: &str) -> Map<String, Value
     derive_inputs(workflow, inputs)
 }
 
+pub fn inputs_for_target_with_results(
+    workflow: &Workflow,
+    target: &str,
+    results_dir: Option<&Path>,
+) -> Map<String, Value> {
+    let mut inputs = Map::new();
+    inputs.insert(
+        target_input_key(workflow),
+        Value::String(target.to_string()),
+    );
+    apply_results_artifact_dir(workflow, &mut inputs, results_dir);
+    derive_inputs(workflow, inputs)
+}
+
+pub fn apply_results_artifact_dir(
+    workflow: &Workflow,
+    inputs: &mut Map<String, Value>,
+    results_dir: Option<&Path>,
+) {
+    if !workflow.inputs.contains_key("target_artifact_dir")
+        || inputs.contains_key("target_artifact_dir")
+    {
+        return;
+    }
+    let Some(dir) = results_dir else {
+        return;
+    };
+
+    let derived = derive_inputs(workflow, inputs.clone());
+    if derived.get("target_kind").and_then(Value::as_str) == Some("prose") {
+        inputs.insert(
+            "target_artifact_dir".into(),
+            Value::String(absolute_path(dir).display().to_string()),
+        );
+    }
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 pub fn workflow_prompt_invocation(raw: &str) -> Option<(&str, &str)> {
     let trimmed = raw.trim();
     let (id, rest) = if let Some(after_slash) = trimmed.strip_prefix('/') {
@@ -324,6 +371,66 @@ mod tests {
     fn target_input_key_falls_back_to_target() {
         let workflow = workflow_with_inputs(Map::new());
         assert_eq!(target_input_key(&workflow), "target");
+    }
+
+    #[test]
+    fn inputs_for_target_with_results_sets_artifact_dir_for_prose() {
+        let workflow = lookup_workflow(None, "fix").unwrap();
+        let results = std::env::temp_dir().join("kres-results-artifacts");
+        let derived = inputs_for_target_with_results(&workflow, "fix this bug", Some(&results));
+        assert_eq!(derived.get("target_kind"), Some(&json!("prose")));
+        assert_eq!(
+            derived.get("target_artifact_dir"),
+            Some(&json!(absolute_path(&results).display().to_string()))
+        );
+    }
+
+    #[test]
+    fn inputs_for_target_with_results_uses_finding_dir_over_results() {
+        let workflow = lookup_workflow(None, "fix").unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-finding-dir-input-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("metadata.yaml"), "id: x\n").unwrap();
+        std::fs::write(tmp.join("FINDING.md"), "# x\n").unwrap();
+        let results = std::env::temp_dir().join("kres-results-artifacts");
+        let derived =
+            inputs_for_target_with_results(&workflow, tmp.to_str().unwrap(), Some(&results));
+        assert_eq!(derived.get("target_kind"), Some(&json!("finding_dir")));
+        assert_eq!(derived.get("target_artifact_dir"), derived.get("target"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn inputs_for_target_with_results_uses_tilde_finding_dir_over_results() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let workflow = lookup_workflow(None, "fix").unwrap();
+        let tmp = home.join(format!(
+            ".kres-finding-dir-input-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("metadata.yaml"), "id: x\n").unwrap();
+        std::fs::write(tmp.join("FINDING.md"), "# x\n").unwrap();
+
+        let suffix = tmp.strip_prefix(&home).unwrap();
+        let target = format!("~/{}", suffix.display());
+        let results = std::env::temp_dir().join("kres-results-artifacts");
+        let derived = inputs_for_target_with_results(&workflow, &target, Some(&results));
+        assert_eq!(derived.get("target_kind"), Some(&json!("finding_dir")));
+        assert_eq!(derived.get("target_artifact_dir"), derived.get("target"));
+        assert_ne!(
+            derived.get("target_artifact_dir"),
+            Some(&json!(absolute_path(&results).display().to_string()))
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

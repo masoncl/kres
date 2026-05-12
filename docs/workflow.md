@@ -143,6 +143,13 @@ setting `target_kind = "finding_dir"`. This matters because
 `finding_dir`. Text that merely mentions `~/` later in the string is
 left as prose.
 
+When `fix:` is run with freeform prose and `--results DIR`, the workflow
+uses `DIR` as `target_artifact_dir`. That gives prose runs the same
+artifact/status path as finding-directory runs without changing the bug
+input text. If `metadata.yaml`, `FINDING.md`, or `summary.md` are absent
+in the results directory, the reaper creates minimal files before writing
+status or patch artifacts.
+
 For finding directories, `metadata.yaml.git.sha` is the audit's HEAD and
 may differ from the workspace HEAD. The research step must verify that
 the bug still exists at the current workspace HEAD.
@@ -234,8 +241,10 @@ the bug still exists at the current workspace HEAD.
    - `FINDING.md`: `**Status:** invalidated` or
      `**Status:** unconfirmed`
 
-   These steps are terminal on success and are skipped for prose targets.
-   The reaper refuses to invalidate unless `research_status=invalid`,
+   These steps are terminal on success and run when `target_artifact_dir`
+   is set. Finding-directory targets use the target directory; prose
+   targets use `--results` when supplied. The reaper refuses to
+   invalidate unless `research_status=invalid`,
    `invalid_evidence_kind` is `source_or_commit_evidence`, and
    `invalid_evidence.trim()` is non-empty. It refuses to mark
    unconfirmed unless `research_status=unconfirmed`. It does not inspect
@@ -264,9 +273,12 @@ the bug still exists at the current workspace HEAD.
    missing evidence, or fresh patch writing.
 
    `code_edits` should use `file_path`, `old_string`, and `new_string`.
-   The runner accepts `path` and `filename` as compatibility aliases for
-   `file_path`, but the prompt tells the model to use `file_path` so it
-   does not confuse edit records with source-symbol records.
+   Each `old_string` must be drawn from the current worktree bytes and
+   match exactly once unless `replace_all=true` is intentionally meant to
+   update every matching occurrence. The runner accepts `path` and
+   `filename` as compatibility aliases for `file_path`, but the prompt
+   tells the model to use `file_path` so it does not confuse edit records
+   with source-symbol records.
 
    For affected files, retry attempts must use `read` against the current
    worktree bytes. `source` results may come from a symbol index that was
@@ -306,15 +318,16 @@ the bug still exists at the current workspace HEAD.
      is correcting prior review `source_defects[]` and not a
      compile-triage patch error.
 
-   The eval accepts either a real source change (`build_target` plus both
-   change booleans and an empty `review_dispute`) or a typed review
-   dispute (`review_dispute_allowed=true`, `review_dispute` non-empty,
-   and no emitted source changes). A no-op response with only
-   `build_target` cannot advance, and a model cannot use
-   `review_dispute` on a first patch attempt or build-failure retry.
-   Missing `build_target` is no longer a driver/schema failure when the
-   runner can infer it from the edited source path. `write-patch` gets
-   six eval attempts before the workflow fails, so transient
+   The eval accepts either a real source change (both change booleans and
+   an empty `review_dispute`) or a typed review dispute
+   (`review_dispute_allowed=true`, `review_dispute` non-empty, and no
+   emitted source changes). A no-op response with only `build_target`
+   cannot advance, and a model cannot use `review_dispute` on a first
+   patch attempt or build-failure retry. Missing `build_target` is valid
+   for header-only, documentation-only, Kconfig-only, or other non-object
+   changes; the deterministic build step skips cleanly when no enabled
+   object target can be derived from the actual git diff. `write-patch`
+   gets six eval attempts before the workflow fails, so transient
    no-op/edit-shape mistakes have more room to self-correct before
    review.
 
@@ -392,7 +405,10 @@ the bug still exists at the current workspace HEAD.
    By default this is derived from the resolved slow-agent model as
    `kres (<slow-model-id>)`; `--assisted-by TEXT` overrides the exact
    value. The prompt requires the commit message to contain exactly
-   `Assisted-by: <assisted_by>`.
+   `Assisted-by: <assisted_by>`. The review step treats that exact
+   configured trailer as allowed; it may only report an `Assisted-by`
+   defect when the trailer is missing, duplicated, or does not exactly
+   match the configured value.
 
    Mutating git followups such as `git add` and `git commit` are rejected
    by the workflow fetcher. Commit/build/publish are deterministic reaper
@@ -570,6 +586,10 @@ the bug still exists at the current workspace HEAD.
    when it is mixed with source or behavior defects, review routes back
    to `write-patch`.
 
+   The configured workflow `Assisted-by: <assisted_by>` trailer is not a
+   maintainer defect. Review may still reject missing, duplicate, or
+   mismatched `Assisted-by` trailers through the structured defect fields.
+
    The commit assertions lens runs only for committed patch review. It
    tries to disprove every factual sentence, causal claim, safety claim,
    scope claim, negative claim, and justification in the commit message,
@@ -624,9 +644,9 @@ the bug still exists at the current workspace HEAD.
 
 10. **publish**
 
-   Reaper action `publish-fix`, only for finding-directory targets with a
-   clean review. It runs `git format-patch -1 --stdout HEAD`, writes
-   `auto-generated-fix.diff` into the finding directory, appends
+   Reaper action `publish-fix`, only when `target_artifact_dir` is set
+   and review is clean. It runs `git format-patch -1 --stdout HEAD`,
+   writes `auto-generated-fix.diff` into the artifact directory, appends
    `auto_generated_fix: auto-generated-fix.diff` to `metadata.yaml`
    idempotently, and adds a cross-link in `summary.md`.
 

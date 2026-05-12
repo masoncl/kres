@@ -3475,6 +3475,7 @@ mod tests {
         let mut m = Map::new();
         m.insert("target".into(), json!("/tmp/finding"));
         m.insert("target_kind".into(), json!("finding_dir"));
+        m.insert("target_artifact_dir".into(), json!("/tmp/finding"));
         m
     }
 
@@ -3485,6 +3486,7 @@ mod tests {
             json!("missing cleanup after synchronous operation"),
         );
         m.insert("target_kind".into(), json!("prose"));
+        m.insert("target_artifact_dir".into(), json!(""));
         m
     }
 
@@ -3521,6 +3523,16 @@ mod tests {
     fn ok_write_patch() -> Value {
         json!({
             "build_target": "drivers/example/example.o",
+            "code_changes_emitted": true,
+            "affected_files_changed": true,
+            "review_dispute": "",
+            "review_dispute_allowed": false
+        })
+    }
+
+    fn ok_header_only_write_patch() -> Value {
+        json!({
+            "build_target": "",
             "code_changes_emitted": true,
             "affected_files_changed": true,
             "review_dispute": "",
@@ -3572,6 +3584,16 @@ mod tests {
             "build_target": "drivers/example/example.o",
             "exit_code": 0,
             "stdout": "",
+            "stderr": ""
+        })
+    }
+
+    fn ok_empty_build_clean() -> Value {
+        json!({
+            "result": "clean",
+            "build_target": "",
+            "exit_code": 0,
+            "stdout": "no build targets derived; skipping compile",
             "stderr": ""
         })
     }
@@ -4009,6 +4031,38 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, TraceEvent::EvalFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn write_patch_allows_non_object_changes_without_build_target() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_header_only_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, ok_empty_build_clean());
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+
+        let trace = run(&wf, &mut driver, prose_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+        assert!(!trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalFailed { id, .. } if id == "write-patch"
+        )));
+        assert_eq!(
+            trace.final_state["write-patch"].outputs.get("build_target"),
+            Some(&json!(""))
+        );
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::StepProduced { id, .. } if id == "build"
+        )));
     }
 
     #[tokio::test]

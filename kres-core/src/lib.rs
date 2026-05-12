@@ -14,6 +14,7 @@
 //! - L1: no parallel "completed_ids" vector — done tasks are queried
 //!   directly off the ordered task list.
 
+pub mod artifact;
 pub mod consent;
 pub mod cost;
 pub mod findings;
@@ -29,6 +30,10 @@ pub mod shutdown;
 pub mod task;
 pub mod todo;
 
+pub use artifact::{
+    ensure_artifact_dir_files, patch_file_matches_head, record_auto_generated_fix,
+    set_finding_status_files, AUTO_GENERATED_FIX_LINK, AUTO_GENERATED_FIX_NAME, SUMMARY_CROSS_LINK,
+};
 pub use consent::ConsentStore;
 pub use cost::{UsageEntry, UsageKey, UsageTracker};
 pub use findings::{

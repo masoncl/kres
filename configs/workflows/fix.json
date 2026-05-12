@@ -92,6 +92,11 @@
       "type": "string",
       "required": false,
       "description": "Exact value for the Assisted-by trailer after `Assisted-by:`. Defaults to `kres (<slow-model-id>)`; override with --assisted-by."
+    },
+    "target_artifact_dir": {
+      "type": "string",
+      "required": false,
+      "description": "Absolute directory for fix artifacts/status updates. Finding-dir targets default to target; prose targets use --results when supplied, otherwise empty."
     }
   },
   "skills": [
@@ -251,12 +256,12 @@
       "depends_on": [
         "research"
       ],
-      "run_if": "research.research_status == 'invalid' && workflow.target_kind == 'finding_dir' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
+      "run_if": "research.research_status == 'invalid' && workflow.target_artifact_dir != '' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
       "agent": "reaper",
       "action": {
         "type": "set-finding-status",
         "args": {
-          "finding_dir": "{{workflow.target}}",
+          "finding_dir": "{{workflow.target_artifact_dir}}",
           "status": "invalidated"
         }
       },
@@ -276,12 +281,12 @@
       "depends_on": [
         "research"
       ],
-      "run_if": "research.research_status == 'unconfirmed' && workflow.target_kind == 'finding_dir'",
+      "run_if": "research.research_status == 'unconfirmed' && workflow.target_artifact_dir != ''",
       "agent": "reaper",
       "action": {
         "type": "set-finding-status",
         "args": {
-          "finding_dir": "{{workflow.target}}",
+          "finding_dir": "{{workflow.target_artifact_dir}}",
           "status": "unconfirmed"
         }
       },
@@ -343,13 +348,18 @@
         "any edit/commit because symbol indexes can be stale. On retry after build or review",
         "feedback, inspect git diff HEAD~1 and read the current worktree bytes before emitting",
         "code_edits. Every old_string in code_edits must come from the file as it actually is on",
-        "disk.",
+        "disk and must match exactly once unless replace_all=true is intentional for every",
+        "matching occurrence. If old_string appears more than once, include more surrounding",
+        "unchanged context so the edit is unique.",
         "",
         "Emit code_edits for the kernel patch. Each code_edits item must use this shape:",
         "{\"file_path\": \"path/to/file.c\", \"old_string\": \"...\", \"new_string\": \"...\"}. Do not use",
         "source-symbol field names such as `filename` in code_edits. Do not write",
         ".kres-commit-msg.tmp here. Do not run git commit. If you know the primary object file,",
         "return it as build_target. Otherwise the runner derives it from the changed .c/.S paths.",
+        "For header-only, documentation-only, Kconfig-only, or other non-object changes, leave",
+        "build_target empty; the deterministic build step will skip cleanly when no enabled",
+        "object target can be derived from the actual git diff.",
         "The reaper will add all other changed .c objects from the actual git diff and skip targets",
         "disabled by the current Kconfig."
       ],
@@ -381,7 +391,7 @@
       },
       "eval": {
         "type": "field_check",
-        "expr": "(build_target != '' && code_changes_emitted == true && affected_files_changed == true && review_dispute == '') || (review_dispute_allowed == true && review_dispute != '' && code_changes_emitted == false && affected_files_changed == false)",
+        "expr": "(code_changes_emitted == true && affected_files_changed == true && review_dispute == '') || (review_dispute_allowed == true && review_dispute != '' && code_changes_emitted == false && affected_files_changed == false)",
         "on_fail": {
           "action": "repeat",
           "max_attempts": 6,
@@ -756,6 +766,11 @@
         "Also review the commit message for banned words and paragraph-length rules. If it is",
         "bad, report it as a defect rather than editing it.",
         "",
+        "The configured `Assisted-by: {{workflow.assisted_by}}` trailer is intentionally required",
+        "by this workflow. Do not report that exact trailer as a non-standard or unacceptable",
+        "trailer. Only report Assisted-by defects when the trailer is missing, duplicated, or",
+        "does not exactly match the configured value.",
+        "",
         "If review is clean, set clean=true. Otherwise set clean=false and populate defects[]."
       ],
       "lenses": [
@@ -893,12 +908,12 @@
       "depends_on": [
         "review"
       ],
-      "run_if": "research.research_status == 'confirmed' && review.clean == true && workflow.target_kind == 'finding_dir'",
+      "run_if": "research.research_status == 'confirmed' && review.clean == true && workflow.target_artifact_dir != ''",
       "agent": "reaper",
       "action": {
         "type": "publish-fix",
         "args": {
-          "finding_dir": "{{workflow.target}}"
+          "finding_dir": "{{workflow.target_artifact_dir}}"
         }
       },
       "outputs": {
@@ -913,10 +928,10 @@
     "success_when_any": [
       "invalidate.terminal_success",
       "unconfirm.terminal_success",
-      "research.research_status == 'invalid' && workflow.target_kind == 'prose' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
-      "research.research_status == 'unconfirmed' && workflow.target_kind == 'prose'",
+      "research.research_status == 'invalid' && workflow.target_artifact_dir == '' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
+      "research.research_status == 'unconfirmed' && workflow.target_artifact_dir == ''",
       "publish.completed",
-      "review.clean == true && workflow.target_kind == 'prose'"
+      "review.clean == true && workflow.target_artifact_dir == ''"
     ],
     "failure_when_any": [
       "research.research_status == 'invalid' && (research.invalid_evidence_kind != 'source_or_commit_evidence' || research.invalid_evidence == '')"

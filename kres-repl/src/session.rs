@@ -3514,7 +3514,11 @@ impl Session {
             return;
         };
 
-        let mut inputs = crate::workflow::inputs_for_target(&workflow, target_trimmed);
+        let mut inputs = crate::workflow::inputs_for_target_with_results(
+            &workflow,
+            target_trimmed,
+            self.cfg.results_dir.as_deref(),
+        );
         if workflow.inputs.contains_key("assisted_by") {
             inputs.insert(
                 "assisted_by".into(),
@@ -5044,7 +5048,7 @@ async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> String {
         );
     }
 
-    let fix_path = dir.join("auto-generated-fix.diff");
+    let fix_path = dir.join(kres_core::AUTO_GENERATED_FIX_NAME);
 
     // Skip when auto-generated-fix.diff already records the current
     // HEAD. The FIX flow has two paths that emit `publish-fix`: the
@@ -5057,18 +5061,12 @@ async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> String {
     // detect "already published this commit". A real amend changes
     // HEAD's sha and falls through to the rewrite path.
     if let Some(head_sha) = git_rev_parse_head(workspace).await {
-        if let Ok(existing) = tokio::fs::read_to_string(&fix_path).await {
-            if existing
-                .lines()
-                .next()
-                .is_some_and(|l| l.starts_with(&format!("From {head_sha} ")))
-            {
-                return format!(
-                    "[publish-fix] {} already up to date for HEAD {}",
-                    fix_path.display(),
-                    &head_sha[..12.min(head_sha.len())],
-                );
-            }
+        if kres_core::patch_file_matches_head(&dir, &head_sha).unwrap_or(false) {
+            return format!(
+                "[publish-fix] {} already up to date for HEAD {}",
+                fix_path.display(),
+                &head_sha[..12.min(head_sha.len())],
+            );
         }
     }
 
@@ -5100,63 +5098,11 @@ async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> String {
         return format!("[publish-fix FAILED] write {}: {e}", fix_path.display());
     }
 
-    // Update metadata.yaml: append `auto_generated_fix:
-    // auto-generated-fix.diff` if not already present. Avoid YAML
-    // libraries here — kres findings ship as flat key:value lines
-    // and a textual append is robust.
-    match tokio::fs::read_to_string(&metadata_path).await {
-        Ok(metadata) => {
-            if !metadata
-                .lines()
-                .any(|l| l.trim_start().starts_with("auto_generated_fix:"))
-            {
-                let mut updated = metadata.trim_end().to_string();
-                updated.push('\n');
-                updated.push_str("auto_generated_fix: auto-generated-fix.diff\n");
-                if let Err(e) = tokio::fs::write(&metadata_path, updated).await {
-                    return format!(
-                        "[publish-fix FAILED] write {}: {e}",
-                        metadata_path.display()
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            return format!("[publish-fix FAILED] read {}: {e}", metadata_path.display());
-        }
-    }
-
-    // Update summary.md: extend the cross-link header line with a
-    // link to the patch. Idempotent: skip when already present.
-    let summary_path = dir.join("summary.md");
-    if summary_path.exists() {
-        match tokio::fs::read_to_string(&summary_path).await {
-            Ok(summary) => {
-                let link = "[auto-generated-fix.diff](auto-generated-fix.diff)";
-                if !summary.contains(link) {
-                    // Look for the cross-link header
-                    // ([FINDING.md]...|[metadata.yaml]...) and append
-                    // ` | <link>`. If absent, prepend the link as a
-                    // standalone first line.
-                    let cross_link = "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)";
-                    let updated = if let Some(pos) = summary.find(cross_link) {
-                        let end = pos + cross_link.len();
-                        format!("{} | {}{}", &summary[..end], link, &summary[end..])
-                    } else {
-                        format!("{link}\n\n{summary}")
-                    };
-                    if let Err(e) = tokio::fs::write(&summary_path, updated).await {
-                        return format!(
-                            "[publish-fix FAILED] write {}: {e}",
-                            summary_path.display()
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                return format!("[publish-fix FAILED] read {}: {e}", summary_path.display());
-            }
-        }
+    if let Err(e) = kres_core::record_auto_generated_fix(&dir) {
+        return format!(
+            "[publish-fix FAILED] record auto-generated fix in {}: {e}",
+            dir.display()
+        );
     }
 
     format!(

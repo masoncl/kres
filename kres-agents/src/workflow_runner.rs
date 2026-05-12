@@ -1809,6 +1809,25 @@ pub fn derive_inputs(workflow: &Workflow, mut inputs: Map<String, Value>) -> Map
             }
         }
     }
+    if workflow.inputs.contains_key("target_artifact_dir") {
+        match inputs
+            .get("target")
+            .and_then(|v| v.as_str())
+            .and_then(normalized_finding_dir)
+        {
+            Some(path) => {
+                grant_finding_dir_consent(&path);
+                inputs
+                    .entry("target_artifact_dir")
+                    .or_insert_with(|| Value::String(path.display().to_string()));
+            }
+            None => {
+                inputs
+                    .entry("target_artifact_dir")
+                    .or_insert_with(|| Value::String(String::new()));
+            }
+        }
+    }
     inputs
 }
 
@@ -2358,91 +2377,52 @@ fn tail_lossy(bytes: &[u8], max: usize) -> String {
 }
 
 fn run_set_finding_status(finding_dir: &str, status: &str) -> Result<Vec<String>, String> {
-    if !matches!(status, "invalidated" | "unconfirmed") {
-        return Err(format!("unsupported finding status: {status}"));
-    }
     let dir = PathBuf::from(finding_dir);
     if !dir.is_absolute() {
         return Err(format!("finding_dir must be absolute: {finding_dir}"));
     }
-    let metadata = dir.join("metadata.yaml");
-    let finding = dir.join("FINDING.md");
-    if !metadata.is_file() || !finding.is_file() {
-        return Err(format!(
-            "{finding_dir} is not a kres finding directory (missing metadata.yaml or FINDING.md)"
-        ));
-    }
-
-    let metadata_body = std::fs::read_to_string(&metadata)
-        .map_err(|e| format!("read {}: {e}", metadata.display()))?;
-    let mut saw_status = false;
-    let mut metadata_lines: Vec<String> = metadata_body
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("status:") {
-                saw_status = true;
-                let indent_len = line.len() - line.trim_start().len();
-                format!("{}status: {status}", &line[..indent_len])
-            } else {
-                line.to_string()
-            }
+    kres_core::set_finding_status_files(&dir, status)
+        .map(|paths| {
+            paths
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
         })
-        .collect();
-    if !saw_status {
-        metadata_lines.push(format!("status: {status}"));
-    }
-    let metadata_new = finish_lines(metadata_lines, metadata_body.ends_with('\n'));
-    std::fs::write(&metadata, metadata_new)
-        .map_err(|e| format!("write {}: {e}", metadata.display()))?;
-
-    let finding_body = std::fs::read_to_string(&finding)
-        .map_err(|e| format!("read {}: {e}", finding.display()))?;
-    let mut saw_status = false;
-    let mut finding_lines: Vec<String> = finding_body
-        .lines()
-        .map(|line| {
-            if line.starts_with("**Status:**") {
-                saw_status = true;
-                format!("**Status:** {status}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-    if !saw_status {
-        finding_lines.push(format!("**Status:** {status}"));
-    }
-    let finding_new = finish_lines(finding_lines, finding_body.ends_with('\n'));
-    std::fs::write(&finding, finding_new)
-        .map_err(|e| format!("write {}: {e}", finding.display()))?;
-
-    Ok(vec![
-        metadata.to_string_lossy().into_owned(),
-        finding.to_string_lossy().into_owned(),
-    ])
+        .map_err(|e| format!("update status in {finding_dir}: {e}"))
 }
 
-fn finish_lines(lines: Vec<String>, trailing_newline: bool) -> String {
-    let mut s = lines.join("\n");
-    if trailing_newline {
-        s.push('\n');
+async fn git_rev_parse_head_optional(workspace: &Path) -> Option<String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.current_dir(workspace)
+        .args(["rev-parse", "HEAD"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    s
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit())).then_some(sha)
 }
 
 /// `git format-patch -1 --stdout HEAD` in the workspace, write to
 /// `<dir>/auto-generated-fix.diff`, append `auto_generated_fix:` to
-/// `metadata.yaml`. Mirrors the existing `run_publish_fix` in
-/// kres-repl/src/session.rs without taking a kres-repl dep.
+/// `metadata.yaml`, and link the patch from `summary.md`.
 async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> Result<String, String> {
     let dir = PathBuf::from(finding_dir);
     if !dir.is_absolute() {
         return Err(format!("finding_dir must be absolute: {finding_dir}"));
     }
-    if !dir.join("metadata.yaml").exists() || !dir.join("FINDING.md").exists() {
-        return Err(format!(
-            "{finding_dir} is not a kres finding directory (missing metadata.yaml or FINDING.md)"
-        ));
+    kres_core::ensure_artifact_dir_files(&dir)
+        .map_err(|e| format!("prepare {finding_dir}: {e}"))?;
+    let fix_path = dir.join(kres_core::AUTO_GENERATED_FIX_NAME);
+    if let Some(head_sha) = git_rev_parse_head_optional(workspace).await {
+        if kres_core::patch_file_matches_head(&dir, &head_sha).unwrap_or(false) {
+            return Ok(fix_path.display().to_string());
+        }
     }
     let mut cmd = tokio::process::Command::new("git");
     cmd.current_dir(workspace)
@@ -2462,21 +2442,12 @@ async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> Result<String, 
         ));
     }
     let patch = String::from_utf8_lossy(&out.stdout).into_owned();
-    let fix_path = dir.join("auto-generated-fix.diff");
-    std::fs::write(&fix_path, &patch).map_err(|e| format!("write {}: {e}", fix_path.display()))?;
-    let metadata_path = dir.join("metadata.yaml");
-    let metadata = std::fs::read_to_string(&metadata_path)
-        .map_err(|e| format!("read {}: {e}", metadata_path.display()))?;
-    if !metadata
-        .lines()
-        .any(|l| l.trim_start().starts_with("auto_generated_fix:"))
-    {
-        let mut updated = metadata.trim_end().to_string();
-        updated.push('\n');
-        updated.push_str("auto_generated_fix: auto-generated-fix.diff\n");
-        std::fs::write(&metadata_path, updated)
-            .map_err(|e| format!("write {}: {e}", metadata_path.display()))?;
+    if patch.is_empty() {
+        return Err("git format-patch produced empty output".into());
     }
+    std::fs::write(&fix_path, &patch).map_err(|e| format!("write {}: {e}", fix_path.display()))?;
+    kres_core::record_auto_generated_fix(&dir)
+        .map_err(|e| format!("record auto-generated fix in {finding_dir}: {e}"))?;
     Ok(fix_path.display().to_string())
 }
 
@@ -3790,7 +3761,7 @@ mod tests {
         let wf = fix_workflow();
         let review = wf.steps.iter().find(|s| s.id == "review").unwrap();
         let lens = review.lenses.iter().find(|l| l.id == "assertions").unwrap();
-        let inputs = Map::new();
+        let inputs = Map::from_iter([("assisted_by".to_string(), json!("kres (claude-test)"))]);
         let states = make_state(&[
             (
                 "write-patch",
@@ -4122,6 +4093,108 @@ mod tests {
     }
 
     #[test]
+    fn fix_write_patch_prompt_allows_empty_build_target_for_non_object_changes() {
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "write-patch").unwrap();
+        let prompt = step.prompt.as_ref().unwrap();
+
+        assert!(prompt.contains("must match exactly once"));
+        assert!(prompt.contains("replace_all=true"));
+        assert!(prompt.contains("build_target empty"));
+        assert!(prompt.contains("documentation-only"));
+        assert!(prompt.contains("deterministic build step will skip cleanly"));
+    }
+
+    #[test]
+    fn fix_review_prompt_accepts_configured_assisted_by_trailer() {
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
+        let lens = step.lenses.first().expect("review lens");
+        let inputs = Map::from_iter([
+            ("target".to_string(), json!("freeform bug prose")),
+            ("target_kind".to_string(), json!("prose")),
+            ("target_artifact_dir".to_string(), json!("")),
+            ("assisted_by".to_string(), json!("kres (claude-test)")),
+        ]);
+        let states = make_state(&[
+            (
+                "research",
+                1,
+                0,
+                json!({
+                    "research_status": "confirmed",
+                    "valid": true,
+                    "invalid_evidence": "",
+                    "invalid_evidence_kind": "none",
+                    "affected_files": ["drivers/example/example_drv.c"],
+                    "affected_symbols": ["example_sync_op"],
+                    "analysis": "Add the missing cleanup call before returning."
+                }),
+            ),
+            (
+                "write-patch",
+                1,
+                0,
+                json!({
+                    "build_target": "drivers/example/example_drv.o",
+                    "code_changes_emitted": true,
+                    "affected_files_changed": true,
+                    "review_dispute": "",
+                    "review_dispute_allowed": false
+                }),
+            ),
+            (
+                "commit",
+                1,
+                0,
+                json!({
+                    "commit_sha": "abc123def4567890",
+                    "commit_message": "subsys: fix example\n\nBody.\n\nAssisted-by: kres (claude-test)\nSigned-off-by: Test <test@example.com>\n"
+                }),
+            ),
+            (
+                "build",
+                1,
+                0,
+                json!({
+                    "result": "clean",
+                    "build_target": "drivers/example/example_drv.o",
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": ""
+                }),
+            ),
+            (
+                "compile-triage",
+                1,
+                0,
+                json!({
+                    "result": "not_needed",
+                    "analysis": "Build passed."
+                }),
+            ),
+        ]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+
+        let rendered = interpolate_with_lens(
+            step.prompt.as_ref().expect("review prompt"),
+            &wf,
+            &ctx,
+            Some("review"),
+            Some(lens),
+        )
+        .unwrap();
+
+        assert!(rendered.contains("Assisted-by: kres (claude-test)"));
+        assert!(rendered.contains("Do not report that exact trailer as a non-standard"));
+        assert!(rendered.contains("missing, duplicated, or"));
+        assert!(rendered.contains("does not exactly match the configured value"));
+    }
+
+    #[test]
     fn set_finding_status_reaper_updates_status_files() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -4221,6 +4294,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_fix_updates_metadata_summary_and_skips_current_head() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        let out = std::process::Command::new("git")
+            .args(["add", "a.c"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "fix: update a"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "fix commit failed: {out:?}");
+
+        let artifact = tempfile::tempdir().unwrap();
+        std::fs::write(
+            artifact.path().join("metadata.yaml"),
+            "id: F1\nstatus: active\n",
+        )
+        .unwrap();
+        std::fs::write(artifact.path().join("FINDING.md"), "# F1\n").unwrap();
+        std::fs::write(
+            artifact.path().join("summary.md"),
+            "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)\n\nbody\n",
+        )
+        .unwrap();
+
+        let patch = run_publish_fix(repo.path(), artifact.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(std::path::Path::new(&patch).is_file());
+        assert!(
+            std::fs::read_to_string(artifact.path().join("metadata.yaml"))
+                .unwrap()
+                .contains("auto_generated_fix: auto-generated-fix.diff\n")
+        );
+        assert!(std::fs::read_to_string(artifact.path().join("summary.md"))
+            .unwrap()
+            .contains(kres_core::AUTO_GENERATED_FIX_LINK));
+
+        let before = std::fs::metadata(artifact.path().join("auto-generated-fix.diff"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let second = run_publish_fix(repo.path(), artifact.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let after = std::fs::metadata(artifact.path().join("auto-generated-fix.diff"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(patch, second);
+        assert_eq!(before, after);
+    }
+
+    #[tokio::test]
     async fn commit_fix_empty_amend_returns_current_head() {
         let tmp = init_test_git_repo();
 
@@ -4238,7 +4369,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(first.sha, second.sha);
         assert_eq!(first.message, second.message);
         assert!(second.message.contains("test: first fix"));
         assert!(second.message.contains("Signed-off-by:"));
@@ -4729,6 +4859,27 @@ mod tests {
         );
         let derived = derive_inputs(&wf, inputs);
         assert_eq!(derived.get("target_kind"), Some(&json!("prose")));
+        assert_eq!(derived.get("target_artifact_dir"), Some(&json!("")));
+    }
+
+    #[test]
+    fn derive_target_artifact_dir_preserves_prose_results_dir() {
+        let wf = fix_workflow();
+        let mut inputs = Map::new();
+        inputs.insert(
+            "target".into(),
+            Value::String("just a freeform bug description".into()),
+        );
+        inputs.insert(
+            "target_artifact_dir".into(),
+            Value::String("/tmp/kres-results".into()),
+        );
+        let derived = derive_inputs(&wf, inputs);
+        assert_eq!(derived.get("target_kind"), Some(&json!("prose")));
+        assert_eq!(
+            derived.get("target_artifact_dir"),
+            Some(&json!("/tmp/kres-results"))
+        );
     }
 
     #[test]

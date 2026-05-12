@@ -45,8 +45,8 @@ impl ConsentStore {
     /// that matches operator intent in practice). If the path is a
     /// directory, the directory itself is granted. Paths are
     /// canonicalised so `/proj/../proj` and symlinks collapse to a
-    /// single entry.  Returns the directory that was ultimately
-    /// added, or None if the path couldn't be resolved.
+    /// single entry. Returns the newly added directory, or None if
+    /// the path couldn't be resolved or was already granted.
     pub fn grant_from_mention(&self, mentioned: &Path) -> Option<PathBuf> {
         let canon = mentioned.canonicalize().ok()?;
         let dir = if canon.is_dir() {
@@ -67,8 +67,11 @@ impl ConsentStore {
         // so the `?` here propagates the rejection cleanly.
         dir.parent()?;
         let mut g = self.granted.write().unwrap();
-        g.insert(dir.clone());
-        Some(dir)
+        if g.insert(dir.clone()) {
+            Some(dir)
+        } else {
+            None
+        }
     }
 
     /// Current set of granted directories (snapshot).
@@ -300,6 +303,19 @@ mod tests {
         let canon = d.canonicalize().unwrap();
         assert_eq!(got, canon);
         assert!(s.is_allowed(&canon.join("x")));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn grant_from_mention_reports_only_new_grants() {
+        let tmp = std::env::temp_dir();
+        let d = tmp.join(format!("kres-consent-dedup-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let s = ConsentStore::new();
+
+        assert!(s.grant_from_mention(&d).is_some());
+        assert!(s.grant_from_mention(&d).is_none());
+
         std::fs::remove_dir_all(&d).ok();
     }
 

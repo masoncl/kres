@@ -271,6 +271,29 @@ fn log_usage(u: &kres_llm::request::Usage) -> LoggedUsage {
     }
 }
 
+fn slow_variant_call_config(
+    model: Model,
+    max_tokens: u32,
+    max_input_tokens: Option<u32>,
+    thinking: Option<ThinkingBudget>,
+    system: Option<String>,
+    stream_label: String,
+) -> CallConfig {
+    let mut cfg = CallConfig::defaults_for(model)
+        .with_max_tokens(max_tokens)
+        .with_stream_label(stream_label);
+    if let Some(thinking) = thinking {
+        cfg = cfg.with_thinking(thinking);
+    }
+    if let Some(system) = system {
+        cfg = cfg.with_system(system);
+    }
+    if let Some(n) = max_input_tokens {
+        cfg = cfg.with_max_input_tokens(n);
+    }
+    cfg
+}
+
 /// Extract the concatenated "thinking" block text from a response, if
 /// any — =` argument to `log_code`.
 fn extract_thinking(resp: &kres_llm::request::MessagesResponse) -> Option<String> {
@@ -1180,18 +1203,14 @@ impl Orchestrator {
                         cache: false,
                         cached_prefix,
                     }];
-                    let mut cfg = CallConfig::defaults_for(model.clone())
-                        .with_max_tokens(max_tokens)
-                        .with_stream_label(lens_label);
-                    if let Some(thinking) = thinking {
-                        cfg = cfg.with_thinking(thinking);
-                    }
-                    if let Some(s) = system {
-                        cfg = cfg.with_system(s);
-                    }
-                    if let Some(n) = max_input_tokens {
-                        cfg = cfg.with_max_input_tokens(n);
-                    }
+                    let cfg = slow_variant_call_config(
+                        model.clone(),
+                        max_tokens,
+                        max_input_tokens,
+                        thinking,
+                        system,
+                        lens_label,
+                    );
                     if let Some(lg) = &logger {
                         lg.log_code_labeled("user", Some(&log_label), &lens_logged, None, None);
                     }
@@ -1337,16 +1356,21 @@ impl Orchestrator {
                 cache: false,
                 cached_prefix: Some(shared_prefix.to_string()),
             }];
-            let warm_max_tokens = 1;
-            let mut cfg = CallConfig::defaults_for(variant.model.clone())
-                .with_max_tokens(warm_max_tokens)
-                .with_thinking(ThinkingBudget::Disabled)
-                .with_stream_label(format!("lens cache warm ({})", variant.label));
-            if let Some(system) = variant.system.clone() {
-                cfg = cfg.with_system(system);
-            }
-            if let Some(max_input_tokens) = variant.max_input_tokens {
-                cfg = cfg.with_max_input_tokens(max_input_tokens);
+            let cfg = slow_variant_call_config(
+                variant.model.clone(),
+                variant.max_tokens,
+                variant.max_input_tokens,
+                variant.thinking,
+                variant.system.clone(),
+                format!("lens cache warm ({})", variant.label),
+            );
+            let log_label = format!(
+                "phase=slow-lens-cache-warm model={} label={}",
+                variant.model.id, variant.label
+            );
+            let warm_logged = format!("{}{}", shared_prefix, messages[0].content);
+            if let Some(lg) = &self.logger {
+                lg.log_code_labeled("user", Some(&log_label), &warm_logged, None, None);
             }
             let result = tokio::select! {
                 _ = shutdown.cancelled() => return warmed,
@@ -1355,6 +1379,17 @@ impl Orchestrator {
             match result {
                 Ok(resp) => {
                     record_usage(&self.usage, "slow", &variant.model, &resp.usage);
+                    if let Some(lg) = &self.logger {
+                        let text = extract_text(&resp);
+                        let thinking = extract_thinking(&resp);
+                        lg.log_code_labeled(
+                            "assistant",
+                            Some(&log_label),
+                            &text,
+                            Some(log_usage(&resp.usage)),
+                            thinking.as_deref(),
+                        );
+                    }
                     successes += 1;
                     warmed.insert(key);
                 }
@@ -1763,6 +1798,35 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 mod tests {
     use super::*;
     use crate::followup::Followup;
+
+    #[test]
+    fn lens_cache_warm_uses_same_slow_request_shape_as_lens_call() {
+        let model = Model::from_id("claude-sonnet-4-6");
+        let thinking = Some(ThinkingBudget::Adaptive(kres_llm::model::Effort::Medium));
+        let warm = slow_variant_call_config(
+            model.clone(),
+            64_000,
+            Some(900_000),
+            thinking,
+            Some("slow system".to_string()),
+            "lens cache warm".to_string(),
+        );
+        let lens = slow_variant_call_config(
+            model,
+            64_000,
+            Some(900_000),
+            thinking,
+            Some("slow system".to_string()),
+            "lens memory".to_string(),
+        );
+
+        assert_eq!(warm.model.id, lens.model.id);
+        assert_eq!(warm.max_tokens, lens.max_tokens);
+        assert_eq!(warm.max_input_tokens, lens.max_input_tokens);
+        assert_eq!(warm.thinking, lens.thinking);
+        assert_eq!(warm.system, lens.system);
+        assert_eq!(warm.system_cached, lens.system_cached);
+    }
 
     #[tokio::test]
     async fn null_fetcher_returns_empty() {

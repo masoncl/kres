@@ -3790,19 +3790,14 @@ impl Session {
     }
 
     fn print_exit_cost_summary(&self) {
-        if self.cfg.exit_on_idle {
-            self.print_usage_summary("final usage before exit", false);
-        }
+        self.print_usage_summary("final usage before exit", false);
     }
 
     fn print_usage_summary(&self, label: &str, show_empty: bool) {
         let snap = self.usage.snapshot();
         if snap.is_empty() {
             if show_empty {
-                if !self.cfg.stdio && !self.cfg.tui {
-                    crate::status::park_scroll_region_bottom();
-                }
-                kres_core::async_eprintln!("(no API usage recorded yet)");
+                self.print_command_output("(no API usage recorded yet)");
             }
             return;
         }
@@ -3830,8 +3825,12 @@ impl Session {
             fmt_k(total.cache_creation_input_tokens),
             fmt_k(total.cache_read_input_tokens),
         ));
-        if !self.cfg.stdio && !self.cfg.tui {
-            crate::status::park_scroll_region_bottom();
+        self.print_command_output(&out);
+    }
+
+    fn print_command_output(&self, out: &str) {
+        if !self.cfg.stdio && !self.cfg.tui && crate::status::print_command_block(out) {
+            return;
         }
         kres_core::async_eprintln!("{out}");
     }
@@ -5073,6 +5072,12 @@ async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> String {
     // HEAD's sha and falls through to the rewrite path.
     if let Some(head_sha) = git_rev_parse_head(workspace).await {
         if kres_core::patch_file_matches_head(&dir, &head_sha).unwrap_or(false) {
+            if let Err(e) = kres_core::clear_invalidation_artifacts(&dir) {
+                return format!(
+                    "[publish-fix FAILED] clear invalidation artifacts in {}: {e}",
+                    dir.display()
+                );
+            }
             return format!(
                 "[publish-fix] {} already up to date for HEAD {}",
                 fix_path.display(),

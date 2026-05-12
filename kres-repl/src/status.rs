@@ -17,6 +17,12 @@
 //! region persists in the user's shell — a `reset` command fixes it.
 
 use std::io::Write;
+use std::sync::{Mutex, OnceLock};
+
+fn terminal_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Current terminal size in rows/cols, via ioctl TIOCGWINSZ on a
 /// tty fd (stderr). Returns None when stderr isn't a tty or the
@@ -49,6 +55,7 @@ pub fn term_size() -> Option<(u16, u16)> {
 /// when stderr isn't a tty or the size lookup fails.
 pub fn install() -> Option<(u16, u16)> {
     let (rows, cols) = term_size()?;
+    let _guard = terminal_lock().lock().unwrap();
     let mut out = std::io::stderr();
     // Paint a blank initial status row so the layout is visible
     // even before the first poll fires.
@@ -73,6 +80,7 @@ pub fn install() -> Option<(u16, u16)> {
 /// path — a background poller runs every few hundred ms.
 /// Truncates to `cols-1` chars so the terminal doesn't wrap.
 pub fn paint(rows: u16, cols: u16, text: &str) {
+    let _guard = terminal_lock().lock().unwrap();
     let mut out = std::io::stderr();
     let status_row = rows - 1;
     // Truncate; account for a trailing space and ensure we don't
@@ -109,9 +117,38 @@ pub fn park_scroll_region_bottom() {
     if rows < 3 {
         return;
     }
+    let _guard = terminal_lock().lock().unwrap();
     let mut out = std::io::stderr();
     let _ = write!(out, "\x1b[{};1H", rows - 2);
     let _ = out.flush();
+}
+
+/// Print foreground command output synchronously above the reserved
+/// status/prompt rows.
+///
+/// Do not route this through the async printer: foreground slash
+/// commands return to the readline loop immediately after printing,
+/// so an async ExternalPrinter send can race the next prompt repaint
+/// and the status-row painter. This function writes the complete
+/// block while holding the same terminal lock as [`paint`].
+pub fn print_command_block(block: &str) -> bool {
+    let Some((rows, _)) = term_size() else {
+        return false;
+    };
+    if rows < 3 {
+        return false;
+    }
+    let _guard = terminal_lock().lock().unwrap();
+    let mut out = std::io::stderr();
+    let _ = write!(out, "\x1b[{};1H", rows - 2);
+    for line in block.lines() {
+        let _ = write!(out, "\r\n\x1b[2K{line}");
+    }
+    if block.ends_with('\n') {
+        let _ = write!(out, "\r\n\x1b[2K");
+    }
+    let _ = out.flush();
+    true
 }
 
 /// Clear a specific terminal row (absolute row number, 1-indexed)
@@ -120,6 +157,7 @@ pub fn park_scroll_region_bottom() {
 /// install() sets up the new scroll region. Preserves scrollback
 /// content unlike a full ESC[2J clear.
 pub fn clear_row_and_reset_region(row: u16) {
+    let _guard = terminal_lock().lock().unwrap();
     let mut out = std::io::stderr();
     // ESC[r        reset scroll region to full screen so our
     //              absolute-cursor-move can reach any row
@@ -132,6 +170,7 @@ pub fn clear_row_and_reset_region(row: u16) {
 /// Restore the terminal: reset the scroll region and clear the
 /// status row. Call on REPL shutdown.
 pub fn restore() {
+    let _guard = terminal_lock().lock().unwrap();
     let mut out = std::io::stderr();
     // ESC[r  reset scroll region to full screen
     if let Some((rows, _)) = term_size() {

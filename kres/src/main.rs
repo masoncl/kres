@@ -1477,7 +1477,9 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     kres_repl::apply_results_artifact_dir(&workflow, &mut inputs_raw, args.results.as_deref());
     let inputs = derive_inputs(&workflow, inputs_raw);
 
-    let mut driver = LlmDriver::new(args.workspace.clone(), workflow.clone());
+    let usage = Arc::new(kres_core::UsageTracker::new());
+    let mut driver =
+        LlmDriver::new(args.workspace.clone(), workflow.clone()).with_usage(usage.clone());
 
     // JSONL turn logging. TurnLogger::new appends `.kres/logs/<uuid>` itself, so
     // pass a base directory (the workspace by default), matching the REPL.
@@ -1610,7 +1612,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
             args.workspace.clone(),
             fetcher,
             None,
-            None,
+            Some(usage.clone()),
             5,
             logger.clone(),
             args.results.as_ref().map(|d| d.join("comparison.json")),
@@ -1672,7 +1674,48 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     for p in run.written_artifacts {
         eprintln!("wrote {}", p.display());
     }
+    eprintln!("{}", format_workflow_usage_summary(&usage));
     kres_repl::workflow_status_result(&run.trace.status)
+}
+
+fn format_workflow_usage_summary(usage: &kres_core::UsageTracker) -> String {
+    let snap = usage.snapshot();
+    if snap.is_empty() {
+        return "final usage before exit: no API usage recorded".to_string();
+    }
+    let total = usage.totals();
+    let mut out = format!("final usage before exit ({} call(s) total):", total.calls);
+    for (k, e) in snap {
+        out.push_str(&format!(
+            "\n  {:>4}/{:<24}  {:>4}x  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+            k.role,
+            k.model,
+            e.calls,
+            fmt_token_count(e.input_tokens),
+            fmt_token_count(e.output_tokens),
+            fmt_token_count(e.cache_creation_input_tokens),
+            fmt_token_count(e.cache_read_input_tokens),
+        ));
+    }
+    out.push_str(&format!(
+        "\n  total         {:>4}x  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+        total.calls,
+        fmt_token_count(total.input_tokens),
+        fmt_token_count(total.output_tokens),
+        fmt_token_count(total.cache_creation_input_tokens),
+        fmt_token_count(total.cache_read_input_tokens),
+    ));
+    out
+}
+
+fn fmt_token_count(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        return format!("{:.1}k", n as f64 / 1_000.0);
+    }
+    format!("{:.2}M", n as f64 / 1_000_000.0)
 }
 
 async fn run_test(args: TestArgs) -> Result<()> {

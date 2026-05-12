@@ -238,6 +238,28 @@ the bug still exists at the current workspace HEAD.
    cannot prove a concrete bug and fix contract, it must not set
    `confirmed` just to keep the fix pipeline moving.
 
+   Proving a concrete bug requires proving the alleged state is valid and
+   reachable, not merely that one local function would mishandle that
+   state if it appeared. For each required flag combination, object
+   state, lock state, refcount state, callback ordering, or lifetime
+   transition, research must inspect the creators/converters and
+   validators of that state. Assertions, `WARN`/`VM_WARN` paths,
+   page-table checks, type contracts, helper comments, and documented API
+   rules can be invalidating evidence when they decisively reject the
+   alleged state. If they raise doubt but do not disprove it, research
+   should return `unconfirmed` and request the missing evidence.
+
+   If the proposed fix restores behavior that current history
+   deliberately removed, research must read that removal commit and
+   require concrete evidence that the removal was wrong or incomplete
+   before confirming. A patch must not be planned only to handle an
+   invalid or deliberately forbidden state. Confirmed research needs a
+   concrete trigger path: creator path -> transformed state -> affected
+   function -> violated contract/bad outcome. If any link is speculative,
+   research should return `unconfirmed` unless source/commit evidence
+   proves the state is impossible or already fixed, in which case it
+   should return `invalid`.
+
    If the bug is invalid and the input is a finding directory, the
    workflow goes to `invalidate` only when `invalid_evidence_kind` is
    `source_or_commit_evidence` and `invalid_evidence` is non-empty. If
@@ -257,15 +279,22 @@ the bug still exists at the current workspace HEAD.
 2. **invalidate / unconfirm**
 
    Reaper action `set-finding-status`, not an LLM edit step. It updates
-   exactly the status fields:
+   the status fields:
 
    - `metadata.yaml`: `status: invalidated` or `status: unconfirmed`
    - `FINDING.md`: `**Status:** invalidated` or
      `**Status:** unconfirmed`
 
+   When the finding is invalidated, the same deterministic reaper action
+   also writes `invalidation.md` in the finding directory. The file
+   records `research.analysis` and `research.invalid_evidence` so the
+   negative result is reviewable without scraping JSONL logs.
+
    These steps are terminal on success and run when `target_artifact_dir`
    is set. Finding-directory targets use the target directory; prose
-   targets use `--results` when supplied. The reaper refuses to
+   targets use `--results` when supplied. Per-todo invalid research in
+   the automatic series driver is recorded as a partial invalidation
+   instead of a whole-finding status change. The reaper refuses to
    invalidate unless `research_status=invalid`,
    `invalid_evidence_kind` is `source_or_commit_evidence`, and
    `invalid_evidence.trim()` is non-empty. It refuses to mark
@@ -441,6 +470,20 @@ the bug still exists at the current workspace HEAD.
    patch or gathered source. In particular, leak/crash/refcount/race and
    cleanup claims should account for fallback cleanup paths before the
    message states them.
+
+   In a fix series, the commit message is scoped to the current fix
+   todo's patch only: before commit, the worktree/index diff against
+   `HEAD`; after commit or during review rewrite, `git diff HEAD~1`.
+   That parent already includes earlier todos in the series, so later
+   commit messages must describe the bug and fix relative to that parent
+   rather than the original pre-series tree. If a message needs to
+   mention a sibling todo or earlier series commit, it must label that
+   context explicitly as earlier/later series context and must not claim
+   a sibling change is absent from, newly added by, or still needed in
+   the current tree unless that is true for the current patch's
+   parent-to-child diff. Stale pre-series snippets or ASCII traces for
+   code already changed by an earlier commit should be omitted or
+   explicitly labeled as pre-series history.
 
    The message should be a human-readable kernel changelog, not a proof
    memo. The expected shape is a small number of short paragraphs that
@@ -673,7 +716,10 @@ the bug still exists at the current workspace HEAD.
    the patch name under `auto_generated_fixes:` in `metadata.yaml`
    idempotently, and adds a cross-link in `summary.md`. Single-fix runs use
    `auto-generated-fix.diff`; series runs use `auto-generated-fix.diff`,
-   `auto-generated-fix-2.diff`, and so on.
+   `auto-generated-fix-2.diff`, and so on. A successful publish also
+   deletes stale `invalidation.md` and `partial-invalidation.md` files
+   from the artifact directory, because the current run has proven and
+   published a valid fix.
 
 ### Fix Series
 
@@ -685,6 +731,16 @@ an artifact directory is available and stops. If research is confirmed,
 it must emit `research.fix_plan`, an ordered array of independently
 committable todos.
 
+Planning uses one todo only when the finding has one coherent failure
+mode and one coherent patch/review surface. It must use multiple todos
+when the input describes multiple independently triggerable failures,
+multiple affected sites with different fix contracts, or changes that
+should be reviewed, retried, built, and published independently. A todo
+does not need to fix the entire finding by itself: series commits may be
+complementary. If one fix depends on another to compile, be safe, or
+make semantic sense, that ordering belongs in `depends_on`; it is not a
+reason to merge independent failure modes into one commit.
+
 Rust owns that array as the series todo list and runs the full JSON fix
 workflow once per todo, in order. Rust parses the plan into typed todo
 records, rejects duplicate IDs, empty core fields, and dependencies that
@@ -694,9 +750,21 @@ full `fix_series_plan`, the selected `current_fix_todo`, one-based
 `fix_index`, and `fix_run_mode=todo` in workflow inputs. The planning
 pass uses `fix_run_mode=planning`.
 
-Per-todo research must stay confirmed. If a per-todo run returns
-invalid or unconfirmed research, the workflow fails that todo instead of
-marking the whole finding invalid/unconfirmed.
+Per-todo research must stay confirmed to reach patch writing. If the bug
+is still proven but the current todo's fix contract is wrong or
+incomplete, research returns `unconfirmed` with
+`research_decision.bug_proven=true`,
+`fix_contract_proven=false`, and `invalidity_proven=false`, plus a typed
+`fix_plan` containing a revised version of the current todo with the
+same `id`. Rust validates that replacement todo, updates the in-memory
+series plan, and reruns the same todo. Each todo has a small revision
+budget so a bad contract cannot loop forever. If research returns
+invalid, unconfirmed without a usable revised todo, or exhausts the
+revision budget, the workflow fails that todo instead of marking the
+whole finding invalid/unconfirmed. For invalid per-todo research with
+actionable source/commit evidence, Rust writes or appends
+`partial-invalidation.md` in the finding directory with the todo id,
+todo title, research analysis, and invalid evidence.
 
 Each todo is treated as its own finding for retry and review purposes:
 step attempts, eval failures, compile triage, review branch-backs,

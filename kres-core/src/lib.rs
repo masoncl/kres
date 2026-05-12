@@ -31,10 +31,11 @@ pub mod task;
 pub mod todo;
 
 pub use artifact::{
-    auto_generated_fix_link, auto_generated_fix_name, ensure_artifact_dir_files,
-    patch_file_matches_head, patch_file_matches_head_named, record_auto_generated_fix,
-    record_auto_generated_fix_named, set_finding_status_files, AUTO_GENERATED_FIX_LINK,
-    AUTO_GENERATED_FIX_NAME, SUMMARY_CROSS_LINK,
+    auto_generated_fix_link, auto_generated_fix_name, clear_invalidation_artifacts,
+    ensure_artifact_dir_files, patch_file_matches_head, patch_file_matches_head_named,
+    record_auto_generated_fix, record_auto_generated_fix_named, set_finding_status_files,
+    write_invalidation_artifact, write_partial_invalidation_artifact, AUTO_GENERATED_FIX_LINK,
+    AUTO_GENERATED_FIX_NAME, INVALIDATION_NAME, PARTIAL_INVALIDATION_NAME, SUMMARY_CROSS_LINK,
 };
 pub use consent::ConsentStore;
 pub use cost::{UsageEntry, UsageKey, UsageTracker};

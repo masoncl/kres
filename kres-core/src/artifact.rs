@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 pub const AUTO_GENERATED_FIX_NAME: &str = "auto-generated-fix.diff";
 pub const AUTO_GENERATED_FIX_LINK: &str = "[auto-generated-fix.diff](auto-generated-fix.diff)";
+pub const INVALIDATION_NAME: &str = "invalidation.md";
+pub const PARTIAL_INVALIDATION_NAME: &str = "partial-invalidation.md";
 pub const SUMMARY_CROSS_LINK: &str = "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)";
 
 pub fn auto_generated_fix_name(index: u32) -> String {
@@ -95,6 +97,79 @@ pub fn set_finding_status_files(finding_dir: &Path, status: &str) -> std::io::Re
     Ok(vec![metadata, finding])
 }
 
+pub fn write_invalidation_artifact(
+    finding_dir: &Path,
+    analysis: &str,
+    invalid_evidence: &str,
+) -> std::io::Result<PathBuf> {
+    ensure_artifact_dir_files(finding_dir)?;
+    let path = finding_dir.join(INVALIDATION_NAME);
+    let body = format!(
+        "# Invalidation\n\n\
+         This finding was invalidated by kres research.\n\n\
+         ## Reason\n\n\
+         {}\n\n\
+         ## Evidence\n\n\
+         {}\n",
+        markdown_text_or_placeholder(analysis, "No analysis was recorded."),
+        markdown_text_or_placeholder(invalid_evidence, "No invalid evidence was recorded."),
+    );
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+pub fn write_partial_invalidation_artifact(
+    finding_dir: &Path,
+    todo_id: &str,
+    todo_title: &str,
+    analysis: &str,
+    invalid_evidence: &str,
+) -> std::io::Result<PathBuf> {
+    ensure_artifact_dir_files(finding_dir)?;
+    let path = finding_dir.join(PARTIAL_INVALIDATION_NAME);
+    let marker = format!(
+        "<!-- kres-partial-invalidation:{} -->",
+        html_comment_key(todo_id)
+    );
+    let section = format!(
+        "{marker}\n\
+         ## Invalidated Todo: {}\n\n\
+         **Todo ID:** `{}`\n\n\
+         **Todo title:** {}\n\n\
+         ### Reason\n\n\
+         {}\n\n\
+         ### Evidence\n\n\
+         {}\n",
+        markdown_text_or_placeholder(todo_title, "Untitled todo."),
+        markdown_text_or_placeholder(todo_id, "unknown"),
+        markdown_text_or_placeholder(todo_title, "Untitled todo."),
+        markdown_text_or_placeholder(analysis, "No analysis was recorded."),
+        markdown_text_or_placeholder(invalid_evidence, "No invalid evidence was recorded."),
+    );
+
+    if path.exists() {
+        let mut existing = std::fs::read_to_string(&path)?;
+        if !existing.contains(&marker) {
+            if !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push('\n');
+            existing.push_str(&section);
+            std::fs::write(&path, existing)?;
+        }
+    } else {
+        let body = format!(
+            "# Partial Invalidation\n\n\
+             One or more fix todos in this broader finding were invalidated. \
+             This file records the invalidated part without marking the whole \
+             finding invalid.\n\n\
+             {section}"
+        );
+        std::fs::write(&path, body)?;
+    }
+    Ok(path)
+}
+
 pub fn record_auto_generated_fix(dir: &Path) -> std::io::Result<()> {
     record_auto_generated_fix_named(dir, AUTO_GENERATED_FIX_NAME)
 }
@@ -102,6 +177,7 @@ pub fn record_auto_generated_fix(dir: &Path) -> std::io::Result<()> {
 pub fn record_auto_generated_fix_named(dir: &Path, fix_name: &str) -> std::io::Result<()> {
     validate_auto_generated_fix_name(fix_name)?;
     ensure_artifact_dir_files(dir)?;
+    clear_invalidation_artifacts(dir)?;
     let metadata_path = dir.join("metadata.yaml");
     let metadata = std::fs::read_to_string(&metadata_path)?;
     let updated = metadata_with_auto_generated_fix(&metadata, fix_name);
@@ -119,6 +195,19 @@ pub fn record_auto_generated_fix_named(dir: &Path, fix_name: &str) -> std::io::R
         }
     }
     Ok(())
+}
+
+pub fn clear_invalidation_artifacts(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut removed = Vec::new();
+    for name in [INVALIDATION_NAME, PARTIAL_INVALIDATION_NAME] {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(removed)
 }
 
 pub fn patch_file_matches_head(dir: &Path, head_sha: &str) -> std::io::Result<bool> {
@@ -145,6 +234,28 @@ fn finish_lines(lines: Vec<String>, trailing_newline: bool) -> String {
         s.push('\n');
     }
     s
+}
+
+fn markdown_text_or_placeholder<'a>(value: &'a str, placeholder: &'static str) -> &'a str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        placeholder
+    } else {
+        trimmed
+    }
+}
+
+fn html_comment_key(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn metadata_with_auto_generated_fix(metadata: &str, fix_name: &str) -> String {
@@ -295,6 +406,52 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_artifacts_record_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(dir.join("FINDING.md"), "# Finding\n").unwrap();
+
+        let full = write_invalidation_artifact(
+            dir,
+            "The alleged dereference is guarded.",
+            "net/foo.c:42 checks ptr before use.",
+        )
+        .unwrap();
+        assert_eq!(full.file_name().unwrap(), INVALIDATION_NAME);
+        let full_body = std::fs::read_to_string(dir.join(INVALIDATION_NAME)).unwrap();
+        assert!(full_body.contains("The alleged dereference is guarded."));
+        assert!(full_body.contains("net/foo.c:42 checks ptr before use."));
+
+        let partial = write_partial_invalidation_artifact(
+            dir,
+            "fix-b",
+            "drop invalid sibling fix",
+            "The sibling claim is false.",
+            "net/bar.c:7 already rejects it.",
+        )
+        .unwrap();
+        write_partial_invalidation_artifact(
+            dir,
+            "fix-b",
+            "drop invalid sibling fix",
+            "The sibling claim is false.",
+            "net/bar.c:7 already rejects it.",
+        )
+        .unwrap();
+        assert_eq!(partial.file_name().unwrap(), PARTIAL_INVALIDATION_NAME);
+        let partial_body = std::fs::read_to_string(dir.join(PARTIAL_INVALIDATION_NAME)).unwrap();
+        assert!(partial_body.contains("Invalidated Todo: drop invalid sibling fix"));
+        assert!(partial_body.contains("net/bar.c:7 already rejects it."));
+        assert_eq!(
+            partial_body
+                .matches("kres-partial-invalidation:fix-b")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn record_auto_generated_fix_updates_metadata_and_summary() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
@@ -320,6 +477,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn record_auto_generated_fix_clears_stale_invalidation_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(dir.join("FINDING.md"), "# F1\n").unwrap();
+        std::fs::write(dir.join("summary.md"), "# Summary\n").unwrap();
+        std::fs::write(dir.join(INVALIDATION_NAME), "stale invalidation").unwrap();
+        std::fs::write(dir.join(PARTIAL_INVALIDATION_NAME), "stale partial").unwrap();
+
+        record_auto_generated_fix(dir).unwrap();
+
+        assert!(!dir.join(INVALIDATION_NAME).exists());
+        assert!(!dir.join(PARTIAL_INVALIDATION_NAME).exists());
+        assert!(std::fs::read_to_string(dir.join("metadata.yaml"))
+            .unwrap()
+            .contains("auto_generated_fixes:"));
     }
 
     #[test]

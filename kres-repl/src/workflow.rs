@@ -233,7 +233,9 @@ pub struct WorkflowRunResult {
     pub written_artifacts: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+const MAX_FIX_TODO_REVISIONS: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct FixSeriesTodo {
     id: String,
     title: String,
@@ -442,76 +444,143 @@ async fn run_fix_series_driver(
             status: FixTodoStatus::Pending,
         })
         .collect();
-    let fix_series_plan = serde_json::to_value(
-        tracked
-            .iter()
-            .map(|tracked| &tracked.todo)
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(Value::Array(Vec::new()));
+    for idx in 0..tracked.len() {
+        let mut revisions = 0usize;
+        loop {
+            tracked[idx].status = FixTodoStatus::InProgress;
+            let fix_series_plan = fix_series_plan_value(&tracked);
+            async_println(format!(
+                "[fix series] start {}/{} {}",
+                idx + 1,
+                fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+                summarize_fix_todo(&tracked[idx].todo)
+            ));
+            let mut item_inputs = inputs.clone();
+            item_inputs.insert("fix_series_plan".into(), fix_series_plan.clone());
+            item_inputs.insert(
+                "current_fix_todo".into(),
+                serde_json::to_value(&tracked[idx].todo).unwrap_or(Value::Null),
+            );
+            item_inputs.insert(
+                "fix_index".into(),
+                Value::Number(serde_json::Number::from((idx + 1) as u64)),
+            );
+            item_inputs.insert("fix_run_mode".into(), Value::String("todo".to_string()));
 
-    for (idx, tracked_todo) in tracked.iter_mut().enumerate() {
-        tracked_todo.status = FixTodoStatus::InProgress;
-        async_println(format!(
-            "[fix series] start {}/{} {}",
-            idx + 1,
-            fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
-            summarize_fix_todo(&tracked_todo.todo)
-        ));
-        let mut item_inputs = inputs.clone();
-        item_inputs.insert("fix_series_plan".into(), fix_series_plan.clone());
-        item_inputs.insert(
-            "current_fix_todo".into(),
-            serde_json::to_value(&tracked_todo.todo).unwrap_or(Value::Null),
-        );
-        item_inputs.insert(
-            "fix_index".into(),
-            Value::Number(serde_json::Number::from((idx + 1) as u64)),
-        );
-        item_inputs.insert("fix_run_mode".into(), Value::String("todo".to_string()));
+            let item_trace = run_with_optional_observer(
+                workflow,
+                driver,
+                item_inputs,
+                iteration_cap,
+                observer.clone(),
+            )
+            .await;
+            let item_research_status =
+                step_output_string(&item_trace, "research", "research_status");
+            let item_status = item_trace.status.clone();
+            let item_workflow_ok = matches!(
+                item_status,
+                WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+            );
+            let item_research_confirmed = item_research_status.as_deref() == Some("confirmed");
+            let item_ok = item_workflow_ok && item_research_confirmed;
 
-        let item_trace = run_with_optional_observer(
-            workflow,
-            driver,
-            item_inputs,
-            iteration_cap,
-            observer.clone(),
-        )
-        .await;
-        let item_research_status = step_output_string(&item_trace, "research", "research_status");
-        let item_status = item_trace.status;
-        let item_workflow_ok = matches!(
-            item_status,
-            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
-        );
-        let item_research_confirmed = item_research_status.as_deref() == Some("confirmed");
-        let item_ok = item_workflow_ok && item_research_confirmed;
-        tracked_todo.status = if item_ok {
-            FixTodoStatus::Done
-        } else {
-            FixTodoStatus::Failed
-        };
-        let item_label = if item_ok { "done" } else { "failed" };
-        async_println(format!(
-            "[fix series] {item_label} {}/{} {}",
-            idx + 1,
-            fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
-            tracked_todo.todo.id
-        ));
-        events.extend(item_trace.events);
-        final_state = item_trace.final_state;
-        status = if item_workflow_ok && !item_research_confirmed {
-            WorkflowStatus::Failure(format!(
-                "fix todo '{}' research_status was {}, expected confirmed",
-                tracked_todo.todo.id,
-                item_research_status
-                    .as_deref()
-                    .unwrap_or("<missing research_status>")
-            ))
-        } else {
-            item_status
-        };
-        if !item_ok {
+            if item_research_status.as_deref() == Some("invalid") {
+                if let Err(e) =
+                    write_partial_invalidation_for_todo(&inputs, &item_trace, &tracked[idx].todo)
+                {
+                    async_println(format!(
+                        "[fix series] failed to write partial invalidation for {}: {e}",
+                        tracked[idx].todo.id
+                    ));
+                }
+            }
+
+            if !item_ok && should_revise_fix_todo(&item_trace) {
+                match revised_current_fix_todo(&item_trace, &tracked, idx) {
+                    Ok(Some(revised)) if revisions < MAX_FIX_TODO_REVISIONS => {
+                        revisions += 1;
+                        async_println(format!(
+                            "[fix series] revise {}/{} {} (revision {}/{})",
+                            idx + 1,
+                            fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+                            tracked[idx].todo.id,
+                            revisions,
+                            MAX_FIX_TODO_REVISIONS
+                        ));
+                        async_println(format!(
+                            "[fix series] revised todo {}",
+                            summarize_fix_todo(&revised)
+                        ));
+                        events.extend(item_trace.events);
+                        tracked[idx].todo = revised;
+                        tracked[idx].status = FixTodoStatus::Pending;
+                        continue;
+                    }
+                    Ok(Some(_)) => {
+                        tracked[idx].status = FixTodoStatus::Failed;
+                        events.extend(item_trace.events);
+                        final_state = item_trace.final_state;
+                        status = WorkflowStatus::Failure(format!(
+                            "fix todo '{}' exceeded revision budget ({})",
+                            tracked[idx].todo.id, MAX_FIX_TODO_REVISIONS
+                        ));
+                        async_println(format!(
+                            "[fix series] failed {}/{} {}",
+                            idx + 1,
+                            fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+                            tracked[idx].todo.id
+                        ));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracked[idx].status = FixTodoStatus::Failed;
+                        events.extend(item_trace.events);
+                        final_state = item_trace.final_state;
+                        status = WorkflowStatus::Failure(format!(
+                            "fix todo '{}' revision invalid: {e}",
+                            tracked[idx].todo.id
+                        ));
+                        async_println(format!(
+                            "[fix series] failed {}/{} {}",
+                            idx + 1,
+                            fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+                            tracked[idx].todo.id
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            tracked[idx].status = if item_ok {
+                FixTodoStatus::Done
+            } else {
+                FixTodoStatus::Failed
+            };
+            let item_label = if item_ok { "done" } else { "failed" };
+            async_println(format!(
+                "[fix series] {item_label} {}/{} {}",
+                idx + 1,
+                fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+                tracked[idx].todo.id
+            ));
+            events.extend(item_trace.events);
+            final_state = item_trace.final_state;
+            status = if item_workflow_ok && !item_research_confirmed {
+                WorkflowStatus::Failure(format!(
+                    "fix todo '{}' research_status was {}, expected confirmed",
+                    tracked[idx].todo.id,
+                    item_research_status
+                        .as_deref()
+                        .unwrap_or("<missing research_status>")
+                ))
+            } else {
+                item_status
+            };
+            break;
+        }
+        if !matches!(tracked[idx].status, FixTodoStatus::Done) {
             break;
         }
     }
@@ -536,16 +605,114 @@ async fn run_with_optional_observer(
     }
 }
 
-fn parse_fix_plan(trace: &Trace) -> Result<Vec<FixSeriesTodo>, String> {
+fn fix_series_plan_value(tracked: &[TrackedFixTodo]) -> Value {
+    serde_json::to_value(
+        tracked
+            .iter()
+            .map(|tracked| &tracked.todo)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(Value::Array(Vec::new()))
+}
+
+fn should_revise_fix_todo(trace: &Trace) -> bool {
+    if step_output_string(trace, "research", "research_status").as_deref() != Some("unconfirmed") {
+        return false;
+    }
+    let Some(decision) = trace
+        .final_state
+        .get("research")
+        .and_then(|st| st.outputs.get("research_decision"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    decision.get("bug_proven").and_then(Value::as_bool) == Some(true)
+        && decision.get("fix_contract_proven").and_then(Value::as_bool) == Some(false)
+        && decision.get("invalidity_proven").and_then(Value::as_bool) == Some(false)
+}
+
+fn write_partial_invalidation_for_todo(
+    inputs: &Map<String, Value>,
+    trace: &Trace,
+    todo: &FixSeriesTodo,
+) -> Result<(), String> {
+    let Some(dir) = inputs.get("target_artifact_dir").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if dir.trim().is_empty() {
+        return Ok(());
+    }
+    let invalid_evidence_kind =
+        step_output_string(trace, "research", "invalid_evidence_kind").unwrap_or_default();
+    let invalid_evidence =
+        step_output_string(trace, "research", "invalid_evidence").unwrap_or_default();
+    if invalid_evidence_kind != "source_or_commit_evidence" || invalid_evidence.trim().is_empty() {
+        return Ok(());
+    }
+    let analysis = step_output_string(trace, "research", "analysis").unwrap_or_default();
+    kres_core::write_partial_invalidation_artifact(
+        Path::new(dir),
+        &todo.id,
+        &todo.title,
+        &analysis,
+        &invalid_evidence,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+fn revised_current_fix_todo(
+    trace: &Trace,
+    tracked: &[TrackedFixTodo],
+    idx: usize,
+) -> Result<Option<FixSeriesTodo>, String> {
+    let Some(plan) = parse_fix_plan_raw(trace)? else {
+        return Ok(None);
+    };
+    let current_id = &tracked[idx].todo.id;
+    let mut matching = plan.into_iter().filter(|todo| &todo.id == current_id);
+    let Some(revised) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err(format!(
+            "revised fix_plan contains duplicate todo id '{}'",
+            current_id
+        ));
+    }
+    validate_fix_todo_shape(&revised, idx)?;
+    for dep in &revised.depends_on {
+        if !tracked[..idx].iter().any(|tracked| &tracked.todo.id == dep) {
+            return Err(format!(
+                "revised todo '{}' depends_on '{}' which is not an earlier todo",
+                revised.id, dep
+            ));
+        }
+    }
+    if revised == tracked[idx].todo {
+        return Ok(None);
+    }
+    Ok(Some(revised))
+}
+
+fn parse_fix_plan_raw(trace: &Trace) -> Result<Option<Vec<FixSeriesTodo>>, String> {
     let Some(raw) = trace
         .final_state
         .get("research")
         .and_then(|st| st.outputs.get("fix_plan"))
     else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let todos: Vec<FixSeriesTodo> = serde_json::from_value(raw.clone())
         .map_err(|e| format!("expected array of fix todo objects: {e}"))?;
+    Ok(Some(todos))
+}
+
+fn parse_fix_plan(trace: &Trace) -> Result<Vec<FixSeriesTodo>, String> {
+    let Some(todos) = parse_fix_plan_raw(trace)? else {
+        return Ok(Vec::new());
+    };
     validate_fix_plan(&todos)?;
     Ok(todos)
 }
@@ -562,19 +729,7 @@ fn step_output_string(trace: &Trace, step: &str, field: &str) -> Option<String> 
 fn validate_fix_plan(todos: &[FixSeriesTodo]) -> Result<(), String> {
     let mut seen = BTreeSet::new();
     for (idx, todo) in todos.iter().enumerate() {
-        if todo.id.trim().is_empty() {
-            return Err(format!("todo {} has empty id", idx + 1));
-        }
-        for (field, value) in [
-            ("title", &todo.title),
-            ("scope", &todo.scope),
-            ("fix_contract", &todo.fix_contract),
-            ("rationale", &todo.rationale),
-        ] {
-            if value.trim().is_empty() {
-                return Err(format!("todo '{}' has empty {field}", todo.id));
-            }
-        }
+        validate_fix_todo_shape(todo, idx)?;
         for dep in &todo.depends_on {
             if !seen.contains(dep) {
                 return Err(format!(
@@ -585,6 +740,23 @@ fn validate_fix_plan(todos: &[FixSeriesTodo]) -> Result<(), String> {
         }
         if !seen.insert(todo.id.clone()) {
             return Err(format!("duplicate todo id '{}'", todo.id));
+        }
+    }
+    Ok(())
+}
+
+fn validate_fix_todo_shape(todo: &FixSeriesTodo, idx: usize) -> Result<(), String> {
+    if todo.id.trim().is_empty() {
+        return Err(format!("todo {} has empty id", idx + 1));
+    }
+    for (field, value) in [
+        ("title", &todo.title),
+        ("scope", &todo.scope),
+        ("fix_contract", &todo.fix_contract),
+        ("rationale", &todo.rationale),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("todo '{}' has empty {field}", todo.id));
         }
     }
     Ok(())
@@ -661,7 +833,7 @@ pub fn workflow_status_label(status: &WorkflowStatus) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::sync::Arc;
 
     use serde_json::json;
@@ -670,6 +842,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
+    use kres_agents::workflow_exec::{StepState, StepStatus};
     use kres_agents::workflow_runner::{AgentEnv, LlmDriver};
     use kres_llm::client::Client;
 
@@ -848,6 +1021,104 @@ mod tests {
                 .unwrap_err()
                 .contains("not an earlier todo")
         );
+    }
+
+    fn research_trace(outputs: Map<String, Value>) -> Trace {
+        let mut final_state = HashMap::new();
+        final_state.insert(
+            "research".to_string(),
+            StepState {
+                id: "research".to_string(),
+                status: StepStatus::Done,
+                attempt: 1,
+                eval_failures: 0,
+                outputs,
+                preserved_outputs_on_skip: Map::new(),
+                lens_outputs: Map::new(),
+            },
+        );
+        Trace {
+            events: Vec::new(),
+            status: WorkflowStatus::Failure("per-todo research not confirmed".to_string()),
+            final_state,
+        }
+    }
+
+    #[test]
+    fn fix_series_revises_current_todo_from_unconfirmed_research() {
+        let mut original = series_todo("fix-one", Vec::new());
+        original.fix_contract = "bad contract".to_string();
+        let mut revised = original.clone();
+        revised.fix_contract = "corrected contract".to_string();
+        revised.rationale = "corrected rationale".to_string();
+
+        let mut outputs = Map::new();
+        outputs.insert("research_status".to_string(), json!("unconfirmed"));
+        outputs.insert(
+            "research_decision".to_string(),
+            json!({
+                "bug_proven": true,
+                "fix_contract_proven": false,
+                "invalidity_proven": false,
+                "needs_more_audit": true
+            }),
+        );
+        outputs.insert("fix_plan".to_string(), json!([revised]));
+
+        let trace = research_trace(outputs);
+        let tracked = vec![TrackedFixTodo {
+            todo: original,
+            status: FixTodoStatus::InProgress,
+        }];
+
+        assert!(should_revise_fix_todo(&trace));
+        let revised = revised_current_fix_todo(&trace, &tracked, 0)
+            .unwrap()
+            .expect("expected revised todo");
+        assert_eq!(revised.fix_contract, "corrected contract");
+    }
+
+    #[test]
+    fn invalid_todo_research_writes_partial_invalidation() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-partial-invalidation-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(tmp.join("FINDING.md"), "# Finding\n").unwrap();
+
+        let mut inputs = Map::new();
+        inputs.insert(
+            "target_artifact_dir".to_string(),
+            json!(tmp.display().to_string()),
+        );
+        let mut outputs = Map::new();
+        outputs.insert("research_status".to_string(), json!("invalid"));
+        outputs.insert("analysis".to_string(), json!("The sibling claim is false."));
+        outputs.insert(
+            "invalid_evidence".to_string(),
+            json!("net/example.c:12 already rejects it."),
+        );
+        outputs.insert(
+            "invalid_evidence_kind".to_string(),
+            json!("source_or_commit_evidence"),
+        );
+        let trace = research_trace(outputs);
+        let todo = series_todo("fix-two", Vec::new());
+
+        write_partial_invalidation_for_todo(&inputs, &trace, &todo).unwrap();
+
+        let body = std::fs::read_to_string(tmp.join("partial-invalidation.md")).unwrap();
+        assert!(body.contains("Invalidated Todo: todo fix-two"));
+        assert!(body.contains("The sibling claim is false."));
+        assert!(body.contains("net/example.c:12 already rejects it."));
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("metadata.yaml")).unwrap(),
+            "id: F1\nstatus: active\n"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     fn fake_messages_response(text: &str) -> Value {

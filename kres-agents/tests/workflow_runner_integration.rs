@@ -363,7 +363,7 @@ async fn fix_workflow_runs_end_to_end_against_mock_llm() {
         ),
     ]);
     responses.extend(clean_review_responses(&workflow));
-    let port = spawn_mock(responses).await;
+    let (port, requests) = spawn_recording_mock(responses).await;
 
     // target_kind=prose so:
     //   - invalidate is skipped (run_if requires finding_dir)
@@ -413,6 +413,21 @@ async fn fix_workflow_runs_end_to_end_against_mock_llm() {
     let r = produced("research");
     assert_eq!(r.get("valid"), Some(&json!(true)));
     assert_eq!(r.get("research_status"), Some(&json!("confirmed")));
+    let requests = requests.lock().await.join("\n---REQUEST---\n");
+    assert!(
+        requests.contains(
+            "Proving a concrete bug requires proving the alleged state is valid and reachable"
+        ),
+        "research prompt did not require valid/reachable state proof"
+    );
+    assert!(
+        requests.contains("restores behavior that current history deliberately removed"),
+        "research prompt did not require checking deliberately removed behavior"
+    );
+    assert!(
+        requests.contains("creator path -> transformed state"),
+        "research prompt did not require a concrete trigger path"
+    );
 
     let wp = produced("write-patch");
     assert_eq!(wp.get("build_target"), Some(&json!("a.o")));
@@ -817,6 +832,14 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
     assert!(
         requests.contains("KRES-READONLY| diff --git a/a.c b/a.c"),
         "current patch diff was not inlined as read-only payload"
+    );
+    assert!(
+        requests.contains("That parent already includes earlier todos in the series"),
+        "commit-message prompt did not explain series parent semantics"
+    );
+    assert!(
+        requests.contains("Do not paste stale pre-series source snippets"),
+        "commit-message prompt did not forbid stale pre-series snippets"
     );
 
     let out = std::process::Command::new("git")

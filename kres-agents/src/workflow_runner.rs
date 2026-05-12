@@ -109,6 +109,7 @@ use async_trait::async_trait;
 use kres_core::findings::Finding;
 use serde_json::{Map, Value};
 
+use kres_core::cost::UsageTracker;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
@@ -201,6 +202,11 @@ pub struct LlmDriver {
     /// step, lens fan-out, consolidate) appends a user/assistant
     /// pair to `code.jsonl`.
     logger: Option<Arc<TurnLogger>>,
+    /// Optional token accounting sink for LLM calls made directly by
+    /// the workflow driver. Calls delegated to the orchestrator are
+    /// recorded by the orchestrator itself; this covers judge,
+    /// consolidate, review-ledger, and AgentEnv fallback calls.
+    usage: Option<Arc<UsageTracker>>,
     /// Optional shutdown handle. When set, every LLM call awaits
     /// alongside `shutdown.cancelled()`; ctrl-C from the REPL
     /// cancels the in-flight workflow run instead of letting it
@@ -220,6 +226,7 @@ impl LlmDriver {
             workflow,
             skills_block: String::new(),
             logger: None,
+            usage: None,
             shutdown: kres_core::Shutdown::new(),
         }
     }
@@ -256,6 +263,11 @@ impl LlmDriver {
 
     pub fn with_logger(mut self, logger: Arc<TurnLogger>) -> Self {
         self.logger = Some(logger);
+        self
+    }
+
+    pub fn with_usage(mut self, usage: Arc<UsageTracker>) -> Self {
+        self.usage = Some(usage);
         self
     }
 
@@ -406,6 +418,7 @@ impl LlmDriver {
                 r.map_err(|e| format!("step '{}' review ledger LLM call: {e}", step.id))?
             }
         };
+        self.record_direct_usage(AgentRole::Fast, &call_cfg, &resp.usage);
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
             let label = format!("phase=review-ledger step={} attempt={attempt}", step.id);
@@ -491,6 +504,31 @@ impl LlmDriver {
             cfg = cfg.with_max_input_tokens(n);
         }
         Some((client, cfg))
+    }
+
+    fn record_direct_usage(
+        &self,
+        role: AgentRole,
+        cfg: &CallConfig,
+        usage: &kres_llm::request::Usage,
+    ) {
+        let Some(tracker) = &self.usage else {
+            return;
+        };
+        let role = match role {
+            AgentRole::Fast => "fast",
+            AgentRole::Slow => "slow",
+            AgentRole::Code => "code",
+            AgentRole::Reaper => "reaper",
+        };
+        tracker.record(
+            role,
+            cfg.model.id.clone(),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+        );
     }
 
     async fn run_llm_step(
@@ -691,6 +729,7 @@ impl LlmDriver {
                     r.map_err(|e| format!("step '{}' LLM call: {e}", step.id))?
                 }
             };
+            self.record_direct_usage(role, &call_cfg, &resp.usage);
             let text = response_text(&resp);
             if let Some(lg) = &self.logger {
                 let label = match lens {
@@ -941,7 +980,14 @@ impl LlmDriver {
                     })?;
                 let dir = interpolate(dir, &self.workflow, ctx, Some(&step.id))
                     .map_err(|e| format!("set-finding-status dir interpolation: {e}"))?;
-                let files_updated = run_set_finding_status(&dir, &status)?;
+                let analysis = step_output_string(ctx, "research", "analysis");
+                let invalid_evidence = step_output_string(ctx, "research", "invalid_evidence");
+                let files_updated = run_set_finding_status(
+                    &dir,
+                    &status,
+                    analysis.as_deref(),
+                    invalid_evidence.as_deref(),
+                )?;
                 let mut out = Map::new();
                 out.insert(
                     "files_updated".into(),
@@ -1087,6 +1133,7 @@ impl Driver for LlmDriver {
                 r.map_err(|e| format!("step '{}' judge LLM call: {e}", step.id))?
             }
         };
+        self.record_direct_usage(role, &call_cfg, &resp.usage);
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
             let label = format!("phase=judge step={}", step.id);
@@ -1240,6 +1287,7 @@ impl Driver for LlmDriver {
                 r.map_err(|e| format!("step '{}' consolidate LLM call: {e}", step.id))?
             }
         };
+        self.record_direct_usage(role, &call_cfg, &resp.usage);
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
             let label = format!("phase=consolidate step={}", step.id);
@@ -2694,19 +2742,42 @@ fn tail_lossy(bytes: &[u8], max: usize) -> String {
     )
 }
 
-fn run_set_finding_status(finding_dir: &str, status: &str) -> Result<Vec<String>, String> {
+fn run_set_finding_status(
+    finding_dir: &str,
+    status: &str,
+    analysis: Option<&str>,
+    invalid_evidence: Option<&str>,
+) -> Result<Vec<String>, String> {
     let dir = PathBuf::from(finding_dir);
     if !dir.is_absolute() {
         return Err(format!("finding_dir must be absolute: {finding_dir}"));
     }
-    kres_core::set_finding_status_files(&dir, status)
+    let mut files: Vec<String> = kres_core::set_finding_status_files(&dir, status)
         .map(|paths| {
             paths
                 .into_iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect()
         })
-        .map_err(|e| format!("update status in {finding_dir}: {e}"))
+        .map_err(|e| format!("update status in {finding_dir}: {e}"))?;
+    if status == "invalidated" {
+        let path = kres_core::write_invalidation_artifact(
+            &dir,
+            analysis.unwrap_or_default(),
+            invalid_evidence.unwrap_or_default(),
+        )
+        .map_err(|e| format!("write invalidation.md in {finding_dir}: {e}"))?;
+        files.push(path.to_string_lossy().into_owned());
+    }
+    Ok(files)
+}
+
+fn step_output_string(ctx: &ExecContext<'_>, step_id: &str, key: &str) -> Option<String> {
+    ctx.steps
+        .get(step_id)
+        .and_then(|st| st.outputs.get(key))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 async fn git_rev_parse_head_optional(workspace: &Path) -> Option<String> {
@@ -2744,6 +2815,8 @@ async fn run_publish_fix(
     let fix_path = dir.join(&fix_name);
     if let Some(head_sha) = git_rev_parse_head_optional(workspace).await {
         if kres_core::patch_file_matches_head_named(&dir, &fix_name, &head_sha).unwrap_or(false) {
+            kres_core::clear_invalidation_artifacts(&dir)
+                .map_err(|e| format!("clear invalidation artifacts in {finding_dir}: {e}"))?;
             return Ok(fix_path.display().to_string());
         }
     }
@@ -4528,7 +4601,8 @@ mod tests {
         )
         .unwrap();
 
-        let files = run_set_finding_status(dir.to_str().unwrap(), "unconfirmed").unwrap();
+        let files =
+            run_set_finding_status(dir.to_str().unwrap(), "unconfirmed", None, None).unwrap();
 
         assert_eq!(files.len(), 2);
         assert_eq!(
@@ -4539,6 +4613,31 @@ mod tests {
             std::fs::read_to_string(dir.join("FINDING.md")).unwrap(),
             "# Finding\n\n**Status:** unconfirmed\n\nbody\n"
         );
+    }
+
+    #[test]
+    fn set_finding_status_reaper_writes_invalidation_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(
+            dir.join("FINDING.md"),
+            "# Finding\n\n**Status:** active\n\nbody\n",
+        )
+        .unwrap();
+
+        let files = run_set_finding_status(
+            dir.to_str().unwrap(),
+            "invalidated",
+            Some("Already guarded."),
+            Some("net/foo.c:10 checks the pointer."),
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 3);
+        let invalidation = std::fs::read_to_string(dir.join("invalidation.md")).unwrap();
+        assert!(invalidation.contains("Already guarded."));
+        assert!(invalidation.contains("net/foo.c:10 checks the pointer."));
     }
 
     fn init_test_git_repo() -> tempfile::TempDir {
@@ -4645,11 +4744,26 @@ mod tests {
             "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)\n\nbody\n",
         )
         .unwrap();
+        std::fs::write(
+            artifact.path().join(kres_core::INVALIDATION_NAME),
+            "stale invalidation",
+        )
+        .unwrap();
+        std::fs::write(
+            artifact.path().join(kres_core::PARTIAL_INVALIDATION_NAME),
+            "stale partial invalidation",
+        )
+        .unwrap();
 
         let patch = run_publish_fix(repo.path(), artifact.path().to_str().unwrap(), 1)
             .await
             .unwrap();
         assert!(std::path::Path::new(&patch).is_file());
+        assert!(!artifact.path().join(kres_core::INVALIDATION_NAME).exists());
+        assert!(!artifact
+            .path()
+            .join(kres_core::PARTIAL_INVALIDATION_NAME)
+            .exists());
         assert!(
             std::fs::read_to_string(artifact.path().join("metadata.yaml"))
                 .unwrap()
@@ -4663,6 +4777,16 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
+        std::fs::write(
+            artifact.path().join(kres_core::INVALIDATION_NAME),
+            "stale invalidation",
+        )
+        .unwrap();
+        std::fs::write(
+            artifact.path().join(kres_core::PARTIAL_INVALIDATION_NAME),
+            "stale partial invalidation",
+        )
+        .unwrap();
         let second = run_publish_fix(repo.path(), artifact.path().to_str().unwrap(), 1)
             .await
             .unwrap();
@@ -4672,6 +4796,11 @@ mod tests {
             .unwrap();
         assert_eq!(patch, second);
         assert_eq!(before, after);
+        assert!(!artifact.path().join(kres_core::INVALIDATION_NAME).exists());
+        assert!(!artifact
+            .path()
+            .join(kres_core::PARTIAL_INVALIDATION_NAME)
+            .exists());
     }
 
     #[tokio::test]

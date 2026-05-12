@@ -260,6 +260,9 @@ pub struct Eval {
     /// field_check expression. Required when kind=FieldCheck.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub expr: Option<String>,
+    /// builtin validator name. Required when kind=Builtin.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
     /// judge_llm prompt. Required when kind=JudgeLlm.
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -310,6 +313,9 @@ where
 pub enum EvalKind {
     /// Comparison expression evaluated locally.
     FieldCheck,
+    /// Named Rust-side validator. A false result is an eval failure
+    /// and consumes the normal on_fail retry budget.
+    Builtin,
     /// LLM-judged. Sends step outputs + judge_prompt to an agent;
     /// the judge replies `{"pass": bool, "reason": string}`.
     JudgeLlm,
@@ -902,18 +908,11 @@ mod tests {
         assert_eq!(wf.steps.len(), 11, "fix workflow has 11 steps");
         let research = wf.steps.iter().find(|s| s.id == "research").unwrap();
         let research_eval = research.eval.as_ref().expect("research eval");
-        assert_eq!(research_eval.kind, EvalKind::FieldCheck);
-        let research_expr = research_eval.expr.as_deref().unwrap_or("");
-        assert!(
-            research_expr.contains("research_status == 'confirmed'")
-                && research_expr.contains("valid == true")
-                && research_expr.contains("research.research_decision.bug_proven == true")
-                && research_expr.contains("research.research_decision.fix_contract_proven == true")
-                && research_expr.contains("research_status == 'invalid'")
-                && research_expr.contains("invalid_evidence != ''")
-                && research_expr.contains("research.research_decision.invalidity_proven == true")
-                && research_expr.contains("research_status == 'unconfirmed'"),
-            "research eval must enforce typed status consistency"
+        assert_eq!(research_eval.kind, EvalKind::Builtin);
+        assert_eq!(
+            research_eval.name.as_deref(),
+            Some("fix_research_status"),
+            "research eval must use the named Rust-side status validator"
         );
         assert_eq!(research_eval.on_fail.action, OnFailAction::Repeat);
         assert_eq!(research_eval.on_fail.max_attempts, Some(3));
@@ -926,16 +925,19 @@ mod tests {
             write_patch.outputs.contains_key("review_dispute_allowed"),
             "write-patch must expose the machine dispute gate"
         );
-        let write_patch_expr = write_patch
+        let write_patch_eval = write_patch
             .eval
             .as_ref()
-            .and_then(|e| e.expr.as_deref())
-            .unwrap_or("");
-        assert!(
-            write_patch_expr.contains("review_dispute != ''")
-                && write_patch_expr.contains("review_dispute_allowed == true")
-                && write_patch_expr.contains("code_changes_emitted == false"),
-            "write-patch eval must allow only machine-gated review disputes without fake edits"
+            .expect("write-patch eval must be configured");
+        assert_eq!(
+            write_patch_eval.kind,
+            EvalKind::Builtin,
+            "write-patch eval must use a named validator"
+        );
+        assert_eq!(
+            write_patch_eval.name.as_deref(),
+            Some("fix_write_patch_output"),
+            "write-patch eval must validate edits/disputes without JSON boolean algebra"
         );
         assert!(wf.steps.iter().any(|s| s.id == "unconfirm"));
         assert!(wf.steps.iter().any(|s| s.id == "fixes-tag-search"));

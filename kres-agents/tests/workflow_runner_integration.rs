@@ -44,6 +44,15 @@ fn fake_messages_response(text: &str) -> Value {
     })
 }
 
+fn review_ledger_response(kind: &str, status: &str) -> Value {
+    fake_messages_response(&format!(
+        "{{\"ledger\": [{{\"id\": \"R1\", \"kind\": \"{kind}\", \"status\": \"{status}\", \
+         \"summary\": \"test review complaint\", \"latest\": \"test fixture\", \
+         \"history\": [{{\"step\": \"test\", \"attempt\": 1, \"action\": \"mapped\", \
+         \"note\": \"fixture ledger update\"}}]}}]}}"
+    ))
+}
+
 struct ResearchFixture<'a> {
     status: &'a str,
     valid: bool,
@@ -63,6 +72,16 @@ fn research_response(lead: &str, fixture: ResearchFixture<'_>) -> Value {
         "invalid_evidence_kind": fixture.invalid_evidence_kind,
         "affected_files": fixture.affected_files,
         "affected_symbols": fixture.affected_symbols,
+        "fix_plan": [{
+            "id": "fix-1",
+            "title": "Fix test bug",
+            "scope": "test fixture scope",
+            "affected_files": fixture.affected_files,
+            "affected_symbols": fixture.affected_symbols,
+            "fix_contract": fixture.analysis,
+            "rationale": "single-commit fixture",
+            "depends_on": []
+        }],
         "research_decision": fixture.research_decision,
         "analysis": fixture.analysis,
     });
@@ -646,14 +665,16 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
         ),
     ]);
     responses.extend(dirty_source_review_responses(&workflow));
+    responses.push_back(review_ledger_response("source", "open"));
+    responses.push_back(fake_messages_response(
+        "Corrected patch.\n\
+         {\"build_target\": \"a.o\", \
+          \"code_edits\": [{\"file_path\": \"a.c\", \
+          \"old_string\": \"int x = 2;\\n\", \
+          \"new_string\": \"int x = 3;\\n\"}]}",
+    ));
+    responses.push_back(review_ledger_response("source", "addressed"));
     responses.extend(vec![
-        fake_messages_response(
-            "Corrected patch.\n\
-             {\"build_target\": \"a.o\", \
-              \"code_edits\": [{\"file_path\": \"a.c\", \
-              \"old_string\": \"int x = 2;\\n\", \
-              \"new_string\": \"int x = 3;\\n\"}]}",
-        ),
         fake_messages_response(
             "No proven introducing commit.\n\
              {\"fixes_sha\": \"\", \
@@ -666,10 +687,11 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
             "Second commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
               \"content\": \"subsystem: corrected patch\\n\\nBody explaining the corrected fix.\\n\\nAssisted-by: kres (test)\\n\", \
-              \"purpose\": \"commit message\"}]}",
+             \"purpose\": \"commit message\"}]}",
         ),
     ]);
     responses.extend(clean_review_responses(&workflow));
+    responses.push_back(review_ledger_response("source", "resolved"));
     let (port, requests) = spawn_recording_mock(responses).await;
 
     let mut inputs = Map::new();
@@ -745,13 +767,16 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
         ),
     ]);
     responses.extend(dirty_commit_message_review_responses(&workflow));
+    responses.push_back(review_ledger_response("commit_message", "open"));
     responses.extend(vec![fake_messages_response(
         "Rewritten commit message.\n\
          {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
           \"content\": \"subsystem: corrected claim\\n\\nBody with the corrected claim.\\n\\nAssisted-by: kres (test)\\n\", \
           \"purpose\": \"commit message\"}]}",
     )]);
+    responses.push_back(review_ledger_response("commit_message", "addressed"));
     responses.extend(clean_review_responses(&workflow));
+    responses.push_back(review_ledger_response("commit_message", "resolved"));
     let (port, requests) = spawn_recording_mock(responses).await;
 
     let mut inputs = Map::new();

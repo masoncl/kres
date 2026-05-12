@@ -248,8 +248,9 @@
           "additionalProperties": false,
           "required": ["type", "on_fail"],
           "properties": {
-            "type": {"type": "string", "enum": ["field_check", "judge_llm"]},
+            "type": {"type": "string", "enum": ["field_check", "judge_llm", "builtin"]},
             "expr": {"type": "string", "description": "field_check: comparison expression."},
+            "name": {"type": "string", "description": "builtin: named Rust validator."},
             "judge_prompt": {"$ref": "#/$defs/prompt_text", "description": "judge_llm: instructions for the judge — the runner appends step outputs as JSON and asks for {pass: bool, reason: string}."},
             "judge_prompt_file": {
               "type": "string",
@@ -262,6 +263,10 @@
             {
               "if": {"properties": {"type": {"const": "field_check"}}},
               "then": {"required": ["expr"]}
+            },
+            {
+              "if": {"properties": {"type": {"const": "builtin"}}},
+              "then": {"required": ["name"]}
             },
             {
               "if": {"properties": {"type": {"const": "judge_llm"}}},

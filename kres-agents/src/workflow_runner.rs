@@ -113,10 +113,11 @@ use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 use crate::workflow::{Agent as AgentRole, Aggregate, Mode, Step, Workflow};
-use crate::workflow_exec::{Driver, ExecContext};
+use crate::workflow_exec::{Driver, ExecContext, REVIEW_LEDGER_STEP_ID};
 
 const JSON_REPAIR_RETRIES: usize = 3;
 const JSON_REPAIR_PREFIX: &str = "IMPORTANT: This step requires a valid JSON object matching OUTPUT SCHEMA; reply with that JSON object as the last top-level JSON in this response.";
+const FAST_GATHER_ALLOWED_FIELDS: &str = "analysis, followups, skill_reads, ready_for_slow";
 
 /// Per-role agent environment: client + call config + system prompt.
 pub struct AgentEnv {
@@ -353,6 +354,102 @@ impl LlmDriver {
         }
     }
 
+    async fn map_review_ledger(
+        &self,
+        step: &Step,
+        attempt: u32,
+        ctx: &ExecContext<'_>,
+    ) -> Result<Option<Map<String, Value>>, String> {
+        if self.workflow.id != "fix" || !step_participates_in_review_ledger(step.id.as_str()) {
+            return Ok(None);
+        }
+        if step.id == "review" {
+            if !review_outputs_or_ledger_nonempty(ctx) {
+                return Ok(None);
+            }
+        } else if !ledger_has_items_or_relevant_review(step.id.as_str(), ctx) {
+            return Ok(None);
+        }
+
+        let (client, base_cfg) = match self.pick(AgentRole::Fast) {
+            Ok(env) => (env.client.clone(), env.config.clone()),
+            Err(_) => self
+                .fallback_client_cfg_from_orchestrator(AgentRole::Fast)
+                .ok_or_else(|| {
+                    format!(
+                        "step '{}' review ledger: no fast AgentEnv and no orchestrator fast client",
+                        step.id
+                    )
+                })?,
+        };
+        let user_text = build_review_ledger_prompt(step, attempt, ctx)?;
+        let messages = vec![Message::plain("user", user_text.clone())];
+        if let Some(lg) = &self.logger {
+            let label = format!("phase=review-ledger step={} attempt={attempt}", step.id);
+            lg.log_code_labeled(
+                "user",
+                Some(&label),
+                &format!("[step={} review_ledger]\n{}", step.id, user_text),
+                None,
+                None,
+            );
+        }
+        let call_cfg = self.config_with_mode(&base_cfg, Some(Mode::Generic));
+        let resp = tokio::select! {
+            _ = self.shutdown.cancelled() => {
+                return Err(format!(
+                    "step '{}' review ledger update cancelled before LLM call returned",
+                    step.id
+                ));
+            }
+            r = client.messages(&call_cfg, &messages) => {
+                r.map_err(|e| format!("step '{}' review ledger LLM call: {e}", step.id))?
+            }
+        };
+        let text = response_text(&resp);
+        if let Some(lg) = &self.logger {
+            let label = format!("phase=review-ledger step={} attempt={attempt}", step.id);
+            lg.log_code_labeled(
+                "assistant",
+                Some(&label),
+                &text,
+                Some(LoggedUsage {
+                    input: resp.usage.input_tokens,
+                    output: resp.usage.output_tokens,
+                    cache_creation: resp.usage.cache_creation_input_tokens,
+                    cache_read: resp.usage.cache_read_input_tokens,
+                }),
+                None,
+            );
+        }
+        for blob in extract_brace_objects(&text).iter().rev() {
+            let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(blob) else {
+                continue;
+            };
+            let Some(ledger) = m.remove("ledger") else {
+                continue;
+            };
+            if !matches!(ledger, Value::Array(_)) {
+                return Err(format!(
+                    "step '{}' review ledger response `ledger` must be an array",
+                    step.id
+                ));
+            }
+            let rendered = serde_json::to_string_pretty(&ledger)
+                .map_err(|e| format!("review ledger render: {e}"))?;
+            let mut out = Map::new();
+            out.insert("items".into(), ledger);
+            out.insert("ledger".into(), Value::String(rendered));
+            out.insert("updated_by_step".into(), Value::String(step.id.clone()));
+            out.insert("updated_attempt".into(), Value::Number(attempt.into()));
+            return Ok(Some(out));
+        }
+        Err(format!(
+            "step '{}' review ledger response had no JSON object with a `ledger` array",
+            step.id
+        ))
+    }
+
     /// Fallback for when no AgentEnv is wired but the orchestrator
     /// has clients for the requested role. Returns
     /// `(client, base_call_config)` matching what AgentEnv would
@@ -445,6 +542,21 @@ impl LlmDriver {
             sid = step.id,
             SCHEMA_HEADER = "OUTPUT SCHEMA"
         );
+        let gather_contract = fast_gather_contract(&[
+            "clean",
+            "defects",
+            "source_defects",
+            "commit_message_defects",
+            "correction_step",
+            "valid",
+            "result",
+            "code_output",
+            "code_edits",
+        ]);
+        let gather_user_text_base = format!(
+            "{skills_prelude}{includes_prelude}{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n{gather_contract}",
+            sid = step.id,
+        );
 
         // Orchestrator path — runs the fast-rounds gather loop with
         // followups → fetcher → accumulated symbols/context, then
@@ -477,6 +589,7 @@ impl LlmDriver {
                 let rctx = crate::pipeline::RunContext {
                     task_brief,
                     mode,
+                    gather_prompt: Some(gather_user_text_base.clone()),
                     ..crate::pipeline::RunContext::default()
                 };
                 let summary = orch
@@ -557,7 +670,17 @@ impl LlmDriver {
                 ),
             };
             if let Some(lg) = &self.logger {
-                lg.log_code("user", &log_user, None, None);
+                let label = match lens {
+                    Some(l) => format!(
+                        "phase=direct-step step={} lens={} attempt={} json_retry={}",
+                        step.id, l.id, attempt, json_retry
+                    ),
+                    None => format!(
+                        "phase=direct-step step={} attempt={} json_retry={}",
+                        step.id, attempt, json_retry
+                    ),
+                };
+                lg.log_code_labeled("user", Some(&label), &log_user, None, None);
             }
 
             let resp = tokio::select! {
@@ -570,8 +693,19 @@ impl LlmDriver {
             };
             let text = response_text(&resp);
             if let Some(lg) = &self.logger {
-                lg.log_code(
+                let label = match lens {
+                    Some(l) => format!(
+                        "phase=direct-step step={} lens={} attempt={} json_retry={}",
+                        step.id, l.id, attempt, json_retry
+                    ),
+                    None => format!(
+                        "phase=direct-step step={} attempt={} json_retry={}",
+                        step.id, attempt, json_retry
+                    ),
+                };
+                lg.log_code_labeled(
                     "assistant",
+                    Some(&label),
                     &text,
                     Some(LoggedUsage {
                         input: resp.usage.input_tokens,
@@ -704,7 +838,28 @@ impl LlmDriver {
                     })?;
                 let dir = interpolate(dir, &self.workflow, ctx, Some(&step.id))
                     .map_err(|e| format!("publish-fix dir interpolation: {e}"))?;
-                let patch_path = run_publish_fix(&self.workspace, &dir).await?;
+                let fix_index = action
+                    .args
+                    .as_ref()
+                    .and_then(|a| a.get("fix_index"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| interpolate(s, &self.workflow, ctx, Some(&step.id)))
+                    .transpose()
+                    .map_err(|e| format!("publish-fix fix_index interpolation: {e}"))?
+                    .map(|s| {
+                        let trimmed = s.trim();
+                        trimmed.parse::<u32>().map_err(|_| {
+                            format!(
+                                "publish-fix fix_index must be a positive integer, got {trimmed:?}"
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(1);
+                if fix_index == 0 {
+                    return Err("publish-fix fix_index must be >= 1".to_string());
+                }
+                let patch_path = run_publish_fix(&self.workspace, &dir, fix_index).await?;
                 let mut out = Map::new();
                 out.insert("patch_path".into(), Value::String(patch_path));
                 Ok(out)
@@ -854,7 +1009,7 @@ impl Driver for LlmDriver {
                     log.push(format!("  → {out}"));
                 }
                 crate::workflow::ActionType::PublishFix => {
-                    let path = run_publish_fix(&self.workspace, &interpolated).await?;
+                    let path = run_publish_fix(&self.workspace, &interpolated, 1).await?;
                     log.push(format!("publish-fix → {path}"));
                 }
                 other => {
@@ -911,8 +1066,10 @@ impl Driver for LlmDriver {
         );
         let messages = vec![Message::plain("user", user_text.clone())];
         if let Some(lg) = &self.logger {
-            lg.log_code(
+            let label = format!("phase=judge step={}", step.id);
+            lg.log_code_labeled(
                 "user",
+                Some(&label),
                 &format!("[step={} judge_llm]\n{}", step.id, user_text),
                 None,
                 None,
@@ -932,8 +1089,10 @@ impl Driver for LlmDriver {
         };
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
-            lg.log_code(
+            let label = format!("phase=judge step={}", step.id);
+            lg.log_code_labeled(
                 "assistant",
+                Some(&label),
                 &text,
                 Some(LoggedUsage {
                     input: resp.usage.input_tokens,
@@ -1060,8 +1219,10 @@ impl Driver for LlmDriver {
         );
         let messages = vec![Message::plain("user", user_text.clone())];
         if let Some(lg) = &self.logger {
-            lg.log_code(
+            let label = format!("phase=consolidate step={}", step.id);
+            lg.log_code_labeled(
                 "user",
+                Some(&label),
                 &format!("[step={} consolidate]\n{}", step.id, user_text),
                 None,
                 None,
@@ -1081,8 +1242,10 @@ impl Driver for LlmDriver {
         };
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
-            lg.log_code(
+            let label = format!("phase=consolidate step={}", step.id);
+            lg.log_code_labeled(
                 "assistant",
+                Some(&label),
                 &text,
                 Some(LoggedUsage {
                     input: resp.usage.input_tokens,
@@ -1171,6 +1334,17 @@ impl Driver for LlmDriver {
             "{skills_prelude}{includes_prelude}{prompt}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\n--- OUTPUT SCHEMA ---\n{schema_tail}",
             sid = step.id,
         );
+        let gather_contract = fast_gather_contract(&[
+            "clean",
+            "defects",
+            "correction_step",
+            "findings",
+            "followups_empty",
+        ]);
+        let gather_user_text = format!(
+            "{skills_prelude}{includes_prelude}{prompt}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\n{gather_contract}",
+            sid = step.id,
+        );
 
         let mode = match self.mode_for(step) {
             Some(crate::workflow::Mode::Coding) => kres_core::TaskMode::Coding,
@@ -1180,6 +1354,7 @@ impl Driver for LlmDriver {
         let rctx = crate::pipeline::RunContext {
             task_brief: step.id.clone(),
             mode,
+            gather_prompt: Some(gather_user_text),
             ..crate::pipeline::RunContext::default()
         };
         let consolidate_rules = match step.consolidate.as_ref() {
@@ -1215,6 +1390,139 @@ impl Driver for LlmDriver {
         map_task_summary_to_outputs(step, &summary)
             .map_err(|e| format!("step '{}' output mapping: {e}", step.id))
     }
+
+    async fn update_review_ledger(
+        &self,
+        step: &Step,
+        attempt: u32,
+        ctx: &ExecContext<'_>,
+    ) -> Result<Option<Map<String, Value>>, String> {
+        self.map_review_ledger(step, attempt, ctx).await
+    }
+}
+
+fn step_participates_in_review_ledger(step_id: &str) -> bool {
+    matches!(step_id, "review" | "write-patch" | "write-commit-message")
+}
+
+fn ledger_has_items_or_relevant_review(step_id: &str, ctx: &ExecContext<'_>) -> bool {
+    ledger_has_relevant_items(step_id, ctx)
+        || match step_id {
+            "write-patch" => step_array_nonempty(ctx, "review", "source_defects"),
+            "write-commit-message" => step_array_nonempty(ctx, "review", "commit_message_defects"),
+            _ => false,
+        }
+}
+
+fn review_outputs_or_ledger_nonempty(ctx: &ExecContext<'_>) -> bool {
+    review_ledger_items(ctx)
+        .as_array()
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+        || step_array_nonempty(ctx, "review", "source_defects")
+        || step_array_nonempty(ctx, "review", "commit_message_defects")
+        || step_array_nonempty(ctx, "review", "defects")
+}
+
+fn ledger_has_relevant_items(step_id: &str, ctx: &ExecContext<'_>) -> bool {
+    let Some(items) = review_ledger_items(ctx).as_array().cloned() else {
+        return false;
+    };
+    items.iter().any(|item| {
+        let Some(obj) = item.as_object() else {
+            return false;
+        };
+        let status = obj
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if matches!(status, "resolved" | "superseded") {
+            return false;
+        }
+        let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("other");
+        match step_id {
+            "write-patch" => !matches!(kind, "commit_message" | "trailer"),
+            "write-commit-message" => matches!(kind, "commit_message" | "trailer"),
+            _ => true,
+        }
+    })
+}
+
+fn review_ledger_items(ctx: &ExecContext<'_>) -> Value {
+    ctx.steps
+        .get(REVIEW_LEDGER_STEP_ID)
+        .and_then(|st| st.outputs.get("items").cloned())
+        .unwrap_or_else(|| Value::Array(Vec::new()))
+}
+
+fn build_review_ledger_prompt(
+    step: &Step,
+    attempt: u32,
+    ctx: &ExecContext<'_>,
+) -> Result<String, String> {
+    let ledger = review_ledger_items(ctx);
+    let ledger_json =
+        serde_json::to_string_pretty(&ledger).map_err(|e| format!("review ledger encode: {e}"))?;
+    let outputs = ctx
+        .steps
+        .get(&step.id)
+        .map(|st| Value::Object(st.outputs.clone()))
+        .unwrap_or(Value::Null);
+    let outputs_json = serde_json::to_string_pretty(&outputs)
+        .map_err(|e| format!("review ledger step-output encode: {e}"))?;
+    let review_context = match step.id.as_str() {
+        "review" => {
+            "Map the review output into the ledger. Add new distinct complaints as open entries. \
+             If a complaint is the same root issue as an existing entry, update that entry instead \
+             of adding a duplicate. If the review is clean, only mark addressed or disputed entries \
+             resolved when the review output gives enough context to show that complaint was rechecked."
+        }
+        "write-patch" => {
+            "Map the patch author's response into the ledger. Source/build/behavior complaints may \
+             move from open to addressed when this attempt emitted relevant code changes, or to \
+             disputed when review_dispute explains why no code change is needed. Do not mark a \
+             complaint resolved; only a later review pass can do that."
+        }
+        "write-commit-message" => {
+            "Map the commit-message author response into the ledger. Commit-message-only complaints \
+             may move from open to addressed when this attempt rewrote the message. Do not mark a \
+             complaint resolved; only a later review pass can do that."
+        }
+        _ => "",
+    };
+    Ok(format!(
+        "You are maintaining the fix workflow review ledger.\n\n\
+         The ledger is structured state used to avoid re-litigating the same review complaint across \
+         write/review loops. Preserve stable entry ids. Merge semantically identical complaints even \
+         if wording, lens, or file:line citations changed. Keep unrelated complaints separate. Do \
+         not infer source correctness yourself; only map review comments and patch-author replies \
+         into ledger state.\n\n\
+         Entry shape:\n\
+         - id: stable short id like R1, R2, ...\n\
+         - kind: source | build | behavior | documentation | test | commit_message | trailer | other\n\
+         - status: open | addressed | disputed | resolved | superseded\n\
+         - summary: one sentence for the root complaint\n\
+         - latest: concise latest state/evidence\n\
+         - history: array of short events with step, attempt, action, and note\n\n\
+         Status rules:\n\
+         - open: review says the fix still has this defect.\n\
+         - addressed: coding/commit-message step claims or appears to have responded; needs review.\n\
+         - disputed: coding step says the review complaint is invalid; needs review adjudication.\n\
+         - resolved: review rechecked the complaint and no longer reports it.\n\
+         - superseded: a later complaint replaces this entry; include the replacement id in latest.\n\n\
+         {review_context}\n\n\
+         CURRENT STEP\n\
+         step: {step_id}\n\
+         attempt: {attempt}\n\n\
+         CURRENT LEDGER JSON\n\
+         {ledger_json}\n\n\
+         CURRENT STEP OUTPUTS JSON\n\
+         {outputs_json}\n\n\
+         Reply with one JSON object and no prose. The `ledger` value must be a JSON array \
+         of entry objects. If the ledger is empty, return exactly this shape:\n\
+         {{\"ledger\": []}}\n",
+        step_id = step.id
+    ))
 }
 
 fn preserve_lens_analysis_for_consolidate(
@@ -1661,6 +1969,16 @@ fn response_text(resp: &kres_llm::request::MessagesResponse) -> String {
         }
     }
     out
+}
+
+fn fast_gather_contract(disallowed_fields: &[&str]) -> String {
+    format!(
+        "--- FAST GATHER CONTRACT ---\n\
+This is the fast gather phase, not the final workflow step response. Gather only the source, history, build, or context needed by the final agent.\n\
+Reply only with the standard fast-agent JSON fields: {FAST_GATHER_ALLOWED_FIELDS}.\n\
+Do not emit final workflow output fields such as {}. Those fields are accepted only from the final step response.",
+        disallowed_fields.join(", ")
+    )
 }
 
 fn with_json_repair_prefix(base: &str, json_retry: usize) -> String {
@@ -2409,18 +2727,23 @@ async fn git_rev_parse_head_optional(workspace: &Path) -> Option<String> {
 }
 
 /// `git format-patch -1 --stdout HEAD` in the workspace, write to
-/// `<dir>/auto-generated-fix.diff`, append `auto_generated_fix:` to
+/// `<dir>/auto-generated-fix*.diff`, record `auto_generated_fixes:` in
 /// `metadata.yaml`, and link the patch from `summary.md`.
-async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> Result<String, String> {
+async fn run_publish_fix(
+    workspace: &Path,
+    finding_dir: &str,
+    fix_index: u32,
+) -> Result<String, String> {
     let dir = PathBuf::from(finding_dir);
     if !dir.is_absolute() {
         return Err(format!("finding_dir must be absolute: {finding_dir}"));
     }
     kres_core::ensure_artifact_dir_files(&dir)
         .map_err(|e| format!("prepare {finding_dir}: {e}"))?;
-    let fix_path = dir.join(kres_core::AUTO_GENERATED_FIX_NAME);
+    let fix_name = kres_core::auto_generated_fix_name(fix_index);
+    let fix_path = dir.join(&fix_name);
     if let Some(head_sha) = git_rev_parse_head_optional(workspace).await {
-        if kres_core::patch_file_matches_head(&dir, &head_sha).unwrap_or(false) {
+        if kres_core::patch_file_matches_head_named(&dir, &fix_name, &head_sha).unwrap_or(false) {
             return Ok(fix_path.display().to_string());
         }
     }
@@ -2446,7 +2769,7 @@ async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> Result<String, 
         return Err("git format-patch produced empty output".into());
     }
     std::fs::write(&fix_path, &patch).map_err(|e| format!("write {}: {e}", fix_path.display()))?;
-    kres_core::record_auto_generated_fix(&dir)
+    kres_core::record_auto_generated_fix_named(&dir, &fix_name)
         .map_err(|e| format!("record auto-generated fix in {finding_dir}: {e}"))?;
     Ok(fix_path.display().to_string())
 }
@@ -4323,14 +4646,14 @@ mod tests {
         )
         .unwrap();
 
-        let patch = run_publish_fix(repo.path(), artifact.path().to_str().unwrap())
+        let patch = run_publish_fix(repo.path(), artifact.path().to_str().unwrap(), 1)
             .await
             .unwrap();
         assert!(std::path::Path::new(&patch).is_file());
         assert!(
             std::fs::read_to_string(artifact.path().join("metadata.yaml"))
                 .unwrap()
-                .contains("auto_generated_fix: auto-generated-fix.diff\n")
+                .contains("auto_generated_fixes:\n- auto-generated-fix.diff\n")
         );
         assert!(std::fs::read_to_string(artifact.path().join("summary.md"))
             .unwrap()
@@ -4340,7 +4663,7 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        let second = run_publish_fix(repo.path(), artifact.path().to_str().unwrap())
+        let second = run_publish_fix(repo.path(), artifact.path().to_str().unwrap(), 1)
             .await
             .unwrap();
         let after = std::fs::metadata(artifact.path().join("auto-generated-fix.diff"))
@@ -4448,6 +4771,16 @@ mod tests {
             assert!(tail.contains(key.as_str()), "schema must mention {key}");
         }
         assert!(tail.contains("LAST top-level JSON"));
+    }
+
+    #[test]
+    fn fast_gather_contract_is_not_a_workflow_output_schema() {
+        let contract = fast_gather_contract(&["clean", "defects", "correction_step"]);
+
+        assert!(contract.contains("FAST GATHER CONTRACT"));
+        assert!(contract.contains("analysis, followups, skill_reads, ready_for_slow"));
+        assert!(contract.contains("clean, defects, correction_step"));
+        assert!(!contract.contains("OUTPUT SCHEMA"));
     }
 
     #[test]

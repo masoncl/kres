@@ -55,6 +55,7 @@
       "Evals are the bridge between JSON outputs and workflow control flow.",
       "`field_check` evaluates an expression over workflow outputs, for example",
       "`write-patch.affected_files_changed == true`.",
+      "`builtin` runs a named Rust validator for reusable workflow safety contracts.",
       "`judge_llm` sends the step outputs plus `judge_prompt` to an agent and expects",
       "`{pass: bool, reason: string}`.",
       "Branching evals are how compile/review failures send the workflow back to `write-patch`",
@@ -97,6 +98,26 @@
       "type": "string",
       "required": false,
       "description": "Absolute directory for fix artifacts/status updates. Finding-dir targets default to target; prose targets use --results when supplied, otherwise empty."
+    },
+    "fix_series_plan": {
+      "type": "array<object>",
+      "required": false,
+      "description": "Machine-provided broader fix series plan. Each item is one independently committed fix todo."
+    },
+    "current_fix_todo": {
+      "type": "object",
+      "required": false,
+      "description": "Machine-provided current fix todo from fix_series_plan. The active workflow run must fix only this item."
+    },
+    "fix_index": {
+      "type": "integer",
+      "required": false,
+      "description": "One-based index of current_fix_todo in fix_series_plan, used for numbered published patch names."
+    },
+    "fix_run_mode": {
+      "type": "string",
+      "required": false,
+      "description": "Machine-provided mode: planning for the initial research/status pass, todo for a per-todo full fix run."
     }
   },
   "skills": [
@@ -138,6 +159,27 @@
         "",
         "BUG INPUT: {{workflow.target}}",
         "KIND: {{workflow.target_kind}}",
+        "FIX RUN MODE: {{workflow.fix_run_mode || 'standalone'}}",
+        "",
+        "BROADER FIX SERIES PLAN, IF THIS IS A PER-TODO RUN:",
+        "{{workflow.fix_series_plan || ''}}",
+        "",
+        "CURRENT FIX TODO, IF THIS IS A PER-TODO RUN:",
+        "{{workflow.current_fix_todo || ''}}",
+        "",
+        "Research has two modes:",
+        "- Planning mode: when CURRENT FIX TODO is empty, determine whether the input contains",
+        "  one bug or multiple independently committable bugs. Create fix_plan as an ordered",
+        "  array of todos, one per commit. Every todo must have id, title, scope, affected_files,",
+        "  affected_symbols, fix_contract, rationale, and depends_on fields. Use one item for",
+        "  a single-commit fix when research_status=confirmed. Split only when parts are separable",
+        "  fixes that should be reviewed, retried, built, and published independently. For",
+        "  invalid or unconfirmed research, fix_plan may be omitted or empty.",
+        "- Per-todo mode: when CURRENT FIX TODO is non-empty, validate only that todo against",
+        "  workspace HEAD and return research fields scoped to that todo. Keep fix_plan equal",
+        "  to the broader series plan so later steps understand the surrounding series, but do",
+        "  not broaden affected_files, affected_symbols, or the fix contract beyond the current",
+        "  todo.",
         "",
         "If KIND is finding_dir, read FINDING.md, summary.md, and metadata.yaml from the target",
         "before doing anything else. metadata.yaml.git.sha is the audit's HEAD; the workspace",
@@ -172,9 +214,12 @@
         "",
         "research_decision is the structured rationale for routing. Keep it consistent with",
         "research_status:",
-        "- confirmed: bug_proven=true, fix_contract_proven=true, invalidity_proven=false, needs_more_audit=false.",
-        "- invalid: bug_proven=false, fix_contract_proven=false, invalidity_proven=true, needs_more_audit=false.",
-        "- unconfirmed: invalidity_proven=false and at least one of bug_proven/fix_contract_proven is false or needs_more_audit=true.",
+        "- confirmed: bug_proven=true, fix_contract_proven=true, invalidity_proven=false, needs_more_audit=false, and no remaining typed followups.",
+        "- invalid: bug_proven=false, fix_contract_proven=false, invalidity_proven=true, needs_more_audit=false, and no remaining typed followups.",
+        "- unconfirmed: invalidity_proven=false, no remaining typed followups, and at least one of bug_proven/fix_contract_proven is false or needs_more_audit=true.",
+        "If more source, callers, history, locking, or API context is needed, emit typed",
+        "followups for that evidence. Do not pair research_status=unconfirmed with concrete",
+        "followups; that is incomplete research, not a terminal status update.",
         "Do not use words like confirmed, verified, proved, or definitely in analysis for an",
         "unconfirmed result; say evidence suggests or not proven instead. Rust routes only",
         "from structured fields, but the prose should not contradict them.",
@@ -224,6 +269,21 @@
         "affected_symbols": {
           "type": "array<string>"
         },
+        "followups": {
+          "type": "array<object>",
+          "optional": true,
+          "description": "Machine-populated typed followups emitted by the slow agent for missing evidence."
+        },
+        "followups_empty": {
+          "type": "boolean",
+          "optional": true,
+          "description": "Machine-populated true only when research emitted no typed followups."
+        },
+        "fix_plan": {
+          "type": "array<object>",
+          "optional": true,
+          "description": "Ordered series plan. Each item is one independent commit todo with id, title, scope, affected_files, affected_symbols, fix_contract, rationale, and depends_on."
+        },
         "research_decision": {
           "type": "object",
           "schema": {
@@ -241,8 +301,8 @@
         }
       },
       "eval": {
-        "type": "field_check",
-        "expr": "(research_status == 'confirmed' && valid == true && invalid_evidence == '' && invalid_evidence_kind == 'none' && research.research_decision.bug_proven == true && research.research_decision.fix_contract_proven == true && research.research_decision.invalidity_proven == false && research.research_decision.needs_more_audit == false) || (research_status == 'invalid' && valid == false && invalid_evidence != '' && invalid_evidence_kind == 'source_or_commit_evidence' && research.research_decision.bug_proven == false && research.research_decision.fix_contract_proven == false && research.research_decision.invalidity_proven == true && research.research_decision.needs_more_audit == false) || (research_status == 'unconfirmed' && valid == false && invalid_evidence == '' && invalid_evidence_kind == 'none' && research.research_decision.invalidity_proven == false && (research.research_decision.bug_proven == false || research.research_decision.fix_contract_proven == false || research.research_decision.needs_more_audit == true))",
+        "type": "builtin",
+        "name": "fix_research_status",
         "on_fail": {
           "action": "repeat",
           "max_attempts": 3,
@@ -327,12 +387,24 @@
         "- affected files: {{research.affected_files}}",
         "- affected symbols: {{research.affected_symbols}}",
         "",
+        "BROADER FIX SERIES PLAN:",
+        "{{research.fix_plan || workflow.fix_series_plan || ''}}",
+        "",
+        "CURRENT FIX TODO:",
+        "{{workflow.current_fix_todo || ''}}",
+        "",
         "RESEARCH ANALYSIS / FIX SKETCH:",
         "{{research.analysis || ''}}",
         "",
         "PATCH FEEDBACK FROM PRIOR BUILD OR REVIEW ATTEMPT, IF ANY:",
         "{{compile-triage.analysis || ''}}",
         "{{review.source_defects || ''}}",
+        "",
+        "REVIEW LEDGER:",
+        "{{review_ledger.ledger || ''}}",
+        "Use this ledger as review history. Address open source/build/behavior entries for the",
+        "current fix todo, and if you dispute one, put the evidence in review_dispute instead",
+        "of re-editing unrelated code.",
         "",
         "This step receives only source/build/behavior defects. Commit-message-only review",
         "defects are routed to write-commit-message and are intentionally not included here.",
@@ -352,7 +424,9 @@
         "matching occurrence. If old_string appears more than once, include more surrounding",
         "unchanged context so the edit is unique.",
         "",
-        "Emit code_edits for the kernel patch. Each code_edits item must use this shape:",
+        "Emit code_edits for the current fix todo only. Do not opportunistically fix sibling",
+        "todos from the broader series, even if the files overlap; those will run through",
+        "their own write/build/review/publish budgets. Each code_edits item must use this shape:",
         "{\"file_path\": \"path/to/file.c\", \"old_string\": \"...\", \"new_string\": \"...\"}. Do not use",
         "source-symbol field names such as `filename` in code_edits. Do not write",
         ".kres-commit-msg.tmp here. Do not run git commit. If you know the primary object file,",
@@ -390,8 +464,8 @@
         }
       },
       "eval": {
-        "type": "field_check",
-        "expr": "(code_changes_emitted == true && affected_files_changed == true && review_dispute == '') || (review_dispute_allowed == true && review_dispute != '' && code_changes_emitted == false && affected_files_changed == false)",
+        "type": "builtin",
+        "name": "fix_write_patch_output",
         "on_fail": {
           "action": "repeat",
           "max_attempts": 6,
@@ -426,6 +500,12 @@
         "",
         "BUG INPUT:",
         "{{workflow.target}}",
+        "",
+        "BROADER FIX SERIES PLAN:",
+        "{{research.fix_plan || workflow.fix_series_plan || ''}}",
+        "",
+        "CURRENT FIX TODO:",
+        "{{workflow.current_fix_todo || ''}}",
         "",
         "RESEARCH ANALYSIS:",
         "{{research.analysis || ''}}",
@@ -524,6 +604,12 @@
         "RESEARCH ANALYSIS:",
         "{{research.analysis || ''}}",
         "",
+        "BROADER FIX SERIES PLAN:",
+        "{{research.fix_plan || workflow.fix_series_plan || ''}}",
+        "",
+        "CURRENT FIX TODO:",
+        "{{workflow.current_fix_todo || ''}}",
+        "",
         "FIXES TAG SEARCH RESULT:",
         "- proven fixes sha: {{fixes-tag-search.fixes_sha || ''}}",
         "- proven fixes subject: {{fixes-tag-search.fixes_subject || ''}}",
@@ -533,6 +619,11 @@
         "",
         "COMMIT-MESSAGE FEEDBACK FROM PRIOR REVIEW ATTEMPT, IF ANY:",
         "{{review.commit_message_defects || ''}}",
+        "",
+        "REVIEW LEDGER:",
+        "{{review_ledger.ledger || ''}}",
+        "Use this ledger as review history. Address open commit-message/trailer entries for the",
+        "current fix todo, but do not make source changes here.",
         "",
         "ASSISTED-BY TRAILER:",
         "- The commit message MUST include exactly this trailer line:",
@@ -710,6 +801,16 @@
         "",
         "Apply the {{lens.id}} review lens to `git diff HEAD~1`.",
         "",
+        "BROADER FIX SERIES PLAN:",
+        "{{research.fix_plan || workflow.fix_series_plan || ''}}",
+        "",
+        "CURRENT FIX TODO:",
+        "{{workflow.current_fix_todo || ''}}",
+        "",
+        "This review is for the current fix todo's commit only. Be aware of the broader",
+        "series so you can catch ordering or dependency mistakes, but do not require this",
+        "commit to implement sibling todos unless the current todo depends on them.",
+        "",
         "LENS: {{lens.id}}",
         "{{lens.investigate}}",
         "",
@@ -730,6 +831,12 @@
         "",
         "PATCH AUTHOR DISPUTE OF PRIOR REVIEW, IF ANY:",
         "{{write-patch.review_dispute || ''}}",
+        "",
+        "REVIEW LEDGER:",
+        "{{review_ledger.ledger || ''}}",
+        "Use this ledger to recognize previously reported complaints. Do not re-report a resolved",
+        "entry unless the current patch regressed it again; if an open, addressed, or disputed",
+        "entry is still defective, report the concrete current defect with fresh evidence.",
         "",
         "If review_dispute is non-empty, this pass is adjudicating a prior source review",
         "defect that the patch author says is already satisfied. The runner also provides",
@@ -913,7 +1020,8 @@
       "action": {
         "type": "publish-fix",
         "args": {
-          "finding_dir": "{{workflow.target_artifact_dir}}"
+          "finding_dir": "{{workflow.target_artifact_dir}}",
+          "fix_index": "{{workflow.fix_index || '1'}}"
         }
       },
       "outputs": {
@@ -934,6 +1042,7 @@
       "review.clean == true && workflow.target_artifact_dir == ''"
     ],
     "failure_when_any": [
+      "workflow.fix_run_mode == 'todo' && research.research_status != 'confirmed'",
       "research.research_status == 'invalid' && (research.invalid_evidence_kind != 'source_or_commit_evidence' || research.invalid_evidence == '')"
     ]
   },

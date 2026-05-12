@@ -36,6 +36,8 @@ const NAMESPACE_OID: Uuid = Uuid::from_bytes([
 #[derive(Debug, Serialize)]
 struct LogEntry<'a> {
     role: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<&'a str>,
     content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<LoggedUsage>,
@@ -113,7 +115,22 @@ impl TurnLogger {
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
     ) {
-        if let Err(e) = self.write(true, role, content, usage, thinking) {
+        self.log_code_labeled(role, None, content, usage, thinking);
+    }
+
+    /// Append to `code.jsonl` with a stable machine label such as
+    /// `step=review lens=memory phase=slow`. The label is metadata,
+    /// not prompt content, so it does not perturb cache prefixes or
+    /// agent behavior.
+    pub fn log_code_labeled(
+        &self,
+        role: &str,
+        label: Option<&str>,
+        content: &str,
+        usage: Option<LoggedUsage>,
+        thinking: Option<&str>,
+    ) {
+        if let Err(e) = self.write(true, role, label, content, usage, thinking) {
             tracing::warn!(target: "kres_core::log", "code log write failed: {e}");
         }
     }
@@ -126,7 +143,7 @@ impl TurnLogger {
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
     ) {
-        if let Err(e) = self.write(false, role, content, usage, thinking) {
+        if let Err(e) = self.write(false, role, None, content, usage, thinking) {
             tracing::warn!(target: "kres_core::log", "main log write failed: {e}");
         }
     }
@@ -135,12 +152,14 @@ impl TurnLogger {
         &self,
         is_code: bool,
         role: &str,
+        label: Option<&str>,
         content: &str,
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
     ) -> io::Result<()> {
         let entry = LogEntry {
             role,
+            label,
             content,
             usage,
             thinking,
@@ -254,5 +273,30 @@ mod tests {
         let s = std::fs::read_to_string(session.join("code.jsonl")).unwrap();
         assert!(!s.contains("cache_creation"));
         assert!(!s.contains("cache_read"));
+    }
+
+    #[test]
+    fn code_log_preserves_label_metadata() {
+        let dir = tempdir().unwrap();
+        let log = TurnLogger::new(dir.path()).unwrap();
+        log.log_code_labeled(
+            "assistant",
+            Some("phase=slow step=review lens=memory"),
+            "{}",
+            None,
+            None,
+        );
+        drop(log);
+
+        let logs = dir.path().join(".kres").join("logs");
+        let session = std::fs::read_dir(&logs)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let s = std::fs::read_to_string(session.join("code.jsonl")).unwrap();
+        assert!(s.contains("\"label\":\"phase=slow step=review lens=memory\""));
+        assert!(s.contains("\"content\":\"{}\""));
     }
 }

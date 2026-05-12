@@ -43,6 +43,19 @@ in the same final top-level JSON object. Do not emit a separate JSON
 object for workflow fields after an earlier object containing
 `code_edits` or `findings`.
 
+When a workflow step runs through the orchestrator, the fast gather
+phase receives a gather-only prompt instead of that final `OUTPUT
+SCHEMA`. This keeps routing fields such as `clean`, `defects`,
+`correction_step`, `valid`, and `result` out of the gather phase. Only
+the final slow/coding/consolidate response is allowed to satisfy the
+workflow step outputs.
+
+`code.jsonl` records may include a `label` field such as
+`phase=fast-gather step=review lens=memory`. The label is logging
+metadata only; it is not sent to the model and does not affect prompt
+caching. Use it to pair interleaved lensed user/assistant records
+instead of relying on adjacent JSONL lines.
+
 If an LLM response does not produce a parseable JSON object matching the
 step schema, the runner retries that LLM step with a one-line JSON
 repair prefix. It tries the original response plus three repair retries.
@@ -111,12 +124,13 @@ that creates one LLM call with one context window and is not a lensed
 workflow step.
 
 Evals control retries and branching. After a step produces outputs and
-machine-populated outputs are added, `field_check` evaluates a local
-expression while `judge_llm` asks an agent for `{pass, reason}`. Passing
-eval marks the step complete and then runs `post_actions`. Failing eval
-follows `eval.on_fail.action`: `repeat` reruns the step, `branch_to`
-moves control back to a named step and invalidates dependent work,
-`continue` keeps going, and `exit_failure` terminates. `max_attempts` and
+machine-populated outputs are added, `field_check` evaluates a small
+local expression, `builtin` runs a named Rust-side validator, and
+`judge_llm` asks an agent for `{pass, reason}`. Passing eval marks the
+step complete and then runs `post_actions`. Failing eval follows
+`eval.on_fail.action`: `repeat` reruns the step, `branch_to` moves
+control back to a named step and invalidates dependent work, `continue`
+keeps going, and `exit_failure` terminates. `max_attempts` and
 `on_exhausted` decide what happens after repeated eval failures. Driver
 errors that occur before usable outputs are produced use the step's eval
 retry budget when the step has an eval block; otherwise they fail unless
@@ -183,6 +197,9 @@ the bug still exists at the current workspace HEAD.
      `needs_more_audit`. These booleans must agree with
      `research_status`; routing never depends on wording inside
      `analysis`.
+   - `followups_empty`: machine-populated boolean. A research result is
+     terminal only when the slow agent emitted no typed followups for
+     missing source, callers, history, locking, or API context.
    - `affected_files`: paths the patch will touch.
    - `affected_symbols`: relevant symbols.
 
@@ -190,27 +207,32 @@ the bug still exists at the current workspace HEAD.
 
    - `analysis`: research narrative and fix sketch for later steps.
 
-   The research step has a structural `field_check` eval. It accepts
-   only one of these typed states:
+   The research step has a structural `builtin` eval named
+   `fix_research_status`. It accepts only one of these typed states:
 
    - confirmed: `research_status=confirmed`, `valid=true`,
      `invalid_evidence=""`, and `invalid_evidence_kind=none`.
      `research_decision` must say the bug and fix contract are both
-     proven, invalidity is not proven, and no more audit is needed.
+     proven, invalidity is not proven, no more audit is needed, and
+     `followups_empty=true`.
    - invalid: `research_status=invalid`, `valid=false`, non-empty
      `invalid_evidence`, and
      `invalid_evidence_kind=source_or_commit_evidence`.
      `research_decision` must say invalidity is proven while the bug and
-     fix contract are not.
+     fix contract are not, and `followups_empty=true`.
    - unconfirmed: `research_status=unconfirmed`, `valid=false`,
      `invalid_evidence=""`, and `invalid_evidence_kind=none`.
      `research_decision` must say invalidity is not proven and either the
      bug, the fix contract, or both remain unproven, or more audit is
-     needed.
+     needed, and `followups_empty=true`.
 
    Malformed JSON, missing required outputs, or inconsistent typed
    fields consume the research eval retry budget and rerun research
    instead of routing prose into later workflow steps.
+
+   If the slow agent emits typed followups, research is incomplete even
+   if it also emits `research_status=unconfirmed`. The eval fails rather
+   than letting `unconfirm` update a finding based on missing evidence.
 
    Only `research_status=confirmed` reaches `write-patch`. If research
    cannot prove a concrete bug and fix contract, it must not set
@@ -318,12 +340,13 @@ the bug still exists at the current workspace HEAD.
      is correcting prior review `source_defects[]` and not a
      compile-triage patch error.
 
-   The eval accepts either a real source change (both change booleans and
-   an empty `review_dispute`) or a typed review dispute
-   (`review_dispute_allowed=true`, `review_dispute` non-empty, and no
-   emitted source changes). A no-op response with only `build_target`
-   cannot advance, and a model cannot use `review_dispute` on a first
-   patch attempt or build-failure retry. Missing `build_target` is valid
+   The `fix_write_patch_output` builtin eval accepts either a real source
+   change (both change booleans and an empty `review_dispute`) or a typed
+   review dispute (`review_dispute_allowed=true`, `review_dispute`
+   non-empty, and no emitted source changes). A no-op response with only
+   `build_target` cannot advance, and a model cannot use
+   `review_dispute` on a first patch attempt or build-failure retry.
+   Missing `build_target` is valid
    for header-only, documentation-only, Kconfig-only, or other non-object
    changes; the deterministic build step skips cleanly when no enabled
    object target can be derived from the actual git diff. `write-patch`
@@ -646,9 +669,47 @@ the bug still exists at the current workspace HEAD.
 
    Reaper action `publish-fix`, only when `target_artifact_dir` is set
    and review is clean. It runs `git format-patch -1 --stdout HEAD`,
-   writes `auto-generated-fix.diff` into the artifact directory, appends
-   `auto_generated_fix: auto-generated-fix.diff` to `metadata.yaml`
-   idempotently, and adds a cross-link in `summary.md`.
+   writes the current fix's patch into the artifact directory, records
+   the patch name under `auto_generated_fixes:` in `metadata.yaml`
+   idempotently, and adds a cross-link in `summary.md`. Single-fix runs use
+   `auto-generated-fix.diff`; series runs use `auto-generated-fix.diff`,
+   `auto-generated-fix-2.diff`, and so on.
+
+### Fix Series
+
+The `/fix` workflow starts with a planning/status pass when no
+`current_fix_todo` is already present in workflow inputs. That pass runs
+the JSON workflow's `research`, `invalidate`, and `unconfirm` steps. If
+research is invalid or unconfirmed, the pass updates finding status when
+an artifact directory is available and stops. If research is confirmed,
+it must emit `research.fix_plan`, an ordered array of independently
+committable todos.
+
+Rust owns that array as the series todo list and runs the full JSON fix
+workflow once per todo, in order. Rust parses the plan into typed todo
+records, rejects duplicate IDs, empty core fields, and dependencies that
+do not point to earlier todos, and tracks each todo as
+`Pending -> InProgress -> Done|Failed`. Each per-todo run receives the
+full `fix_series_plan`, the selected `current_fix_todo`, one-based
+`fix_index`, and `fix_run_mode=todo` in workflow inputs. The planning
+pass uses `fix_run_mode=planning`.
+
+Per-todo research must stay confirmed. If a per-todo run returns
+invalid or unconfirmed research, the workflow fails that todo instead of
+marking the whole finding invalid/unconfirmed.
+
+Each todo is treated as its own finding for retry and review purposes:
+step attempts, eval failures, compile triage, review branch-backs,
+commit-message rewrites, commit/amend state, and publish are scoped to
+that per-todo workflow run. Later todos see the already-committed earlier
+fixes in workspace history, but patch-writing is instructed to edit only
+the current todo's scope.
+
+Top-level fix series runs do not currently support workflow
+`--resume`/`--state-dir` snapshots. A per-todo workflow run may still use
+the normal executor path when `current_fix_todo` is provided explicitly,
+but the automatic planning-plus-series driver rejects snapshot flags
+instead of silently falling back to an older single-run path.
 
 ### Fix Flow Invariants
 

@@ -41,11 +41,18 @@
 //! has produced.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use crate::workflow::{Aggregate, Lens, OnExhausted, OnFailAction, Step, Workflow};
+
+/// Synthetic workflow step that carries review-history state across
+/// fix loops. It is not schedulable, but prompt interpolation can
+/// reference `{{review_ledger.ledger}}` exactly like any other step
+/// output, and snapshots persist it with the real steps.
+pub const REVIEW_LEDGER_STEP_ID: &str = "review_ledger";
 
 /// Snapshot of one step's runtime state. Carries the everything
 /// needed to resume from disk: status, attempt counter, eval
@@ -234,6 +241,20 @@ pub trait Driver: Sync {
     ) -> Result<Map<String, Value>, String> {
         Err("driver does not implement lens_fan_out_consolidate".into())
     }
+
+    /// Optional post-step ledger update. Production fix workflows
+    /// use this to maintain a structured review complaint ledger in
+    /// Rust state after review and coding steps settle. Returning
+    /// `None` leaves the ledger unchanged; errors are logged by the
+    /// executor and do not fail the underlying fix workflow.
+    async fn update_review_ledger(
+        &self,
+        _step: &Step,
+        _attempt: u32,
+        _ctx: &ExecContext<'_>,
+    ) -> Result<Option<Map<String, Value>>, String> {
+        Ok(None)
+    }
 }
 
 /// Read-only view exposed to `Driver::run`. Has the workflow inputs
@@ -396,6 +417,7 @@ pub fn format_event(ev: &TraceEvent) -> String {
         } => {
             let kv = format_output_map(outputs);
             let _ = writeln!(out, "✓ produced {id} (attempt {attempt}) — {{{kv}}}");
+            append_output_details(&mut out, outputs, 900);
         }
         TraceEvent::EvalPassed { id, attempt } => {
             let _ = writeln!(out, "✓ eval ok {id} (attempt {attempt})");
@@ -455,6 +477,7 @@ pub fn format_event(ev: &TraceEvent) -> String {
                 out,
                 "  · lens {lens_id}@{id} (attempt {attempt}) — {{{kv}}}"
             );
+            append_output_details(&mut out, outputs, 350);
         }
         TraceEvent::Consolidating {
             id,
@@ -505,6 +528,7 @@ impl Trace {
                 } => {
                     let kv = format_output_map(outputs);
                     out.push_str(&format!("✓ produced {id} (attempt {attempt}) — {{{kv}}}\n"));
+                    append_output_details(&mut out, outputs, 900);
                 }
                 TraceEvent::EvalPassed { id, attempt } => {
                     out.push_str(&format!("✓ eval ok {id} (attempt {attempt})\n"));
@@ -560,6 +584,7 @@ impl Trace {
                     out.push_str(&format!(
                         "  · lens {lens_id}@{id} (attempt {attempt}) — {{{kv}}}\n"
                     ));
+                    append_output_details(&mut out, outputs, 350);
                 }
                 TraceEvent::Consolidating {
                     id,
@@ -593,10 +618,203 @@ impl Trace {
 fn format_output_map(outputs: &Map<String, Value>) -> String {
     outputs
         .iter()
-        .filter(|(k, _)| !k.starts_with('_'))
+        .filter(|(k, _)| !k.starts_with('_') && !is_detail_output_key(k))
         .map(|(k, v)| format!("{k}={}", format_output_value(k, v)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn append_output_details(out: &mut String, outputs: &Map<String, Value>, analysis_chars: usize) {
+    append_text_detail(out, outputs, "analysis", analysis_chars);
+    append_text_detail(out, outputs, "invalid_evidence", analysis_chars.min(500));
+    append_text_detail(out, outputs, "fixes_evidence", analysis_chars.min(500));
+    append_text_detail(out, outputs, "review_dispute", analysis_chars.min(500));
+    append_fix_plan_detail(out, outputs);
+    append_followup_detail(out, outputs);
+    append_defect_detail(out, outputs, "defects");
+    append_defect_detail(out, outputs, "source_defects");
+    append_defect_detail(out, outputs, "commit_message_defects");
+    append_commit_message_detail(out, outputs);
+    append_text_detail(out, outputs, "stdout", 500);
+    append_text_detail(out, outputs, "stderr", 500);
+}
+
+fn is_detail_output_key(key: &str) -> bool {
+    matches!(
+        key,
+        "analysis"
+            | "invalid_evidence"
+            | "fixes_evidence"
+            | "review_dispute"
+            | "fix_plan"
+            | "followups"
+            | "defects"
+            | "source_defects"
+            | "commit_message_defects"
+            | "commit_message"
+            | "stdout"
+            | "stderr"
+    )
+}
+
+fn append_text_detail(out: &mut String, outputs: &Map<String, Value>, key: &str, max_chars: usize) {
+    let Some(s) = outputs.get(key).and_then(Value::as_str) else {
+        return;
+    };
+    if s.trim().is_empty() {
+        return;
+    }
+    let excerpt = truncate_chars(&clean_ws(s), max_chars);
+    out.push_str(&format!("    {key}: {excerpt}\n"));
+}
+
+fn append_fix_plan_detail(out: &mut String, outputs: &Map<String, Value>) {
+    let Some(items) = outputs.get("fix_plan").and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    out.push_str("    fix_plan:\n");
+    for (idx, item) in items.iter().take(6).enumerate() {
+        let Some(obj) = item.as_object() else {
+            out.push_str(&format!(
+                "      {}. {}\n",
+                idx + 1,
+                truncate_chars(&clean_ws(&item.to_string()), 180)
+            ));
+            continue;
+        };
+        let id = obj.get("id").and_then(Value::as_str).unwrap_or("<no id>");
+        let title = obj
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("<no title>");
+        out.push_str(&format!(
+            "      {}. {id}: {}\n",
+            idx + 1,
+            truncate_chars(&clean_ws(title), 160)
+        ));
+        if let Some(scope) = obj.get("scope").and_then(Value::as_str) {
+            if !scope.trim().is_empty() {
+                out.push_str(&format!(
+                    "         scope: {}\n",
+                    truncate_chars(&clean_ws(scope), 220)
+                ));
+            }
+        }
+        if let Some(contract) = obj.get("fix_contract").and_then(Value::as_str) {
+            if !contract.trim().is_empty() {
+                out.push_str(&format!(
+                    "         fix: {}\n",
+                    truncate_chars(&clean_ws(contract), 220)
+                ));
+            }
+        }
+    }
+    if items.len() > 6 {
+        out.push_str(&format!("      ... +{} more\n", items.len() - 6));
+    }
+}
+
+fn append_followup_detail(out: &mut String, outputs: &Map<String, Value>) {
+    let Some(items) = outputs.get("followups").and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    out.push_str("    followups:\n");
+    for item in items.iter().take(6) {
+        let Some(obj) = item.as_object() else {
+            out.push_str(&format!(
+                "      - {}\n",
+                truncate_chars(&clean_ws(&item.to_string()), 200)
+            ));
+            continue;
+        };
+        let kind = obj
+            .get("type")
+            .or_else(|| obj.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("followup");
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>");
+        let reason = obj.get("reason").and_then(Value::as_str).unwrap_or("");
+        if reason.trim().is_empty() {
+            out.push_str(&format!("      - {kind}:{name}\n"));
+        } else {
+            out.push_str(&format!(
+                "      - {kind}:{name} - {}\n",
+                truncate_chars(&clean_ws(reason), 220)
+            ));
+        }
+    }
+    if items.len() > 6 {
+        out.push_str(&format!("      ... +{} more\n", items.len() - 6));
+    }
+}
+
+fn append_defect_detail(out: &mut String, outputs: &Map<String, Value>, key: &str) {
+    let Some(items) = outputs.get(key).and_then(Value::as_array) else {
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    out.push_str(&format!("    {key}:\n"));
+    for item in items.iter().take(5) {
+        let Some(obj) = item.as_object() else {
+            out.push_str(&format!(
+                "      - {}\n",
+                truncate_chars(&clean_ws(&item.to_string()), 220)
+            ));
+            continue;
+        };
+        let where_ = obj
+            .get("where")
+            .or_else(|| obj.get("file"))
+            .or_else(|| obj.get("path"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let what = obj
+            .get("what")
+            .or_else(|| obj.get("summary"))
+            .and_then(Value::as_str)
+            .unwrap_or("<no summary>");
+        out.push_str(&format!(
+            "      - {where_}: {}\n",
+            truncate_chars(&clean_ws(what), 260)
+        ));
+    }
+    if items.len() > 5 {
+        out.push_str(&format!("      ... +{} more\n", items.len() - 5));
+    }
+}
+
+fn append_commit_message_detail(out: &mut String, outputs: &Map<String, Value>) {
+    let Some(s) = outputs.get("commit_message").and_then(Value::as_str) else {
+        return;
+    };
+    if s.trim().is_empty() {
+        return;
+    }
+    let mut lines = s.lines().map(str::trim).filter(|line| !line.is_empty());
+    if let Some(subject) = lines.next() {
+        out.push_str(&format!(
+            "    commit_message: {}\n",
+            truncate_chars(subject, 180)
+        ));
+    }
+    let body = lines.collect::<Vec<_>>().join(" ");
+    if !body.is_empty() {
+        out.push_str(&format!(
+            "      {}\n",
+            truncate_chars(&clean_ws(&body), 500)
+        ));
+    }
 }
 
 fn format_output_value(key: &str, value: &Value) -> String {
@@ -686,7 +904,7 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 /// [`TraceEvent`] is recorded so callers (the REPL, a TUI) can
 /// stream progress instead of waiting for the final
 /// `Trace::pretty()` dump.
-pub type EventObserver = Box<dyn Fn(&TraceEvent) + Send + Sync>;
+pub type EventObserver = Arc<dyn Fn(&TraceEvent) + Send + Sync>;
 
 /// Push `ev` into `events` AND, if an observer is wired, fire it
 /// against the just-recorded event. Replaces every direct
@@ -781,6 +999,59 @@ pub async fn run_with_persistence<D: Driver + ?Sized + Send>(
     .await
 }
 
+fn empty_review_ledger_state() -> StepState {
+    let mut outputs = Map::new();
+    outputs.insert("items".into(), Value::Array(Vec::new()));
+    outputs.insert("ledger".into(), Value::String("[]".into()));
+    StepState {
+        id: REVIEW_LEDGER_STEP_ID.to_string(),
+        status: StepStatus::Done,
+        attempt: 0,
+        eval_failures: 0,
+        outputs,
+        preserved_outputs_on_skip: Map::new(),
+        lens_outputs: Map::new(),
+    }
+}
+
+fn snapshot_steps(workflow: &Workflow, state: &HashMap<String, StepState>) -> Vec<StepState> {
+    let mut steps: Vec<StepState> = workflow
+        .steps
+        .iter()
+        .filter_map(|s| state.get(&s.id).cloned())
+        .collect();
+    if !workflow.steps.iter().any(|s| s.id == REVIEW_LEDGER_STEP_ID) {
+        if let Some(ledger) = state.get(REVIEW_LEDGER_STEP_ID) {
+            steps.push(ledger.clone());
+        }
+    }
+    steps
+}
+
+fn workflow_uses_review_ledger(workflow: &Workflow) -> bool {
+    workflow.id == "fix"
+        || workflow.steps.iter().any(|step| {
+            step.prompt
+                .as_deref()
+                .map(|p| p.contains("review_ledger."))
+                .unwrap_or(false)
+                || step
+                    .consolidate
+                    .as_ref()
+                    .map(|c| c.prompt.contains("review_ledger."))
+                    .unwrap_or(false)
+        })
+}
+
+fn ensure_review_ledger_state(state: &mut HashMap<String, StepState>, workflow: &Workflow) {
+    if workflow_uses_review_ledger(workflow) && !state.contains_key(REVIEW_LEDGER_STEP_ID) {
+        state.insert(
+            REVIEW_LEDGER_STEP_ID.to_string(),
+            empty_review_ledger_state(),
+        );
+    }
+}
+
 async fn run_internal<D: Driver + ?Sized + Send>(
     workflow: &Workflow,
     driver: &mut D,
@@ -808,6 +1079,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             )
         })
         .collect();
+    ensure_review_ledger_state(&mut state, workflow);
 
     // Seed from a resume snapshot if present. Steps not in the
     // snapshot keep their fresh-Pending state; existing steps that
@@ -818,13 +1090,25 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         for s in seeds {
             if let Some(slot) = state.get_mut(&s.id) {
                 let resumed_status = match s.status {
-                    StepStatus::Pending | StepStatus::BranchedAway => StepStatus::Pending,
+                    StepStatus::Pending | StepStatus::BranchedAway
+                        if s.id != REVIEW_LEDGER_STEP_ID =>
+                    {
+                        StepStatus::Pending
+                    }
                     other => other,
                 };
                 *slot = StepState {
                     status: resumed_status,
                     ..s
                 };
+            } else if s.id == REVIEW_LEDGER_STEP_ID {
+                state.insert(
+                    REVIEW_LEDGER_STEP_ID.to_string(),
+                    StepState {
+                        status: StepStatus::Done,
+                        ..s
+                    },
+                );
             }
         }
     }
@@ -845,11 +1129,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             schema_version: 1,
             workflow_id: workflow.id.clone(),
             inputs: inputs.clone(),
-            steps: workflow
-                .steps
-                .iter()
-                .filter_map(|s| state.get(&s.id).cloned())
-                .collect(),
+            steps: snapshot_steps(workflow, state),
             events_count,
         };
         if let Err(e) = snap.save(dir) {
@@ -1370,6 +1650,31 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 outputs,
             },
         );
+        let ledger_ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &state,
+        };
+        match driver
+            .update_review_ledger(step, attempt, &ledger_ctx)
+            .await
+        {
+            Ok(Some(outputs)) => {
+                let st = state
+                    .entry(REVIEW_LEDGER_STEP_ID.to_string())
+                    .or_insert_with(empty_review_ledger_state);
+                st.status = StepStatus::Done;
+                st.outputs = outputs;
+                snapshot_save(&state, events.len());
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "kres_agents::workflow_exec",
+                    "step '{}' review ledger update failed: {e}",
+                    step.id
+                );
+            }
+        }
 
         // Eval, if configured.
         let Some(eval) = &step.eval else {
@@ -1419,7 +1724,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             workflow_inputs: &inputs,
             steps: &state,
         };
-        let passed = match eval.kind {
+        let (passed, eval_reason) = match eval.kind {
             crate::workflow::EvalKind::FieldCheck => {
                 let expr_str = match eval.expr.as_deref() {
                     Some(s) => s,
@@ -1432,7 +1737,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     }
                 };
                 match expr::eval(expr_str, &ctx_for_eval, Some(&step.id)) {
-                    Ok(b) => b,
+                    Ok(b) => (b, None),
                     Err(e) => {
                         status = WorkflowStatus::Failure(format!(
                             "step '{}' eval expr error: {e}",
@@ -1442,8 +1747,37 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     }
                 }
             }
+            crate::workflow::EvalKind::Builtin => {
+                let name = match eval.name.as_deref() {
+                    Some(s) => s,
+                    None => {
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' builtin eval missing name",
+                            step.id
+                        ));
+                        break;
+                    }
+                };
+                match eval_builtin(name, step, &ctx_for_eval) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' builtin eval error: {e}",
+                            step.id
+                        ));
+                        break;
+                    }
+                }
+            }
             crate::workflow::EvalKind::JudgeLlm => match driver.judge(step, &ctx_for_eval).await {
-                Ok((p, _reason)) => p,
+                Ok((p, reason)) => {
+                    let reason = if reason.trim().is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    };
+                    (p, reason)
+                }
                 Err(e) => {
                     status = WorkflowStatus::Failure(format!(
                         "step '{}' judge_llm eval error: {e}",
@@ -1511,7 +1845,10 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         let eval_failures = st.eval_failures;
         let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
         let exhausted = attempt >= max;
-        let action_label = format!("{:?}", eval.on_fail.action);
+        let action_label = match eval_reason.as_deref() {
+            Some(reason) => format!("{:?} ({reason})", eval.on_fail.action),
+            None => format!("{:?}", eval.on_fail.action),
+        };
         record(
             &mut events,
             &observer,
@@ -1755,6 +2092,144 @@ fn retry_driver_error(
         },
     );
     true
+}
+
+fn eval_builtin(
+    name: &str,
+    step: &Step,
+    ctx: &ExecContext<'_>,
+) -> Result<(bool, Option<String>), String> {
+    match name {
+        "fix_research_status" => Ok(eval_fix_research_status(step, ctx)),
+        "fix_write_patch_output" => Ok(eval_fix_write_patch_output(step, ctx)),
+        other => Err(format!("unknown builtin eval '{other}'")),
+    }
+}
+
+fn eval_fix_research_status(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|st| &st.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(status) = output_str(outputs, "research_status") else {
+        return eval_fail("research_status must be a string");
+    };
+    let Some(valid) = output_bool(outputs, "valid") else {
+        return eval_fail("valid must be a boolean");
+    };
+    let Some(invalid_evidence) = output_str(outputs, "invalid_evidence") else {
+        return eval_fail("invalid_evidence must be a string");
+    };
+    let Some(invalid_evidence_kind) = output_str(outputs, "invalid_evidence_kind") else {
+        return eval_fail("invalid_evidence_kind must be a string");
+    };
+    let Some(followups_empty) = output_bool(outputs, "followups_empty") else {
+        return eval_fail("followups_empty must be a boolean");
+    };
+    if !followups_empty {
+        return eval_fail(
+            "research emitted typed followups, so it cannot terminally classify the finding yet",
+        );
+    }
+
+    let decision = outputs
+        .get("research_decision")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let Some(bug_proven) = decision_bool(&decision, "bug_proven") else {
+        return eval_fail("research_decision.bug_proven must be a boolean");
+    };
+    let Some(fix_contract_proven) = decision_bool(&decision, "fix_contract_proven") else {
+        return eval_fail("research_decision.fix_contract_proven must be a boolean");
+    };
+    let Some(invalidity_proven) = decision_bool(&decision, "invalidity_proven") else {
+        return eval_fail("research_decision.invalidity_proven must be a boolean");
+    };
+    let Some(needs_more_audit) = decision_bool(&decision, "needs_more_audit") else {
+        return eval_fail("research_decision.needs_more_audit must be a boolean");
+    };
+
+    let ok = match status {
+        "confirmed" => {
+            valid
+                && invalid_evidence.is_empty()
+                && invalid_evidence_kind == "none"
+                && bug_proven
+                && fix_contract_proven
+                && !invalidity_proven
+                && !needs_more_audit
+        }
+        "invalid" => {
+            !valid
+                && !invalid_evidence.trim().is_empty()
+                && invalid_evidence_kind == "source_or_commit_evidence"
+                && !bug_proven
+                && !fix_contract_proven
+                && invalidity_proven
+                && !needs_more_audit
+        }
+        "unconfirmed" => {
+            !valid
+                && invalid_evidence.is_empty()
+                && invalid_evidence_kind == "none"
+                && !invalidity_proven
+                && (!bug_proven || !fix_contract_proven || needs_more_audit)
+        }
+        other => return eval_fail(&format!("unknown research_status '{other}'")),
+    };
+    if ok {
+        (true, None)
+    } else {
+        eval_fail(&format!(
+            "research_status '{status}' is inconsistent with valid/invalid_evidence/research_decision"
+        ))
+    }
+}
+
+fn eval_fail(reason: &str) -> (bool, Option<String>) {
+    (false, Some(reason.to_string()))
+}
+
+fn eval_fix_write_patch_output(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|st| &st.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(code_changes_emitted) = output_bool(outputs, "code_changes_emitted") else {
+        return eval_fail("code_changes_emitted must be a boolean");
+    };
+    let Some(affected_files_changed) = output_bool(outputs, "affected_files_changed") else {
+        return eval_fail("affected_files_changed must be a boolean");
+    };
+    let Some(review_dispute_allowed) = output_bool(outputs, "review_dispute_allowed") else {
+        return eval_fail("review_dispute_allowed must be a boolean");
+    };
+    let review_dispute = output_str(outputs, "review_dispute").unwrap_or_default();
+
+    if code_changes_emitted && affected_files_changed && review_dispute.trim().is_empty() {
+        return (true, None);
+    }
+    if review_dispute_allowed
+        && !review_dispute.trim().is_empty()
+        && !code_changes_emitted
+        && !affected_files_changed
+    {
+        return (true, None);
+    }
+    eval_fail(
+        "write-patch must either emit a real source change or a permitted review dispute with no source changes",
+    )
+}
+
+fn output_str<'a>(outputs: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    outputs.get(key).and_then(Value::as_str)
+}
+
+fn output_bool(outputs: &Map<String, Value>, key: &str) -> Option<bool> {
+    outputs.get(key).and_then(Value::as_bool)
+}
+
+fn decision_bool(decision: &Map<String, Value>, key: &str) -> Option<bool> {
+    decision.get(key).and_then(Value::as_bool)
 }
 
 /// Combine per-lens output maps into one aggregated map per the
@@ -2407,7 +2882,10 @@ mod tests {
         let mut outputs = Map::new();
         outputs.insert(
             "analysis".into(),
-            json!("The patch adds the missing cleanup call. This pairs object lifetime correctly. Review is clean. The reviewer also checked cleanup ordering, synchronous completion, reference handling, commit message wording, error paths, lock coverage, and NULL handling. Extra detail should not flood the terminal."),
+            json!(format!(
+                "The patch adds the missing cleanup call. This pairs object lifetime correctly. {}",
+                "Extra detail should not flood the terminal. ".repeat(80)
+            )),
         );
         outputs.insert("clean".into(), json!(true));
         outputs.insert("defects".into(), json!([]));
@@ -2419,10 +2897,11 @@ mod tests {
         });
 
         assert!(line.contains("✓ produced review (attempt 1)"));
-        assert!(line.contains("analysis=\"The patch adds the missing cleanup call."));
+        assert!(line.contains("analysis: The patch adds the missing cleanup call."));
         assert!(line.contains("clean=true"));
-        assert!(line.contains("defects=[]"));
-        assert!(!line.contains("Extra detail should not flood"));
+        assert!(!line.contains("defects=[]"));
+        assert!(line.contains("..."));
+        assert!(line.len() < 1_200);
     }
 
     #[tokio::test]
@@ -3368,6 +3847,91 @@ mod tests {
         assert_eq!(*first_calls.lock().unwrap(), 0, "first must NOT re-run");
     }
 
+    #[tokio::test]
+    async fn review_ledger_update_is_visible_and_persisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "ledger-test",
+            "steps": [
+                {"id": "review", "agent": "fast", "prompt": "p"},
+                {"id": "write-patch", "agent": "fast", "prompt": "p", "depends_on": ["review"]}
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        struct LedgerDriver {
+            saw_ledger: std::sync::Arc<std::sync::Mutex<bool>>,
+        }
+
+        #[async_trait]
+        impl Driver for LedgerDriver {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, String> {
+                if step.id == "write-patch" {
+                    let items = ctx.steps[REVIEW_LEDGER_STEP_ID].outputs["items"]
+                        .as_array()
+                        .unwrap();
+                    assert_eq!(items.len(), 1);
+                    *self.saw_ledger.lock().unwrap() = true;
+                }
+                Ok(Map::new())
+            }
+
+            async fn update_review_ledger(
+                &self,
+                step: &Step,
+                attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Option<Map<String, Value>>, String> {
+                if step.id != "review" {
+                    return Ok(None);
+                }
+                let ledger = json!([{
+                    "id": "R1",
+                    "kind": "source",
+                    "status": "open",
+                    "summary": "missing source fix"
+                }]);
+                let mut out = Map::new();
+                out.insert("items".into(), ledger.clone());
+                out.insert("ledger".into(), Value::String(ledger.to_string()));
+                out.insert("updated_by_step".into(), Value::String(step.id.clone()));
+                out.insert("updated_attempt".into(), Value::Number(attempt.into()));
+                Ok(Some(out))
+            }
+        }
+
+        let saw_ledger = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let mut driver = LedgerDriver {
+            saw_ledger: saw_ledger.clone(),
+        };
+        let trace =
+            run_with_persistence(&wf, &mut driver, Map::new(), 20, tmp.path().to_path_buf()).await;
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert!(*saw_ledger.lock().unwrap());
+        assert_eq!(
+            trace.final_state[REVIEW_LEDGER_STEP_ID].outputs["updated_by_step"],
+            Value::String("review".into())
+        );
+
+        let snap = WorkflowSnapshot::load(tmp.path(), "ledger-test").unwrap();
+        let ledger_state = snap
+            .steps
+            .iter()
+            .find(|s| s.id == REVIEW_LEDGER_STEP_ID)
+            .expect("review ledger state persisted");
+        assert_eq!(
+            ledger_state.outputs["updated_by_step"],
+            Value::String("review".into())
+        );
+    }
+
     /// Workflow.completion.success_when_any short-circuits the run.
     #[tokio::test]
     async fn completion_success_expression_short_circuits() {
@@ -3498,6 +4062,7 @@ mod tests {
             "valid": true,
             "invalid_evidence": "",
             "invalid_evidence_kind": "none",
+            "followups_empty": true,
             "affected_files": ["drivers/example/example.c"],
             "affected_symbols": ["example_lookup"],
             "research_decision": {
@@ -3964,7 +4529,7 @@ mod tests {
         driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let r2 = received.clone();
-        let observer: EventObserver = Box::new(move |ev| {
+        let observer: EventObserver = std::sync::Arc::new(move |ev| {
             // Tag each event with its kind for the assertion.
             let tag = match ev {
                 TraceEvent::StepStarted { id, .. } => format!("start:{id}"),
@@ -4424,6 +4989,7 @@ mod tests {
             "valid": false,
             "invalid_evidence": "fs/foo.c:120 already null-checks p",
             "invalid_evidence_kind": "source_or_commit_evidence",
+            "followups_empty": true,
             "affected_files": [],
             "affected_symbols": [],
             "research_decision": {
@@ -4476,6 +5042,7 @@ mod tests {
             "valid": false,
             "invalid_evidence": "",
             "invalid_evidence_kind": "none",
+            "followups_empty": true,
             "affected_files": [],
             "affected_symbols": [],
             "research_decision": {
@@ -4514,6 +5081,7 @@ mod tests {
             "valid": false,
             "invalid_evidence": "",
             "invalid_evidence_kind": "none",
+            "followups_empty": true,
             "affected_files": ["mm/memory.c"],
             "affected_symbols": ["do_swap_page"],
             "research_decision": {
@@ -4553,6 +5121,7 @@ mod tests {
             "valid": false,
             "invalid_evidence": "",
             "invalid_evidence_kind": "none",
+            "followups_empty": true,
             "affected_files": ["mm/memory.c"],
             "affected_symbols": ["do_swap_page"],
             "research_decision": {
@@ -4587,6 +5156,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn research_with_unmet_followups_does_not_mark_unconfirmed() {
+        let wf = fix_workflow();
+        let incomplete_research = json!({
+            "research_status": "unconfirmed",
+            "valid": false,
+            "invalid_evidence": "",
+            "invalid_evidence_kind": "none",
+            "followups_empty": false,
+            "followups": [{"type": "source", "name": "offline_pages", "reason": "needed to prove the hotplug path"}],
+            "affected_files": ["mm/page_alloc.c"],
+            "affected_symbols": ["zone_pcp_reset"],
+            "research_decision": {
+                "bug_proven": false,
+                "fix_contract_proven": true,
+                "invalidity_proven": false,
+                "needs_more_audit": true
+            },
+            "analysis": "Need the requested source before terminally classifying the finding."
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, incomplete_research.clone())
+            .with("research", 2, incomplete_research.clone())
+            .with("research", 3, incomplete_research);
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+        assert!(trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::Exhausted { id, .. } if id == "research")));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "unconfirm")));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::StepProduced { id, .. } if id == "write-patch")));
+    }
+
+    #[tokio::test]
     async fn research_invalid_prose_short_circuits_before_commit() {
         let wf = fix_workflow();
         let invalid_research = json!({
@@ -4594,6 +5204,7 @@ mod tests {
             "valid": false,
             "invalid_evidence": "drivers/example/foo.c already releases the reference on completion",
             "invalid_evidence_kind": "source_or_commit_evidence",
+            "followups_empty": true,
             "affected_files": [],
             "affected_symbols": [],
             "research_decision": {

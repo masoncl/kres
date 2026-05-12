@@ -74,6 +74,15 @@ use crate::{
 /// `Message::cache` entirely so we don't pay the +25% write tax
 /// on a tail nothing will read.
 const CACHED_PREFIX_FIELDS: &[&str] = &["skills"];
+const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
+    "question",
+    "symbols",
+    "context",
+    "previous_findings",
+    "skills",
+    "plan",
+];
+const MIN_LENS_CACHE_WARM_PREFIX_CHARS: usize = 4096;
 
 /// Abstraction over the main-agent's data-fetch capability.
 /// Implementations route followups to MCP tools, grep, read, git.
@@ -208,6 +217,11 @@ pub struct RunContext {
     /// chain. Prepended to every fast/slow/main user turn so a
     /// derived task doesn't lose the operator's original question
     pub original_prompt: String,
+    /// Optional fast-agent gather prompt. Workflow steps use this
+    /// to keep final output schemas away from the gather phase while
+    /// preserving the exact final prompt for the slow/coding agent.
+    /// When unset, gather and final synthesis both use `prompt`.
+    pub gather_prompt: Option<String>,
     /// Which pipeline this task should run. `Analysis` (default)
     /// feeds the findings merger; `Coding` swaps in
     /// `slow_coding_system`, skips the lens fan-out, and returns a
@@ -327,6 +341,18 @@ impl Orchestrator {
     ) -> Result<TaskSummary, AgentError> {
         let composed = prepend_original_prompt(prompt, &ctx.original_prompt);
         let prompt: &str = composed.as_str();
+        let gather_composed;
+        let gather_prompt = if let Some(gather) = ctx.gather_prompt.as_deref() {
+            gather_composed = prepend_original_prompt(gather, &ctx.original_prompt);
+            gather_composed.as_str()
+        } else {
+            prompt
+        };
+        let log_task = if ctx.task_brief.is_empty() {
+            "task".to_string()
+        } else {
+            ctx.task_brief.clone()
+        };
         // Per-run skills clone — mutated mid-loop by `skill_reads`
         // responses so the fast agent can pull in extra files
         // mid-gather (§27,).
@@ -368,7 +394,7 @@ impl Orchestrator {
             } else {
                 None
             };
-            let mut cp = CodePrompt::new(prompt)
+            let mut cp = CodePrompt::new(gather_prompt)
                 .with_symbols(new_syms)
                 .with_context(new_ctx);
             if let Some(ref pf) = pf_manifest {
@@ -414,7 +440,8 @@ impl Orchestrator {
             }
 
             if let Some(lg) = &self.logger {
-                lg.log_code("user", &logged_content, None, None);
+                let label = format!("phase=fast-gather task={log_task} round={fast_rounds}");
+                lg.log_code_labeled("user", Some(&label), &logged_content, None, None);
             }
             if !new_syms.is_empty() || !new_ctx.is_empty() {
                 kres_core::async_eprintln!(
@@ -434,8 +461,10 @@ impl Orchestrator {
                     let t = extract_text(&resp);
                     if let Some(lg) = &self.logger {
                         let thinking = extract_thinking(&resp);
-                        lg.log_code(
+                        let label = format!("phase=fast-gather task={log_task} round={fast_rounds}");
+                        lg.log_code_labeled(
                             "assistant",
+                            Some(&label),
                             &t,
                             Some(log_usage(&resp.usage)),
                             thinking.as_deref(),
@@ -682,7 +711,8 @@ impl Orchestrator {
             cfg = cfg.with_max_input_tokens(n);
         }
         if let Some(lg) = &self.logger {
-            lg.log_code("user", &slow_logged, None, None);
+            let label = format!("phase=slow task={log_task}");
+            lg.log_code_labeled("user", Some(&label), &slow_logged, None, None);
         }
         kres_core::async_eprintln!(
             "[slow] analyzing with {} symbol(s), {} context item(s), {} previous finding(s)",
@@ -700,15 +730,17 @@ impl Orchestrator {
                 let t = extract_text(&resp);
                 if let Some(lg) = &self.logger {
                     let thinking = extract_thinking(&resp);
-                    lg.log_code(
+                    let label = format!("phase=slow task={log_task}");
+                    lg.log_code_labeled(
                         "assistant",
+                        Some(&label),
                         &t,
                         Some(log_usage(&resp.usage)),
-                            thinking.as_deref(),
-                        );
-                    }
-                    t
+                        thinking.as_deref(),
+                    );
                 }
+                t
+            }
         };
         let mut slow_parsed = parse_code_response(&text);
         // bugs.md#M3: surface the non-JSON case instead of letting it
@@ -755,6 +787,12 @@ impl Orchestrator {
             slow_parsed.findings.len(),
             slow_parsed.followups.len(),
         );
+        if !slow_parsed.analysis.trim().is_empty() {
+            kres_core::async_eprintln!(
+                "[slow] analysis: {}",
+                truncate(&one_line(&slow_parsed.analysis), 900)
+            );
+        }
         if !slow_parsed.followups.is_empty() {
             let fus: Vec<String> = slow_parsed
                 .followups
@@ -1009,10 +1047,18 @@ impl Orchestrator {
         }
         let composed = prepend_original_prompt(prompt, &ctx.original_prompt);
         let prompt: &str = composed.as_str();
+        let gather_composed;
+        let gather_prompt = if let Some(gather) = ctx.gather_prompt.as_deref() {
+            gather_composed = prepend_original_prompt(gather, &ctx.original_prompt);
+            gather_composed.as_str()
+        } else {
+            prompt
+        };
         // Gather once via fast+main (same loop as run_once, up to the
         // point where we'd call the slow agent).
-        let (symbols, context, fast_rounds, live_skills) =
-            self.gather(prompt, ctx.plan.as_ref(), shutdown).await?;
+        let (symbols, context, fast_rounds, live_skills) = self
+            .gather(gather_prompt, ctx.plan.as_ref(), shutdown)
+            .await?;
 
         // Fan out N slow-agent calls in parallel. Slow-agent
         // followups are returned to the workflow layer; they are not
@@ -1031,6 +1077,30 @@ impl Orchestrator {
         } else {
             self.slow_variants.clone()
         };
+        // bugs.md#cache: all review lenses receive the same gathered
+        // source/context. Warm that shared prefix once per slow
+        // model/system before launching the parallel lens calls, so
+        // the fan-out reads the Anthropic cache instead of racing N
+        // identical cache creations.
+        let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
+        let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
+        let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
+        let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
+        let mut shared_cp = CodePrompt::new(prompt)
+            .with_symbols(&trimmed_symbols)
+            .with_context(&trimmed_context)
+            .with_previous_findings(&trimmed_prev);
+        if let Some(sk) = &live_skills {
+            shared_cp = shared_cp.with_skills(sk);
+        }
+        if let Some(ref p) = ctx.plan {
+            shared_cp = shared_cp.with_plan(p);
+        }
+        let (shared_prefix, _) = shared_cp.to_cached_split_json(LENS_SHARED_CACHE_FIELDS)?;
+        let warmed_prefixes = self
+            .warm_lens_shared_cache(&slow_variants, &shared_prefix, shutdown)
+            .await;
+
         let mut futures = Vec::with_capacity(lenses.len() * slow_variants.len());
         for (idx, lens) in lenses.iter().enumerate() {
             // §20b: send identity-only lens descriptors to the slow
@@ -1052,19 +1122,12 @@ impl Orchestrator {
             if !lens.reason.is_empty() {
                 lens_extra.push_str(&format!("\n(why: {})", lens.reason));
             }
-            let lens_prompt = format!("{prompt}\n\n{lens_extra}");
-            // bugs.md#L5: same trim applies in the lens path.
-            // Redact `details` first — per-task narrative is
-            // /summary-only and never reaches a lens agent.
-            let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
-            let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
-            let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
-            let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
-            let mut lens_cp = CodePrompt::new(&lens_prompt)
+            let mut lens_cp = CodePrompt::new(prompt)
                 .with_symbols(&trimmed_symbols)
                 .with_context(&trimmed_context)
                 .with_previous_findings(&trimmed_prev)
-                .with_parallel_lenses(&parallel_lenses);
+                .with_parallel_lenses(&parallel_lenses)
+                .with_lens_instruction(&lens_extra);
             // §cache: include skills in the lens prompt — same
             // rationale as the single slow call above. Use the
             // post-gather `live_skills` so any skill files the fast
@@ -1076,12 +1139,14 @@ impl Orchestrator {
             if let Some(ref p) = ctx.plan {
                 lens_cp = lens_cp.with_plan(p);
             }
-            let (lens_prefix, lens_suffix) = lens_cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
-            let lens_logged = format!("{lens_prefix}{lens_suffix}");
+            let lens_suffix = lens_cp.to_cached_tail_json(LENS_SHARED_CACHE_FIELDS)?;
+            let lens_logged = format!("{shared_prefix}{lens_suffix}");
             for variant in slow_variants.iter().cloned() {
                 let client = variant.client.clone();
                 let model = variant.model.clone();
                 let system = variant.system.clone();
+                let cache_key = lens_cache_key(&model.id, system.as_deref());
+                let use_warmed_prefix = warmed_prefixes.contains(&cache_key);
                 let max_tokens = variant.max_tokens;
                 let max_input_tokens = variant.max_input_tokens;
                 let thinking = variant.thinking;
@@ -1090,22 +1155,30 @@ impl Orchestrator {
                 let usage = self.usage.clone();
                 let logger = self.logger.clone();
                 let lens_label = format!("lens {} ({model_label})", lens.name);
-                let lens_prefix = lens_prefix.clone();
+                let log_label = format!(
+                    "phase=slow-lens task={} lens={} model={model_label}",
+                    ctx.task_brief, lens.id
+                );
+                let shared_prefix = shared_prefix.clone();
                 let lens_suffix = lens_suffix.clone();
                 let lens_logged = lens_logged.clone();
                 futures.push(async move {
                     // Each lens fan-out is a one-shot slow call. Same
                     // reasoning as the single slow path above: skip the
-                    // tail cache tax, keep the prefix cache for skills.
+                    // tail cache tax, keep the exact warmed shared
+                    // prefix as the cached block when this model/system
+                    // successfully warmed it. Otherwise fold the same
+                    // prefix bytes into the plain content.
+                    let (content, cached_prefix) = if use_warmed_prefix {
+                        (lens_suffix, Some(shared_prefix))
+                    } else {
+                        (format!("{shared_prefix}{lens_suffix}"), None)
+                    };
                     let messages = vec![Message {
                         role: "user".into(),
-                        content: lens_suffix,
+                        content,
                         cache: false,
-                        cached_prefix: if lens_prefix.is_empty() {
-                            None
-                        } else {
-                            Some(lens_prefix)
-                        },
+                        cached_prefix,
                     }];
                     let mut cfg = CallConfig::defaults_for(model.clone())
                         .with_max_tokens(max_tokens)
@@ -1120,7 +1193,7 @@ impl Orchestrator {
                         cfg = cfg.with_max_input_tokens(n);
                     }
                     if let Some(lg) = &logger {
-                        lg.log_code("user", &lens_logged, None, None);
+                        lg.log_code_labeled("user", Some(&log_label), &lens_logged, None, None);
                     }
                     tokio::select! {
                         _ = shutdown_c.cancelled() => None,
@@ -1130,8 +1203,9 @@ impl Orchestrator {
                                 let t = extract_text(&resp);
                                 if let Some(lg) = &logger {
                                     let th = extract_thinking(&resp);
-                                    lg.log_code(
+                                    lg.log_code_labeled(
                                         "assistant",
+                                        Some(&log_label),
                                         &t,
                                         Some(log_usage(&resp.usage)),
                                         th.as_deref(),
@@ -1229,6 +1303,79 @@ impl Orchestrator {
         })
     }
 
+    async fn warm_lens_shared_cache(
+        &self,
+        slow_variants: &[SlowAgentVariant],
+        shared_prefix: &str,
+        shutdown: &Shutdown,
+    ) -> HashSet<String> {
+        let mut warmed = HashSet::new();
+        if shared_prefix.len() < MIN_LENS_CACHE_WARM_PREFIX_CHARS {
+            return warmed;
+        }
+
+        let mut attempted = HashSet::new();
+        let mut attempts = 0usize;
+        let mut successes = 0usize;
+        for variant in slow_variants {
+            let key = lens_cache_key(&variant.model.id, variant.system.as_deref());
+            if !attempted.insert(key.clone()) {
+                continue;
+            }
+            if shutdown.is_cancelled() {
+                return warmed;
+            }
+            attempts += 1;
+            let messages = vec![Message {
+                role: "user".into(),
+                content: concat!(
+                    "  \"_cache_warm\": true,\n",
+                    "  \"_cache_warm_instruction\": \"Do not analyze this payload. Reply with a single period.\"\n",
+                    "}\n"
+                )
+                .to_string(),
+                cache: false,
+                cached_prefix: Some(shared_prefix.to_string()),
+            }];
+            let warm_max_tokens = 1;
+            let mut cfg = CallConfig::defaults_for(variant.model.clone())
+                .with_max_tokens(warm_max_tokens)
+                .with_thinking(ThinkingBudget::Disabled)
+                .with_stream_label(format!("lens cache warm ({})", variant.label));
+            if let Some(system) = variant.system.clone() {
+                cfg = cfg.with_system(system);
+            }
+            if let Some(max_input_tokens) = variant.max_input_tokens {
+                cfg = cfg.with_max_input_tokens(max_input_tokens);
+            }
+            let result = tokio::select! {
+                _ = shutdown.cancelled() => return warmed,
+                r = variant.client.messages_streaming(&cfg, &messages) => r,
+            };
+            match result {
+                Ok(resp) => {
+                    record_usage(&self.usage, "slow", &variant.model, &resp.usage);
+                    successes += 1;
+                    warmed.insert(key);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "kres_agents",
+                        model = %variant.model.id,
+                        "lens shared cache warm failed: {e}"
+                    );
+                }
+            }
+        }
+        if attempts > 0 {
+            kres_core::async_eprintln!(
+                "[review lenses] warmed shared context cache: {successes}/{attempts} model/system prefix(es), {}k chars",
+                shared_prefix.len() / 1000,
+            );
+        }
+        warmed
+    }
+
     /// Helper that runs the fast→main loop and returns accumulated
     /// (symbols, context, rounds_used). Shared between run_once and
     /// run_with_lenses.
@@ -1313,7 +1460,8 @@ impl Orchestrator {
                 cfg = cfg.with_max_input_tokens(n);
             }
             if let Some(lg) = &self.logger {
-                lg.log_code("user", &logged_content, None, None);
+                let label = format!("phase=fast-gather-lenses round={fast_rounds}");
+                lg.log_code_labeled("user", Some(&label), &logged_content, None, None);
             }
             let text = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fast call".into())),
@@ -1323,8 +1471,10 @@ impl Orchestrator {
                     let t = extract_text(&resp);
                     if let Some(lg) = &self.logger {
                         let th = extract_thinking(&resp);
-                        lg.log_code(
+                        let label = format!("phase=fast-gather-lenses round={fast_rounds}");
+                        lg.log_code_labeled(
                             "assistant",
+                            Some(&label),
                             &t,
                             Some(log_usage(&resp.usage)),
                             th.as_deref(),
@@ -1589,6 +1739,14 @@ fn truncate(s: &str, n: usize) -> String {
     }
     let head: String = s.chars().take(n).collect();
     format!("{head}…")
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn lens_cache_key(model_id: &str, system: Option<&str>) -> String {
+    format!("{}\0{}", model_id, system.unwrap_or(""))
 }
 
 fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {

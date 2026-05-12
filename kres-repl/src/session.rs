@@ -2249,6 +2249,7 @@ impl Session {
                     if let Some(h) = sigwinch_handle.as_ref() {
                         h.abort();
                     }
+                    self.print_exit_cost_summary();
                     crate::status::restore();
                     return Ok(());
                 }
@@ -2302,6 +2303,7 @@ impl Session {
         if let Some(h) = sigwinch_handle.as_ref() {
             h.abort();
         }
+        self.print_exit_cost_summary();
         crate::status::restore();
 
         // §50: walk every registered MCP client and ask for a
@@ -2690,6 +2692,7 @@ impl Session {
                     previous_findings,
                     task_brief: task_brief_clone,
                     original_prompt,
+                    gather_prompt: None,
                     mode: task_mode,
                     plan: plan_for_ctx,
                     allow_plan_rewrite,
@@ -3569,7 +3572,7 @@ impl Session {
         // Fix #9: stream trace events as they happen so the
         // operator sees fast-round counters / fan-out / lens
         // results live, not just after the run finishes.
-        let observer: kres_agents::workflow_exec::EventObserver = Box::new(move |ev| {
+        let observer: kres_agents::workflow_exec::EventObserver = std::sync::Arc::new(move |ev| {
             async_println(
                 kres_agents::workflow_exec::format_event(ev)
                     .trim_end_matches('\n')
@@ -3783,18 +3786,30 @@ impl Session {
     }
 
     fn print_cost(&self) {
+        self.print_usage_summary("usage", true);
+    }
+
+    fn print_exit_cost_summary(&self) {
+        if self.cfg.exit_on_idle {
+            self.print_usage_summary("final usage before exit", false);
+        }
+    }
+
+    fn print_usage_summary(&self, label: &str, show_empty: bool) {
         let snap = self.usage.snapshot();
         if snap.is_empty() {
-            if !self.cfg.stdio && !self.cfg.tui {
-                crate::status::park_scroll_region_bottom();
+            if show_empty {
+                if !self.cfg.stdio && !self.cfg.tui {
+                    crate::status::park_scroll_region_bottom();
+                }
+                kres_core::async_eprintln!("(no API usage recorded yet)");
             }
-            kres_core::async_eprintln!("(no API usage recorded yet)");
             return;
         }
         let total = self.usage.totals();
         // Show per-row input/output and cache-create/cache-read,
         // plus a total line.
-        let mut out = format!("usage ({} call(s) total):", total.calls);
+        let mut out = format!("{label} ({} call(s) total):", total.calls);
         for (k, e) in &snap {
             out.push_str(&format!(
                 "\n  {:>4}/{:<24}  {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
@@ -5019,16 +5034,16 @@ async fn git_rev_parse_head(workspace: &Path) -> Option<String> {
 
 /// Publish the workspace's HEAD commit as `auto-generated-fix.diff`
 /// inside a kres finding directory. Triggered by the slow agent's
-/// `publish-fix` followup as the last step of the FIX flow, after
-/// build and review have passed. The argument is the absolute path
+/// legacy `publish-fix` followup. Workflow-owned `/fix` uses the
+/// deterministic workflow reaper path instead. The argument is the absolute path
 /// to a finding directory (the kres --export shape with
 /// `metadata.yaml`, `FINDING.md`, `summary.md`).
 ///
 /// On success the directory gains:
 /// - `auto-generated-fix.diff` — the output of
 ///   `git format-patch -1 --stdout HEAD` from the workspace.
-/// - `metadata.yaml` gains an `auto_generated_fix:` key naming
-///   the patch file (idempotent — skipped if already present).
+/// - `metadata.yaml` records the patch under `auto_generated_fixes:`
+///   (idempotent — skipped if already present).
 /// - `summary.md`'s cross-link header gains a third link
 ///   pointing at the patch (idempotent).
 ///
@@ -5051,11 +5066,7 @@ async fn run_publish_fix(workspace: &Path, finding_dir: &str) -> String {
     let fix_path = dir.join(kres_core::AUTO_GENERATED_FIX_NAME);
 
     // Skip when auto-generated-fix.diff already records the current
-    // HEAD. The FIX flow has two paths that emit `publish-fix`: the
-    // review task's slow agent ends with one, and the dedicated
-    // `publish-fix` plan step emits another. Without this guard
-    // `git format-patch` runs twice for the same SHA and rewrites
-    // an identical file. `git format-patch -1 --stdout HEAD` opens
+    // HEAD. `git format-patch -1 --stdout HEAD` opens
     // each patch with `From <40-hex-sha> Mon Sep 17 00:00:00 2001`,
     // so comparing that prefix to `git rev-parse HEAD` is enough to
     // detect "already published this commit". A real amend changes

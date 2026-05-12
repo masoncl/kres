@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use kres_core::io::async_println;
 use serde_json::{Map, Value};
 
 use kres_agents::workflow_exec::{
@@ -232,6 +233,35 @@ pub struct WorkflowRunResult {
     pub written_artifacts: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct FixSeriesTodo {
+    id: String,
+    title: String,
+    scope: String,
+    #[serde(default)]
+    affected_files: Vec<String>,
+    #[serde(default)]
+    affected_symbols: Vec<String>,
+    fix_contract: String,
+    rationale: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixTodoStatus {
+    Pending,
+    InProgress,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedFixTodo {
+    todo: FixSeriesTodo,
+    status: FixTodoStatus,
+}
+
 pub async fn run_workflow_driver(
     workflow: &Workflow,
     driver: &mut LlmDriver,
@@ -245,6 +275,34 @@ pub async fn run_workflow_driver(
         results_dir,
         observer,
     } = options;
+
+    if workflow.id == "fix"
+        && !inputs.contains_key("current_fix_todo")
+        && !inputs.contains_key("fix_series_plan")
+    {
+        if resume || state_dir.is_some() {
+            return Err(anyhow::anyhow!(
+                "fix series workflow does not support workflow snapshot --resume/--state-dir yet"
+            ));
+        }
+        let trace = run_fix_series_driver(
+            workflow,
+            driver,
+            inputs.clone(),
+            iteration_cap,
+            observer.clone(),
+        )
+        .await;
+        let written_artifacts = if let Some(results_dir) = results_dir.as_ref() {
+            kres_agents::workflow_runner::write_workflow_artefacts(results_dir, workflow, &trace)?
+        } else {
+            Vec::new()
+        };
+        return Ok(WorkflowRunResult {
+            trace,
+            written_artifacts,
+        });
+    }
 
     let trace = match (resume, state_dir.as_ref(), observer) {
         (true, Some(state_dir), None) => {
@@ -296,6 +354,290 @@ pub async fn run_workflow_driver(
         trace,
         written_artifacts,
     })
+}
+
+async fn run_fix_series_driver(
+    workflow: &Workflow,
+    driver: &mut LlmDriver,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+    observer: Option<EventObserver>,
+) -> Trace {
+    let mut planning_workflow = workflow.clone();
+    planning_workflow
+        .steps
+        .retain(|s| matches!(s.id.as_str(), "research" | "invalidate" | "unconfirm"));
+    planning_workflow.completion = None;
+    let mut planning_inputs = inputs.clone();
+    planning_inputs.insert("fix_run_mode".into(), Value::String("planning".to_string()));
+
+    let planning_trace = match observer.clone() {
+        Some(obs) => {
+            run_with_observer(
+                &planning_workflow,
+                driver,
+                planning_inputs,
+                iteration_cap,
+                obs,
+            )
+            .await
+        }
+        None => run_with_cap(&planning_workflow, driver, planning_inputs, iteration_cap).await,
+    };
+
+    if !matches!(
+        planning_trace.status,
+        WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+    ) {
+        return planning_trace;
+    }
+
+    let research_status = step_output_string(&planning_trace, "research", "research_status");
+    if research_status.as_deref() != Some("confirmed") {
+        async_println(format!(
+            "[fix series] planning stopped with research_status={}",
+            research_status
+                .as_deref()
+                .unwrap_or("<missing research_status>")
+        ));
+        return planning_trace;
+    }
+
+    let plan = match parse_fix_plan(&planning_trace) {
+        Ok(plan) => plan,
+        Err(e) => {
+            let mut trace = planning_trace;
+            trace.status = WorkflowStatus::Failure(format!("research.fix_plan invalid: {e}"));
+            return trace;
+        }
+    };
+    if plan.is_empty() {
+        let mut trace = planning_trace;
+        trace.status = WorkflowStatus::Failure(
+            "research.fix_plan invalid: confirmed research must return at least one fix todo"
+                .to_string(),
+        );
+        return trace;
+    }
+    async_println(format!(
+        "[fix series] research confirmed; {} fix todo(s) planned",
+        plan.len()
+    ));
+    for (idx, todo) in plan.iter().enumerate() {
+        async_println(format!(
+            "[fix series] plan {}/{} {}",
+            idx + 1,
+            plan.len(),
+            summarize_fix_todo(todo)
+        ));
+    }
+
+    let mut events = planning_trace.events;
+    let mut final_state = planning_trace.final_state;
+    let mut status = WorkflowStatus::Success;
+    let mut tracked: Vec<TrackedFixTodo> = plan
+        .into_iter()
+        .map(|todo| TrackedFixTodo {
+            todo,
+            status: FixTodoStatus::Pending,
+        })
+        .collect();
+    let fix_series_plan = serde_json::to_value(
+        tracked
+            .iter()
+            .map(|tracked| &tracked.todo)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(Value::Array(Vec::new()));
+
+    for (idx, tracked_todo) in tracked.iter_mut().enumerate() {
+        tracked_todo.status = FixTodoStatus::InProgress;
+        async_println(format!(
+            "[fix series] start {}/{} {}",
+            idx + 1,
+            fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+            summarize_fix_todo(&tracked_todo.todo)
+        ));
+        let mut item_inputs = inputs.clone();
+        item_inputs.insert("fix_series_plan".into(), fix_series_plan.clone());
+        item_inputs.insert(
+            "current_fix_todo".into(),
+            serde_json::to_value(&tracked_todo.todo).unwrap_or(Value::Null),
+        );
+        item_inputs.insert(
+            "fix_index".into(),
+            Value::Number(serde_json::Number::from((idx + 1) as u64)),
+        );
+        item_inputs.insert("fix_run_mode".into(), Value::String("todo".to_string()));
+
+        let item_trace = run_with_optional_observer(
+            workflow,
+            driver,
+            item_inputs,
+            iteration_cap,
+            observer.clone(),
+        )
+        .await;
+        let item_research_status = step_output_string(&item_trace, "research", "research_status");
+        let item_status = item_trace.status;
+        let item_workflow_ok = matches!(
+            item_status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        );
+        let item_research_confirmed = item_research_status.as_deref() == Some("confirmed");
+        let item_ok = item_workflow_ok && item_research_confirmed;
+        tracked_todo.status = if item_ok {
+            FixTodoStatus::Done
+        } else {
+            FixTodoStatus::Failed
+        };
+        let item_label = if item_ok { "done" } else { "failed" };
+        async_println(format!(
+            "[fix series] {item_label} {}/{} {}",
+            idx + 1,
+            fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+            tracked_todo.todo.id
+        ));
+        events.extend(item_trace.events);
+        final_state = item_trace.final_state;
+        status = if item_workflow_ok && !item_research_confirmed {
+            WorkflowStatus::Failure(format!(
+                "fix todo '{}' research_status was {}, expected confirmed",
+                tracked_todo.todo.id,
+                item_research_status
+                    .as_deref()
+                    .unwrap_or("<missing research_status>")
+            ))
+        } else {
+            item_status
+        };
+        if !item_ok {
+            break;
+        }
+    }
+
+    Trace {
+        events,
+        status,
+        final_state,
+    }
+}
+
+async fn run_with_optional_observer(
+    workflow: &Workflow,
+    driver: &mut LlmDriver,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+    observer: Option<EventObserver>,
+) -> Trace {
+    match observer {
+        Some(obs) => run_with_observer(workflow, driver, inputs, iteration_cap, obs).await,
+        None => run_with_cap(workflow, driver, inputs, iteration_cap).await,
+    }
+}
+
+fn parse_fix_plan(trace: &Trace) -> Result<Vec<FixSeriesTodo>, String> {
+    let Some(raw) = trace
+        .final_state
+        .get("research")
+        .and_then(|st| st.outputs.get("fix_plan"))
+    else {
+        return Ok(Vec::new());
+    };
+    let todos: Vec<FixSeriesTodo> = serde_json::from_value(raw.clone())
+        .map_err(|e| format!("expected array of fix todo objects: {e}"))?;
+    validate_fix_plan(&todos)?;
+    Ok(todos)
+}
+
+fn step_output_string(trace: &Trace, step: &str, field: &str) -> Option<String> {
+    trace
+        .final_state
+        .get(step)
+        .and_then(|st| st.outputs.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn validate_fix_plan(todos: &[FixSeriesTodo]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for (idx, todo) in todos.iter().enumerate() {
+        if todo.id.trim().is_empty() {
+            return Err(format!("todo {} has empty id", idx + 1));
+        }
+        for (field, value) in [
+            ("title", &todo.title),
+            ("scope", &todo.scope),
+            ("fix_contract", &todo.fix_contract),
+            ("rationale", &todo.rationale),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("todo '{}' has empty {field}", todo.id));
+            }
+        }
+        for dep in &todo.depends_on {
+            if !seen.contains(dep) {
+                return Err(format!(
+                    "todo '{}' depends_on '{}' which is not an earlier todo",
+                    todo.id, dep
+                ));
+            }
+        }
+        if !seen.insert(todo.id.clone()) {
+            return Err(format!("duplicate todo id '{}'", todo.id));
+        }
+    }
+    Ok(())
+}
+
+fn summarize_fix_todo(todo: &FixSeriesTodo) -> String {
+    let mut out = format!(
+        "{} - {}",
+        todo.id,
+        truncate_display(&one_line(&todo.title), 160)
+    );
+    if !todo.scope.trim().is_empty() {
+        out.push_str(&format!(
+            "\n    scope: {}",
+            truncate_display(&one_line(&todo.scope), 220)
+        ));
+    }
+    if !todo.fix_contract.trim().is_empty() {
+        out.push_str(&format!(
+            "\n    fix: {}",
+            truncate_display(&one_line(&todo.fix_contract), 220)
+        ));
+    }
+    if !todo.affected_files.is_empty() {
+        let files = todo
+            .affected_files
+            .iter()
+            .take(5)
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tail = if todo.affected_files.len() > 5 {
+            format!(", +{} more", todo.affected_files.len() - 5)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("\n    files: {files}{tail}"));
+    }
+    out
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_display(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated.trim_end())
+    } else {
+        truncated
+    }
 }
 
 pub fn workflow_status_result(status: &WorkflowStatus) -> Result<()> {
@@ -472,6 +814,40 @@ mod tests {
         assert!(review_prompt_file_from_prompt("plain question", None)
             .unwrap()
             .is_none());
+    }
+
+    fn series_todo(id: &str, depends_on: Vec<String>) -> FixSeriesTodo {
+        FixSeriesTodo {
+            id: id.to_string(),
+            title: format!("todo {id}"),
+            scope: "scope".to_string(),
+            affected_files: Vec::new(),
+            affected_symbols: Vec::new(),
+            fix_contract: "contract".to_string(),
+            rationale: "rationale".to_string(),
+            depends_on,
+        }
+    }
+
+    #[test]
+    fn fix_series_plan_validation_rejects_brittle_shapes() {
+        assert!(validate_fix_plan(&[series_todo("first", Vec::new())]).is_ok());
+        assert!(validate_fix_plan(&[
+            series_todo("first", Vec::new()),
+            series_todo("second", vec!["first".to_string()])
+        ])
+        .is_ok());
+        assert!(validate_fix_plan(&[
+            series_todo("dup", Vec::new()),
+            series_todo("dup", Vec::new())
+        ])
+        .unwrap_err()
+        .contains("duplicate"));
+        assert!(
+            validate_fix_plan(&[series_todo("late", vec!["missing".to_string()])])
+                .unwrap_err()
+                .contains("not an earlier todo")
+        );
     }
 
     fn fake_messages_response(text: &str) -> Value {

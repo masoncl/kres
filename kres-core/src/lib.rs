@@ -38,7 +38,7 @@ pub use artifact::{
     AUTO_GENERATED_FIX_NAME, INVALIDATION_NAME, PARTIAL_INVALIDATION_NAME, SUMMARY_CROSS_LINK,
 };
 pub use consent::ConsentStore;
-pub use cost::{UsageEntry, UsageKey, UsageTracker};
+pub use cost::{format_token_count, format_usage_summary, UsageEntry, UsageKey, UsageTracker};
 pub use findings::{
     apply_delta_to_list, redact_findings_for_agent, relevant_subset, ApplyReport, DeltaCounts,
     Finding, FindingDetail, FindingsFile, FindingsStore, Severity, Status,

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use kres_agents::{AgentConfig, AgentKind, DataFetcher, Orchestrator, RunContext};
 use kres_core::log::TurnLogger;
-use kres_core::{FindingsStore, TaskManager, TaskState, UsageTracker};
+use kres_core::{format_usage_summary, FindingsStore, TaskManager, TaskState, UsageTracker};
 use kres_llm::{client::Client, RateLimiter};
 
 use crate::commands::{parse_command, Command};
@@ -870,6 +870,7 @@ impl Session {
         let deferred_for_ctrlc = self.deferred.clone();
         let last_prompt_for_ctrlc = self.last_prompt.clone();
         let persist_sig_for_ctrlc = self.persist_sig.clone();
+        let usage_for_ctrlc = self.usage.clone();
         let ctrlc_handle = tokio::spawn(async move {
             // Each round: wait for ctrl-c, cooperatively cancel, arm a
             // 3s second-hit window for a hard exit, then loop. The
@@ -910,6 +911,13 @@ impl Session {
                         kres_core::async_eprintln!("\n(second ctrl-c — aborting)");
                         crate::tui::emergency_restore_terminal();
                         crate::status::restore();
+                        if let Some(out) = format_usage_summary(
+                            &usage_for_ctrlc,
+                            "final usage before exit",
+                            Some("final usage before exit: no API usage recorded"),
+                        ) {
+                            eprintln!("{out}");
+                        }
                         std::process::exit(130);
                     }
                     _ = tokio::time::sleep(Duration::from_secs(3)) => {}
@@ -2258,8 +2266,8 @@ impl Session {
                     if let Some(h) = sigwinch_handle.as_ref() {
                         h.abort();
                     }
-                    self.print_exit_cost_summary();
-                    crate::status::restore();
+                    self.restore_terminal_for_final_output();
+                    self.print_exit_cost_summary_direct();
                     return Ok(());
                 }
                 Command::Unknown(name) => {
@@ -2312,8 +2320,8 @@ impl Session {
         if let Some(h) = sigwinch_handle.as_ref() {
             h.abort();
         }
-        self.print_exit_cost_summary();
-        crate::status::restore();
+        self.restore_terminal_for_final_output();
+        self.print_exit_cost_summary_direct();
 
         // §50: walk every registered MCP client and ask for a
         // graceful shutdown with a 2s grace window. Without this
@@ -3795,46 +3803,33 @@ impl Session {
     }
 
     fn print_cost(&self) {
-        self.print_usage_summary("usage", true);
+        if let Some(out) =
+            format_usage_summary(&self.usage, "usage", Some("(no API usage recorded yet)"))
+        {
+            self.print_command_output(&out);
+        }
     }
 
-    fn print_exit_cost_summary(&self) {
-        self.print_usage_summary("final usage before exit", false);
-    }
-
-    fn print_usage_summary(&self, label: &str, show_empty: bool) {
-        let snap = self.usage.snapshot();
-        if snap.is_empty() {
-            if show_empty {
-                self.print_command_output("(no API usage recorded yet)");
-            }
+    fn print_exit_cost_summary_direct(&self) {
+        let Some(out) = format_usage_summary(
+            &self.usage,
+            "final usage before exit",
+            Some("final usage before exit: no API usage recorded"),
+        ) else {
             return;
+        };
+        use std::io::Write as _;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{out}");
+        let _ = stderr.flush();
+    }
+
+    fn restore_terminal_for_final_output(&self) {
+        if self.cfg.tui && !self.cfg.stdio {
+            crate::tui::emergency_restore_terminal();
+        } else if !self.cfg.stdio {
+            crate::status::restore();
         }
-        let total = self.usage.totals();
-        // Show per-row input/output and cache-create/cache-read,
-        // plus a total line.
-        let mut out = format!("{label} ({} call(s) total):", total.calls);
-        for (k, e) in &snap {
-            out.push_str(&format!(
-                "\n  {:>4}/{:<24}  {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
-                k.role,
-                k.model,
-                e.calls,
-                fmt_k(e.input_tokens),
-                fmt_k(e.output_tokens),
-                fmt_k(e.cache_creation_input_tokens),
-                fmt_k(e.cache_read_input_tokens),
-            ));
-        }
-        out.push_str(&format!(
-            "\n  total         {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
-            total.calls,
-            fmt_k(total.input_tokens),
-            fmt_k(total.output_tokens),
-            fmt_k(total.cache_creation_input_tokens),
-            fmt_k(total.cache_read_input_tokens),
-        ));
-        self.print_command_output(&out);
     }
 
     fn print_command_output(&self, out: &str) {
@@ -5440,18 +5435,6 @@ pub fn expand_inline_load(text: &str) -> String {
         i += 1;
     }
     out
-}
-
-/// Human token counts: `12345` → `12.3k`. Matches
-/// helper at.
-fn fmt_k(n: u64) -> String {
-    if n < 1_000 {
-        return n.to_string();
-    }
-    if n < 1_000_000 {
-        return format!("{:.1}k", n as f64 / 1_000.0);
-    }
-    format!("{:.2}M", n as f64 / 1_000_000.0)
 }
 
 #[cfg(test)]

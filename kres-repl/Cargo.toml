@@ -21,11 +21,10 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 rustyline = "14"
 libc = "0.2"
-# TUI scaffolding (stage 1 of the ratatui migration). Opt-in via
-# `--tui`; the default REPL path still uses rustyline + the DECSTBM
-# status line. `crossterm` is ratatui's default backend and is the
-# source of the keyboard/resize event stream the TUI polls.
-ratatui = "0.29"
+# TUI scaffolding. `unstable-rendered-line-info` exposes
+# Paragraph::line_count(), which we need so scrollback follows the
+# same wrapped-row model ratatui actually renders.
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 
 [dev-dependencies]

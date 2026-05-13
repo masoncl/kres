@@ -1855,48 +1855,14 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     for p in run.written_artifacts {
         eprintln!("wrote {}", p.display());
     }
-    eprintln!("{}", format_workflow_usage_summary(&usage));
+    if let Some(summary) = kres_core::format_usage_summary(
+        &usage,
+        "final usage before exit",
+        Some("final usage before exit: no API usage recorded"),
+    ) {
+        eprintln!("{summary}");
+    }
     kres_repl::workflow_status_result(&run.trace.status)
-}
-
-fn format_workflow_usage_summary(usage: &kres_core::UsageTracker) -> String {
-    let snap = usage.snapshot();
-    if snap.is_empty() {
-        return "final usage before exit: no API usage recorded".to_string();
-    }
-    let total = usage.totals();
-    let mut out = format!("final usage before exit ({} call(s) total):", total.calls);
-    for (k, e) in snap {
-        out.push_str(&format!(
-            "\n  {:>4}/{:<24}  {:>4}x  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
-            k.role,
-            k.model,
-            e.calls,
-            fmt_token_count(e.input_tokens),
-            fmt_token_count(e.output_tokens),
-            fmt_token_count(e.cache_creation_input_tokens),
-            fmt_token_count(e.cache_read_input_tokens),
-        ));
-    }
-    out.push_str(&format!(
-        "\n  total         {:>4}x  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
-        total.calls,
-        fmt_token_count(total.input_tokens),
-        fmt_token_count(total.output_tokens),
-        fmt_token_count(total.cache_creation_input_tokens),
-        fmt_token_count(total.cache_read_input_tokens),
-    ));
-    out
-}
-
-fn fmt_token_count(n: u64) -> String {
-    if n < 1_000 {
-        return n.to_string();
-    }
-    if n < 1_000_000 {
-        return format!("{:.1}k", n as f64 / 1_000.0);
-    }
-    format!("{:.2}M", n as f64 / 1_000_000.0)
 }
 
 async fn run_test(args: TestArgs) -> Result<()> {

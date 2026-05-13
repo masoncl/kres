@@ -107,6 +107,27 @@ User prompt → Task created → Task thread starts
 - `async_print()` clears readline line before printing to avoid garbled output
 - All background output (task status, results) uses `async_print`
 
+### Ratatui TUI
+- Read ratatui's widget implementation before changing rendering or
+  scrolling behavior. Do not infer viewport behavior from terminal
+  intuition.
+- `Paragraph::wrap(Wrap { .. })` reflows logical input lines through
+  ratatui's `WordWrapper`; `Paragraph::scroll((y, x))` is applied
+  after wrapping, so `y` is a rendered-row offset, not a stored-line
+  index.
+- For scrollback panes that wrap text, do not pre-slice the last N
+  logical lines and then hand that to `Paragraph`; older wrapped lines
+  can consume the viewport and clip newer output. Build the paragraph
+  from the full retained scrollback, compute `Paragraph::line_count(width)`,
+  and use `Paragraph::scroll` to follow the rendered tail.
+- `Paragraph::line_count` is behind ratatui's
+  `unstable-rendered-line-info` feature. Keep that feature enabled
+  rather than copying or approximating ratatui's private wrapping logic.
+- Tests for scrollback visibility must render through ratatui
+  (`TestBackend`/`Terminal` or equivalent) and assert on the rendered
+  buffer. Tests that only validate local line-count approximations are
+  not sufficient for TUI scrolling bugs.
+
 ### Task System
 - Each todo item becomes a `Task` with its own thread
 - Task states: `pending → inference → waiting_main → gathering → done`

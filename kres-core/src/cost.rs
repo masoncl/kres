@@ -94,6 +94,50 @@ impl UsageTracker {
     }
 }
 
+pub fn format_usage_summary(
+    usage: &UsageTracker,
+    label: &str,
+    empty_message: Option<&str>,
+) -> Option<String> {
+    let snap = usage.snapshot();
+    if snap.is_empty() {
+        return empty_message.map(str::to_string);
+    }
+    let total = usage.totals();
+    let mut out = format!("{label} ({} call(s) total):", total.calls);
+    for (k, e) in &snap {
+        out.push_str(&format!(
+            "\n  {:>4}/{:<24}  {:>4}x  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+            k.role,
+            k.model,
+            e.calls,
+            format_token_count(e.input_tokens),
+            format_token_count(e.output_tokens),
+            format_token_count(e.cache_creation_input_tokens),
+            format_token_count(e.cache_read_input_tokens),
+        ));
+    }
+    out.push_str(&format!(
+        "\n  total         {:>4}x  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+        total.calls,
+        format_token_count(total.input_tokens),
+        format_token_count(total.output_tokens),
+        format_token_count(total.cache_creation_input_tokens),
+        format_token_count(total.cache_read_input_tokens),
+    ));
+    Some(out)
+}
+
+pub fn format_token_count(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        return format!("{:.1}k", n as f64 / 1_000.0);
+    }
+    format!("{:.2}M", n as f64 / 1_000_000.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +158,31 @@ mod tests {
         assert_eq!(total.input_tokens, 1150);
         assert_eq!(total.output_tokens, 530);
         assert_eq!(total.calls, 3);
+    }
+
+    #[test]
+    fn formats_usage_summary() {
+        let t = UsageTracker::new();
+        t.record("fast", "claude", 12_300, 400, 1000, 9000);
+
+        let out = format_usage_summary(&t, "usage", None).unwrap();
+
+        assert!(out.contains("usage (1 call(s) total):"));
+        assert!(out.contains("fast/claude"));
+        assert!(out.contains("in=    12.3k"));
+        assert!(out.contains("cache_create=     1.0k"));
+        assert!(out.contains("cache_read=     9.0k"));
+    }
+
+    #[test]
+    fn formats_empty_usage_only_when_requested() {
+        let t = UsageTracker::new();
+
+        assert_eq!(format_usage_summary(&t, "usage", None), None);
+        assert_eq!(
+            format_usage_summary(&t, "usage", Some("empty")),
+            Some("empty".to_string())
+        );
     }
 
     #[test]

@@ -64,6 +64,7 @@ use tokio::sync::mpsc;
 /// bound stops a pathological agent from leaking unbounded memory
 /// over a long session.
 pub const SCROLLBACK_CAP: usize = 10_000;
+const MAX_RATATUI_SCROLL_Y: usize = u16::MAX as usize;
 
 /// Shared state between the crossterm event loop (which owns input)
 /// and background writers (which push lines via the installed
@@ -113,6 +114,7 @@ impl Scrollback {
             g.first_id += drop;
         }
     }
+
     /// Snapshot the last `max_rows` lines for a draw tick. Cheap —
     /// clones at most `max_rows` strings (on a 50-row terminal that's
     /// ~50 allocations per 100ms tick).
@@ -143,6 +145,9 @@ impl Scrollback {
         let vec_start = anchor_id.saturating_sub(g.first_id).min(g.lines.len());
         let vec_end = (vec_start + max_rows).min(g.lines.len());
         g.lines[vec_start..vec_end].to_vec()
+    }
+    pub fn all_lines(&self) -> Vec<String> {
+        self.inner.lock().unwrap().lines.clone()
     }
     /// Number of currently-retained lines. Doesn't count evicted
     /// entries — use `total_logical_lines` when you need the
@@ -240,6 +245,104 @@ pub fn render_markdown_block(body: &str) -> Vec<Line<'static>> {
         out.push(Line::from(split_inline_code(line, code_style)));
     }
     out
+}
+
+fn render_scrollback_lines(window: &[String]) -> Vec<Line<'static>> {
+    let mut body = Vec::new();
+    let mut i = 0;
+    while i < window.len() {
+        if window[i] == MD_BLOCK_START {
+            let start = i + 1;
+            let end = window[start..]
+                .iter()
+                .position(|l| l == MD_BLOCK_END)
+                .map(|p| start + p)
+                .unwrap_or(window.len());
+            let block = window[start..end].join("\n");
+            body.extend(render_markdown_block(&block));
+            i = if end < window.len() { end + 1 } else { end };
+        } else if window[i] == MD_BLOCK_END {
+            i += 1;
+        } else {
+            body.push(Line::from(window[i].clone()));
+            i += 1;
+        }
+    }
+    body
+}
+
+fn rendered_line_count(body: &[Line<'static>], width: u16) -> usize {
+    Paragraph::new(body.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+fn scrollback_body_for_view(
+    lines: &[String],
+    width: u16,
+    viewport_rows: usize,
+) -> (Vec<Line<'static>>, usize) {
+    let body = render_scrollback_lines(lines);
+    let line_count = rendered_line_count(&body, width);
+    let max_line_count = MAX_RATATUI_SCROLL_Y.saturating_add(viewport_rows);
+    if line_count <= max_line_count || lines.is_empty() {
+        return (body, line_count);
+    }
+
+    let mut low = 0usize;
+    let mut high = lines.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let candidate = render_scrollback_lines(&lines[mid..]);
+        if rendered_line_count(&candidate, width) <= max_line_count {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+
+    let body = render_scrollback_lines(&lines[low..]);
+    let line_count = rendered_line_count(&body, width);
+    if line_count <= max_line_count {
+        return (body, line_count);
+    }
+
+    // If one retained logical line alone wraps beyond ratatui's u16
+    // scroll range, keep the visible tail of that line. This is rare,
+    // but it preserves the newest output instead of clamping above it.
+    let fallback_source = lines
+        .iter()
+        .rev()
+        .find(|line| line.as_str() != MD_BLOCK_START && line.as_str() != MD_BLOCK_END)
+        .cloned()
+        .unwrap_or_default();
+    let mut fallback_rows = max_line_count;
+    loop {
+        let fallback = truncate_line_tail(&fallback_source, width, fallback_rows);
+        let fallback_lines = [fallback];
+        let body = render_scrollback_lines(&fallback_lines);
+        let line_count = rendered_line_count(&body, width);
+        if line_count <= max_line_count {
+            return (body, line_count);
+        }
+        if fallback_rows == 0 {
+            return (Vec::new(), 0);
+        }
+        fallback_rows /= 2;
+    }
+}
+
+fn truncate_line_tail(line: &str, width: u16, max_rows: usize) -> String {
+    let width = usize::from(width.max(1));
+    let marker = "[truncated] ";
+    let mut keep = width.saturating_mul(max_rows).saturating_sub(marker.len());
+    keep = keep.min(line.chars().count());
+    if keep == line.chars().count() {
+        return line.to_string();
+    }
+    let mut tail = line.chars().rev().take(keep).collect::<Vec<_>>();
+    tail.reverse();
+    format!("{marker}{}", tail.into_iter().collect::<String>())
 }
 
 /// Turn a prose line into a vector of spans, styling anything
@@ -963,18 +1066,16 @@ pub fn run_tui(
     if let Some(ref p) = history_path {
         input.history = load_history(p);
     }
-    // Scrollback view state. `None` = follow mode (always show the
-    // tail). `Some(i)` = pinned at absolute line index `i` — new
-    // lines pushed at the tail don't shift what the operator is
-    // looking at, because the window is `[anchor..anchor+rows]`
-    // regardless of total length. PgDn / End restore follow by
-    // clearing back to None.
-    let mut view_anchor: Option<usize> = None;
+    // Scrollback view state. `None` = follow mode (render the
+    // bottom after ratatui wrapping). `Some(y)` = pinned at a
+    // rendered-row scroll offset; PgDn / End restore follow.
+    let mut scroll_y: Option<usize> = None;
     // Track what we showed last draw so PgUp / PgDn can step by one
     // page (= visible rows - 1 for continuity).  Initialise to a
     // sensible default in case the first key press fires before the
     // first draw tick.
     let mut last_scrollback_rows: usize = 20;
+    let mut last_max_scroll_y: usize = 0;
 
     // Cap on the input box height — past this, the input scrolls
     // rather than pushing the scrollback pane off-screen. Rustyline
@@ -1012,77 +1113,26 @@ pub fn run_tui(
 
             let scrollback_rows = chunks[0].height as usize;
             last_scrollback_rows = scrollback_rows;
-            let total = scrollback.total_logical_lines();
-            let first = scrollback.first_id();
-            // Clamp anchor into the currently-valid logical range.
-            // Three nudges:
-            //   1. anchor < first_id → line has been evicted. Snap
-            //      to `first_id` so the view sits on the oldest
-            //      retained line instead of silently following.
-            //   2. anchor + rows >= total → the tail would already
-            //      be on-screen from this anchor; drop the pin so
-            //      we follow again (and the [PIN] marker clears).
-            //   3. anchor >= total → buffer was cleared under us;
-            //      follow.
-            if let Some(a) = view_anchor {
-                // Cases 2 and 3 both drop the pin — the tail would
-                // already be on-screen (so no point pinning) or the
-                // buffer was cleared under us (so there's nothing
-                // left to pin to). Case 1 snaps up to the oldest
-                // retained line instead of silently following.
-                if a >= total || a + scrollback_rows >= total {
-                    view_anchor = None;
-                } else if a < first {
-                    view_anchor = Some(first);
-                }
+            let lines = scrollback.all_lines();
+            let (mut body, line_count) =
+                scrollback_body_for_view(&lines, chunks[0].width, scrollback_rows);
+            let max_scroll_y = line_count.saturating_sub(scrollback_rows);
+            last_max_scroll_y = max_scroll_y;
+            if scroll_y.is_some_and(|y| y >= max_scroll_y) {
+                scroll_y = None;
             }
-            let window = match view_anchor {
-                Some(anchor_id) => scrollback.window_from(anchor_id, scrollback_rows),
-                None => scrollback.window(scrollback_rows, 0),
-            };
-            // Pad the top with blank lines so content is anchored
-            // to the bottom of the pane (against the status line),
-            // matching terminal scrollback convention. Without this,
-            // a short buffer renders at the top of the pane and
-            // leaves an empty gap between the latest line and the
-            // status row — the operator submits /followup, gets a
-            // one-line response, and sees it isolated high in the
-            // pane with nothing near the prompt, reading as if the
-            // command produced nothing.
-            let pad = scrollback_rows.saturating_sub(window.len());
-            // Expand markdown regions: when we hit MD_BLOCK_START,
-            // gather lines until the matching MD_BLOCK_END, feed the
-            // joined body through `render_markdown_block`, and
-            // splice its styled Lines in place of the raw lines.
-            // Marker lines are dropped. A window slice that cuts
-            // through a bracketed region (MD_START before the
-            // window, or MD_END after) falls back to plain rendering
-            // for the visible half — acceptable for a first pass.
-            let mut body: Vec<Line> = (0..pad).map(|_| Line::from("")).collect();
-            let mut i = 0;
-            while i < window.len() {
-                if window[i] == MD_BLOCK_START {
-                    let start = i + 1;
-                    let end = window[start..]
-                        .iter()
-                        .position(|l| l == MD_BLOCK_END)
-                        .map(|p| start + p)
-                        .unwrap_or(window.len());
-                    let block = window[start..end].join("\n");
-                    body.extend(render_markdown_block(&block));
-                    // Skip past MD_END when we found one; otherwise
-                    // we already consumed to the window tail.
-                    i = if end < window.len() { end + 1 } else { end };
-                } else if window[i] == MD_BLOCK_END {
-                    // Dangling close marker (window started
-                    // mid-block); swallow it.
-                    i += 1;
-                } else {
-                    body.push(Line::from(window[i].clone()));
-                    i += 1;
-                }
+            debug_assert!(max_scroll_y <= MAX_RATATUI_SCROLL_Y);
+            let y = scroll_y.unwrap_or(max_scroll_y) as u16;
+            if line_count < scrollback_rows {
+                let pad = scrollback_rows - line_count;
+                let mut padded = Vec::with_capacity(body.len() + pad);
+                padded.extend((0..pad).map(|_| Line::from("")));
+                padded.append(&mut body);
+                body = padded;
             }
-            let output = Paragraph::new(body).wrap(Wrap { trim: false });
+            let output = Paragraph::new(body)
+                .wrap(Wrap { trim: false })
+                .scroll((y, 0));
             f.render_widget(output, chunks[0]);
 
             // When scrolled away from the bottom, prefix the
@@ -1091,8 +1141,8 @@ pub fn run_tui(
             // the anchored top line's index so they can tell how
             // far back they've walked.
             let status_text = status_fn(chunks[1].width as usize);
-            let status_text = if let Some(a) = view_anchor {
-                format!("[PIN @{a}] {status_text}")
+            let status_text = if let Some(y) = scroll_y {
+                format!("[PIN row {y}/{max_scroll_y}] {status_text}")
             } else {
                 status_text
             };
@@ -1312,7 +1362,7 @@ pub fn run_tui(
                         // press End/Ctrl-End. Operators who meant
                         // to keep reading the old page wouldn't
                         // be submitting in the first place.
-                        view_anchor = None;
+                        scroll_y = None;
                         // `/edit` on its own submits a prompt via
                         // $EDITOR. In rustyline mode this is the
                         // cmd_edit path; here we do the same work
@@ -1373,7 +1423,7 @@ pub fn run_tui(
                         // repaint. Doesn't drop the buffer —
                         // operators who want to purge scrollback
                         // can /clear.
-                        view_anchor = None;
+                        scroll_y = None;
                         terminal.clear()?;
                     }
                     (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
@@ -1395,7 +1445,7 @@ pub fn run_tui(
                             // handoff is just a more elaborate
                             // Enter and the operator expects to
                             // see the response.
-                            view_anchor = None;
+                            scroll_y = None;
                         }
                         terminal.clear()?;
                     }
@@ -1409,53 +1459,31 @@ pub fn run_tui(
                     (KeyCode::Up, _) => input.move_up(),
                     (KeyCode::Down, _) => input.move_down(),
                     (KeyCode::PageUp, _) => {
-                        // Step by (rows - 1) so one line of
-                        // context carries over between pages,
-                        // matching the convention `less` uses.
-                        // First PgUp converts follow → pin at
-                        // (total - rows - step); further PgUps
-                        // decrement the anchor. Anchor values are
-                        // logical line ids; clamp at `first_id` so
-                        // we can't page past the oldest retained
-                        // line into evicted-id territory.
                         let step = last_scrollback_rows.saturating_sub(1).max(1);
-                        let total = scrollback.total_logical_lines();
-                        let first = scrollback.first_id();
-                        let raw = match view_anchor {
-                            Some(a) => a.saturating_sub(step),
-                            None => total
-                                .saturating_sub(last_scrollback_rows)
-                                .saturating_sub(step),
-                        };
-                        view_anchor = Some(raw.max(first));
+                        let current = scroll_y.unwrap_or(last_max_scroll_y);
+                        scroll_y = Some(current.saturating_sub(step));
                     }
                     (KeyCode::PageDown, _) => {
                         let step = last_scrollback_rows.saturating_sub(1).max(1);
-                        view_anchor = match view_anchor {
-                            Some(a) => {
-                                let next = a.saturating_add(step);
-                                let total = scrollback.total_logical_lines();
-                                if next + last_scrollback_rows >= total {
-                                    None
-                                } else {
-                                    Some(next)
-                                }
-                            }
-                            None => None,
-                        };
+                        if let Some(y) = scroll_y {
+                            let next = y.saturating_add(step);
+                            scroll_y = if next >= last_max_scroll_y {
+                                None
+                            } else {
+                                Some(next)
+                            };
+                        }
                     }
                     // Ctrl+Home / Ctrl+End jump to the top and
                     // bottom of scrollback. Bare Home/End are
                     // reserved for input-line cursor moves (below)
                     // so the common cursor-to-start / cursor-to-end
-                    // gestures keep working. Top = first retained
-                    // logical id so the PIN marker shows a real,
-                    // visible line.
+                    // gestures keep working.
                     (KeyCode::Home, m) if m.contains(KeyModifiers::CONTROL) => {
-                        view_anchor = Some(scrollback.first_id());
+                        scroll_y = Some(0);
                     }
                     (KeyCode::End, m) if m.contains(KeyModifiers::CONTROL) => {
-                        view_anchor = None;
+                        scroll_y = None;
                     }
                     (KeyCode::Backspace, _) => input.backspace(),
                     (KeyCode::Delete, _) => input.delete(),
@@ -1509,27 +1537,18 @@ pub fn run_tui(
                 // copy.
                 match me.kind {
                     MouseEventKind::ScrollUp => {
-                        let total = scrollback.total_logical_lines();
-                        let first = scrollback.first_id();
-                        let raw = match view_anchor {
-                            Some(a) => a.saturating_sub(3),
-                            None => total.saturating_sub(last_scrollback_rows).saturating_sub(3),
-                        };
-                        view_anchor = Some(raw.max(first));
+                        let current = scroll_y.unwrap_or(last_max_scroll_y);
+                        scroll_y = Some(current.saturating_sub(3));
                     }
                     MouseEventKind::ScrollDown => {
-                        view_anchor = match view_anchor {
-                            Some(a) => {
-                                let next = a.saturating_add(3);
-                                let total = scrollback.total_logical_lines();
-                                if next + last_scrollback_rows >= total {
-                                    None
-                                } else {
-                                    Some(next)
-                                }
-                            }
-                            None => None,
-                        };
+                        if let Some(y) = scroll_y {
+                            let next = y.saturating_add(3);
+                            scroll_y = if next >= last_max_scroll_y {
+                                None
+                            } else {
+                                Some(next)
+                            };
+                        }
                     }
                     _ => {}
                 }
@@ -1721,6 +1740,60 @@ mod tests {
         let sb = Scrollback::new();
         sb.push("alpha\nbeta\ngamma");
         assert_eq!(sb.tail(10), vec!["alpha", "beta", "gamma"]);
+    }
+
+    fn render_scrollback_tail(lines: &[&str], width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+
+        let lines = lines
+            .iter()
+            .map(|line| (*line).to_string())
+            .collect::<Vec<_>>();
+        let (body, line_count) = scrollback_body_for_view(&lines, width, height as usize);
+        let scroll_y = line_count.saturating_sub(height as usize) as u16;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let widget = Paragraph::new(body)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll_y, 0));
+                frame.render_widget(widget, frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrollback_tail_uses_ratatui_wrapped_scroll_rows() {
+        let rows = render_scrollback_tail(
+            &[
+                "older output wraps before the command rows",
+                "fast/claude-sonnet",
+                "slow/claude-opus",
+            ],
+            20,
+            3,
+        );
+
+        assert!(rows.iter().any(|row| row.contains("fast/claude-sonnet")));
+        assert!(rows.iter().any(|row| row.contains("slow/claude-opus")));
+    }
+
+    #[test]
+    fn scrollback_tail_survives_more_than_u16_wrapped_rows() {
+        let very_old = "x".repeat(70_000);
+        let rows = render_scrollback_tail(&[&very_old, "A", "B"], 1, 2);
+
+        assert_eq!(rows, vec!["A", "B"]);
     }
 
     #[test]

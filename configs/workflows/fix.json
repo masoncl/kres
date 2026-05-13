@@ -509,7 +509,7 @@
       "depends_on": [
         "write-patch"
       ],
-      "run_if": "research.research_status == 'confirmed' && write-patch.code_changes_emitted == true",
+      "run_if": "research.research_status == 'confirmed' && write-patch.code_changes_emitted == true && fixes-tag-search.attempt == 0",
       "preserve_outputs_on_skip": true,
       "agent": "fast",
       "mode": "audit",

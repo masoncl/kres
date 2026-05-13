@@ -963,8 +963,8 @@ mod tests {
         assert_eq!(fixes.depends_on, vec!["write-patch".to_string()]);
         assert_eq!(
             fixes.run_if.as_deref(),
-            Some("research.research_status == 'confirmed' && write-patch.code_changes_emitted == true"),
-            "fixes-tag-search must run only when the patch changed"
+            Some("research.research_status == 'confirmed' && write-patch.code_changes_emitted == true && fixes-tag-search.attempt == 0"),
+            "fixes-tag-search must run only once, after the first emitted patch"
         );
         assert!(
             fixes.preserve_outputs_on_skip,

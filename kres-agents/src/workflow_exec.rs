@@ -4693,7 +4693,6 @@ mod tests {
             .with("write-patch", 1, ok_write_patch())
             .with("write-patch", 2, ok_write_patch())
             .with("fixes-tag-search", 1, ok_fixes_tag_search())
-            .with("fixes-tag-search", 2, ok_fixes_tag_search())
             .with("write-commit-message", 1, ok_commit_message())
             .with("write-commit-message", 2, ok_commit_message())
             .with("commit", 1, ok_commit())
@@ -4720,6 +4719,17 @@ mod tests {
             })
             .collect();
         assert_eq!(write_patch_attempts, vec![1, 2]);
+        let fixes_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "fixes-tag-search" => {
+                    Some(*attempt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fixes_attempts, vec![1]);
     }
 
     /// Source-code review defects branch back to patch writing. The
@@ -4736,7 +4746,6 @@ mod tests {
             .with("write-patch", 1, ok_write_patch())
             .with("write-patch", 2, ok_write_patch())
             .with("fixes-tag-search", 1, ok_fixes_tag_search())
-            .with("fixes-tag-search", 2, ok_fixes_tag_search())
             .with("write-commit-message", 1, ok_commit_message())
             .with("write-commit-message", 2, ok_commit_message())
             .with("commit", 1, ok_commit())
@@ -4763,6 +4772,17 @@ mod tests {
             e,
             TraceEvent::BranchedTo { from, to } if from == "review" && to == "write-patch"
         )));
+        let fixes_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "fixes-tag-search" => {
+                    Some(*attempt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fixes_attempts, vec![1]);
     }
 
     /// Patch writing can dispute an incorrect source review without

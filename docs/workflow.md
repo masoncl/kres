@@ -407,6 +407,11 @@ the bug still exists at the current workspace HEAD.
    also inspect `git diff` for the latest uncommitted correction. It must
    not base provenance on an incremental retry diff alone.
 
+   The step runs at most once per fix todo. Later review/build cycles
+   reuse the preserved `fixes-tag-search` output instead of repeating
+   history research. Missing optional `Fixes:` metadata is not a reason to
+   keep searching on every patch iteration.
+
    This step is intentionally stricter than a quick blame lookup.
    `git blame` can seed candidates, but the agent must inspect candidate
    diffs, follow moved/renamed code with `git log --follow`, and use

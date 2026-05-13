@@ -1,6 +1,0 @@
-{
-  "key": "@FAST_KEY@",
-  "max_tokens": 32000,
-  "rate_limit": 800000,
-  "system_file": "system-prompts/todo-agent.system.md"
-}

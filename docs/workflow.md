@@ -840,7 +840,9 @@ workflow-defined task loop. It uses the optimized lens path:
 The parallel slow calls are the important part of `/review`; keep them
 unless the operator explicitly chooses a cheaper custom workflow.
 
-When multiple `--slow` tags are passed, review runs in comparison mode.
+When multiple `--slow` selectors are passed, review runs in comparison
+mode. Each selector resolves to one slow model JSON file (`sonnet` and
+`opus` are aliases; other values match filenames under `~/.kres/models/`).
 Each active lens prompt is sent to every configured slow model, so a
 commit review with six active lenses and `--slow sonnet --slow opus`
 performs twelve slow calls after the shared gather. Every per-lens

@@ -1,0 +1,9 @@
+{
+  "api_key": "@SLOW_KEY@",
+  "model": "claude-opus-4-7",
+  "defaults": {
+    "max_tokens": 128000,
+    "max_input_tokens": 900000,
+    "rate_limit": 800000
+  }
+}

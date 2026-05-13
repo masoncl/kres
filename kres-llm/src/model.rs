@@ -4,7 +4,11 @@
 //! Fixes bugs.md#R2: thinking budget default leaves room for output
 //! tokens instead of swallowing the entire max_tokens budget.
 
-use std::path::Path;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    Anthropic,
+    OpenAi,
+}
 
 /// A model id paired with its known output-token ceiling.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,22 +18,6 @@ pub struct Model {
 }
 
 impl Model {
-    /// Infer the model from an API-key file name — matches the
-    /// `pick_model` semantics. "opus" in the
-    /// filename → Opus 4.7. Otherwise Sonnet 4.6.
-    pub fn from_key_file(path: &Path) -> Self {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if name.contains("opus") {
-            Model::opus_4_7()
-        } else {
-            Model::sonnet_4_6()
-        }
-    }
-
     pub fn opus_4_7() -> Self {
         Self {
             id: "claude-opus-4-7".to_string(),
@@ -51,6 +39,7 @@ impl Model {
         let id: String = id.into();
         let max_output_tokens = match id.as_str() {
             "claude-opus-4-7" | "claude-opus-4-6" => 128_000,
+            id if is_openai_model(id) => 128_000,
             _ => 64_000,
         };
         Self {
@@ -58,6 +47,19 @@ impl Model {
             max_output_tokens,
         }
     }
+
+    pub fn provider(&self) -> Provider {
+        if is_openai_model(&self.id) {
+            Provider::OpenAi
+        } else {
+            Provider::Anthropic
+        }
+    }
+}
+
+fn is_openai_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id.starts_with("gpt-") || id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4")
 }
 
 /// How extended thinking is configured for a single call.
@@ -105,10 +107,15 @@ impl Effort {
 impl ThinkingBudget {
     /// Best default for a given model id.
     ///
+    /// - OpenAI reasoning models use the same adaptive effort enum,
+    ///   mapped to the provider's reasoning request field.
     /// - Models with "opus-4-7" (or later) in the id use adaptive
     ///   (medium).
     /// - Everything else uses an explicit budget sized for the output cap.
     pub fn default_for_model(model_id: &str, max_tokens: u32) -> Self {
+        if is_openai_model(model_id) {
+            return ThinkingBudget::Adaptive(Effort::Medium);
+        }
         // Model families that require adaptive schema. Keep this list
         // conservative — when in doubt, use explicit-budget thinking.
         let adaptive = model_id.contains("opus-4-7") || model_id.contains("opus-4-8");
@@ -167,37 +174,6 @@ impl ThinkingBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn key_file_opus_selects_opus_4_7() {
-        // bugs.md#R1
-        let p = PathBuf::from("/home/user/opus.api.key");
-        let m = Model::from_key_file(&p);
-        assert_eq!(m.id, "claude-opus-4-7");
-        assert_eq!(m.max_output_tokens, 128_000);
-    }
-
-    #[test]
-    fn key_file_unknown_falls_back_to_sonnet() {
-        let p = PathBuf::from("/home/user/other.key");
-        let m = Model::from_key_file(&p);
-        assert_eq!(m.id, "claude-sonnet-4-6");
-    }
-
-    #[test]
-    fn key_file_no_name_component_falls_back_to_sonnet() {
-        let p = PathBuf::from("");
-        let m = Model::from_key_file(&p);
-        assert_eq!(m.id, "claude-sonnet-4-6");
-    }
-
-    #[test]
-    fn key_file_case_insensitive() {
-        let p = PathBuf::from("/home/user/OPUS.API.KEY");
-        let m = Model::from_key_file(&p);
-        assert_eq!(m.id, "claude-opus-4-7");
-    }
 
     #[test]
     fn default_thinking_budget_leaves_room_for_output() {
@@ -242,6 +218,17 @@ mod tests {
     fn default_for_model_unknown_defaults_to_explicit() {
         let b = ThinkingBudget::default_for_model("claude-sonnet-4-6", 64_000);
         assert!(matches!(b, ThinkingBudget::ExplicitBudget(_)));
+    }
+
+    #[test]
+    fn gpt_models_use_openai_provider_and_reasoning_effort() {
+        let m = Model::from_id("gpt-5.5");
+        assert_eq!(m.provider(), Provider::OpenAi);
+        assert_eq!(m.max_output_tokens, 128_000);
+        assert_eq!(
+            ThinkingBudget::default_for_model(&m.id, m.max_output_tokens),
+            ThinkingBudget::Adaptive(Effort::Medium)
+        );
     }
 
     #[test]

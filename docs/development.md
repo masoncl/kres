@@ -11,12 +11,10 @@ kres/
 ├── kres-mcp/                      stdio JSON-RPC client for MCP servers
 ├── kres-agents/                   fast / slow / main / todo / consolidator / merger
 ├── kres-repl/                     readline UI, commands, signal handling
-├── configs/                       per-agent JSON configs (shipped defaults)
-│   ├── fast-code-agent.json
-│   ├── slow-code-agent-opus.json
-│   ├── slow-code-agent-sonnet.json
-│   ├── main-agent.json
-│   ├── todo-agent.json
+├── configs/                       shipped runtime defaults
+│   ├── models/
+│   │   ├── claude-opus-4-7.json
+│   │   └── claude-sonnet-4-6.json
 │   ├── settings.json
 │   ├── mcp.json
 │   └── prompts/                   system prompts + review templates

@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use kres_agents::{AgentConfig, DataFetcher, Orchestrator, RunContext};
+use kres_agents::{AgentConfig, AgentKind, DataFetcher, Orchestrator, RunContext};
 use kres_core::log::TurnLogger;
 use kres_core::{FindingsStore, TaskManager, TaskState, UsageTracker};
 use kres_llm::{client::Client, RateLimiter};
@@ -18,6 +18,10 @@ use crate::commands::{parse_command, Command};
 #[derive(Debug, Clone)]
 pub struct ReplConfig {
     pub stop_grace: Duration,
+    /// Lines emitted after the REPL output sink is installed. Startup
+    /// context must go through this path because TUI mode owns an
+    /// alternate-screen scrollback.
+    pub startup_lines: Vec<String>,
     /// Path to the canonical `findings.json` (jsondb-backed). When
     /// None, nothing is written to disk and findings stay in memory.
     pub findings_base: Option<PathBuf>,
@@ -95,6 +99,7 @@ impl Default for ReplConfig {
     fn default() -> Self {
         Self {
             stop_grace: Duration::from_secs(5),
+            startup_lines: Vec::new(),
             findings_base: None,
             turns_limit: 0,
             follow_followups: false,
@@ -854,6 +859,10 @@ impl Session {
         // Kept as Option<JoinHandle> = None so the teardown code
         // paths compile unchanged.
         let sigwinch_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        for line in &self.cfg.startup_lines {
+            kres_core::async_eprintln!("{line}");
+        }
 
         let root = self.mgr.root_shutdown().clone();
         let mgr_for_ctrlc = self.mgr.clone();
@@ -4105,13 +4114,15 @@ pub async fn build_orchestrator(
     comparison_path: Option<PathBuf>,
     settings: &crate::settings::Settings,
 ) -> Result<BuiltAgents> {
-    let fast_cfg = AgentConfig::load(fast_cfg_path)
+    let fast_cfg = AgentConfig::load_for_role(fast_cfg_path, AgentKind::Fast)
         .with_context(|| format!("loading fast agent config {}", fast_cfg_path.display()))?;
-    let slow_cfg = AgentConfig::load(slow_cfg_path)
+    let slow_cfg = AgentConfig::load_for_role(slow_cfg_path, AgentKind::Slow)
         .with_context(|| format!("loading slow agent config {}", slow_cfg_path.display()))?;
 
-    let fast_key = fast_cfg.key.clone();
-    let slow_key = slow_cfg.key.clone();
+    let fast_credentials = fast_cfg.credentials()?;
+    let slow_credentials = slow_cfg.credentials()?;
+    let fast_key = fast_credentials.cache_key();
+    let slow_key = slow_credentials.cache_key();
 
     let fast_model = crate::settings::pick_model(
         fast_cfg.model.as_deref(),
@@ -4137,10 +4148,9 @@ pub async fn build_orchestrator(
     // Shared rate limiter keyed by API-key string: agents using the
     // same key share a bucket so they can't collectively burst past
     // the per-key server limit. Capacity comes from whichever config
-    // was read first for that key. (Previously keyed on key_file
-    // path; now that keys are inline in the config we key on the key
-    // string itself, which is equivalent when two configs share a
-    // key and correctly separate when they don't.)
+    // was read first for that key. Keys are inline in model configs,
+    // so the literal secret is the shared limiter key when two roles
+    // intentionally use the same account.
     let mut limiters: std::collections::HashMap<String, Arc<RateLimiter>> =
         std::collections::HashMap::new();
     let fast_limiter = fast_cfg
@@ -4160,12 +4170,12 @@ pub async fn build_orchestrator(
             })
     };
     let fast_client = Arc::new(
-        Client::builder(fast_key.clone())
+        Client::builder(fast_credentials)
             .rate_limiter(fast_limiter.clone())
             .build()?,
     );
     let slow_client = Arc::new(
-        Client::builder(slow_key.clone())
+        Client::builder(slow_credentials)
             .rate_limiter(slow_limiter.clone())
             .build()?,
     );
@@ -4182,7 +4192,7 @@ pub async fn build_orchestrator(
         if cfg_path == slow_cfg_path {
             continue;
         }
-        let cfg = AgentConfig::load(&cfg_path)
+        let cfg = AgentConfig::load_for_role(&cfg_path, AgentKind::Slow)
             .with_context(|| format!("loading slow agent config {}", cfg_path.display()))?;
         let mut variant_settings = settings.clone();
         if let Some(id) = model_override {
@@ -4193,7 +4203,8 @@ pub async fn build_orchestrator(
             crate::settings::ModelRole::Slow,
             &variant_settings,
         );
-        let key = cfg.key.clone();
+        let credentials = cfg.credentials()?;
+        let key = credentials.cache_key();
         let limiter = if let Some(existing) = limiters.get(&key) {
             Some(existing.clone())
         } else {
@@ -4203,7 +4214,7 @@ pub async fn build_orchestrator(
             }
             limiter
         };
-        let client = Arc::new(Client::builder(key).rate_limiter(limiter).build()?);
+        let client = Arc::new(Client::builder(credentials).rate_limiter(limiter).build()?);
         let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
         let thinking = cfg
             .thinking

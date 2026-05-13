@@ -5,7 +5,6 @@
 //! is required (non-streaming would time out on large prompts).
 //!
 //! Defaults fixed from bugs.md:
-//! - R1: model defaults from key-file name to current versions.
 //! - R2: thinking budget default is `min(max_tokens/4, 32_000)` when the
 //!   operator omits `--thinking-budget`.
 
@@ -13,21 +12,26 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use anyhow::{bail, Context, Result};
+use kres_agents::AgentConfig;
 use kres_llm::{
-    client::Client, config::CallConfig, key::load_api_key, request::Message,
-    stream::StreamEventKind, Model, ThinkingBudget,
+    client::Client, config::CallConfig, request::Message, stream::StreamEventKind, Model,
+    ThinkingBudget,
 };
 use serde_json::Value;
 
 use crate::TurnArgs;
 
 pub async fn run_turn(args: TurnArgs) -> Result<()> {
-    let api_key = load_api_key(&args.key_file)
-        .with_context(|| format!("loading key file {}", args.key_file.display()))?;
+    let agent_cfg = AgentConfig::load(&args.config)
+        .with_context(|| format!("loading model config {}", args.config.display()))?;
 
     let model = match args.model.as_deref() {
         Some(id) => Model::from_id(id),
-        None => Model::from_key_file(&args.key_file),
+        None => agent_cfg
+            .model
+            .as_deref()
+            .map(Model::from_id)
+            .unwrap_or_else(Model::sonnet_4_6),
     };
     let max_tokens = args.max_tokens.unwrap_or(model.max_output_tokens);
 
@@ -72,7 +76,7 @@ pub async fn run_turn(args: TurnArgs) -> Result<()> {
     }
     eprintln!("sending request (streaming)...");
 
-    let client = Client::new(api_key)?;
+    let client = Client::new(agent_cfg.credentials()?)?;
     let messages = vec![Message {
         role: "user".into(),
         content: context,

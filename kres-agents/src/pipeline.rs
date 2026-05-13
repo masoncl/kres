@@ -1102,9 +1102,10 @@ impl Orchestrator {
         };
         // bugs.md#cache: all review lenses receive the same gathered
         // source/context. Warm that shared prefix once per slow
-        // model/system before launching the parallel lens calls, so
-        // the fan-out reads the Anthropic cache instead of racing N
-        // identical cache creations.
+        // model/system before launching the parallel lens calls. On
+        // Anthropic this writes the explicit ephemeral prompt cache;
+        // on GPT/OpenAI deployments it gives provider-side automatic
+        // prefix caching a single stable request to match.
         let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
         let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
         let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
@@ -1187,11 +1188,11 @@ impl Orchestrator {
                 let lens_logged = lens_logged.clone();
                 futures.push(async move {
                     // Each lens fan-out is a one-shot slow call. Same
-                    // reasoning as the single slow path above: skip the
-                    // tail cache tax, keep the exact warmed shared
-                    // prefix as the cached block when this model/system
-                    // successfully warmed it. Otherwise fold the same
-                    // prefix bytes into the plain content.
+                    // reasoning as the single slow path above: avoid
+                    // caching the volatile tail, keep the exact warmed
+                    // shared prefix separate when this model/system
+                    // successfully warmed it, and otherwise fold the
+                    // same prefix bytes into the plain content.
                     let (content, cached_prefix) = if use_warmed_prefix {
                         (lens_suffix, Some(shared_prefix))
                     } else {

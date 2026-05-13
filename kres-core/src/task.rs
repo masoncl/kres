@@ -117,12 +117,10 @@ pub struct TaskManager {
     /// This is separate from `inner` so a long merge doesn't block
     /// reads of task state.
     findings_extract_lock: Mutex<()>,
-    /// §30: per-session parallelism cap. Every spawn acquires a
-    /// permit before its closure runs; releasing happens when the
-    /// closure exits. Default is unbounded so older tests aren't
-    /// stalled by a cap they didn't set. `with_max_parallel(N)`
-    /// shrinks it to match ["concurrency"]`
-    /// (default 3,).
+    /// Per-session parallelism cap. Every spawn acquires a permit
+    /// before its closure runs; releasing happens when the closure
+    /// exits. Default is unbounded so tests and callers that do not
+    /// opt into a cap keep their existing behavior.
     parallel_semaphore: Arc<tokio::sync::Semaphore>,
 }
 

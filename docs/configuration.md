@@ -2,26 +2,26 @@
 
 ## Config directory: `~/.kres/`
 
-`kres repl` resolves every optional config path in this order:
+`kres repl` resolves agent config paths in this order:
 
 1. explicit CLI flag (e.g. `--fast-agent /path/to/fast.json`)
-2. same filename under `~/.kres/`
+2. model file under `~/.kres/models/<resolved-model-id>.json`
 
-Default filenames looked up in `~/.kres/`:
+Non-agent paths such as `mcp.json` and `skills/` only use explicit
+CLI flags and the same filename under `~/.kres/`.
+
+Default non-agent filenames looked up in `~/.kres/`:
 
 | Flag              | Default under `~/.kres/`         |
 |-------------------|----------------------------------|
-| `--fast-agent`    | `fast-code-agent.json`           |
-| `--slow` tag      | `slow-code-agent-<tag>.json`     |
-| `--main-agent`    | `main-agent.json`                |
-| `--todo-agent`    | `todo-agent.json`                |
 | `--mcp-config`    | `mcp.json`                       |
 | `--skills`        | `skills/`                        |
 | `--findings`      | `findings.json`                  |
 
-A missing file in `~/.kres/` is not an error — the "not
-configured" branch fires as if the flag were absent. The
-`history` file is always written to `~/.kres/history`.
+A missing model file in `~/.kres/models/` is not an error by
+itself, but any role whose model file cannot be resolved is treated
+as not configured unless the matching explicit `--*-agent` flag was
+provided. The `history` file is always written to `~/.kres/history`.
 
 ## Model selection
 
@@ -37,17 +37,137 @@ Runtime precedence (`kres-repl/src/settings.rs::pick_model`):
 2. `settings.models.<role>` in `~/.kres/settings.json`.
 3. `Model::sonnet_4_6()` — built-in fallback.
 
-Shipped agent configs no longer set `"model"`, so step 2 drives
-a fresh install. Per-run CLI overrides (`--fast-model`,
-`--slow-model`, `--main-model`, `--todo-model`) beat
-`settings.json`. A known `--slow <tag>` (sonnet/opus) implies a
-slow model id unless `--slow-model` is also passed.
+Model files set `"model"`, so settings selects which model file each
+role loads. Per-run REPL overrides (`--fast-model`, `--slow-model`,
+`--main-model`, `--todo-model`) beat `settings.json`. The one-shot
+workflow executor accepts only `--fast-model` and `--slow-model`
+because it has no main/todo agent roles. `--slow <name>` selects a
+slow model config: `sonnet` and `opus` are aliases for the shipped
+model ids, while any other value must match exactly one JSON file under
+`~/.kres/models/` by filename. Exact stem matches win over substring
+matches. `--slow` and `--slow-model` are mutually exclusive.
+
+For example, with these files:
+
+```text
+~/.kres/models/claude-sonnet-4-6.json
+~/.kres/models/gpt-5.5-high.json
+~/.kres/models/gpt-5.5-xhigh.json
+~/.kres/models/local-coder.json
+```
+
+`--slow sonnet` selects the Sonnet alias, `--slow gpt-5.5-xhigh`
+selects the exact filename stem, `--slow local` selects
+`local-coder.json` if it is the only filename containing `local`, and
+`--slow gpt-5.5` fails because both GPT files match.
 
 Pointing fast and slow at the same model is fine: the fast/slow
 distinction is driven by per-agent system prompts and the
 context each agent receives, not by model choice. Two different
 models is a cost/latency optimisation, not a correctness
 requirement.
+
+GPT model ids such as `gpt-5.5` use the OpenAI adapter in `kres-llm`.
+The normal layout is one file per model:
+
+```text
+~/.kres/models/gpt-5.5.json
+```
+
+That file carries model credentials plus default request parameters.
+Role sections are optional; add them only when a role needs different
+tuning. The top-level `api_key` is used for every role that loads that
+model file:
+
+```json
+{
+  "api_key": "...",
+  "model": "claude-sonnet-4-6",
+  "defaults": {
+    "rate_limit": 800000
+  },
+  "fast": {
+    "max_tokens": 64000,
+    "max_input_tokens": 800000
+  },
+  "main": {
+    "max_tokens": 16384
+  },
+  "todo": {
+    "max_tokens": 32000
+  },
+  "slow": {
+    "max_tokens": 64000,
+    "max_input_tokens": 900000
+  }
+}
+```
+
+For a role-specific load, kres merges model-file fields in this order:
+
+1. Top-level fields.
+2. `defaults`.
+3. The selected role section: `fast`, `slow`, `main`, or `todo`.
+
+Later entries replace earlier entries for the same key. Config files
+are strict: unknown fields are rejected instead of ignored.
+
+For OpenAI API access, set `provider: "openai"`. `base_url` is
+optional and defaults to `https://api.openai.com/v1`; set it only for a
+compatible proxy:
+
+```json
+{
+  "provider": "openai",
+  "api_key": "...",
+  "model": "gpt-5.5",
+  "defaults": {
+    "max_tokens": 128000,
+    "max_input_tokens": 900000,
+    "rate_limit": 900000,
+    "thinking": {"type": "adaptive", "effort": "medium"}
+  },
+  "slow": {
+    "thinking": {"type": "adaptive", "effort": "high"}
+  }
+}
+```
+
+For Azure or Azure API Management deployments, use the same `api_key`
+field plus `host`:
+
+```json
+{
+  "host": "example.azure-api.net",
+  "api_key": "...",
+  "api_version": "2025-04-01-preview",
+  "model": "gpt-5.5",
+  "defaults": {
+    "thinking": {"type": "adaptive", "effort": "medium"}
+  },
+  "slow": {
+    "thinking": {"type": "adaptive", "effort": "high"}
+  }
+}
+```
+
+GPT-5/o-series calls use the Responses API. `thinking` maps to
+OpenAI `reasoning.effort`, and kres sends text verbosity `medium` by
+default. Explicit thinking budgets are mapped onto OpenAI effort
+tiers; adaptive `low` / `medium` / `high` are sent directly.
+
+All provider credentials use the same JSON field name: `api_key`.
+Legacy `key`, `primary_key`, and `secondary_key` fields are rejected.
+
+Model files use each role's default embedded system prompt unless a
+role section overrides `system` or `system_file`. The default prompt is
+injected by role when the loaded config has neither field.
+
+Legacy role-specific filenames such as `fast-code-agent.json`,
+`main-agent.json`, `todo-agent.json`, and
+`slow-code-agent-<tag>.json` are no longer auto-discovered from
+`~/.kres/`. Existing files with those names are ignored unless passed
+explicitly with the corresponding `--*-agent` flag.
 
 ## System prompts
 
@@ -56,14 +176,16 @@ slow-generic / main / todo) are compiled into the kres binary
 (`kres-agents/src/embedded_prompts.rs`). `setup.sh` does NOT
 install them on disk — rebuilding kres refreshes them.
 
-Shipped configs reference `system_file:
-"system-prompts/<name>.system.md"` resolved relative to the
-config file's directory, i.e. `~/.kres/system-prompts/<name>`.
+When a model config under `~/.kres/models/` sets
+`system_file: "system-prompts/<name>.system.md"`, kres resolves that to
+`~/.kres/system-prompts/<name>`, then falls back to the embedded prompt
+with the same basename. Shipped model configs normally omit
+`system_file`; the loader supplies the correct role default.
 
 `AgentConfig::load` order:
 
-1. **Disk override**: `~/.kres/system-prompts/<basename>` if it
-   exists and is non-empty — used verbatim.
+1. **Disk override**: `~/.kres/system-prompts/<basename>` if it is
+   readable — used verbatim.
 2. **Embedded**: compiled-in copy keyed by basename.
 3. **Error**: neither present → load fails naming both paths.
 
@@ -165,6 +287,10 @@ Point `setup.sh` at your clone:
 ./setup.sh --fast-key $FAST_API_KEY --slow-key $SLOW_API_KEY \
            --review-prompts /path/to/review-prompts
 ```
+
+`setup.sh --fast-key` and `--slow-key` replace the `@FAST_KEY@` and
+`@SLOW_KEY@` placeholders in `~/.kres/models/*.json`. The replacement
+lands in `api_key` fields.
 
 Without a resolvable path, `setup.sh` leaves the kernel skill
 uninstalled — agents still run, but the slow agent loses the

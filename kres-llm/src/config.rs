@@ -12,6 +12,10 @@ pub struct CallConfig {
     pub temperature: Option<f32>,
     /// Optional system prompt.
     pub system: Option<String>,
+    /// OpenAI Responses API text verbosity. Ignored by Anthropic.
+    /// Defaults to provider-side medium verbosity in the OpenAI request
+    /// builder when unset.
+    pub text_verbosity: Option<String>,
     /// Emit the system prompt as a `cache_control: {ephemeral}` block
     /// so the Anthropic prompt cache scores a hit across runs that
     /// reuse the same system. Matches for all four
@@ -42,6 +46,7 @@ impl CallConfig {
             thinking,
             temperature: None,
             system: None,
+            text_verbosity: None,
             system_cached: true,
             max_input_tokens: None,
             stream_label: None,
@@ -64,6 +69,11 @@ impl CallConfig {
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
+        self
+    }
+
+    pub fn with_text_verbosity(mut self, verbosity: impl Into<String>) -> Self {
+        self.text_verbosity = Some(verbosity.into());
         self
     }
 

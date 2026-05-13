@@ -17,36 +17,137 @@ use std::sync::Arc;
 use crate::{
     config::CallConfig,
     error::LlmError,
+    model::Provider,
     proxy::detect_proxy,
     rate_limit::RateLimiter,
-    request::{Message, MessagesRequest, MessagesResponse},
+    request::{ContentBlock, Message, MessagesRequest, MessagesResponse, Usage},
     stream::{parse_event, StreamEvent},
 };
 
-const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_API_VERSION: &str = "2025-04-01-preview";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LlmCredentials {
+    Anthropic {
+        api_key: String,
+    },
+    OpenAi {
+        api_key: String,
+        base_url: String,
+    },
+    AzureOpenAi {
+        host: String,
+        api_key: String,
+        api_version: String,
+    },
+}
+
+impl LlmCredentials {
+    pub fn anthropic(api_key: impl Into<String>) -> Self {
+        Self::Anthropic {
+            api_key: api_key.into(),
+        }
+    }
+
+    pub fn openai(api_key: impl Into<String>, base_url: Option<String>) -> Self {
+        Self::OpenAi {
+            api_key: api_key.into(),
+            base_url: base_url.unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+        }
+    }
+
+    pub fn azure_openai(
+        host: impl Into<String>,
+        api_key: impl Into<String>,
+        api_version: Option<String>,
+    ) -> Self {
+        Self::AzureOpenAi {
+            host: host.into(),
+            api_key: api_key.into(),
+            api_version: api_version.unwrap_or_else(|| DEFAULT_OPENAI_API_VERSION.to_string()),
+        }
+    }
+
+    pub fn cache_key(&self) -> String {
+        match self {
+            LlmCredentials::Anthropic { api_key } => format!("anthropic:{api_key}"),
+            LlmCredentials::OpenAi { api_key, base_url } => {
+                format!("openai:{}:{api_key}", normalize_url(base_url))
+            }
+            LlmCredentials::AzureOpenAi { host, api_key, .. } => {
+                format!("azure-openai:{}:{api_key}", normalize_url(host))
+            }
+        }
+    }
+
+    fn api_key(&self) -> &str {
+        match self {
+            LlmCredentials::Anthropic { api_key } => api_key,
+            LlmCredentials::OpenAi { api_key, .. } => api_key,
+            LlmCredentials::AzureOpenAi { api_key, .. } => api_key,
+        }
+    }
+
+    fn default_base_url(&self) -> String {
+        match self {
+            LlmCredentials::Anthropic { .. } => DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+            LlmCredentials::OpenAi { base_url, .. } => normalize_url(base_url),
+            LlmCredentials::AzureOpenAi { host, .. } => normalize_url(host),
+        }
+    }
+
+    fn is_azure_openai(&self) -> bool {
+        matches!(self, LlmCredentials::AzureOpenAi { .. })
+    }
+}
+
+impl From<String> for LlmCredentials {
+    fn from(value: String) -> Self {
+        LlmCredentials::anthropic(value)
+    }
+}
+
+impl From<&str> for LlmCredentials {
+    fn from(value: &str) -> Self {
+        LlmCredentials::anthropic(value)
+    }
+}
+
+fn normalize_url(url: &str) -> String {
+    let url = url.trim().trim_end_matches('/');
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("https://{url}")
+    }
+}
 
 #[derive(Clone)]
 pub struct Client {
-    api_key: String,
+    credentials: LlmCredentials,
     base_url: String,
     http: reqwest::Client,
-    /// Optional shared rate limiter. Multiple Clients with the same
-    /// API key should share one via `Arc::clone`.
+    /// Optional shared rate limiter. Multiple clients with the same
+    /// credential should share one via `Arc::clone`.
     rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl Client {
-    /// Build a client from an API key; picks up https_proxy / HTTPS_PROXY
-    /// from the environment automatically.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, LlmError> {
-        Self::builder(api_key).build()
+    /// Build a client from provider credentials; picks up https_proxy /
+    /// HTTPS_PROXY from the environment automatically.
+    pub fn new(credentials: impl Into<LlmCredentials>) -> Result<Self, LlmError> {
+        Self::builder(credentials).build()
     }
 
-    pub fn builder(api_key: impl Into<String>) -> ClientBuilder {
+    pub fn builder(credentials: impl Into<LlmCredentials>) -> ClientBuilder {
+        let credentials = credentials.into();
+        let base_url = credentials.default_base_url();
         ClientBuilder {
-            api_key: api_key.into(),
-            base_url: DEFAULT_BASE_URL.to_string(),
+            credentials,
+            base_url,
             proxy: detect_proxy(),
             no_proxy: false,
             timeout: None,
@@ -68,6 +169,9 @@ impl Client {
     /// Used on a 429 to decide whether the payload needs shrinking
     /// before retrying (§10 in todo.md).
     pub async fn count_tokens_exact(&self, cfg: &CallConfig, messages: &[Message]) -> Option<u64> {
+        if cfg.model.provider() != Provider::Anthropic {
+            return None;
+        }
         #[derive(serde::Serialize)]
         struct Body<'a> {
             model: &'a str,
@@ -87,7 +191,7 @@ impl Client {
         let resp = self
             .http
             .post(format!("{}/v1/messages/count_tokens", self.base_url))
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.credentials.api_key())
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header(header::CONTENT_TYPE, "application/json")
             .json(&body)
@@ -120,6 +224,9 @@ impl Client {
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
+        if cfg.model.provider() == Provider::OpenAi {
+            return self.openai_messages(cfg, messages).await;
+        }
         const MAX_RETRIES: u32 = 20;
         let mut working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
@@ -128,7 +235,7 @@ impl Client {
             let resp_result = self
                 .http
                 .post(format!("{}/v1/messages", self.base_url))
-                .header("x-api-key", &self.api_key)
+                .header("x-api-key", self.credentials.api_key())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header(header::CONTENT_TYPE, "application/json")
                 .json(&body)
@@ -223,6 +330,9 @@ impl Client {
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<StreamHandle, LlmError> {
+        if cfg.model.provider() == Provider::OpenAi {
+            return self.openai_stream_messages(cfg, messages).await;
+        }
         use eventsource_stream::Eventsource;
 
         let body = MessagesRequest::from_config(cfg, messages, true);
@@ -233,7 +343,7 @@ impl Client {
             let resp_result = self
                 .http
                 .post(format!("{}/v1/messages", self.base_url))
-                .header("x-api-key", &self.api_key)
+                .header("x-api-key", self.credentials.api_key())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "text/event-stream")
@@ -328,6 +438,9 @@ impl Client {
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
+        if cfg.model.provider() == Provider::OpenAi {
+            return self.openai_messages(cfg, messages).await;
+        }
         const MAX_RETRIES: u32 = 20;
         let mut working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
@@ -347,7 +460,7 @@ impl Client {
             let resp_result = self
                 .http
                 .post(format!("{}/v1/messages", self.base_url))
-                .header("x-api-key", &self.api_key)
+                .header("x-api-key", self.credentials.api_key())
                 .header("anthropic-version", ANTHROPIC_VERSION)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "text/event-stream")
@@ -448,6 +561,572 @@ impl Client {
             });
         }
         Err(LlmError::Other("exhausted retries".into()))
+    }
+
+    async fn openai_messages(
+        &self,
+        cfg: &CallConfig,
+        messages: &[Message],
+    ) -> Result<MessagesResponse, LlmError> {
+        if use_openai_responses_api(&cfg.model.id) {
+            return self.openai_responses_messages(cfg, messages).await;
+        }
+        const MAX_RETRIES: u32 = 20;
+        let mut working_messages: Vec<Message> = messages.to_vec();
+        let mut consecutive_429s: u32 = 0;
+        for attempt in 0..=MAX_RETRIES {
+            let body = OpenAiChatRequest::from_config(cfg, &working_messages, false);
+            let resp_result = self
+                .http
+                .post(self.openai_chat_url(cfg))
+                .headers(self.openai_headers())
+                .json(&body)
+                .send()
+                .await;
+            let resp = match resp_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < MAX_RETRIES && is_transport_retryable(&e) {
+                        let wait = backoff_duration(attempt);
+                        log_transport_retry("openai_messages", attempt, MAX_RETRIES, &e, wait);
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    if is_transport_retryable(&e) {
+                        log_transport_giveup("openai_messages", MAX_RETRIES, &e);
+                    }
+                    return Err(LlmError::Http(e));
+                }
+            };
+            let status = resp.status();
+            if status.is_success() {
+                let raw = resp.json::<OpenAiChatResponse>().await?;
+                return Ok(raw.into_messages_response());
+            }
+            let retry_after = parse_retry_after(&resp);
+            let body_text = resp.text().await.unwrap_or_default();
+            if attempt < MAX_RETRIES && is_retryable_status(status) {
+                let base_wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                let wait = if status.as_u16() == 429 {
+                    consecutive_429s += 1;
+                    extended_wait(base_wait, consecutive_429s)
+                } else {
+                    consecutive_429s = 0;
+                    base_wait
+                };
+                if status.as_u16() == 429 {
+                    let estimated = estimate_message_tokens(&working_messages);
+                    let over_limit = cfg
+                        .max_input_tokens
+                        .map(|limit| estimated > limit as u64)
+                        .unwrap_or(false);
+                    kres_core::async_eprintln!(
+                        "[rate-limit] 429 (openai) attempt={}/{} consecutive={} estimated_tokens={} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
+                        attempt,
+                        MAX_RETRIES,
+                        consecutive_429s,
+                        estimated,
+                        cfg.max_input_tokens,
+                        retry_after,
+                        wait,
+                        over_limit,
+                        if over_limit { "over-limit" } else { "wait" },
+                    );
+                    if over_limit {
+                        let target_tokens = (cfg.max_input_tokens.unwrap() as u64 * 9) / 10;
+                        let target_chars = (target_tokens as usize).saturating_mul(4);
+                        let _ =
+                            shrink_last_user_message_for_retry(&mut working_messages, target_chars);
+                    }
+                }
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            return Err(LlmError::ApiStatus {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+        Err(LlmError::Other("exhausted retries".into()))
+    }
+
+    async fn openai_responses_messages(
+        &self,
+        cfg: &CallConfig,
+        messages: &[Message],
+    ) -> Result<MessagesResponse, LlmError> {
+        const MAX_RETRIES: u32 = 20;
+        let mut working_messages: Vec<Message> = messages.to_vec();
+        let mut consecutive_429s: u32 = 0;
+        for attempt in 0..=MAX_RETRIES {
+            let body = OpenAiResponsesRequest::from_config(cfg, &working_messages, false);
+            let resp_result = self
+                .http
+                .post(self.openai_responses_url())
+                .headers(self.openai_headers())
+                .json(&body)
+                .send()
+                .await;
+            let resp = match resp_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < MAX_RETRIES && is_transport_retryable(&e) {
+                        let wait = backoff_duration(attempt);
+                        log_transport_retry(
+                            "openai_responses_messages",
+                            attempt,
+                            MAX_RETRIES,
+                            &e,
+                            wait,
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    if is_transport_retryable(&e) {
+                        log_transport_giveup("openai_responses_messages", MAX_RETRIES, &e);
+                    }
+                    return Err(LlmError::Http(e));
+                }
+            };
+            let status = resp.status();
+            if status.is_success() {
+                let raw = resp.json::<OpenAiResponsesResponse>().await?;
+                return Ok(raw.into_messages_response());
+            }
+            let retry_after = parse_retry_after(&resp);
+            let body_text = resp.text().await.unwrap_or_default();
+            if attempt < MAX_RETRIES && is_retryable_status(status) {
+                let base_wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
+                let wait = if status.as_u16() == 429 {
+                    consecutive_429s += 1;
+                    extended_wait(base_wait, consecutive_429s)
+                } else {
+                    consecutive_429s = 0;
+                    base_wait
+                };
+                if status.as_u16() == 429 {
+                    let estimated = estimate_message_tokens(&working_messages);
+                    let over_limit = cfg
+                        .max_input_tokens
+                        .map(|limit| estimated > limit as u64)
+                        .unwrap_or(false);
+                    kres_core::async_eprintln!(
+                        "[rate-limit] 429 (openai responses) attempt={}/{} consecutive={} estimated_tokens={} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
+                        attempt,
+                        MAX_RETRIES,
+                        consecutive_429s,
+                        estimated,
+                        cfg.max_input_tokens,
+                        retry_after,
+                        wait,
+                        over_limit,
+                        if over_limit { "over-limit" } else { "wait" },
+                    );
+                    if over_limit {
+                        let target_tokens = (cfg.max_input_tokens.unwrap() as u64 * 9) / 10;
+                        let target_chars = (target_tokens as usize).saturating_mul(4);
+                        let _ =
+                            shrink_last_user_message_for_retry(&mut working_messages, target_chars);
+                    }
+                }
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            return Err(LlmError::ApiStatus {
+                status: status.as_u16(),
+                body: body_text,
+            });
+        }
+        Err(LlmError::Other("exhausted retries".into()))
+    }
+
+    async fn openai_stream_messages(
+        &self,
+        cfg: &CallConfig,
+        messages: &[Message],
+    ) -> Result<StreamHandle, LlmError> {
+        let resp = self.openai_messages(cfg, messages).await?;
+        let text = response_text(&resp);
+        let events = futures::stream::iter(vec![
+            Ok(StreamEvent {
+                kind: crate::stream::StreamEventKind::BlockStart {
+                    index: 0,
+                    block_type: "text".to_string(),
+                },
+            }),
+            Ok(StreamEvent {
+                kind: crate::stream::StreamEventKind::TextDelta { index: 0, text },
+            }),
+            Ok(StreamEvent {
+                kind: crate::stream::StreamEventKind::BlockStop { index: 0 },
+            }),
+            Ok(StreamEvent {
+                kind: crate::stream::StreamEventKind::MessageStop,
+            }),
+        ]);
+        Ok(StreamHandle {
+            inner: Box::pin(events),
+        })
+    }
+
+    fn openai_chat_url(&self, cfg: &CallConfig) -> String {
+        match &self.credentials {
+            LlmCredentials::AzureOpenAi { api_version, .. } => format!(
+                "{}/openai/deployments/{}/chat/completions?api-version={}",
+                self.base_url, cfg.model.id, api_version
+            ),
+            _ => format!("{}/chat/completions", self.openai_base_url()),
+        }
+    }
+
+    fn openai_responses_url(&self) -> String {
+        match &self.credentials {
+            LlmCredentials::AzureOpenAi { api_version, .. } => {
+                format!(
+                    "{}/openai/responses?api-version={}",
+                    self.base_url, api_version
+                )
+            }
+            _ => format!("{}/responses", self.openai_base_url()),
+        }
+    }
+
+    fn openai_headers(&self) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        let key = header::HeaderValue::from_str(self.credentials.api_key())
+            .unwrap_or_else(|_| header::HeaderValue::from_static(""));
+        if self.credentials.is_azure_openai() {
+            headers.insert("api-key", key.clone());
+            headers.insert("Ocp-Apim-Subscription-Key", key);
+        } else {
+            let bearer = format!("Bearer {}", self.credentials.api_key());
+            let bearer = header::HeaderValue::from_str(&bearer)
+                .unwrap_or_else(|_| header::HeaderValue::from_static(""));
+            headers.insert(header::AUTHORIZATION, bearer);
+        }
+        headers
+    }
+
+    fn openai_base_url(&self) -> String {
+        if self.base_url == DEFAULT_ANTHROPIC_BASE_URL {
+            DEFAULT_OPENAI_BASE_URL.to_string()
+        } else {
+            self.base_url.clone()
+        }
+    }
+}
+
+fn estimate_message_tokens(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .map(|m| {
+            let prefix = m.cached_prefix.as_ref().map(|s| s.len()).unwrap_or(0);
+            ((prefix + m.content.len()) / 4) as u64
+        })
+        .sum()
+}
+
+fn response_text(resp: &MessagesResponse) -> String {
+    let mut out = String::new();
+    for block in &resp.content {
+        if let ContentBlock::Text { text } = block {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+fn use_openai_responses_api(model_id: &str) -> bool {
+    let id = model_id.to_ascii_lowercase();
+    id.starts_with("gpt-5") || id.starts_with('o')
+}
+
+fn openai_reasoning_effort(thinking: crate::model::ThinkingBudget) -> Option<&'static str> {
+    match thinking {
+        crate::model::ThinkingBudget::Disabled => None,
+        crate::model::ThinkingBudget::Adaptive(effort) => Some(effort.as_str()),
+        crate::model::ThinkingBudget::ExplicitBudget(tokens) => {
+            if tokens <= 2_048 {
+                Some("minimal")
+            } else if tokens <= 8_192 {
+                Some("low")
+            } else if tokens <= 16_384 {
+                Some("medium")
+            } else {
+                Some("high")
+            }
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OpenAiResponsesRequest {
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    input: Vec<OpenAiResponsesInputMessage>,
+    max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenAiReasoningRequest>,
+    text: OpenAiTextRequest,
+    stream: bool,
+}
+
+impl OpenAiResponsesRequest {
+    fn from_config(cfg: &CallConfig, messages: &[Message], stream: bool) -> Self {
+        let input = messages
+            .iter()
+            .map(|m| {
+                let role = match m.role.as_str() {
+                    "assistant" => "assistant",
+                    _ => "user",
+                };
+                OpenAiResponsesInputMessage {
+                    role: role.to_string(),
+                    content: match &m.cached_prefix {
+                        Some(prefix) => format!("{prefix}{}", m.content),
+                        None => m.content.clone(),
+                    },
+                }
+            })
+            .collect();
+        Self {
+            model: cfg.model.id.clone(),
+            instructions: cfg.system.clone(),
+            input,
+            max_output_tokens: cfg.max_tokens,
+            reasoning: openai_reasoning_effort(cfg.thinking)
+                .map(|effort| OpenAiReasoningRequest { effort }),
+            text: OpenAiTextRequest {
+                verbosity: cfg
+                    .text_verbosity
+                    .as_deref()
+                    .unwrap_or("medium")
+                    .to_string(),
+            },
+            stream,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OpenAiResponsesInputMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OpenAiReasoningRequest {
+    effort: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OpenAiTextRequest {
+    verbosity: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAiResponsesResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    usage: Option<OpenAiResponsesUsage>,
+    #[serde(default)]
+    output_text: Option<String>,
+    #[serde(default)]
+    output: Vec<OpenAiResponsesOutputItem>,
+}
+
+impl OpenAiResponsesResponse {
+    fn into_messages_response(self) -> MessagesResponse {
+        let text = self.output_text.unwrap_or_else(|| {
+            self.output
+                .into_iter()
+                .flat_map(|item| item.content.into_iter())
+                .filter_map(openai_response_content_text)
+                .collect::<String>()
+        });
+        MessagesResponse {
+            model: self.model,
+            stop_reason: self.status,
+            usage: self.usage.map(Into::into).unwrap_or_default(),
+            content: vec![ContentBlock::Text { text }],
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAiResponsesOutputItem {
+    #[serde(default)]
+    content: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAiResponsesUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAiInputTokenDetails>,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiInputTokenDetails>,
+}
+
+impl From<OpenAiResponsesUsage> for Usage {
+    fn from(value: OpenAiResponsesUsage) -> Self {
+        let cached_tokens = value
+            .input_tokens_details
+            .or(value.prompt_tokens_details)
+            .map(|details| details.cached_tokens)
+            .unwrap_or(0);
+        Usage {
+            input_tokens: value.input_tokens.or(value.prompt_tokens).unwrap_or(0),
+            output_tokens: value.output_tokens.or(value.completion_tokens).unwrap_or(0),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cached_tokens,
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct OpenAiInputTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+fn openai_response_content_text(value: serde_json::Value) -> Option<String> {
+    value
+        .get("text")
+        .and_then(|text| text.as_str())
+        .or_else(|| value.get("content").and_then(|content| content.as_str()))
+        .map(ToString::to_string)
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OpenAiChatRequest {
+    messages: Vec<OpenAiChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    stream: bool,
+}
+
+impl OpenAiChatRequest {
+    fn from_config(cfg: &CallConfig, messages: &[Message], stream: bool) -> Self {
+        let mut out = Vec::new();
+        if let Some(system) = cfg.system.as_deref() {
+            out.push(OpenAiChatMessage {
+                role: "system".to_string(),
+                content: system.to_string(),
+            });
+        }
+        for m in messages {
+            let role = match m.role.as_str() {
+                "assistant" => "assistant",
+                _ => "user",
+            };
+            out.push(OpenAiChatMessage {
+                role: role.to_string(),
+                content: match &m.cached_prefix {
+                    Some(prefix) => format!("{prefix}{}", m.content),
+                    None => m.content.clone(),
+                },
+            });
+        }
+        let gpt5_or_reasoning = cfg.model.id.starts_with("gpt-5") || cfg.model.id.starts_with('o');
+        Self {
+            messages: out,
+            max_tokens: (!gpt5_or_reasoning).then_some(cfg.max_tokens),
+            max_completion_tokens: gpt5_or_reasoning.then_some(cfg.max_tokens),
+            temperature: (!gpt5_or_reasoning).then_some(cfg.temperature.unwrap_or(0.0)),
+            stream,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OpenAiChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+    #[serde(default)]
+    choices: Vec<OpenAiChoice>,
+}
+
+impl OpenAiChatResponse {
+    fn into_messages_response(self) -> MessagesResponse {
+        let stop_reason = self.choices.first().and_then(|c| c.finish_reason.clone());
+        let text = self
+            .choices
+            .into_iter()
+            .filter_map(|c| c.message)
+            .map(|m| m.content.unwrap_or_default())
+            .collect::<String>();
+        MessagesResponse {
+            model: self.model,
+            stop_reason,
+            usage: self.usage.map(Into::into).unwrap_or_default(),
+            content: vec![ContentBlock::Text { text }],
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAiChoice {
+    #[serde(default)]
+    message: Option<OpenAiResponseMessage>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAiResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAiInputTokenDetails>,
+}
+
+impl From<OpenAiUsage> for Usage {
+    fn from(value: OpenAiUsage) -> Self {
+        Usage {
+            input_tokens: value.prompt_tokens,
+            output_tokens: value.completion_tokens,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: value
+                .prompt_tokens_details
+                .map(|details| details.cached_tokens)
+                .unwrap_or(0),
+        }
     }
 }
 
@@ -664,7 +1343,7 @@ fn transport_error_kind(e: &reqwest::Error) -> &'static str {
 /// Without this, an offline / DNS-broken host looks like kres just hanging.
 fn log_transport_retry(label: &str, attempt: u32, max: u32, e: &reqwest::Error, wait: Duration) {
     kres_core::async_eprintln!(
-        "[network] {} attempt={}/{} kind={} error={} — retrying in {:?} (check connectivity to api.anthropic.com)",
+        "[network] {} attempt={}/{} kind={} error={} — retrying in {:?} (check connectivity to the configured API endpoint)",
         label,
         attempt + 1,
         max + 1,
@@ -804,7 +1483,7 @@ impl StreamHandle {
 
 #[derive(Clone)]
 pub struct ClientBuilder {
-    api_key: String,
+    credentials: LlmCredentials,
     base_url: String,
     proxy: Option<String>,
     no_proxy: bool,
@@ -858,7 +1537,7 @@ impl ClientBuilder {
         }
         let http = b.build()?;
         Ok(Client {
-            api_key: self.api_key,
+            credentials: self.credentials,
             base_url: self.base_url,
             http,
             rate_limiter: self.rate_limiter,
@@ -942,6 +1621,164 @@ mod tests {
         assert_eq!(parsed["skills"][0], "stable skill body");
         assert_eq!(parsed["symbols"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["symbols"][0]["definition"], "small");
+    }
+
+    #[test]
+    fn official_openai_uses_responses_url_and_bearer_header() {
+        let client = Client::builder(LlmCredentials::openai("secret", None))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.openai_responses_url(),
+            "https://api.openai.com/v1/responses"
+        );
+        let headers = client.openai_headers();
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer secret")
+        );
+        assert!(headers.get("api-key").is_none());
+    }
+
+    #[test]
+    fn azure_openai_uses_azure_url_and_api_key_headers() {
+        let client = Client::builder(LlmCredentials::azure_openai(
+            "dev.example.net",
+            "secret",
+            Some("2024-02-15-preview".to_string()),
+        ))
+        .build()
+        .unwrap();
+        assert_eq!(
+            client.openai_responses_url(),
+            "https://dev.example.net/openai/responses?api-version=2024-02-15-preview"
+        );
+        let headers = client.openai_headers();
+        assert_eq!(
+            headers.get("api-key").and_then(|v| v.to_str().ok()),
+            Some("secret")
+        );
+        assert_eq!(
+            headers
+                .get("Ocp-Apim-Subscription-Key")
+                .and_then(|v| v.to_str().ok()),
+            Some("secret")
+        );
+        assert!(headers.get(header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn openai_gpt5_request_uses_max_completion_tokens() {
+        let cfg = CallConfig::defaults_for(Model::from_id("gpt-5.5"))
+            .with_max_tokens(128)
+            .with_system("sys");
+        let msgs = vec![Message::plain("user", "hi")];
+        let req = OpenAiChatRequest::from_config(&cfg, &msgs, false);
+        let v = serde_json::to_value(req).unwrap();
+        assert_eq!(v["max_completion_tokens"], 128);
+        assert!(v.get("max_tokens").is_none());
+        assert!(v.get("temperature").is_none());
+        assert_eq!(v["messages"][0]["role"], "system");
+        assert_eq!(v["messages"][1]["content"], "hi");
+    }
+
+    #[test]
+    fn openai_gpt5_responses_request_sets_reasoning_and_medium_verbosity() {
+        let cfg = CallConfig::defaults_for(Model::from_id("gpt-5.5"))
+            .with_max_tokens(128)
+            .with_system("sys")
+            .with_thinking(crate::model::ThinkingBudget::Adaptive(
+                crate::model::Effort::High,
+            ));
+        let msgs = vec![Message::plain("user", "hi")];
+        let req = OpenAiResponsesRequest::from_config(&cfg, &msgs, false);
+        let v = serde_json::to_value(req).unwrap();
+        assert_eq!(v["model"], "gpt-5.5");
+        assert_eq!(v["instructions"], "sys");
+        assert_eq!(v["max_output_tokens"], 128);
+        assert_eq!(v["reasoning"]["effort"], "high");
+        assert_eq!(v["text"]["verbosity"], "medium");
+        assert_eq!(v["input"][0]["role"], "user");
+        assert_eq!(v["input"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn openai_responses_request_honors_text_verbosity_override() {
+        let cfg = CallConfig::defaults_for(Model::from_id("gpt-5.5"))
+            .with_max_tokens(128)
+            .with_text_verbosity("high");
+        let msgs = vec![Message::plain("user", "hi")];
+        let req = OpenAiResponsesRequest::from_config(&cfg, &msgs, false);
+        let v = serde_json::to_value(req).unwrap();
+        assert_eq!(v["text"]["verbosity"], "high");
+    }
+
+    #[test]
+    fn openai_explicit_budget_maps_to_reasoning_effort() {
+        assert_eq!(
+            openai_reasoning_effort(crate::model::ThinkingBudget::ExplicitBudget(2_048)),
+            Some("minimal")
+        );
+        assert_eq!(
+            openai_reasoning_effort(crate::model::ThinkingBudget::ExplicitBudget(8_192)),
+            Some("low")
+        );
+        assert_eq!(
+            openai_reasoning_effort(crate::model::ThinkingBudget::ExplicitBudget(16_384)),
+            Some("medium")
+        );
+        assert_eq!(
+            openai_reasoning_effort(crate::model::ThinkingBudget::ExplicitBudget(16_385)),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn openai_responses_response_maps_to_messages_response() {
+        let raw = r#"{
+            "model": "gpt-5.5",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "hello"}]
+            }],
+            "usage": {
+                "input_tokens": 3000,
+                "output_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 2048}
+            }
+        }"#;
+        let resp: OpenAiResponsesResponse = serde_json::from_str(raw).unwrap();
+        let mapped = resp.into_messages_response();
+        assert_eq!(mapped.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(mapped.stop_reason.as_deref(), Some("completed"));
+        assert_eq!(mapped.usage.input_tokens, 3000);
+        assert_eq!(mapped.usage.output_tokens, 4);
+        assert_eq!(mapped.usage.cache_read_input_tokens, 2048);
+        assert_eq!(response_text(&mapped), "hello");
+    }
+
+    #[test]
+    fn openai_response_maps_to_messages_response() {
+        let raw = r#"{
+            "model": "gpt-5.5",
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 3000,
+                "completion_tokens": 4,
+                "prompt_tokens_details": {"cached_tokens": 1024}
+            }
+        }"#;
+        let resp: OpenAiChatResponse = serde_json::from_str(raw).unwrap();
+        let mapped = resp.into_messages_response();
+        assert_eq!(mapped.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(mapped.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(mapped.usage.input_tokens, 3000);
+        assert_eq!(mapped.usage.output_tokens, 4);
+        assert_eq!(mapped.usage.cache_read_input_tokens, 1024);
+        assert_eq!(response_text(&mapped), "hello");
     }
 
     #[test]

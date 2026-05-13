@@ -334,9 +334,9 @@ mod tests {
 
     #[test]
     fn parses_fix_with_target() {
-        match parse_command("/fix /home/clm/local/kernel-bugs/findings/sample") {
+        match parse_command("/fix /tmp/kres/findings/sample") {
             Command::Fix { target } => {
-                assert_eq!(target, "/home/clm/local/kernel-bugs/findings/sample");
+                assert_eq!(target, "/tmp/kres/findings/sample");
             }
             other => panic!("expected Fix, got {other:?}"),
         }

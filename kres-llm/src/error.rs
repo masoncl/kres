@@ -17,9 +17,6 @@ pub enum LlmError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("API key file {path} is empty")]
-    EmptyKey { path: String },
-
     #[error("unsupported scheme in proxy URL: {0}")]
     BadProxy(String),
 

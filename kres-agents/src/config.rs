@@ -1,22 +1,24 @@
 //! Agent config files.
 //!
-//! Shape of each per-agent JSON file: `key`, `model`, `max_tokens`,
-//! `max_input_tokens`, `rate_limit`, `thinking`, `system` (or
-//! `system_file`), plus agent-specific fields like `concurrency`
-//! (main).
+//! Shape of each per-agent JSON file: credentials (`api_key` for all
+//! providers, plus `host` + optional `api_version` for Azure GPT),
+//! `model`, `max_tokens`, `max_input_tokens`, `rate_limit`, `thinking`,
+//! and `system` (or `system_file`).
 //!
-//! The `key` field carries the literal API key string. Shipped
+//! The `api_key` field carries the literal API key string. Shipped
 //! configs in the repo carry `@FAST_KEY@` / `@SLOW_KEY@` placeholders
-//! that setup.sh rewrites at install time (setup.sh --fast-key /
-//! --slow-key accepts either a literal string or a path whose
-//! contents get substituted in).
+//! that setup.sh rewrites at install time from literal
+//! `--fast-key` / `--slow-key` values.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::AgentError;
-use kres_llm::model::{Effort, ThinkingBudget};
+use kres_llm::{
+    model::{Effort, ThinkingBudget},
+    LlmCredentials, Model, Provider,
+};
 
 /// Which agent role this config describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,14 +32,23 @@ pub enum AgentKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// Literal API key string. setup.sh substitutes @FAST_KEY@ /
     /// @SLOW_KEY@ placeholders in the shipped configs at install
     /// time; operators can also edit the file directly.
-    pub key: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub api_version: Option<String>,
     /// Model id override. Required in practice — when omitted, kres
-    /// falls back to Model::sonnet_4_6() since there is no key file
-    /// to sniff. All shipped configs set this.
+    /// falls back to Model::sonnet_4_6(). All shipped configs set this.
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -59,10 +70,6 @@ pub struct AgentConfig {
     /// When omitted, kres uses model-aware defaults.
     #[serde(default)]
     pub thinking: Option<AgentThinkingConfig>,
-    /// Max concurrent service workers, only meaningful for the main
-    /// agent.
-    #[serde(default)]
-    pub concurrency: Option<u32>,
     /// Inline system prompt (passed to Anthropic as `system`). If
     /// `system_file` is also set, `system_file` wins.
     #[serde(default)]
@@ -73,8 +80,9 @@ pub struct AgentConfig {
     ///   1. `~/...` → `$HOME/...`
     ///   2. Absolute path → used as-is
     ///   3. Relative path → resolved against the CONFIG FILE's
-    ///      directory (so `~/.kres/fast-code-agent.json` can
-    ///      reference a sibling `fast-code-agent.system.md`).
+    ///      directory. For model configs under `~/.kres/models/`, a
+    ///      `system-prompts/<name>.system.md` path also checks
+    ///      `~/.kres/system-prompts/<name>.system.md`.
     ///
     /// Intended so long prompts can live in versioned `.md` files
     /// rather than as escaped JSON strings.
@@ -132,23 +140,37 @@ impl From<AgentThinkingEffort> for Effort {
 
 impl AgentConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, AgentError> {
+        Self::load_with_role(path, None)
+    }
+
+    pub fn load_for_role(path: impl AsRef<Path>, role: AgentKind) -> Result<Self, AgentError> {
+        Self::load_with_role(path, Some(role))
+    }
+
+    fn load_with_role(path: impl AsRef<Path>, role: Option<AgentKind>) -> Result<Self, AgentError> {
+        let role_name = role.and_then(AgentKind::model_section);
+        let default_system_file = role.and_then(AgentKind::default_system_file);
+        Self::load_with_role_name(path, role_name, default_system_file)
+    }
+
+    fn load_with_role_name(
+        path: impl AsRef<Path>,
+        role_name: Option<&str>,
+        default_system_file: Option<&str>,
+    ) -> Result<Self, AgentError> {
         let cfg_path = path.as_ref();
         let raw = std::fs::read_to_string(cfg_path)?;
-        let cfg: AgentConfig = serde_json::from_str(&raw)?;
-        if cfg.key.trim().is_empty() {
-            return Err(AgentError::Other(format!(
-                "agent config {} has an empty `key` field — did setup.sh run?",
-                cfg_path.display()
-            )));
-        }
-        if cfg.key.starts_with('@') && cfg.key.ends_with('@') {
-            return Err(AgentError::Other(format!(
-                "agent config {} still contains the placeholder key {:?}; run setup.sh --fast-key/--slow-key to fill it in",
-                cfg_path.display(),
-                cfg.key
-            )));
-        }
+        let cfg: AgentConfig = serde_json::from_value(expand_model_config_sections(
+            serde_json::from_str(&raw)?,
+            role_name,
+        )?)?;
         let mut cfg = cfg;
+        if cfg.system.is_none() && cfg.system_file.is_none() {
+            if let Some(default) = default_system_file {
+                cfg.system_file = Some(PathBuf::from(default));
+            }
+        }
+        cfg.validate_credentials(cfg_path)?;
         // Resolve and read `system_file` if present. It supersedes
         // any inline `system` — callers that want to override
         // should just drop the `system_file` field.
@@ -156,49 +178,231 @@ impl AgentConfig {
         // Resolution order, in descending priority:
         //   1. Disk file at the resolved path. An operator who
         //      wants to customize a prompt drops a file at the
-        //      referenced path (typically `~/.kres/prompts/X.md`)
+        //      referenced path (typically
+        //      `~/.kres/system-prompts/X.md`)
         //      and kres reads it.
         //   2. Embedded prompt keyed by the file's basename. This
         //      is the normal path for stock installs — the
         //      `.system.md` files are compiled into the binary
         //      via `include_str!` (see `embedded_prompts` module),
-        //      so a fresh install with no `~/.kres/prompts/` copy
+        //      so a fresh install with no `~/.kres/system-prompts/`
+        //      copy
         //      still runs. This replaces the previous "setup.sh
         //      must copy every prompt" workflow — operators no
         //      longer need `setup.sh --overwrite` when the repo's
         //      prompts change; rebuilding kres refreshes them.
         //   3. Both missing → error, same as before.
         if let Some(ref sf) = cfg.system_file {
-            let expanded = expand_tilde(sf);
-            let resolved = if expanded.is_absolute() {
-                expanded
-            } else {
-                // Relative to the config file's parent directory.
-                cfg_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(expanded)
-            };
-            let disk_read = std::fs::read_to_string(&resolved);
-            match disk_read {
-                Ok(body) => {
-                    cfg.system = Some(body);
-                }
-                Err(disk_err) => {
-                    let basename = resolved.file_name().and_then(|o| o.to_str()).unwrap_or("");
-                    if let Some(embedded) = crate::embedded_prompts::lookup(basename) {
-                        cfg.system = Some(embedded.to_string());
-                    } else {
-                        return Err(AgentError::Other(format!(
-                            "system_file {}: {disk_err} (no embedded fallback for basename '{basename}')",
-                            resolved.display()
-                        )));
+            let candidates = system_file_candidates(cfg_path, sf);
+            let mut last_err: Option<std::io::Error> = None;
+            for resolved in &candidates {
+                match std::fs::read_to_string(resolved) {
+                    Ok(body) => {
+                        cfg.system = Some(body);
+                        break;
                     }
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            if cfg.system.is_none() {
+                let basename = candidates
+                    .first()
+                    .and_then(|p| p.file_name())
+                    .and_then(|o| o.to_str())
+                    .unwrap_or("");
+                if let Some(embedded) = crate::embedded_prompts::lookup(basename) {
+                    cfg.system = Some(embedded.to_string());
+                } else {
+                    let attempted = candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let disk_err = last_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "not found".to_string());
+                    return Err(AgentError::Other(format!(
+                        "system_file {attempted}: {disk_err} (no embedded fallback for basename '{basename}')"
+                    )));
                 }
             }
         }
         Ok(cfg)
     }
+
+    pub fn credentials(&self) -> Result<LlmCredentials, AgentError> {
+        let provider = self.provider.as_deref().map(normalize_provider);
+        let api_key = self.api_key.as_deref().ok_or_else(|| {
+            AgentError::Other("agent config missing credentials: set `api_key`".into())
+        })?;
+        if let Some(host) = self.host.as_deref() {
+            return Ok(LlmCredentials::azure_openai(
+                host,
+                api_key,
+                self.api_version.clone(),
+            ));
+        }
+        if matches!(provider.as_deref(), Some("openai" | "open_ai")) || self.model_is_openai() {
+            return Ok(LlmCredentials::openai(api_key, self.base_url.clone()));
+        }
+        Ok(LlmCredentials::anthropic(api_key))
+    }
+
+    pub fn credential_cache_key(&self) -> Result<String, AgentError> {
+        Ok(self.credentials()?.cache_key())
+    }
+
+    fn validate_credentials(&self, cfg_path: &Path) -> Result<(), AgentError> {
+        match self.api_key.as_deref() {
+            Some(k) if valid_secret(k) => Ok(()),
+            Some(k) if k.starts_with('@') && k.ends_with('@') => {
+                Err(AgentError::Other(format!(
+                    "agent config {} still contains the placeholder key {:?}; run setup.sh --fast-key/--slow-key to fill it in",
+                    cfg_path.display(),
+                    k
+                )))
+            }
+            _ => Err(AgentError::Other(format!(
+                "agent config {} missing credentials: set `api_key`",
+                cfg_path.display()
+            ))),
+        }
+    }
+
+    fn model_is_openai(&self) -> bool {
+        self.model
+            .as_deref()
+            .map(|id| Model::from_id(id).provider() == Provider::OpenAi)
+            .unwrap_or(false)
+    }
+}
+
+impl AgentKind {
+    fn model_section(self) -> Option<&'static str> {
+        match self {
+            AgentKind::Fast => Some("fast"),
+            AgentKind::Slow => Some("slow"),
+            AgentKind::Main => Some("main"),
+            AgentKind::Todo => Some("todo"),
+            AgentKind::Consolidator | AgentKind::Merger => None,
+        }
+    }
+
+    fn default_system_file(self) -> Option<&'static str> {
+        match self {
+            AgentKind::Fast => Some("system-prompts/fast-code-agent.system.md"),
+            AgentKind::Slow => Some("system-prompts/slow-code-agent-audit.system.md"),
+            AgentKind::Main => Some("system-prompts/main-agent.system.md"),
+            AgentKind::Todo => Some("system-prompts/todo-agent.system.md"),
+            AgentKind::Consolidator | AgentKind::Merger => None,
+        }
+    }
+}
+
+fn role_default_system_file(role: &str) -> Option<&'static str> {
+    match role {
+        "fast" => AgentKind::Fast.default_system_file(),
+        "slow" => AgentKind::Slow.default_system_file(),
+        "main" => AgentKind::Main.default_system_file(),
+        "todo" => AgentKind::Todo.default_system_file(),
+        _ => None,
+    }
+}
+
+fn expand_model_config_sections(
+    value: serde_json::Value,
+    role: Option<&str>,
+) -> Result<serde_json::Value, AgentError> {
+    let Some(obj) = value.as_object() else {
+        return Ok(value);
+    };
+    if !obj.contains_key("defaults")
+        && !obj.contains_key("fast")
+        && !obj.contains_key("slow")
+        && !obj.contains_key("main")
+        && !obj.contains_key("todo")
+    {
+        return Ok(value);
+    }
+
+    let mut merged = serde_json::Map::new();
+    for (k, v) in obj {
+        if !matches!(k.as_str(), "defaults" | "fast" | "slow" | "main" | "todo") {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(defaults) = obj.get("defaults") {
+        merge_object_section(&mut merged, defaults, "defaults")?;
+    }
+    if let Some(role) = role {
+        if let Some(section) = obj.get(role) {
+            merge_object_section(&mut merged, section, role)?;
+        }
+        if !merged.contains_key("system") && !merged.contains_key("system_file") {
+            if let Some(default) = role_default_system_file(role) {
+                merged.insert(
+                    "system_file".to_string(),
+                    serde_json::Value::String(default.to_string()),
+                );
+            }
+        }
+    }
+    Ok(serde_json::Value::Object(merged))
+}
+
+fn merge_object_section(
+    dst: &mut serde_json::Map<String, serde_json::Value>,
+    section: &serde_json::Value,
+    name: &str,
+) -> Result<(), AgentError> {
+    let Some(obj) = section.as_object() else {
+        return Err(AgentError::Other(format!(
+            "agent config section `{name}` must be a JSON object"
+        )));
+    };
+    for (k, v) in obj {
+        if is_credential_key(k) {
+            return Err(AgentError::Other(format!(
+                "agent config section `{name}` must not set credential field `{k}`; set credentials once at the model-file top level"
+            )));
+        }
+        dst.insert(k.clone(), v.clone());
+    }
+    Ok(())
+}
+
+fn is_credential_key(key: &str) -> bool {
+    matches!(
+        key,
+        "api_key" | "provider" | "base_url" | "host" | "api_version"
+    )
+}
+
+fn system_file_candidates(cfg_path: &Path, system_file: &Path) -> Vec<PathBuf> {
+    let expanded = expand_tilde(system_file);
+    if expanded.is_absolute() {
+        return vec![expanded];
+    }
+
+    let config_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = Vec::new();
+    if config_dir.file_name().and_then(|n| n.to_str()) == Some("models")
+        && expanded.starts_with("system-prompts")
+    {
+        if let Some(root) = config_dir.parent() {
+            candidates.push(root.join(&expanded));
+        }
+    }
+    candidates.push(config_dir.join(expanded));
+    candidates
+}
+
+fn normalize_provider(provider: &str) -> String {
+    provider.trim().replace('-', "_").to_ascii_lowercase()
+}
+
+fn valid_secret(secret: &str) -> bool {
+    !(secret.trim().is_empty() || secret.starts_with('@') && secret.ends_with('@'))
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
@@ -238,21 +442,19 @@ mod tests {
     fn loads_full_shape() {
         let p = write_tmp(
             r#"{
-                "key": "sk-live-key-value",
+                "api_key": "sk-live-key-value",
                 "model": "claude-opus-4-7",
                 "max_tokens": 128000,
                 "max_input_tokens": 900000,
                 "rate_limit": 800000,
                 "thinking": {"type": "adaptive", "effort": "high"},
-                "concurrency": 3,
                 "system": "you are a fast agent"
             }"#,
         );
         let c = AgentConfig::load(&p).unwrap();
-        assert_eq!(c.key, "sk-live-key-value");
+        assert_eq!(c.api_key.as_deref(), Some("sk-live-key-value"));
         assert_eq!(c.model.as_deref(), Some("claude-opus-4-7"));
         assert_eq!(c.max_tokens, Some(128000));
-        assert_eq!(c.concurrency, Some(3));
         assert_eq!(
             c.thinking.as_ref().map(|t| t.to_budget(128000)),
             Some(ThinkingBudget::Adaptive(Effort::High))
@@ -263,9 +465,13 @@ mod tests {
 
     #[test]
     fn minimal_shape() {
-        let p = write_tmp(r#"{"key": "sk-abc"}"#);
+        let p = write_tmp(r#"{"api_key": "sk-abc"}"#);
         let c = AgentConfig::load(&p).unwrap();
-        assert_eq!(c.key, "sk-abc");
+        assert_eq!(c.api_key.as_deref(), Some("sk-abc"));
+        assert!(matches!(
+            c.credentials().unwrap(),
+            LlmCredentials::Anthropic { .. }
+        ));
         assert_eq!(c.model, None);
         assert_eq!(c.max_tokens, None);
         assert_eq!(c.thinking, None);
@@ -274,10 +480,138 @@ mod tests {
     }
 
     #[test]
+    fn gpt_credentials_use_individual_fields() {
+        let p = write_tmp(
+            r#"{
+                "host": "example.azure.net",
+                "api_key": "sk-gpt",
+                "api_version": "2024-02-15-preview",
+                "model": "gpt-5.5"
+            }"#,
+        );
+        let c = AgentConfig::load(&p).unwrap();
+        assert_eq!(c.api_key.as_deref(), Some("sk-gpt"));
+        assert!(matches!(
+            c.credentials().unwrap(),
+            LlmCredentials::AzureOpenAi { .. }
+        ));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn official_openai_credentials_use_api_key_fields() {
+        let p = write_tmp(
+            r#"{
+                "provider": "openai",
+                "api_key": "sk-openai",
+                "base_url": "https://api.openai.com/v1",
+                "model": "gpt-5.5"
+            }"#,
+        );
+        let c = AgentConfig::load(&p).unwrap();
+        assert!(matches!(
+            c.credentials().unwrap(),
+            LlmCredentials::OpenAi { .. }
+        ));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn official_openai_rejects_legacy_key_field() {
+        let p = write_tmp(
+            r#"{
+                "provider": "openai",
+                "key": "sk-openai",
+                "model": "gpt-5.5"
+            }"#,
+        );
+        let msg = format!("{}", AgentConfig::load(&p).unwrap_err());
+        assert!(msg.contains("unknown field `key`"), "got: {msg}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn gpt_model_rejects_legacy_key_field_without_provider() {
+        let p = write_tmp(
+            r#"{
+                "key": "sk-openai",
+                "model": "gpt-5.5"
+            }"#,
+        );
+        let msg = format!("{}", AgentConfig::load(&p).unwrap_err());
+        assert!(msg.contains("unknown field `key`"), "got: {msg}");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn model_file_defaults_and_role_sections_are_merged() {
+        let p = write_tmp(
+            r#"{
+                "provider": "openai",
+                "api_key": "sk-openai",
+                "model": "gpt-5.5",
+                "defaults": {
+                    "max_tokens": 64000,
+                    "rate_limit": 900000,
+                    "thinking": {"type": "adaptive", "effort": "medium"}
+                },
+                "fast": {
+                    "max_tokens": 16000,
+                    "thinking": {"type": "adaptive", "effort": "low"}
+                },
+                "slow": {
+                    "thinking": {"type": "adaptive", "effort": "high"}
+                }
+            }"#,
+        );
+        let fast = AgentConfig::load_for_role(&p, AgentKind::Fast).unwrap();
+        let slow = AgentConfig::load_for_role(&p, AgentKind::Slow).unwrap();
+        assert_eq!(fast.max_tokens, Some(16000));
+        assert_eq!(fast.rate_limit, Some(900000));
+        assert_eq!(
+            fast.thinking.as_ref().map(|t| t.to_budget(16000)),
+            Some(ThinkingBudget::Adaptive(Effort::Low))
+        );
+        assert_eq!(slow.max_tokens, Some(64000));
+        assert_eq!(
+            slow.thinking.as_ref().map(|t| t.to_budget(64000)),
+            Some(ThinkingBudget::Adaptive(Effort::High))
+        );
+        assert!(matches!(
+            slow.credentials().unwrap(),
+            LlmCredentials::OpenAi { .. }
+        ));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn model_role_sections_reject_credentials() {
+        let p = write_tmp(
+            r#"{
+                "api_key": "sk-top-level",
+                "model": "claude-sonnet-4-6",
+                "slow": {
+                    "api_key": "sk-role-level",
+                    "max_tokens": 64000
+                }
+            }"#,
+        );
+        let msg = format!(
+            "{}",
+            AgentConfig::load_for_role(&p, AgentKind::Slow).unwrap_err()
+        );
+        assert!(
+            msg.contains("must not set credential field `api_key`"),
+            "got: {msg}"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
     fn thinking_enabled_clamps_budget() {
         let p = write_tmp(
             r#"{
-                "key": "sk-abc",
+                "api_key": "sk-abc",
                 "thinking": {"type": "enabled", "budget_tokens": 99000}
             }"#,
         );
@@ -294,7 +628,7 @@ mod tests {
         // An unsubstituted setup.sh placeholder must surface as a
         // clear config error rather than silently hitting the API
         // with a string like "@FAST_KEY@".
-        let p = write_tmp(r#"{"key": "@FAST_KEY@"}"#);
+        let p = write_tmp(r#"{"api_key": "@FAST_KEY@"}"#);
         let msg = format!("{}", AgentConfig::load(&p).unwrap_err());
         assert!(
             msg.contains("placeholder") && msg.contains("@FAST_KEY@"),
@@ -305,9 +639,9 @@ mod tests {
 
     #[test]
     fn empty_key_errors() {
-        let p = write_tmp(r#"{"key": ""}"#);
+        let p = write_tmp(r#"{"api_key": ""}"#);
         let msg = format!("{}", AgentConfig::load(&p).unwrap_err());
-        assert!(msg.contains("empty"), "got: {msg}");
+        assert!(msg.contains("set `api_key`"), "got: {msg}");
         std::fs::remove_file(&p).ok();
     }
 
@@ -320,7 +654,11 @@ mod tests {
         let md_path = dir.join("prompt.md");
         std::fs::write(&md_path, "body from the md file").unwrap();
         let cfg_path = dir.join("agent.json");
-        std::fs::write(&cfg_path, r#"{"key": "sk-x", "system_file": "prompt.md"}"#).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"{"api_key": "sk-x", "system_file": "prompt.md"}"#,
+        )
+        .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
         assert_eq!(c.system.as_deref(), Some("body from the md file"));
         std::fs::remove_dir_all(&dir).ok();
@@ -334,7 +672,7 @@ mod tests {
         std::fs::write(&md_path, "absolute-path body").unwrap();
         let cfg_path = dir.join("agent.json");
         let cfg_body = format!(
-            r#"{{"key": "sk-x", "system_file": "{}"}}"#,
+            r#"{{"api_key": "sk-x", "system_file": "{}"}}"#,
             md_path.display()
         );
         std::fs::write(&cfg_path, cfg_body).unwrap();
@@ -352,7 +690,7 @@ mod tests {
         let cfg_path = dir.join("agent.json");
         std::fs::write(
             &cfg_path,
-            r#"{"key": "sk-x", "system": "inline-should-lose", "system_file": "prompt.md"}"#,
+            r#"{"api_key": "sk-x", "system": "inline-should-lose", "system_file": "prompt.md"}"#,
         )
         .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
@@ -366,7 +704,8 @@ mod tests {
         // (the `.system.md` table is agent-role specific) and the
         // disk path is absent → both fallbacks fail and the caller
         // gets a clear error.
-        let p = write_tmp(r#"{"key": "sk-x", "system_file": "/tmp/does-not-exist-kres-test.md"}"#);
+        let p =
+            write_tmp(r#"{"api_key": "sk-x", "system_file": "/tmp/does-not-exist-kres-test.md"}"#);
         let e = AgentConfig::load(&p).unwrap_err();
         let msg = format!("{e}");
         assert!(msg.contains("system_file"), "got: {msg}");
@@ -381,7 +720,7 @@ mod tests {
     fn missing_system_file_falls_back_to_embedded_prompt() {
         // When the disk path is absent but the basename matches a
         // known embedded prompt (the typical "stock install, no
-        // ~/.kres/prompts/" case), kres uses the compiled-in copy
+        // ~/.kres/system-prompts/" case), kres uses the compiled-in copy
         // instead of erroring. This test targets `main-agent.system.md`
         // because that name is guaranteed present in the embedded
         // table.
@@ -393,7 +732,7 @@ mod tests {
         let cfg_path = dir.join("agent.json");
         std::fs::write(
             &cfg_path,
-            r#"{"key": "sk-x", "system_file": "prompts/main-agent.system.md"}"#,
+            r#"{"api_key": "sk-x", "system_file": "system-prompts/main-agent.system.md"}"#,
         )
         .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
@@ -419,7 +758,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Shadow the embedded main-agent prompt with a tiny
         // operator-supplied one. Same basename, different body.
-        let prompts = dir.join("prompts");
+        let prompts = dir.join("system-prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(
             prompts.join("main-agent.system.md"),
@@ -429,11 +768,36 @@ mod tests {
         let cfg_path = dir.join("agent.json");
         std::fs::write(
             &cfg_path,
-            r#"{"key": "sk-x", "system_file": "prompts/main-agent.system.md"}"#,
+            r#"{"api_key": "sk-x", "system_file": "system-prompts/main-agent.system.md"}"#,
         )
         .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
         assert_eq!(c.system.as_deref(), Some("OPERATOR-OVERRIDE BODY"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_config_default_system_file_uses_config_root_override() {
+        let root =
+            std::env::temp_dir().join(format!("kres-model-sysfile-root-{}", std::process::id()));
+        let models = root.join("models");
+        let prompts = root.join("system-prompts");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(
+            prompts.join("fast-code-agent.system.md"),
+            "MODEL ROOT OVERRIDE",
+        )
+        .unwrap();
+        let cfg_path = models.join("claude-sonnet-4-6.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"api_key": "sk-x", "model": "claude-sonnet-4-6"}"#,
+        )
+        .unwrap();
+
+        let c = AgentConfig::load_for_role(&cfg_path, AgentKind::Fast).unwrap();
+        assert_eq!(c.system.as_deref(), Some("MODEL ROOT OVERRIDE"));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

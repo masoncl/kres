@@ -47,7 +47,7 @@ use kres_core::findings::{
 };
 use serde_json::json;
 
-use kres_agents::AgentConfig;
+use kres_agents::{AgentConfig, AgentKind};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 /// Conservative fallback when the caller didn't set max_input_tokens
@@ -121,14 +121,14 @@ pub fn load_fast_for_summary(
     fast_cfg_path: &Path,
     settings: &crate::settings::Settings,
 ) -> Result<(Arc<Client>, Model, u32, Option<u32>)> {
-    let fast_cfg = AgentConfig::load(fast_cfg_path)
+    let fast_cfg = AgentConfig::load_for_role(fast_cfg_path, AgentKind::Fast)
         .with_context(|| format!("loading fast agent config {}", fast_cfg_path.display()))?;
     let fast_model = crate::settings::pick_model(
         fast_cfg.model.as_deref(),
         crate::settings::ModelRole::Fast,
         settings,
     );
-    let client = Arc::new(Client::new(fast_cfg.key.clone())?);
+    let client = Arc::new(Client::new(fast_cfg.credentials()?)?);
     let max_tokens = fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens);
     Ok((client, fast_model, max_tokens, fast_cfg.max_input_tokens))
 }

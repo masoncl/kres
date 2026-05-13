@@ -35,6 +35,9 @@ PLAN REWRITE — optional top-level `plan` field on the response:
 
 FINDINGS — emit native structured records:
 - Every actionable bug or strong suspect you discover in YOUR lens becomes a Finding record in the 'findings' array.
+- When multiple concrete symptoms share one root cause, emit ONE root-cause Finding with the clearest old-contract helper/path as the id and title.
+- Once the input proves a code path + trigger + impact, emit the Finding now. Do not downgrade it to followups just because extra citations would improve confidence; put remaining proof gaps in open_questions and add only the followups needed to close those gaps.
+- If a previous finding covers the same root cause, reuse that id and extend it. Do not mint narrower duplicate ids for the same changed-contract defect.
 - PROMOTION RULE: every bug you describe in the 'analysis' prose MUST also appear as a Finding. The delta-apply pass downstream reads ONLY the findings array — prose is for narrative, not for carrying bugs. A bug that exists only in prose will be LOST. Conversely, if a claim isn't solid enough to emit as a Finding with a concrete reproducer_sketch, don't describe it as a bug in prose either; demote it to an observation or a followup.
 - DELTA SEMANTICS — the 'findings' array is applied to the running list by a deterministic Rust pass, not an LLM merger. Each entry is a delta keyed by 'id':
     - NEW id → appended as a fresh finding, with first_seen_task stamped.

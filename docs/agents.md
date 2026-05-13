@@ -1,21 +1,22 @@
 # Agents — flow of work per task
 
-Every task cycles through these roles, all configured under
-`~/.kres/`:
+Every task cycles through these roles. Normal installs configure them
+through `~/.kres/models/<model-id>.json`; explicit `--*-agent` paths
+remain available for one-off overrides.
 
-- **fast** (`fast-code-agent.json`) — scopes the task and emits a
+- **fast** — scopes the task and emits a
   list of `followups`: grep / read / semcode / git fetches the
   main agent should run.
-- **main** (`main-agent.json`) — the data fetcher. Dispatches
+- **main** — the data fetcher. Dispatches
   followups to local tools and MCP servers (semcode via
   `mcp.json`). Output is fed back into fast for another round.
   The fast↔main loop ends when fast emits `ready_for_slow` or
   `--gather-turns` is hit.
-- **slow** (`slow-code-agent-<tag>.json`, default `sonnet`) — the
+- **slow** (default tag `sonnet`) — the
   deep analyser. Gets the gathered symbols, the cumulative
   findings, and the task brief; returns analysis prose plus
   structured findings.
-- **todo** (`todo-agent.json`) — dedups the slow agent's
+- **todo** — dedups the slow agent's
   followups against the current todo list, reprioritises, and
   may reshape the plan.
 - **merger** — non-agent fast-client call that folds new

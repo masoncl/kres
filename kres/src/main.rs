@@ -4,10 +4,11 @@
 //! Anthropic API; the REPL (the default subcommand) is the main entry
 //! point.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use kres_agents::AgentKind;
 
 mod turn;
 
@@ -39,13 +40,13 @@ enum Command {
     /// cross-field invariants. Prints "ok: <n> steps" on success or
     /// the first batch of validation errors and exits non-zero.
     ValidateWorkflow(ValidateWorkflowArgs),
-    /// Run a workflow JSON file end-to-end. Loads agent configs from
-    /// `--kres-dir` (default `~/.kres/`), resolves workflow inputs,
+    /// Run a workflow JSON file end-to-end. Loads model configs from
+    /// `--kres-dir/models` (default `~/.kres/models`), resolves workflow inputs,
     /// drives the executor against the kres-llm client, and prints
     /// the per-step trace as the run progresses. Final exit status:
     /// 0 on Success / TerminalSuccess, non-zero on Failure /
     /// IterationCap.
-    RunWorkflow(RunWorkflowArgs),
+    RunWorkflow(Box<RunWorkflowArgs>),
 }
 
 #[derive(Args, Debug)]
@@ -67,14 +68,23 @@ struct RunWorkflowArgs {
     /// Workspace for git/make post-actions. Defaults to cwd.
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    /// Directory holding fast-code-agent.json / slow-code-agent-*.json
-    /// (the same set the REPL reads). Defaults to ~/.kres/.
+    /// Directory holding settings.json, models/, skills/, workflows/,
+    /// and mcp.json. Defaults to ~/.kres/.
     #[arg(long, value_name = "DIR")]
     kres_dir: Option<PathBuf>,
-    /// Slow agent tag (sonnet/opus/...) — picks
-    /// slow-code-agent-<tag>.json. Defaults to sonnet.
-    #[arg(long, default_value = "sonnet")]
-    slow: String,
+    /// Slow agent selector. Known aliases (sonnet/opus) map to model ids;
+    /// otherwise selects one JSON file in <kres-dir>/models with this
+    /// text somewhere in its filename. When omitted, settings.models.slow
+    /// stays in charge.
+    #[arg(long, conflicts_with = "slow_model")]
+    slow: Option<String>,
+    /// Override the fast-agent model id. Beats settings.json.
+    #[arg(long, value_name = "ID")]
+    fast_model: Option<String>,
+    /// Override the slow-agent model id. Beats settings.json.
+    /// Mutually exclusive with --slow.
+    #[arg(long, value_name = "ID", conflicts_with = "slow")]
+    slow_model: Option<String>,
     /// Directory of skill .md files. Defaults to <kres-dir>/skills/.
     /// Skill files named in workflow.skills are loaded eagerly and
     /// prepended to every step prompt.
@@ -124,18 +134,15 @@ struct RunWorkflowArgs {
 
 #[derive(Args, Debug)]
 struct ReplArgs {
-    /// Fast code agent config (context gathering). Defaults to
-    /// ~/.kres/fast-code-agent.json.
+    /// Explicit fast code agent config path. When omitted, kres uses
+    /// ~/.kres/models/<resolved-fast-model>.json.
     #[arg(long)]
     fast_agent: Option<PathBuf>,
-    /// Slow agent tag — picks ~/.kres/slow-code-agent-<tag>.json
-    /// (or the shipped configs/ default). When omitted the file
-    /// resolver falls back to "sonnet" but the slow model id from
-    /// settings.json is left alone. When passed AND the tag is a
-    /// known shorthand (sonnet/opus) the matching model id ALSO
-    /// overrides settings.models.slow — pass --slow-model to
-    /// override the model independently.
-    #[arg(long, value_delimiter = ',')]
+    /// Slow agent selector. Known aliases (sonnet/opus) map to model ids;
+    /// otherwise selects one JSON file in ~/.kres/models with this text
+    /// somewhere in its filename.
+    /// Mutually exclusive with --slow-model.
+    #[arg(long, value_delimiter = ',', conflicts_with = "slow_model")]
     slow: Vec<String>,
     /// Explicit slow-agent config path (overrides --slow).
     #[arg(long)]
@@ -143,9 +150,9 @@ struct ReplArgs {
     /// Override the fast-agent model id. Beats settings.json.
     #[arg(long, value_name = "ID")]
     fast_model: Option<String>,
-    /// Override the slow-agent model id. Beats settings.json and
-    /// beats the tag-derived default from --slow.
-    #[arg(long, value_name = "ID")]
+    /// Override the slow-agent model id. Beats settings.json.
+    /// Mutually exclusive with --slow.
+    #[arg(long, value_name = "ID", conflicts_with = "slow")]
     slow_model: Option<String>,
     /// Override the main-agent model id. Beats settings.json.
     #[arg(long, value_name = "ID")]
@@ -158,14 +165,12 @@ struct ReplArgs {
     /// `kres (<resolved-slow-model-id>)`.
     #[arg(long, value_name = "TEXT")]
     assisted_by: Option<String>,
-    /// Main agent config JSON file. Defaults to
-    /// ~/.kres/main-agent.json.
+    /// Explicit main agent config path. When omitted, kres uses
+    /// ~/.kres/models/<resolved-main-model>.json.
     #[arg(long)]
     main_agent: Option<PathBuf>,
-    /// Todo-list maintenance agent config. A tools-disabled variant
-    /// used for update_todo calls so the main agent's tool-dispatch
-    /// system prompt doesn't cause it to emit <actions> tags or
-    /// hallucinate research. Defaults to ~/.kres/todo-agent.json.
+    /// Explicit todo-list maintenance agent config path. When omitted,
+    /// kres uses ~/.kres/models/<resolved-todo-model>.json.
     #[arg(long)]
     todo_agent: Option<PathBuf>,
     /// MCP servers config JSON file. Defaults to ~/.kres/mcp.json.
@@ -237,11 +242,12 @@ struct ReplArgs {
     ///      `[kind] name[: reason]` lines become session-wide
     ///      slow-agent lenses, the rest is submitted as the opening
     ///      prompt.
-    ///   2. `--prompt "word: extra details"` — look for
-    ///      `~/.kres/prompts/<word>-template.md`. If it exists, the
-    ///      extra details are prepended to the template contents and
-    ///      that combined text becomes the prompt. e.g.
-    ///      `--prompt "review: all interfaces in kernel/futex/*.c"`.
+    ///   2. `--prompt "word: extra details"` — look for a non-workflow
+    ///      slash-command template named `word`, first under
+    ///      `~/.kres/commands/word.md` and then in the embedded
+    ///      user_commands table. If found, the extra details are
+    ///      prepended to that template. Workflow-owned names such as
+    ///      `review`, `triage`, and `fix` dispatch through JSON workflows.
     ///   3. `--prompt "<anything else>"` — submitted verbatim as the
     ///      opening prompt.
     #[arg(long, value_name = "PROMPT")]
@@ -350,8 +356,8 @@ struct ReplArgs {
 
 #[derive(Parser, Debug)]
 struct TestArgs {
-    /// Path to API-key file (model is auto-selected from filename).
-    key_file: PathBuf,
+    /// Path to model/agent config JSON.
+    config: PathBuf,
     /// Override the model id.
     #[arg(long)]
     model: Option<String>,
@@ -362,8 +368,8 @@ struct TestArgs {
 
 #[derive(Parser, Debug)]
 struct TurnArgs {
-    /// Path to API-key file (model is auto-selected from filename).
-    key_file: PathBuf,
+    /// Path to model/agent config JSON.
+    config: PathBuf,
     /// JSON input file (stdin is used if omitted).
     #[arg(short, long)]
     input: Option<PathBuf>,
@@ -403,7 +409,7 @@ fn main() -> Result<()> {
         Some(Command::Test(args)) => rt.block_on(run_test(args)),
         Some(Command::Turn(args)) => rt.block_on(turn::run_turn(args)),
         Some(Command::ValidateWorkflow(args)) => run_validate_workflow(args),
-        Some(Command::RunWorkflow(args)) => rt.block_on(run_workflow(args)),
+        Some(Command::RunWorkflow(args)) => rt.block_on(run_workflow(*args)),
         None => {
             // Workflow prompt invocations use their workflow-owned
             // path. Fix/triage run through the workflow executor.
@@ -413,6 +419,7 @@ fn main() -> Result<()> {
             // agent, and --turns controls how many fresh review tasks
             // run.
             if let Some(short_circuit) = workflow_short_circuit_from_repl_args(&cli.repl) {
+                validate_workflow_short_circuit_model_flags(&cli.repl)?;
                 rt.block_on(run_workflow(short_circuit))
             } else {
                 rt.block_on(run_repl(cli.repl))
@@ -445,7 +452,7 @@ fn main() -> Result<()> {
 }
 
 /// Path to `~/.kres/` — the per-user config dir. Returns None when
-/// $HOME is unset. Used to locate the default names for agent JSON
+/// $HOME is unset. Used to locate model configs, non-agent config
 /// files, the skills directory, findings base, and mcp.json.
 /// Resolve the --prompt CLI argument into (source-description, body).
 ///
@@ -513,12 +520,17 @@ fn kres_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".kres"))
 }
 
-/// Map `--slow <tag>` to a concrete model id when the tag is a
-/// known shorthand. Keeps the flag useful as a model selector on
-/// top of its historical role as a max_tokens variant picker.
-/// Returns None for unknown tags so settings.json stays in charge.
+fn kres_config_dirs() -> Vec<PathBuf> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    vec![home.join(".kres")]
+}
+
+/// Map `--slow <selector>` to a concrete model id when the selector is a
+/// known shorthand. Unknown selectors are resolved by model-config filename.
 fn slow_tag_to_model_id(tag: &str) -> Option<&'static str> {
-    match tag {
+    match tag.to_ascii_lowercase().as_str() {
         "sonnet" => Some("claude-sonnet-4-6"),
         "opus" => Some("claude-opus-4-7"),
         _ => None,
@@ -534,7 +546,7 @@ fn default_assisted_by_for_slow_agent(
     settings: &kres_repl::Settings,
 ) -> String {
     let cfg_model = slow_agent
-        .and_then(|path| kres_agents::AgentConfig::load(path).ok())
+        .and_then(|path| kres_agents::AgentConfig::load_for_role(path, AgentKind::Slow).ok())
         .and_then(|cfg| cfg.model);
     let model = kres_repl::pick_model(cfg_model.as_deref(), kres_repl::ModelRole::Slow, settings);
     assisted_by_from_model_id(&model.id)
@@ -552,6 +564,27 @@ fn resolved_assisted_by(
         .unwrap_or_else(|| default_assisted_by_for_slow_agent(slow_agent, settings))
 }
 
+fn resolved_agent_model_label(
+    agent_path: Option<&PathBuf>,
+    role: kres_repl::ModelRole,
+    settings: &kres_repl::Settings,
+) -> String {
+    let agent_kind = agent_kind_for_model_role(role);
+    let cfg_model = agent_path
+        .and_then(|path| kres_agents::AgentConfig::load_for_role(path, agent_kind).ok())
+        .and_then(|cfg| cfg.model);
+    kres_repl::pick_model(cfg_model.as_deref(), role, settings).id
+}
+
+fn agent_kind_for_model_role(role: kres_repl::ModelRole) -> AgentKind {
+    match role {
+        kres_repl::ModelRole::Fast => AgentKind::Fast,
+        kres_repl::ModelRole::Slow => AgentKind::Slow,
+        kres_repl::ModelRole::Main => AgentKind::Main,
+        kres_repl::ModelRole::Todo => AgentKind::Todo,
+    }
+}
+
 /// Resolve an optional CLI path:
 /// - If the caller passed `--foo /abs/path`, use it verbatim.
 /// - Otherwise look in `~/.kres/<default_name>`. Return the path only
@@ -561,28 +594,144 @@ fn resolve_default(cli: Option<&PathBuf>, default_name: &str) -> Option<PathBuf>
     if let Some(p) = cli {
         return Some(p.clone());
     }
-    let fallback = kres_dir()?.join(default_name);
-    if fallback.exists() {
-        Some(fallback)
-    } else {
-        None
+    for dir in kres_config_dirs() {
+        let fallback = dir.join(default_name);
+        if fallback.exists() {
+            return Some(fallback);
+        }
+    }
+    None
+}
+
+fn model_config_path(dir: &Path, model_id: &str) -> PathBuf {
+    dir.join("models").join(format!("{model_id}.json"))
+}
+
+fn resolve_agent_for_model_in_dirs(
+    cli: Option<&PathBuf>,
+    model_id: Option<&str>,
+    dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(p) = cli {
+        return Some(p.clone());
+    }
+    let model_id = model_id?;
+    for dir in dirs {
+        let model_cfg = model_config_path(dir, model_id);
+        if model_cfg.exists() {
+            return Some(model_cfg);
+        }
+    }
+    None
+}
+
+fn resolve_agent_for_model(cli: Option<&PathBuf>, model_id: Option<&str>) -> Option<PathBuf> {
+    resolve_agent_for_model_in_dirs(cli, model_id, &kres_config_dirs())
+}
+
+fn find_model_config_by_filename_selector(
+    dirs: &[PathBuf],
+    selector: &str,
+) -> Result<Option<PathBuf>> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(anyhow::anyhow!("--slow selector must not be empty"));
+    }
+    let selector_stem = selector.strip_suffix(".json").unwrap_or(selector);
+    let selector_lower = selector_stem.to_ascii_lowercase();
+    let mut exact = Vec::new();
+    let mut contains = Vec::new();
+
+    for dir in dirs {
+        let models_dir = dir.join("models");
+        let entries = match std::fs::read_dir(&models_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to read {}", models_dir.display()));
+            }
+        };
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("failed to read {}", models_dir.display()))?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let stem_lower = stem.to_ascii_lowercase();
+            if stem_lower == selector_lower {
+                exact.push(path);
+            } else if stem_lower.contains(&selector_lower) {
+                contains.push(path);
+            }
+        }
+    }
+
+    let mut matches = if exact.is_empty() { contains } else { exact };
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        _ => {
+            let rendered = matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(anyhow::anyhow!(
+                "--slow {selector:?} is ambiguous; matched: {rendered}"
+            ))
+        }
     }
 }
 
-fn resolve_slow_agent_for_tag(tag: &str) -> Option<PathBuf> {
-    let name = format!("slow-code-agent-{tag}.json");
-    kres_dir()
-        .map(|d| d.join(&name))
-        .filter(|p| p.exists())
-        .or_else(|| {
-            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let candidates = [
-                manifest.join("../configs").join(&name),
-                manifest.join("configs").join(&name),
-                PathBuf::from("configs").join(&name),
-            ];
-            candidates.into_iter().find(|p| p.exists())
-        })
+fn resolve_slow_selector_in_dirs(
+    selector: &str,
+    dirs: &[PathBuf],
+) -> Result<(PathBuf, Option<String>)> {
+    if let Some(model_id) = slow_tag_to_model_id(selector) {
+        if let Some(path) = resolve_agent_for_model_in_dirs(None, Some(model_id), dirs) {
+            return Ok((path, Some(model_id.to_string())));
+        }
+    }
+    if let Some(path) = find_model_config_by_filename_selector(dirs, selector)? {
+        return Ok((path, None));
+    }
+    Err(anyhow::anyhow!(
+        "--slow {selector:?} did not match any model JSON under {}",
+        if dirs.is_empty() {
+            "<no kres config dirs>".to_string()
+        } else {
+            dirs.iter()
+                .map(|p| p.join("models").display().to_string())
+                .collect::<Vec<_>>()
+                .join(" or ")
+        }
+    ))
+}
+
+fn apply_slow_model_override_from_spec(
+    settings: &mut kres_repl::Settings,
+    spec: &(PathBuf, Option<String>),
+) {
+    if let Some(model_id) = spec.1.as_ref() {
+        settings.set_model(kres_repl::ModelRole::Slow, Some(model_id.clone()));
+    }
+}
+
+fn load_settings_for_kres_dir(kres_dir: &Path, workspace: &Path) -> kres_repl::Settings {
+    let global = kres_dir.join("settings.json");
+    let project = workspace.join(".kres").join("settings.json");
+    kres_repl::Settings::load_merged_with_paths(Some(&global), &project)
+}
+
+fn apply_workflow_model_overrides(settings: &mut kres_repl::Settings, args: &RunWorkflowArgs) {
+    settings.set_model(kres_repl::ModelRole::Fast, args.fast_model.clone());
+    settings.set_model(kres_repl::ModelRole::Slow, args.slow_model.clone());
 }
 
 async fn run_repl(args: ReplArgs) -> Result<()> {
@@ -591,74 +740,52 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     use kres_repl::{build_orchestrator, ReplConfig, Session};
     use std::sync::Arc;
 
-    // --- Resolve agent configs -------------------------------------
-    // Explicit path wins; otherwise look in ~/.kres/<default>.
-    let fast_agent = resolve_default(args.fast_agent.as_ref(), "fast-code-agent.json");
-
-    // --slow is a tag; --slow-agent is an explicit path override.
-    // Resolution for --slow: prefer ~/.kres/slow-code-agent-<tag>.json,
-    // then fall back to <binary-repo>/configs/slow-code-agent-<tag>.json.
-    // When the operator didn't pass --slow at all, default the file
-    // resolver to "sonnet" — the model id is left to settings.json
-    // (see the override block below).
-    let requested_slow_tags = if args.slow.is_empty() {
-        vec!["sonnet".to_string()]
-    } else {
-        args.slow.clone()
-    };
-    let slow_agent_specs: Vec<(PathBuf, Option<String>)> = if let Some(p) = args.slow_agent.clone()
-    {
-        vec![(p, args.slow_model.clone())]
-    } else {
-        requested_slow_tags
-            .iter()
-            .filter_map(|tag| {
-                resolve_slow_agent_for_tag(tag).map(|p| {
-                    let model = args
-                        .slow_model
-                        .clone()
-                        .or_else(|| slow_tag_to_model_id(tag).map(str::to_string));
-                    (p, model)
-                })
-            })
-            .collect()
-    };
-    let slow_agent = slow_agent_specs.first().map(|(p, _)| p.clone());
-
-    let main_agent = resolve_default(args.main_agent.as_ref(), "main-agent.json");
-    let todo_agent = resolve_default(args.todo_agent.as_ref(), "todo-agent.json");
-    let mcp_config = resolve_default(args.mcp_config.as_ref(), "mcp.json");
-    let skills_dir = resolve_default(args.skills.as_ref(), "skills");
-
     // Per-user settings (~/.kres/settings.json). Carries the default
-    // model-id for each agent role; picked up by every agent-
-    // construction site via kres_repl::settings::pick_model.
-    // Missing file is not an error — every field is optional.
-    //
-    // CLI model overrides are applied into this struct before any
-    // pick_model call runs, so `--<role>-model` always wins. The
-    // precedence (highest → lowest) inside pick_model stays:
-    //   1. agent config's `"model"` field
-    //   2. settings.models.<role>  ← CLI overrides land here
-    //   3. Model::sonnet_4_6() default
-    //
-    // When --slow is passed as a known tag (sonnet/opus) we also map
-    // it to a model id, so `--slow sonnet` actually switches the
-    // slow model. Explicit --slow-model still beats the tag mapping.
+    // model-id for each agent role. CLI model overrides are applied
+    // before config path resolution so model-file fallback can find
+    // ~/.kres/models/<model-id>.json.
     let mut settings = kres_repl::Settings::load_merged(&args.workspace);
-    // Only map the --slow tag to a model id when the operator
-    // actually passed --slow. Without this gate the clap default
-    // "sonnet" would unconditionally overwrite settings.models.slow
-    // every run, masking whatever the operator set in
-    if let Some(tag) = args.slow.first() {
-        if let Some(id) = slow_tag_to_model_id(tag) {
-            settings.set_model(kres_repl::ModelRole::Slow, Some(id.to_string()));
-        }
-    }
     settings.set_model(kres_repl::ModelRole::Fast, args.fast_model.clone());
     settings.set_model(kres_repl::ModelRole::Slow, args.slow_model.clone());
     settings.set_model(kres_repl::ModelRole::Main, args.main_model.clone());
     settings.set_model(kres_repl::ModelRole::Todo, args.todo_model.clone());
+
+    // --- Resolve role configs --------------------------------------
+    // Explicit path wins; otherwise use ~/.kres/models/<resolved-model-id>.json.
+    let fast_agent = resolve_agent_for_model(
+        args.fast_agent.as_ref(),
+        settings.model_for(kres_repl::ModelRole::Fast),
+    );
+
+    let slow_agent_specs: Vec<(PathBuf, Option<String>)> = if let Some(p) = args.slow_agent.clone()
+    {
+        vec![(p, args.slow_model.clone())]
+    } else if args.slow.is_empty() {
+        resolve_agent_for_model(None, settings.model_for(kres_repl::ModelRole::Slow))
+            .map(|p| vec![(p, args.slow_model.clone())])
+            .unwrap_or_default()
+    } else {
+        let dirs = kres_config_dirs();
+        args.slow
+            .iter()
+            .map(|selector| resolve_slow_selector_in_dirs(selector, &dirs))
+            .collect::<Result<Vec<_>>>()?
+    };
+    if let Some(spec) = slow_agent_specs.first() {
+        apply_slow_model_override_from_spec(&mut settings, spec);
+    }
+    let slow_agent = slow_agent_specs.first().map(|(p, _)| p.clone());
+
+    let main_agent = resolve_agent_for_model(
+        args.main_agent.as_ref(),
+        settings.model_for(kres_repl::ModelRole::Main),
+    );
+    let todo_agent = resolve_agent_for_model(
+        args.todo_agent.as_ref(),
+        settings.model_for(kres_repl::ModelRole::Todo),
+    );
+    let mcp_config = resolve_default(args.mcp_config.as_ref(), "mcp.json");
+    let skills_dir = resolve_default(args.skills.as_ref(), "skills");
     let assisted_by =
         resolved_assisted_by(args.assisted_by.as_ref(), slow_agent.as_ref(), &settings);
 
@@ -718,7 +845,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             Some(p) => p.clone(),
             None => {
                 return Err(anyhow::anyhow!(
-                    "--summary requires a fast agent config (pass --fast-agent or drop one in ~/.kres/fast-code-agent.json)"
+                    "--summary requires a fast agent config (pass --fast-agent or configure ~/.kres/models/<fast-model>.json)"
                 ));
             }
         };
@@ -828,6 +955,10 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     }
 
     // --- Announce resolved paths -----------------------------------
+    // Buffer these until the REPL output sink is installed. In TUI
+    // mode, printing before Session::run() enters the alternate
+    // screen leaves the lines outside the visible scrollback.
+    let mut startup_lines = Vec::new();
     for (label, p) in [
         ("fast-agent", fast_agent.as_ref()),
         ("slow-agent", slow_agent.as_ref()),
@@ -838,22 +969,23 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         ("findings", findings_base.as_ref()),
     ] {
         match p {
-            Some(path) => kres_core::async_eprintln!("{label}: {}", path.display()),
-            None => kres_core::async_eprintln!("{label}: (none)"),
+            Some(path) => startup_lines.push(format!("{label}: {}", path.display())),
+            None => startup_lines.push(format!("{label}: (none)")),
         }
     }
-    kres_core::async_eprintln!("results: {}", results_dir.display());
-    kres_core::async_eprintln!("report:  {}", report_path.display());
-    kres_core::async_eprintln!("todo:    {}", todo_path.display());
+    startup_lines.push(format!("results: {}", results_dir.display()));
+    startup_lines.push(format!("report:  {}", report_path.display()));
+    startup_lines.push(format!("todo:    {}", todo_path.display()));
     // Settings summary: show whichever paths settings.json would
     // fill in for each role, so the operator can confirm the
     // per-user defaults without spelunking into ~/.kres.
     match kres_repl::Settings::default_path() {
-        Some(p) if p.exists() => kres_core::async_eprintln!("settings: {}", p.display()),
-        Some(p) => {
-            kres_core::async_eprintln!("settings: {} (absent; using fallbacks)", p.display())
-        }
-        None => kres_core::async_eprintln!("settings: (no $HOME; using fallbacks)"),
+        Some(p) if p.exists() => startup_lines.push(format!("settings: {}", p.display())),
+        Some(p) => startup_lines.push(format!(
+            "settings: {} (absent; using fallbacks)",
+            p.display()
+        )),
+        None => startup_lines.push("settings: (no $HOME; using fallbacks)".to_string()),
     }
     for (role, label) in [
         (kres_repl::ModelRole::Fast, "fast"),
@@ -862,14 +994,28 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         (kres_repl::ModelRole::Todo, "todo"),
     ] {
         match settings.model_for(role) {
-            Some(id) => kres_core::async_eprintln!("  default {label} model: {id}"),
-            None => kres_core::async_eprintln!(
+            Some(id) => startup_lines.push(format!("  default {label} model: {id}")),
+            None => startup_lines.push(format!(
                 "  default {label} model: (unset — agent config or sonnet_4_6 fallback)"
-            ),
+            )),
         }
     }
+    for (role, label, path) in [
+        (kres_repl::ModelRole::Fast, "fast", fast_agent.as_ref()),
+        (kres_repl::ModelRole::Slow, "slow", slow_agent.as_ref()),
+        (kres_repl::ModelRole::Main, "main", main_agent.as_ref()),
+        (kres_repl::ModelRole::Todo, "todo", todo_agent.as_ref()),
+    ] {
+        startup_lines.push(format!(
+            "  active {label} model: {}",
+            resolved_agent_model_label(path, role, &settings)
+        ));
+    }
     if args.turns > 0 {
-        kres_core::async_eprintln!("--turns: stop after {} completed task run(s)", args.turns);
+        startup_lines.push(format!(
+            "--turns: stop after {} completed task run(s)",
+            args.turns
+        ));
     }
     // report, todo are parsed for CLI parity with ; wiring their
     // downstream use is follow-on work. Keep them non-dead:
@@ -884,6 +1030,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     let persist_path = Some(results_dir.join("session.json"));
     let cfg = ReplConfig {
         stop_grace: std::time::Duration::from_millis(args.stop_grace_ms),
+        startup_lines,
         findings_base,
         turns_limit: args.turns,
         follow_followups: args.follow,
@@ -1126,14 +1273,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         // define_goal / check_goal loop on the same model.
         let mut goal_client_from_main: Option<Arc<kres_agents::GoalClient>> = None;
         let fetcher: Arc<dyn kres_agents::pipeline::DataFetcher> = match main_agent.as_ref() {
-            Some(p) => match kres_agents::AgentConfig::load(p) {
+            Some(p) => match kres_agents::AgentConfig::load_for_role(p, AgentKind::Main) {
                 Ok(mc) => {
                     let model = kres_repl::pick_model(
                         mc.model.as_deref(),
                         kres_repl::ModelRole::Main,
                         &settings,
                     );
-                    let client = Arc::new(kres_llm::client::Client::new(mc.key.clone())?);
+                    let client = Arc::new(kres_llm::client::Client::new(mc.credentials()?)?);
                     let ma_max_tokens =
                         mc.max_tokens.unwrap_or(model.max_output_tokens).min(32_000);
                     // Deliberately NOT mc.system — the main-agent
@@ -1235,14 +1382,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
 
         // Optional todo agent.
         if let Some(ref tc_path) = todo_agent {
-            match kres_agents::AgentConfig::load(tc_path) {
+            match kres_agents::AgentConfig::load_for_role(tc_path, AgentKind::Todo) {
                 Ok(tc_cfg) => {
                     let model = kres_repl::pick_model(
                         tc_cfg.model.as_deref(),
                         kres_repl::ModelRole::Todo,
                         &settings,
                     );
-                    let client = Arc::new(kres_llm::client::Client::new(tc_cfg.key.clone())?);
+                    let client = Arc::new(kres_llm::client::Client::new(tc_cfg.credentials()?)?);
                     let todo_client = Arc::new(kres_agents::TodoClient {
                         client,
                         model: model.clone(),
@@ -1262,7 +1409,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         kres_core::async_eprintln!("orchestrator: ready (gather_turns={})", args.gather_turns);
     } else {
         kres_core::async_eprintln!(
-            "orchestrator: not configured (pass --fast-agent and --slow/--slow-agent)"
+            "orchestrator: not configured (pass --fast-agent/--slow-agent or configure matching ~/.kres/models/*.json files)"
         );
     }
     if let Some(ref raw_arg) = args.prompt {
@@ -1382,7 +1529,9 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
         input: std::mem::take(&mut input),
         workspace,
         kres_dir: resolved_kres_dir,
-        slow: "sonnet".into(),
+        slow: repl.slow.first().cloned(),
+        fast_model: repl.fast_model.clone(),
+        slow_model: repl.slow_model.clone(),
         skills_dir: None,
         logs: None,
         state_dir: None,
@@ -1396,6 +1545,24 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
         mcp_config: None,
         assisted_by: repl.assisted_by.clone(),
     })
+}
+
+fn validate_workflow_short_circuit_model_flags(repl: &ReplArgs) -> Result<()> {
+    let mut unsupported = Vec::new();
+    if repl.main_model.is_some() {
+        unsupported.push("--main-model");
+    }
+    if repl.todo_model.is_some() {
+        unsupported.push("--todo-model");
+    }
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} {} not supported for workflow executor prompts; use --fast-model/--slow-model or run the REPL task loop",
+        unsupported.join(" and "),
+        if unsupported.len() == 1 { "is" } else { "are" }
+    )
 }
 
 fn grant_prompt_path_mentions(workspace: &std::path::Path, prompt: &str) {
@@ -1432,8 +1599,8 @@ fn run_validate_workflow(args: ValidateWorkflowArgs) -> Result<()> {
 }
 
 /// Run a workflow end-to-end against the kres-llm client. Builds an
-/// `LlmDriver` with whichever agent configs are present in
-/// `--kres-dir`, applies derive rules to the input map, then drives
+/// `LlmDriver` with whichever model configs are present in
+/// `--kres-dir/models`, applies derive rules to the input map, then drives
 /// the executor. Trace is printed line-by-line as events happen.
 async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     use std::sync::Arc;
@@ -1448,11 +1615,25 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         .or_else(|| dirs::home_dir().map(|h| h.join(".kres")))
         .ok_or_else(|| anyhow::anyhow!("could not resolve kres-dir (set --kres-dir)"))?;
     let workflow = kres_repl::load_workflow_path_or_id(&args.path, Some(&kres_dir))?;
-    let fast_path = kres_dir.join("fast-code-agent.json");
-    let slow_path = kres_dir.join(format!("slow-code-agent-{}.json", args.slow));
+    let mut settings = load_settings_for_kres_dir(&kres_dir, &args.workspace);
+    apply_workflow_model_overrides(&mut settings, &args);
+    let fast_model_cfg = settings
+        .model_for(kres_repl::ModelRole::Fast)
+        .map(|model| model_config_path(&kres_dir, model));
+    let slow_model_cfg = if let Some(selector) = args.slow.as_deref() {
+        let spec = resolve_slow_selector_in_dirs(selector, std::slice::from_ref(&kres_dir))?;
+        apply_slow_model_override_from_spec(&mut settings, &spec);
+        let (path, _) = spec;
+        Some(path)
+    } else {
+        settings
+            .model_for(kres_repl::ModelRole::Slow)
+            .map(|model| model_config_path(&kres_dir, model))
+    };
+    let fast_path = fast_model_cfg.unwrap_or_else(|| kres_dir.join("models/__missing_fast__.json"));
+    let slow_path = slow_model_cfg.unwrap_or_else(|| kres_dir.join("models/__missing_slow__.json"));
 
     let mut inputs_raw = parse_input_kvs(&args.input)?;
-    let settings = kres_repl::Settings::load_merged(&args.workspace);
     if workflow.inputs.contains_key("assisted_by") {
         if let Some(value) = args
             .assisted_by
@@ -1505,8 +1686,8 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     // Keep the AgentEnv fallback path for workflows that do not need
     // followup gathering, but use the same settings model selection as the REPL.
     if fast_path.exists() {
-        let cfg = AgentConfig::load(&fast_path)?;
-        let client = Arc::new(Client::new(cfg.key.clone())?);
+        let cfg = AgentConfig::load_for_role(&fast_path, AgentKind::Fast)?;
+        let client = Arc::new(Client::new(cfg.credentials()?)?);
         let model =
             kres_repl::pick_model(cfg.model.as_deref(), kres_repl::ModelRole::Fast, &settings);
         let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
@@ -1523,8 +1704,8 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         ));
     }
     if slow_path.exists() {
-        let cfg = AgentConfig::load(&slow_path)?;
-        let client = Arc::new(Client::new(cfg.key.clone())?);
+        let cfg = AgentConfig::load_for_role(&slow_path, AgentKind::Slow)?;
+        let client = Arc::new(Client::new(cfg.credentials()?)?);
         let model =
             kres_repl::pick_model(cfg.model.as_deref(), kres_repl::ModelRole::Slow, &settings);
         let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
@@ -1547,7 +1728,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
 
     if driver.fast.is_none() && driver.slow.is_none() {
         return Err(anyhow::anyhow!(
-            "no agent configs found in {} — workflow can't run without at least one role wired",
+            "no model configs found in {}/models — workflow can't run without at least one role wired",
             kres_dir.display()
         ));
     }
@@ -1628,7 +1809,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         );
     } else {
         eprintln!(
-            "orchestrator: not wired (need both fast+slow agent configs); falling back to single-shot LLM calls — followups WILL NOT be gathered"
+            "orchestrator: not wired (need both fast+slow model configs); falling back to single-shot LLM calls — followups WILL NOT be gathered"
         );
     }
 
@@ -1719,17 +1900,22 @@ fn fmt_token_count(n: u64) -> String {
 }
 
 async fn run_test(args: TestArgs) -> Result<()> {
+    use kres_agents::AgentConfig;
     use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
-    let api_key = kres_llm::key::load_api_key(&args.key_file)
-        .with_context(|| format!("loading key file {}", args.key_file.display()))?;
+    let agent_cfg = AgentConfig::load(&args.config)
+        .with_context(|| format!("loading model config {}", args.config.display()))?;
     let model = match args.model.as_deref() {
         Some(id) => Model::from_id(id),
-        None => Model::from_key_file(&args.key_file), // bugs.md#R1
+        None => agent_cfg
+            .model
+            .as_deref()
+            .map(Model::from_id)
+            .unwrap_or_else(Model::sonnet_4_6),
     };
     kres_core::async_eprintln!("model: {}", model.id);
 
-    let client = Client::new(api_key)?;
+    let client = Client::new(agent_cfg.credentials()?)?;
     // Defaults now pick the right thinking schema per model family
     // (adaptive for opus-4-7+, explicit budget for older). Cap
     // max_tokens to keep the smoke test small.
@@ -1783,12 +1969,11 @@ mod tests {
 
     #[test]
     fn test_args_parse() {
-        let c =
-            Cli::try_parse_from(["kres", "test", "/tmp/opus.api.key", "--prompt", "hi"]).unwrap();
+        let c = Cli::try_parse_from(["kres", "test", "/tmp/model.json", "--prompt", "hi"]).unwrap();
         match c.cmd {
             Some(Command::Test(a)) => {
                 assert_eq!(a.prompt, "hi");
-                assert_eq!(a.key_file, PathBuf::from("/tmp/opus.api.key"));
+                assert_eq!(a.config, PathBuf::from("/tmp/model.json"));
             }
             _ => panic!("expected test"),
         }
@@ -1799,7 +1984,7 @@ mod tests {
         let c = Cli::try_parse_from([
             "kres",
             "turn",
-            "/tmp/sonnet.api.key",
+            "/tmp/model.json",
             "-i",
             "in.json",
             "-o",
@@ -1810,6 +1995,7 @@ mod tests {
         .unwrap();
         match c.cmd {
             Some(Command::Turn(a)) => {
+                assert_eq!(a.config, PathBuf::from("/tmp/model.json"));
                 assert_eq!(a.thinking_budget, Some(0));
                 assert_eq!(a.output, PathBuf::from("out.md"));
             }
@@ -1886,6 +2072,46 @@ mod tests {
     }
 
     #[test]
+    fn workflow_prompt_short_circuit_preserves_fast_slow_model_overrides() {
+        let c = Cli::try_parse_from([
+            "kres",
+            "--prompt",
+            "fix: /tmp/finding",
+            "--fast-model",
+            "fast-test",
+            "--slow-model",
+            "slow-test",
+        ])
+        .unwrap();
+
+        let args = workflow_short_circuit_from_repl_args(&c.repl)
+            .expect("fix prompt should short-circuit");
+        assert_eq!(args.fast_model.as_deref(), Some("fast-test"));
+        assert_eq!(args.slow_model.as_deref(), Some("slow-test"));
+        validate_workflow_short_circuit_model_flags(&c.repl).unwrap();
+    }
+
+    #[test]
+    fn workflow_prompt_short_circuit_rejects_unused_main_todo_model_overrides() {
+        let c = Cli::try_parse_from([
+            "kres",
+            "--prompt",
+            "fix: /tmp/finding",
+            "--main-model",
+            "main-test",
+            "--todo-model",
+            "todo-test",
+        ])
+        .unwrap();
+
+        assert!(workflow_short_circuit_from_repl_args(&c.repl).is_some());
+        assert!(
+            validate_workflow_short_circuit_model_flags(&c.repl).is_err(),
+            "workflow executor prompt must not silently accept unused main/todo model overrides"
+        );
+    }
+
+    #[test]
     fn one_flag_defaults_off_and_parses() {
         let bare = Cli::try_parse_from(["kres"]).unwrap();
         assert!(!bare.repl.one, "--one must default off");
@@ -1903,6 +2129,73 @@ mod tests {
     }
 
     #[test]
+    fn run_workflow_slow_tag_unset_when_not_passed() {
+        let c = Cli::try_parse_from(["kres", "run-workflow", "workflow-id:fix"]).unwrap();
+        match c.cmd {
+            Some(Command::RunWorkflow(args)) => assert!(args.slow.is_none()),
+            other => panic!("expected run-workflow command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_workflow_model_overrides_parse() {
+        let c = Cli::try_parse_from([
+            "kres",
+            "run-workflow",
+            "workflow-id:fix",
+            "--fast-model",
+            "fast-test",
+            "--slow-model",
+            "slow-test",
+        ])
+        .unwrap();
+        match c.cmd {
+            Some(Command::RunWorkflow(args)) => {
+                assert_eq!(args.fast_model.as_deref(), Some("fast-test"));
+                assert_eq!(args.slow_model.as_deref(), Some("slow-test"));
+            }
+            other => panic!("expected run-workflow command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_workflow_does_not_accept_unwired_main_todo_model_overrides() {
+        assert!(Cli::try_parse_from([
+            "kres",
+            "run-workflow",
+            "workflow-id:fix",
+            "--main-model",
+            "main-test",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "kres",
+            "run-workflow",
+            "workflow-id:fix",
+            "--todo-model",
+            "todo-test",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn slow_tag_conflicts_with_slow_model() {
+        assert!(
+            Cli::try_parse_from(["kres", "--slow", "opus", "--slow-model", "gpt-5.5"]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "kres",
+            "run-workflow",
+            "workflow-id:fix",
+            "--slow",
+            "opus",
+            "--slow-model",
+            "gpt-5.5",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn slow_tag_passes_through_when_set() {
         let c = Cli::try_parse_from(["kres", "--slow", "opus"]).unwrap();
         assert_eq!(c.repl.slow, vec!["opus"]);
@@ -1912,6 +2205,115 @@ mod tests {
     fn slow_tag_can_repeat_for_comparison() {
         let c = Cli::try_parse_from(["kres", "--slow", "sonnet", "--slow", "opus"]).unwrap();
         assert_eq!(c.repl.slow, vec!["sonnet", "opus"]);
+    }
+
+    #[test]
+    fn slow_selector_prefers_exact_model_filename_match() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-slow-selector-exact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("foo.json"), "{}").unwrap();
+        std::fs::write(models.join("foo-large.json"), "{}").unwrap();
+
+        let found = find_model_config_by_filename_selector(std::slice::from_ref(&base), "foo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, models.join("foo.json"));
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn slow_selector_accepts_unique_substring_model_filename_match() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-slow-selector-substring-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("company-foo-xhigh.json"), "{}").unwrap();
+
+        let (found, model_override) =
+            resolve_slow_selector_in_dirs("foo", std::slice::from_ref(&base)).unwrap();
+        assert_eq!(found, models.join("company-foo-xhigh.json"));
+        assert_eq!(model_override, None);
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn slow_selector_rejects_ambiguous_substring_model_filename_match() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-slow-selector-ambiguous-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("foo-fast.json"), "{}").unwrap();
+        std::fs::write(models.join("foo-slow.json"), "{}").unwrap();
+
+        let err = resolve_slow_selector_in_dirs("foo", std::slice::from_ref(&base))
+            .expect_err("ambiguous selector must fail");
+        assert!(err.to_string().contains("ambiguous"));
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn slow_selector_known_alias_resolves_to_shipped_model_id() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-slow-selector-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("claude-sonnet-4-6.json"), "{}").unwrap();
+
+        let (found, model_override) =
+            resolve_slow_selector_in_dirs("sonnet", std::slice::from_ref(&base)).unwrap();
+        assert_eq!(found, models.join("claude-sonnet-4-6.json"));
+        assert_eq!(model_override.as_deref(), Some("claude-sonnet-4-6"));
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn slow_selector_alias_override_updates_primary_slow_settings() {
+        let spec = (
+            PathBuf::from("/tmp/claude-sonnet-4-6.json"),
+            Some("claude-sonnet-4-6".to_string()),
+        );
+        let mut settings = kres_repl::Settings::default();
+        settings.set_model(
+            kres_repl::ModelRole::Slow,
+            Some("claude-opus-4-7".to_string()),
+        );
+
+        apply_slow_model_override_from_spec(&mut settings, &spec);
+
+        assert_eq!(
+            settings.model_for(kres_repl::ModelRole::Slow),
+            Some("claude-sonnet-4-6")
+        );
     }
 
     #[test]
@@ -1950,6 +2352,52 @@ mod tests {
             resolved_assisted_by(Some(&"operator value".to_string()), None, &settings),
             "operator value"
         );
+    }
+
+    #[test]
+    fn run_workflow_settings_load_from_kres_dir_then_project_overlay() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-run-workflow-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let kres_dir = base.join("kres-dir");
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&kres_dir).unwrap();
+        std::fs::create_dir_all(workspace.join(".kres")).unwrap();
+        std::fs::write(
+            kres_dir.join("settings.json"),
+            r#"{"models":{"fast":"fast-global","slow":"slow-global","main":"main-global","todo":"todo-global"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.join(".kres/settings.json"),
+            r#"{"models":{"main":"main-project"}}"#,
+        )
+        .unwrap();
+
+        let settings = load_settings_for_kres_dir(&kres_dir, &workspace);
+        assert_eq!(
+            settings.model_for(kres_repl::ModelRole::Fast),
+            Some("fast-global")
+        );
+        assert_eq!(
+            settings.model_for(kres_repl::ModelRole::Slow),
+            Some("slow-global")
+        );
+        assert_eq!(
+            settings.model_for(kres_repl::ModelRole::Main),
+            Some("main-project")
+        );
+        assert_eq!(
+            settings.model_for(kres_repl::ModelRole::Todo),
+            Some("todo-global")
+        );
+
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]

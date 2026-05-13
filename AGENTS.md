@@ -111,7 +111,6 @@ User prompt → Task created → Task thread starts
 - Each todo item becomes a `Task` with its own thread
 - Task states: `pending → inference → waiting_main → gathering → done`
 - `TaskManager` handles scheduling (respects `depends_on`), servicing, reaping
-- Max parallel tasks configurable via `"concurrency"` in main-agent.json
 
 ### Shared Symbol Cache
 - `TaskManager.symbol_cache` and `context_cache` are thread-safe (via `cache_lock`)
@@ -291,12 +290,9 @@ this repo's `configs/` tree:
 
 | File | Purpose |
 |------|---------|
-| `fast-code-agent.json` | Fast agent: key, max_tokens, rate_limit, system prompt (model id lives in `settings.json`) |
-| `slow-code-agent-<tag>.json` | Slow agent variants; `--slow <tag>` picks one (default: sonnet). Tags differ by `max_tokens`. Known tags (sonnet/opus) also imply a slow model id, overriding `settings.json` unless `--slow-model` is also passed |
-| `main-agent.json` | Main agent: key, max_tokens, rate_limit, concurrency, system prompt (model id lives in `settings.json`) |
-| `todo-agent.json` | Todo-list-maintenance agent (tools-disabled variant) |
+| `models/<model-id>.json` | Model/role config selected by `settings.json` or CLI model flags. Uses `api_key`, provider fields, max_tokens, rate_limit, thinking, and optional role sections (`fast`, `slow`, `main`, `todo`). |
 | `mcp.json` | MCP server definitions (installed only when semcode-mcp is available) |
-| `settings.json` | Per-user defaults (today: per-role model ids). CLI flags `--fast-model`, `--slow-model`, `--main-model`, `--todo-model` override the matching role; a known `--slow <tag>` (sonnet/opus) also overrides the slow model id unless `--slow-model` is given |
+| `settings.json` | Per-user defaults for per-role model ids. CLI flags `--fast-model`, `--slow-model`, `--main-model`, `--todo-model` override the matching role. `--slow <name>` selects one slow model JSON file: `sonnet`/`opus` are aliases for shipped model ids, and other values match filenames under `models/`. `--slow` and `--slow-model` are mutually exclusive. |
 | `system-prompts/*.system.md` | Optional operator overrides for agent system prompts. Default prompts are embedded in the kres binary (`kres-agents/src/embedded_prompts.rs`); a file at `~/.kres/system-prompts/<basename>` shadows the embedded copy. Empty by default |
 | `commands/<name>.md` | Optional operator overrides (or additions) for non-workflow slash-command templates. Summary rendering reads `summary` / `summary-markdown` templates through `kres-agents/src/user_commands.rs`; workflow-owned names (`fix`, `review`, `triage`) are reserved and cannot be resurrected as prompt templates. |
 | `workflows/<name>.json` | Optional operator overrides for shipped workflows such as `fix`, `review`, and `triage`. Disk overrides shadow embedded workflow JSON. |
@@ -393,14 +389,14 @@ used by the fix workflow after `Assisted-by:`. When omitted, kres derives
 
 ```
 ~/.kres/                      # Populated by setup.sh
-  fast-code-agent.json        # Fast agent config (with inline API key)
-  slow-code-agent-sonnet.json # Default slow agent
-  slow-code-agent-opus.json   # Alternative slow agent (--slow opus)
-  main-agent.json             # Main agent config
-  todo-agent.json             # Todo-list-maintenance agent config
+  models/
+    claude-sonnet-4-6.json    # Default fast/main/todo model config
+    claude-opus-4-7.json      # Default slow model config
   mcp.json                    # MCP server registry (semcode, …)
   settings.json               # Per-user defaults (model ids per role)
-  prompts/                    # System prompts + bug-summary.md
+  system-prompts/             # Optional agent system prompt overrides
+  commands/                   # Optional non-workflow command overrides
+  workflows/                  # Optional workflow JSON overrides
   skills/                     # Skill files (kernel.md, …)
   sessions/<ts>/              # Per-run artifacts when --results not set
     findings.json             # jsondb-backed canonical findings (delta-applied, no history)

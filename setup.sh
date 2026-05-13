@@ -2,22 +2,21 @@
 #
 # setup.sh — initialize a kres config directory.
 #
-# Copies the agent configs, system prompts, and skills shipped in this
+# Copies model configs, optional MCP config, and skills shipped in this
 # repo into the destination directory (default ~/.kres) and substitutes
-# the slow/fast API keys into each config file. Existing destination
-# files are left untouched unless --overwrite is passed.
+# API-key placeholders in each model file. Existing destination files
+# are left untouched unless --overwrite is passed.
 #
 # Usage:
 #   setup.sh [--dest DIR] [--slow-key KEY] [--fast-key KEY] [--overwrite]
 #
-# --slow-key / --fast-key accept either a path to an existing key file
-# (whose trimmed contents become the key) or a literal key string.
-# The argument's value is substituted inline for the @SLOW_KEY@ /
-# @FAST_KEY@ placeholder in the installed config JSON — no separate
-# key files are written.
+# --slow-key / --fast-key accept literal key strings. The argument's
+# value is substituted inline for the @SLOW_KEY@ / @FAST_KEY@
+# placeholder in the installed config JSON — no external credential
+# files are read or written.
 #
-# --fast-key feeds fast-code-agent, main-agent, and todo-agent.
-# --slow-key feeds every slow-code-agent variant (opus, sonnet).
+# --fast-key feeds the default Sonnet model config.
+# --slow-key feeds the default Opus model config.
 #
 # Without --overwrite, any destination file that already exists is
 # reported and skipped. The script is idempotent in that mode.
@@ -32,8 +31,8 @@ Usage: $0 [--dest DIR] [--slow-key KEY] [--fast-key KEY]
 
 Options:
   --dest DIR             Destination directory (default: \$HOME/.kres)
-  --slow-key KEY         Slow-agent API key (path to existing file OR literal)
-  --fast-key KEY         Fast / main / todo agent API key (path OR literal)
+  --slow-key KEY         Slow-agent API key literal
+  --fast-key KEY         Fast / main / todo agent API key literal
   --slow MODEL           Model id used for the slow agent in settings.json.
                          Default: claude-opus-4-7.
   --model MODEL          Model id used for fast/main/todo agents in
@@ -105,25 +104,21 @@ fi
 
 mkdir -p "${DEST}"
 mkdir -p "${DEST}/skills"
+mkdir -p "${DEST}/models"
+mkdir -p "${DEST}/system-prompts"
+mkdir -p "${DEST}/commands"
+mkdir -p "${DEST}/workflows"
 
 say() { printf '  %s\n' "$*"; }
 
 # resolve_key KEY — returns the literal API key string that should be
-# substituted for @FAST_KEY@ / @SLOW_KEY@ placeholders. The argument
-# may be either a path to an existing file (whose trimmed contents
-# become the key) or a literal key string. An empty argument returns
-# the empty string, signalling 'leave placeholder in place'.
+# substituted for @FAST_KEY@ / @SLOW_KEY@ placeholders. An empty
+# argument returns the empty string, signalling 'leave placeholder in
+# place'.
 resolve_key() {
   local val="$1"
   if [[ -z "$val" ]]; then
     printf ''
-    return 0
-  fi
-  if [[ -f "$val" ]]; then
-    # Trim leading/trailing whitespace (newlines especially) so a
-    # multiline key file doesn't smuggle an unintended newline into
-    # the installed JSON.
-    awk 'BEGIN{ORS=""} {gsub(/^[[:space:]]+|[[:space:]]+$/,""); print}' "$val"
     return 0
   fi
   printf '%s' "$val"
@@ -162,13 +157,11 @@ install_file() {
   say "wrote: ${dst}"
 }
 
-# install_config SRC DST PLACEHOLDER KEY_VALUE — copy a JSON config,
-# substituting the literal token PLACEHOLDER (e.g. `@FAST_KEY@`) with
-# KEY_VALUE. If KEY_VALUE is empty, the file is copied verbatim so
-# the operator can edit it later. Same overwrite semantics as
-# install_file.
-install_config() {
-  local src="$1" dst="$2" placeholder="$3" key_value="$4"
+# install_model_config SRC DST — copy a model JSON config, replacing
+# both @FAST_KEY@ and @SLOW_KEY@ placeholders. If a key value is empty,
+# its placeholder is left in place so the operator can edit later.
+install_model_config() {
+  local src="$1" dst="$2"
   if [[ ! -e "$src" ]]; then
     echo "error: source missing: $src" >&2
     return 1
@@ -177,31 +170,50 @@ install_config() {
     say "keep: ${dst}"
     return 0
   fi
-  if [[ -z "${key_value}" ]]; then
-    install -m 0644 "$src" "$dst"
-    say "wrote: ${dst} (${placeholder} left in place — edit before running)"
-    return 0
-  fi
-  # Literal string substitution via awk — no regex metachar concerns
-  # on either side. jq would also work but isn't guaranteed present;
-  # awk is in POSIX and handles every reasonable key value.
   local tmp
   tmp="$(mktemp "${dst}.tmp.XXXXXX")"
-  awk -v ph="${placeholder}" -v val="${key_value}" '
-    BEGIN { lp = length(ph) }
-    {
-      line = $0
+  KRES_FAST_KEY_VALUE="${FAST_KEY_VALUE}" \
+  KRES_SLOW_KEY_VALUE="${SLOW_KEY_VALUE}" \
+  awk \
+    -v fast_ph="@FAST_KEY@" \
+    -v slow_ph="@SLOW_KEY@" \
+    '
+    BEGIN {
+      fast_val = ENVIRON["KRES_FAST_KEY_VALUE"]
+      slow_val = ENVIRON["KRES_SLOW_KEY_VALUE"]
+    }
+    function json_escape(s,    out, i, c) {
+      out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else if (c == "\n") out = out "\\n"
+        else if (c == "\r") out = out "\\r"
+        else if (c == "\t") out = out "\\t"
+        else out = out c
+      }
+      return out
+    }
+    function subst(line, ph, val,    out, i, lp, replacement) {
+      lp = length(ph)
+      replacement = (val == "" ? ph : json_escape(val))
       out = ""
       while ((i = index(line, ph)) > 0) {
-        out  = out substr(line, 1, i - 1) val
+        out  = out substr(line, 1, i - 1) replacement
         line = substr(line, i + lp)
       }
-      print out line
+      return out line
     }
-  ' "$src" > "$tmp"
+    {
+      line = subst($0, fast_ph, fast_val)
+      line = subst(line, slow_ph, slow_val)
+      print line
+    }
+    ' "$src" > "$tmp"
   mv "$tmp" "$dst"
   chmod 0640 "$dst"
-  say "wrote: ${dst} (${placeholder}=$(redact "${key_value}"))"
+  say "wrote: ${dst} (@FAST_KEY@=$(redact "${FAST_KEY_VALUE}"), @SLOW_KEY@=$(redact "${SLOW_KEY_VALUE}"))"
 }
 
 echo "kres setup"
@@ -212,7 +224,7 @@ say "fast key:     $(redact "${FAST_KEY_VALUE}")"
 say "slow model:   ${SLOW_MODEL}"
 say "model:        ${MODEL}"
 
-echo "system prompts and agent configs:"
+echo "system prompts and model configs:"
 # Every shipped prompt/template is embedded via include_str!:
 # agent `*.system.md` prompts go through
 # kres-agents::embedded_prompts, summary templates go through
@@ -220,8 +232,8 @@ echo "system prompts and agent configs:"
 # configs/workflows/*.json. None of these files are installed on
 # disk by default — rebuilding kres refreshes the lot.
 #
-# Override directories (both empty on a fresh install, both
-# honoured by the respective loaders when populated):
+# Override directories (empty on a fresh install, honoured by the
+# respective loaders when populated):
 #
 #   ~/.kres/system-prompts/<agent>.system.md
 #     → override an agent system prompt. AgentConfig::load reads
@@ -235,42 +247,18 @@ echo "system prompts and agent configs:"
 #   ~/.kres/workflows/<name>.json
 #     → override a shipped workflow such as review, triage, or fix.
 #
-# Both override directories are new; older installs populated
-# ~/.kres/prompts/ directly. The rename prevents stale files
-# from an earlier install shadowing embedded defaults after an
-# upgrade — leftover files under ~/.kres/prompts/ are safe to
-# delete.
+# These override directories are separate from the old
+# ~/.kres/prompts/ tree. The rename prevents stale files from an
+# earlier install shadowing embedded defaults after an upgrade —
+# leftover files under ~/.kres/prompts/ are safe to delete.
 #
 # No shipped command templates are installed to ~/.kres/prompts/.
-mkdir -p "${DEST}/prompts"
-shopt -s nullglob
-for src in "${CONFIGS_SRC}/prompts"/*.md; do
-  case "$(basename "$src")" in
-    *.system.md | bug-summary.md | bug-summary-markdown.md | commit-kernel-template.md | triage-template.md)
-      # Embedded in the binary; skip.
-      ;;
-    *)
-      install_file "$src" "${DEST}/prompts/$(basename "$src")"
-      ;;
-  esac
-done
-shopt -u nullglob
 
-# Fast / main / todo agent configs → fast key (placeholder
-# @FAST_KEY@).
-install_config "${CONFIGS_SRC}/fast-code-agent.json" \
-               "${DEST}/fast-code-agent.json" "@FAST_KEY@" "${FAST_KEY_VALUE}"
-install_config "${CONFIGS_SRC}/main-agent.json" \
-               "${DEST}/main-agent.json" "@FAST_KEY@" "${FAST_KEY_VALUE}"
-install_config "${CONFIGS_SRC}/todo-agent.json" \
-               "${DEST}/todo-agent.json" "@FAST_KEY@" "${FAST_KEY_VALUE}"
-
-# Slow agent variants → slow key (placeholder @SLOW_KEY@). Two tags
-# ship; kres picks one via `--slow <tag>` (default: sonnet).
-for tag in opus sonnet; do
-  install_config "${CONFIGS_SRC}/slow-code-agent-${tag}.json" \
-                 "${DEST}/slow-code-agent-${tag}.json" \
-                 "@SLOW_KEY@" "${SLOW_KEY_VALUE}"
+# Model configs. kres no longer auto-loads legacy
+# ~/.kres/*-agent.json files; normal startup resolves each role to
+# ~/.kres/models/<resolved-model-id>.json.
+for src in "${CONFIGS_SRC}/models"/*.json; do
+  install_model_config "$src" "${DEST}/models/$(basename "$src")"
 done
 
 # MCP registry: install mcp.json only when we actually have a
@@ -332,8 +320,7 @@ fi
 # ~/.kres/settings.json on every start. The shipped file has two
 # placeholder tokens (@SLOW_MODEL@ for the slow role, @MODEL@ for
 # fast/main/todo); we substitute them with --slow / --model values
-# (or the built-in defaults) the same way install_config handles
-# API-key placeholders.
+# (or the built-in defaults).
 settings_dst="${DEST}/settings.json"
 if [[ -e "${settings_dst}" ]] && [[ "${OVERWRITE}" -ne 1 ]]; then
   say "keep: ${settings_dst}"
@@ -455,8 +442,8 @@ fi
 echo "done."
 if [[ -z "${FAST_KEY_VALUE}" ]] || [[ -z "${SLOW_KEY_VALUE}" ]]; then
   echo
-  echo "note: one or both agent-config placeholders were not substituted."
-  echo "      edit ${DEST}/*.json and replace @FAST_KEY@ / @SLOW_KEY@ with"
+  echo "note: one or both model-config placeholders were not substituted."
+  echo "      edit ${DEST}/models/*.json and replace @FAST_KEY@ / @SLOW_KEY@ with"
   echo "      your API key strings, or re-run setup.sh with --fast-key /"
-  echo "      --slow-key (either a literal key or a path to a key file)."
+  echo "      --slow-key and literal key values."
 fi

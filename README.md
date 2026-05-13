@@ -95,6 +95,9 @@ a one-dir-per-finding format:
   merger flow and how follow-up tasks drive larger reviews.
 - [docs/workflow.md](docs/workflow.md) — the workflow-backed
   `/review`, `/triage`, and `/fix` flows.
+- [docs/generating-fixes.md](docs/generating-fixes.md) — safety
+  process kres uses before editing, committing, reviewing, and
+  publishing generated kernel fixes.
 - [docs/coding-tasks.md](docs/coding-tasks.md) — reproducer and
   fix generation (`code_output`, `code_edits`, `bash` verify).
 - [docs/turns-and-follow.md](docs/turns-and-follow.md) — when

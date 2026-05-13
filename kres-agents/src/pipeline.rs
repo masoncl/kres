@@ -53,9 +53,9 @@ use crate::{
 /// prefix and mutated per task.
 ///
 /// `skills` is the only fat field that actually stays byte-stable
-/// across tasks (typically 20-80k chars of skill bodies). Keeping
-/// only it here lets task 2+ hit the skills cache written by task
-/// 1 for the full ~5min TTL.
+/// across tasks (typically 20-80k chars of skill bodies). Fast-agent
+/// gather rounds still use this prefix cache because they can make
+/// multiple round trips before slow handoff.
 ///
 /// Everything other than `skills` goes in the volatile tail —
 /// including `plan_rewrite_allowed`, which is `Option<bool>` with
@@ -68,11 +68,10 @@ use crate::{
 /// `c5843f10-…` confirmed: i=2 (fast) and i=4 (slow) had a common
 /// prefix of 5 chars, cache_read=0.
 ///
-/// For fast-agent gather rounds the tail still cache-hits on
-/// round 2+ via the `Message::cache` flag; for one-shot
-/// slow/lens/consolidate/merge calls the caller drops
-/// `Message::cache` entirely so we don't pay the +25% write tax
-/// on a tail nothing will read.
+/// For fast-agent gather rounds the tail still cache-hits on round
+/// 2+ via the `Message::cache` flag. Non-lensed slow-agent calls do
+/// not use this cache at all; review lenses use the separate
+/// `LENS_SHARED_CACHE_FIELDS` prefix and warmup path below.
 const CACHED_PREFIX_FIELDS: &[&str] = &["skills"];
 const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
     "question",
@@ -638,18 +637,12 @@ impl Orchestrator {
         let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
         let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
         let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
-        // §cache: same split policy on the slow-agent user message.
-        // The question + previous_findings are stable across a
-        // retry; symbols/context are volatile per-task.
-        // §cache: include skills in the slow-agent prompt too.
-        // Without it the cached prefix is just `{question}` — on
-        // the order of 50 bytes — which Anthropic ignores for
-        // prompt caching (there's a minimum cacheable block size).
-        // Session `83f8ef0e` confirmed: slow call top-level keys
-        // were `[question, context]`, no skills, `cache_read=0`,
-        // `cache_create=27349`. Passing skills lifts the prefix
-        // well past the minimum and gives the slow agent the same
-        // domain guidance the fast agent has.
+        // Non-lensed slow calls are one-shot. Do not use prompt
+        // cache split/warmup here: there is no parallel fan-out to
+        // amortize the cache write, and repeated workflow correction
+        // passes should not keep paying to create slow-agent cache
+        // entries. Review paths that actually benefit from a shared
+        // context prefix go through run_with_lenses below.
         let mut slow_cp = CodePrompt::new(prompt)
             .with_symbols(&trimmed_symbols)
             .with_context(&trimmed_context)
@@ -668,21 +661,12 @@ impl Orchestrator {
         if ctx.allow_plan_rewrite {
             slow_cp = slow_cp.with_plan_rewrite_allowed(true);
         }
-        let (slow_prefix, slow_suffix) = slow_cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
-        let slow_logged = format!("{slow_prefix}{slow_suffix}");
-        // Slow agent is one-shot per task — no round 2 will ever
-        // read the tail cache. Drop `cache` to avoid the +25% write
-        // tax on the volatile suffix. `cached_prefix` still carries
-        // a cache_control block so cross-task skills reads hit.
+        let slow_logged = slow_cp.to_json_string()?;
         let messages = vec![Message {
             role: "user".into(),
-            content: slow_suffix.clone(),
+            content: slow_logged.clone(),
             cache: false,
-            cached_prefix: if slow_prefix.is_empty() {
-                None
-            } else {
-                Some(slow_prefix.clone())
-            },
+            cached_prefix: None,
         }];
         let mut cfg = CallConfig::defaults_for(self.slow_model.clone())
             .with_max_tokens(self.slow_max_tokens)

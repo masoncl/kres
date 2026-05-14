@@ -155,6 +155,11 @@ pub enum StepStatus {
     BranchedAway,
 }
 
+pub enum LensFanOutConsolidate {
+    Unsupported,
+    Outputs(Map<String, Value>),
+}
+
 /// A driver returns the outputs a step would emit. Tests script
 /// outcomes by `(step_id, attempt)`; production drivers (see
 /// [`crate::workflow_runner::LlmDriver`]) call the kres-llm client.
@@ -227,19 +232,17 @@ pub trait Driver: Sync {
     }
 
     /// Optimised dispatch for a lensed step whose `aggregate` is
-    /// `Consolidate`. Drivers that wire an Orchestrator +
-    /// ConsolidatorClient can override this to gather ONCE and fan
-    /// out N parallel slow calls (`Orchestrator::run_with_lenses`).
-    /// Default returns Err so the
-    /// executor falls back to the per-lens path: N independent
-    /// gather loops + N slow calls + a separate
-    /// `driver.consolidate()` call.
+    /// `Consolidate`. `Ok(Unsupported)` means the driver has no
+    /// shared-gather implementation and the executor should use the
+    /// regular per-lens path. `Err` means the shared-gather path ran
+    /// and failed; the executor must spend the step retry budget
+    /// rather than silently repeating work through another engine.
     async fn lens_fan_out_consolidate(
         &self,
         _step: &Step,
         _ctx: &ExecContext<'_>,
-    ) -> Result<Map<String, Value>, String> {
-        Err("driver does not implement lens_fan_out_consolidate".into())
+    ) -> Result<LensFanOutConsolidate, String> {
+        Ok(LensFanOutConsolidate::Unsupported)
     }
 
     /// Optional post-step ledger update. Production fix workflows
@@ -1396,44 +1399,75 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             );
             // Try the optimised single-gather + fan-out + consolidate
             // path first when aggregate=Consolidate AND the driver
-            // can handle it. On success, return the aggregated map
-            // out of the lens block so the standard eval +
-            // post_actions code below runs. On Err, fall through to
-            // the per-lens loop. Fix #7: collapses N independent
-            // gathers into 1 when the configuration supports it.
+            // advertises support for it. On success, return the
+            // aggregated map out of the lens block so the standard
+            // eval + post_actions code below runs. Runtime/schema
+            // errors from a supported optimised path consume the
+            // step retry budget instead of silently falling back to
+            // the old repeated-gather loop.
             let mut optimised: Option<Map<String, Value>> = None;
             if matches!(
                 active_step.aggregate.unwrap_or_default(),
                 Aggregate::Consolidate
             ) {
-                if let Ok(aggregated) = driver
+                match driver
                     .lens_fan_out_consolidate(&active_step, &driver_ctx)
                     .await
                 {
-                    record(
-                        &mut events,
-                        &observer,
-                        TraceEvent::Consolidating {
-                            id: step.id.clone(),
+                    Ok(LensFanOutConsolidate::Outputs(aggregated)) => {
+                        record(
+                            &mut events,
+                            &observer,
+                            TraceEvent::Consolidating {
+                                id: step.id.clone(),
+                                attempt,
+                                lens_count: active_step.lenses.len(),
+                            },
+                        );
+                        record(
+                            &mut events,
+                            &observer,
+                            TraceEvent::FanIn {
+                                id: step.id.clone(),
+                                attempt,
+                                aggregated: aggregated.clone(),
+                                strategy: "Consolidate".into(),
+                            },
+                        );
+                        optimised = Some(aggregated);
+                    }
+                    Ok(LensFanOutConsolidate::Unsupported) => {}
+                    Err(e) => {
+                        if retry_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
                             attempt,
-                            lens_count: active_step.lenses.len(),
-                        },
-                    );
-                    record(
-                        &mut events,
-                        &observer,
-                        TraceEvent::FanIn {
-                            id: step.id.clone(),
-                            attempt,
-                            aggregated: aggregated.clone(),
-                            strategy: "Consolidate".into(),
-                        },
-                    );
-                    optimised = Some(aggregated);
+                            &format!("shared lens fan-out driver error: {e}"),
+                        ) {
+                            snapshot_save(&state, events.len());
+                            continue;
+                        }
+                        status = WorkflowStatus::Failure(format!(
+                            "step '{}' shared lens fan-out attempt {attempt} driver error: {e}",
+                            step.id
+                        ));
+                        record(
+                            &mut events,
+                            &observer,
+                            TraceEvent::Terminated {
+                                status: status.clone(),
+                            },
+                        );
+                        snapshot_save(&state, events.len());
+                        return Trace {
+                            events,
+                            status,
+                            final_state: state,
+                        };
+                    }
                 }
-                // Optimised path returned Err — fall through to the
-                // per-lens loop. The FanOut event was already
-                // recorded, so the per-lens path skips its own.
             }
             // If the optimised path produced an aggregate, return
             // it out of the lens block so the standard eval +
@@ -4310,13 +4344,15 @@ mod tests {
                 &self,
                 _step: &Step,
                 _ctx: &ExecContext<'_>,
-            ) -> Result<Map<String, Value>, String> {
+            ) -> Result<LensFanOutConsolidate, String> {
                 let mut n = self.calls.lock().unwrap();
                 *n += 1;
                 // Pass on the second attempt so the workflow ends
                 // Success after a retry — proves eval ran.
                 let pass = *n >= 2;
-                Ok(serde_json::from_value(json!({"clean": pass})).unwrap())
+                Ok(LensFanOutConsolidate::Outputs(
+                    serde_json::from_value(json!({"clean": pass})).unwrap(),
+                ))
             }
         }
         let wf_json = serde_json::json!({
@@ -4458,8 +4494,10 @@ mod tests {
                 &self,
                 _step: &Step,
                 _ctx: &ExecContext<'_>,
-            ) -> Result<Map<String, Value>, String> {
-                Ok(serde_json::from_value(json!({"findings": []})).unwrap())
+            ) -> Result<LensFanOutConsolidate, String> {
+                Ok(LensFanOutConsolidate::Outputs(
+                    serde_json::from_value(json!({"findings": []})).unwrap(),
+                ))
             }
         }
         let wf = lensed_review_workflow();
@@ -4487,12 +4525,95 @@ mod tests {
         assert_eq!(fan_in.as_deref(), Some("Consolidate"));
     }
 
-    /// When `lens_fan_out_consolidate` returns Err, the executor
+    /// If a driver advertises the shared-gather lens path and that
+    /// path returns a runtime/schema error, the executor must spend
+    /// the step retry budget. It must not fall back to the per-lens
+    /// loop, because that reintroduces repeated gathering and hides
+    /// the actual shared-path failure.
+    #[tokio::test]
+    async fn optimised_lens_error_retries_instead_of_falling_back() {
+        struct FailingOptimisedDriver {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+
+        #[async_trait]
+        impl Driver for FailingOptimisedDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, String> {
+                panic!("per-lens run() must not repair shared fan-out failures")
+            }
+
+            async fn lens_fan_out_consolidate(
+                &self,
+                _step: &Step,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<LensFanOutConsolidate, String> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    Err("lens json validation failed".into())
+                } else {
+                    Ok(LensFanOutConsolidate::Outputs(
+                        serde_json::from_value(json!({"clean": true})).unwrap(),
+                    ))
+                }
+            }
+        }
+
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "opt-error-retry",
+            "steps": [{
+                "id": "review",
+                "agent": "slow",
+                "prompt": "p",
+                "lenses": [{"id": "source"}, {"id": "commit"}],
+                "aggregate": "consolidate",
+                "consolidate": {"prompt": "merge"},
+                "outputs": {"clean": {"type": "boolean"}},
+                "eval": {
+                    "type": "field_check",
+                    "expr": "clean == true",
+                    "on_fail": {"action": "repeat", "max_attempts": 3}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut driver = FailingOptimisedDriver {
+            calls: calls.clone(),
+        };
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::EvalFailed {
+                id,
+                action,
+                eval_failures: 1,
+                ..
+            } if id == "review" && action.contains("shared lens fan-out driver error")
+        )));
+        assert!(!trace
+            .events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::LensProduced { .. })));
+    }
+
+    /// When shared-gather lens fan-out is unsupported, the executor
     /// falls back to the per-lens loop used by ScriptedDriver tests.
     #[tokio::test]
     async fn fallback_lens_fan_out_uses_per_lens_loop() {
-        // ScriptedDriver doesn't override lens_fan_out_consolidate
-        // so it returns Err → executor falls back.
+        // ScriptedDriver doesn't override lens_fan_out_consolidate,
+        // so the default returns Unsupported and the executor falls
+        // back.
         let wf = lensed_review_workflow();
         let mut driver = ScriptedDriver::new()
             .with("investigate|lifetime", 1, json!({"findings": []}))

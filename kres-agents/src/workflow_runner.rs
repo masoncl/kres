@@ -30,10 +30,14 @@
 //!    JSON blocks like `{"result": "preexisting_error"}` from
 //!    fix.json's compile-triage step).
 //!
-//! Lensed steps make N parallel `run_once_with_ctx` calls — each
-//! lens gets its own gather loop + slow call. The
-//! `aggregate: consolidate` strategy then runs the existing
-//! N+1 LLM merge pass on the per-lens outputs.
+//! Lensed `aggregate: consolidate` steps use the orchestrator's
+//! shared-gather fan-out path when possible: gather once, run each
+//! slow lens against the same source/context, then consolidate. Fix
+//! review steps with `clean`/`defects`/`correction_step` keep the
+//! same shared gather but use deterministic Rust fan-in so routing
+//! between source and commit-message correction is not inferred from
+//! prose. If that optimized path is unavailable, the executor falls
+//! back to per-lens `run_once_with_ctx` calls.
 //!
 //! ### AgentEnv fallback (tests)
 //!
@@ -114,11 +118,45 @@ use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 use crate::workflow::{Agent as AgentRole, Aggregate, Mode, Step, Workflow};
-use crate::workflow_exec::{Driver, ExecContext, REVIEW_LEDGER_STEP_ID};
+use crate::workflow_exec::{Driver, ExecContext, LensFanOutConsolidate, REVIEW_LEDGER_STEP_ID};
 
 const JSON_REPAIR_RETRIES: usize = 3;
 const JSON_REPAIR_PREFIX: &str = "IMPORTANT: This step requires a valid JSON object matching OUTPUT SCHEMA; reply with that JSON object as the last top-level JSON in this response.";
 const FAST_GATHER_ALLOWED_FIELDS: &str = "analysis, followups, skill_reads, ready_for_slow";
+const DEFAULT_GATHER_DISALLOWED_FIELDS: &[&str] = &[
+    "clean",
+    "defects",
+    "source_defects",
+    "commit_message_defects",
+    "correction_step",
+    "valid",
+    "result",
+    "code_output",
+    "code_edits",
+];
+const LENS_GATHER_DISALLOWED_FIELDS: &[&str] = &[
+    "clean",
+    "defects",
+    "correction_step",
+    "source_defects",
+    "commit_message_defects",
+    "findings",
+    "followups_empty",
+];
+
+type StructuredLensOutputs = Vec<(String, Map<String, Value>)>;
+
+struct StepPromptTexts {
+    user_text_base: String,
+    gather_user_text_base: String,
+}
+
+#[derive(Clone, Copy)]
+enum LensInterpolation<'a> {
+    None,
+    Specific(&'a crate::workflow::Lens),
+    SharedFanout,
+}
 
 /// Per-role agent environment: client + call config + system prompt.
 pub struct AgentEnv {
@@ -185,11 +223,14 @@ pub struct LlmDriver {
     /// `DataFetcher`, and returns a `TaskSummary` carrying findings
     /// + followups + code_output + analysis.
     pub orchestrator: Option<Arc<crate::pipeline::Orchestrator>>,
-    /// When set alongside [`Self::orchestrator`], lensed steps with
-    /// `aggregate: consolidate` delegate to
-    /// `Orchestrator::run_with_lenses` (ONE shared gather + N
-    /// parallel slow calls + this consolidator). Without it the
-    /// executor falls back to N independent orchestrator calls.
+    /// When set alongside [`Self::orchestrator`], non-structured
+    /// lensed steps with `aggregate: consolidate` delegate to
+    /// `Orchestrator::run_with_lenses` (one shared gather + N
+    /// parallel slow calls + this consolidator). Structured fix
+    /// review outputs use the same shared gather but deterministic
+    /// Rust fan-in, so they do not require this client. Without it,
+    /// non-structured lensed steps fall back to independent
+    /// orchestrator calls.
     pub consolidator: Option<Arc<crate::pipeline::ConsolidatorClient>>,
     pub workspace: PathBuf,
     pub workflow: Workflow,
@@ -531,32 +572,44 @@ impl LlmDriver {
         );
     }
 
-    async fn run_llm_step(
+    async fn build_step_prompt_texts(
         &self,
         step: &Step,
         attempt: u32,
         ctx: &ExecContext<'_>,
-        role: AgentRole,
         lens: Option<&crate::workflow::Lens>,
-    ) -> Result<Map<String, Value>, String> {
-        // Build the user prompt body once; both the orchestrator
-        // path and the AgentEnv fallback use the same string.
+        shared_lens_fanout: bool,
+        gather_disallowed_fields: &[&str],
+    ) -> Result<StepPromptTexts, String> {
         let prompt_raw = step
             .prompt
             .as_deref()
             .ok_or_else(|| format!("step '{}' has no prompt", step.id))?;
-        let prompt = interpolate_with_lens(prompt_raw, &self.workflow, ctx, Some(&step.id), lens)
-            .map_err(|e| format!("step '{}' prompt interpolation: {e}", step.id))?;
+        let prompt = if shared_lens_fanout {
+            interpolate_for_shared_lens_fanout(prompt_raw, &self.workflow, ctx, Some(&step.id))
+        } else {
+            let lens_binding = match lens {
+                Some(l) => LensInterpolation::Specific(l),
+                None => LensInterpolation::None,
+            };
+            interpolate_with_lens_binding(
+                prompt_raw,
+                &self.workflow,
+                ctx,
+                Some(&step.id),
+                lens_binding,
+            )
+        }
+        .map_err(|e| format!("step '{}' prompt interpolation: {e}", step.id))?;
         let schema_tail = build_output_schema_tail(step);
         let lens_tag = match lens {
             Some(l) => format!("\nlens: {}", l.id),
             None => String::new(),
         };
-        // Fix #4: avoid double-including skills. The orchestrator
-        // path serializes its own `skills` field into the
-        // CodePrompt envelope (pipeline.rs CodePrompt::with_skills),
-        // so when an orchestrator is wired AND has skills set, our
-        // prelude would duplicate them. Suppress in that case.
+        // Avoid double-including skills. The orchestrator path
+        // serializes its own `skills` field into the CodePrompt
+        // envelope, so when an orchestrator is wired and has skills
+        // set, the text prelude would duplicate them.
         let skip_prelude = self
             .orchestrator
             .as_ref()
@@ -580,21 +633,35 @@ impl LlmDriver {
             sid = step.id,
             SCHEMA_HEADER = "OUTPUT SCHEMA"
         );
-        let gather_contract = fast_gather_contract(&[
-            "clean",
-            "defects",
-            "source_defects",
-            "commit_message_defects",
-            "correction_step",
-            "valid",
-            "result",
-            "code_output",
-            "code_edits",
-        ]);
+        let gather_contract = fast_gather_contract(gather_disallowed_fields);
         let gather_user_text_base = format!(
             "{skills_prelude}{includes_prelude}{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n{gather_contract}",
             sid = step.id,
         );
+        Ok(StepPromptTexts {
+            user_text_base,
+            gather_user_text_base,
+        })
+    }
+
+    async fn run_llm_step(
+        &self,
+        step: &Step,
+        attempt: u32,
+        ctx: &ExecContext<'_>,
+        role: AgentRole,
+        lens: Option<&crate::workflow::Lens>,
+    ) -> Result<Map<String, Value>, String> {
+        let prompt_texts = self
+            .build_step_prompt_texts(
+                step,
+                attempt,
+                ctx,
+                lens,
+                false,
+                DEFAULT_GATHER_DISALLOWED_FIELDS,
+            )
+            .await?;
 
         // Orchestrator path — runs the fast-rounds gather loop with
         // followups → fetcher → accumulated symbols/context, then
@@ -608,7 +675,7 @@ impl LlmDriver {
         if let Some(orch_base) = &self.orchestrator {
             let mut last_parse_err: Option<String> = None;
             for json_retry in 0..=JSON_REPAIR_RETRIES {
-                let user_text = with_json_repair_prefix(&user_text_base, json_retry);
+                let user_text = with_json_repair_prefix(&prompt_texts.user_text_base, json_retry);
                 let allowed = effective_actions(step, &self.workflow);
                 let orch = orchestrator_with_gated_fetcher(orch_base, allowed);
                 let orch = &orch;
@@ -627,7 +694,7 @@ impl LlmDriver {
                 let rctx = crate::pipeline::RunContext {
                     task_brief,
                     mode,
-                    gather_prompt: Some(gather_user_text_base.clone()),
+                    gather_prompt: Some(prompt_texts.gather_user_text_base.clone()),
                     ..crate::pipeline::RunContext::default()
                 };
                 let summary = orch
@@ -695,7 +762,7 @@ impl LlmDriver {
         let call_cfg = self.config_for_call(env, self.mode_for(step));
         let mut last_parse_err: Option<String> = None;
         for json_retry in 0..=JSON_REPAIR_RETRIES {
-            let user_text = with_json_repair_prefix(&user_text_base, json_retry);
+            let user_text = with_json_repair_prefix(&prompt_texts.user_text_base, json_retry);
             let messages = vec![Message::plain("user", user_text.clone())];
             let log_user = match lens {
                 Some(l) => format!(
@@ -1318,29 +1385,17 @@ impl Driver for LlmDriver {
         Ok(outputs)
     }
 
-    /// Fix #7: shared-gather + parallel lens fan-out + consolidate
-    /// in one call. Maps the workflow's `Lens` shape onto
-    /// kres-core's `LensSpec` and delegates to
-    /// `Orchestrator::run_with_lenses`. Returns Err when either the
-    /// orchestrator OR the consolidator isn't wired so the executor
-    /// falls back to the per-lens path.
+    /// Shared-gather + parallel lens fan-out + consolidate in one
+    /// call. `Unsupported` means the executor should use the regular
+    /// per-lens path; `Err` means this shared path ran and failed.
     async fn lens_fan_out_consolidate(
         &self,
         step: &Step,
         ctx: &ExecContext<'_>,
-    ) -> Result<Map<String, Value>, String> {
-        if uses_structured_review_outputs(step) {
-            return Err("structured review outputs use deterministic per-lens fan-in".into());
-        }
-
-        let orch = self
-            .orchestrator
-            .as_ref()
-            .ok_or_else(|| "no orchestrator wired".to_string())?;
-        let consolidator = self
-            .consolidator
-            .as_ref()
-            .ok_or_else(|| "no ConsolidatorClient wired".to_string())?;
+    ) -> Result<LensFanOutConsolidate, String> {
+        let Some(orch) = self.orchestrator.as_ref() else {
+            return Ok(LensFanOutConsolidate::Unsupported);
+        };
         // Same per-step gating as the regular orchestrator path.
         let allowed = effective_actions(step, &self.workflow);
         let orch = orchestrator_with_gated_fetcher(orch, allowed);
@@ -1351,48 +1406,17 @@ impl Driver for LlmDriver {
             .map(crate::workflow::lens_to_spec)
             .collect();
 
-        // Build the user-text prompt the same way the per-step path
-        // does — skills, includes, schema tail, all in one message.
-        let prompt_raw = step
-            .prompt
-            .as_deref()
-            .ok_or_else(|| format!("step '{}' has no prompt", step.id))?;
-        let prompt = interpolate(prompt_raw, &self.workflow, ctx, Some(&step.id))
-            .map_err(|e| format!("step '{}' prompt interpolation: {e}", step.id))?;
-        let schema_tail = build_output_schema_tail(step);
-        let skills_prelude = if self.skills_block.is_empty()
-            || self
-                .orchestrator
-                .as_ref()
-                .map(|o| o.skills.is_some())
-                .unwrap_or(false)
-        {
-            String::new()
-        } else {
-            format!("--- SKILLS ---{}\n", self.skills_block)
-        };
-        let includes_block = resolve_includes(&step.include, &self.workflow, ctx, Some(&step.id))
-            .map_err(|e| format!("step '{}' include resolution: {e}", step.id))?;
-        let includes_prelude = if includes_block.is_empty() {
-            String::new()
-        } else {
-            format!("--- INCLUDES ---\n{includes_block}\n\n")
-        };
-        let user_text = format!(
-            "{skills_prelude}{includes_prelude}{prompt}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\n--- OUTPUT SCHEMA ---\n{schema_tail}",
-            sid = step.id,
-        );
-        let gather_contract = fast_gather_contract(&[
-            "clean",
-            "defects",
-            "correction_step",
-            "findings",
-            "followups_empty",
-        ]);
-        let gather_user_text = format!(
-            "{skills_prelude}{includes_prelude}{prompt}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\n{gather_contract}",
-            sid = step.id,
-        );
+        let attempt = ctx.steps.get(&step.id).map(|st| st.attempt).unwrap_or(1);
+        let prompt_texts = self
+            .build_step_prompt_texts(
+                step,
+                attempt,
+                ctx,
+                None,
+                true,
+                LENS_GATHER_DISALLOWED_FIELDS,
+            )
+            .await?;
 
         let mode = match self.mode_for(step) {
             Some(crate::workflow::Mode::Coding) => kres_core::TaskMode::Coding,
@@ -1402,8 +1426,38 @@ impl Driver for LlmDriver {
         let rctx = crate::pipeline::RunContext {
             task_brief: step.id.clone(),
             mode,
-            gather_prompt: Some(gather_user_text),
+            gather_prompt: Some(prompt_texts.gather_user_text_base),
             ..crate::pipeline::RunContext::default()
+        };
+        if uses_structured_review_outputs(step) {
+            let repair_instruction = format!(
+                "{JSON_REPAIR_PREFIX}\n\
+                 Your previous response for this review lens did not satisfy the workflow output schema. \
+                 Reuse the same gathered source/context. Reply only with the required JSON object for this \
+                 lens; do not request more gathering unless the missing evidence is truly unavailable."
+            );
+            let fanout = orch
+                .run_lenses_shared_gather_repairing(
+                    &prompt_texts.user_text_base,
+                    &lenses,
+                    &rctx,
+                    &self.shutdown,
+                    crate::pipeline::LensRepairPolicy {
+                        max_retries: JSON_REPAIR_RETRIES,
+                        repair_instruction: &repair_instruction,
+                    },
+                    |output| validate_structured_review_lens_output(step, output),
+                )
+                .await
+                .map_err(|e| format!("step '{}' shared lens fan-out: {e}", step.id))?;
+            let per_lens = structured_review_lens_outputs(step, fanout)?;
+            let outputs = consolidate_structured_review(&per_lens)
+                .map_err(|e| format!("step '{}' structured lens consolidate: {e}", step.id))?;
+            return Ok(LensFanOutConsolidate::Outputs(outputs));
+        }
+
+        let Some(consolidator) = self.consolidator.as_ref() else {
+            return Ok(LensFanOutConsolidate::Unsupported);
         };
         let consolidate_rules = match step.consolidate.as_ref() {
             Some(cfg) => Some(
@@ -1415,7 +1469,7 @@ impl Driver for LlmDriver {
         };
         let summary = orch
             .run_with_lenses(
-                &user_text,
+                &prompt_texts.user_text_base,
                 &lenses,
                 consolidator,
                 consolidate_rules.as_deref(),
@@ -1435,8 +1489,9 @@ impl Driver for LlmDriver {
             apply_code_edits(&self.workspace, &summary.code_edits)
                 .map_err(|e| format!("step '{}' code_edits apply: {e}", step.id))?;
         }
-        map_task_summary_to_outputs(step, &summary)
-            .map_err(|e| format!("step '{}' output mapping: {e}", step.id))
+        let outputs = map_task_summary_to_outputs(step, &summary)
+            .map_err(|e| format!("step '{}' output mapping: {e}", step.id))?;
+        Ok(LensFanOutConsolidate::Outputs(outputs))
     }
 
     async fn update_review_ledger(
@@ -1593,6 +1648,83 @@ fn uses_structured_review_outputs(step: &Step) -> bool {
     step.outputs.contains_key("clean")
         && step.outputs.contains_key("defects")
         && step.outputs.contains_key("correction_step")
+}
+
+fn structured_review_lens_outputs(
+    step: &Step,
+    fanout: crate::pipeline::LensFanoutOutput,
+) -> Result<StructuredLensOutputs, String> {
+    if !fanout.failures.is_empty() {
+        return Err(format!(
+            "step '{}' shared lens fan-out failed {} of {} lens call(s): {}",
+            step.id,
+            fanout.failures.len(),
+            fanout.attempted,
+            fanout.failure_summary()
+        ));
+    }
+    if fanout.outputs.len() != fanout.attempted {
+        return Err(format!(
+            "step '{}' shared lens fan-out completed {} of {} lens call(s)",
+            step.id,
+            fanout.outputs.len(),
+            fanout.attempted
+        ));
+    }
+
+    let multi_variant = fanout.slow_variant_count > 1;
+    let mut per_lens = Vec::with_capacity(fanout.outputs.len());
+    for output in fanout.outputs {
+        let parsed = parse_structured_review_lens_output(step, &output)?;
+        per_lens.push((structured_lens_output_label(&output, multi_variant), parsed));
+    }
+    Ok(per_lens)
+}
+
+fn structured_lens_output_label(
+    output: &crate::pipeline::LensRunOutput,
+    include_model: bool,
+) -> String {
+    if include_model {
+        if let Some(model) = output.slow_model.as_deref() {
+            return format!("{}@{model}", output.lens_id);
+        }
+    }
+    output.lens_id.clone()
+}
+
+fn parse_structured_review_lens_output(
+    step: &Step,
+    output: &crate::pipeline::LensRunOutput,
+) -> Result<Map<String, Value>, String> {
+    let mut parsed = extract_outputs(&output.raw_response, step).map_err(|e| {
+        format!(
+            "step '{}' lens '{}' output extraction: {e}",
+            step.id, output.lens_id
+        )
+    })?;
+    validate_required_outputs(step, &parsed).map_err(|e| {
+        format!(
+            "step '{}' lens '{}' output validation: {e}",
+            step.id, output.lens_id
+        )
+    })?;
+    if let Some(analysis) = parsed.get("analysis").and_then(Value::as_str) {
+        if analysis.trim().is_empty() && !output.parsed.analysis.trim().is_empty() {
+            parsed.insert(
+                "analysis".into(),
+                Value::String(output.parsed.analysis.clone()),
+            );
+        }
+    }
+    Ok(parsed)
+}
+
+fn validate_structured_review_lens_output(
+    step: &Step,
+    output: &crate::pipeline::LensRunOutput,
+) -> Result<(), String> {
+    parse_structured_review_lens_output(step, output).map(|_| ())
 }
 
 fn consolidate_structured_review(
@@ -1788,7 +1920,7 @@ pub fn interpolate(
     ctx: &ExecContext<'_>,
     current_step: Option<&str>,
 ) -> Result<String> {
-    interpolate_with_lens(src, workflow, ctx, current_step, None)
+    interpolate_with_lens_binding(src, workflow, ctx, current_step, LensInterpolation::None)
 }
 
 /// Lens-aware interpolation. When `lens` is `Some`, `{{lens.<key>}}`
@@ -1801,6 +1933,35 @@ pub fn interpolate_with_lens(
     ctx: &ExecContext<'_>,
     current_step: Option<&str>,
     lens: Option<&crate::workflow::Lens>,
+) -> Result<String> {
+    let binding = match lens {
+        Some(lens) => LensInterpolation::Specific(lens),
+        None => LensInterpolation::None,
+    };
+    interpolate_with_lens_binding(src, workflow, ctx, current_step, binding)
+}
+
+fn interpolate_for_shared_lens_fanout(
+    src: &str,
+    workflow: &Workflow,
+    ctx: &ExecContext<'_>,
+    current_step: Option<&str>,
+) -> Result<String> {
+    interpolate_with_lens_binding(
+        src,
+        workflow,
+        ctx,
+        current_step,
+        LensInterpolation::SharedFanout,
+    )
+}
+
+fn interpolate_with_lens_binding(
+    src: &str,
+    workflow: &Workflow,
+    ctx: &ExecContext<'_>,
+    current_step: Option<&str>,
+    lens: LensInterpolation<'_>,
 ) -> Result<String> {
     let mut out = String::with_capacity(src.len());
     let mut rest = src;
@@ -1824,7 +1985,7 @@ fn resolve_interp(
     workflow: &Workflow,
     ctx: &ExecContext<'_>,
     current_step: Option<&str>,
-    lens: Option<&crate::workflow::Lens>,
+    lens: LensInterpolation<'_>,
 ) -> Result<String> {
     // Fallback chain: a || b || c — first truthy wins.
     if expr.contains("||") {
@@ -1850,7 +2011,7 @@ fn resolve_one(
     workflow: &Workflow,
     ctx: &ExecContext<'_>,
     current_step: Option<&str>,
-    lens: Option<&crate::workflow::Lens>,
+    lens: LensInterpolation<'_>,
 ) -> Result<Value> {
     // String literal in single quotes.
     if expr.starts_with('\'') && expr.ends_with('\'') && expr.len() >= 2 {
@@ -1861,10 +2022,19 @@ fn resolve_one(
         return Err(anyhow!("empty interpolation"));
     }
     if parts[0] == "lens" {
-        let l = lens.ok_or_else(|| anyhow!("'lens.*' interpolation outside a lens fan-out"))?;
         if parts.len() == 1 {
             return Err(anyhow!("'lens' needs a field selector (e.g. lens.id)"));
         }
+        if matches!(lens, LensInterpolation::SharedFanout) {
+            return Ok(shared_fanout_lens_value(&parts[1..]));
+        }
+        let l = match lens {
+            LensInterpolation::Specific(l) => l,
+            LensInterpolation::None => {
+                return Err(anyhow!("'lens.*' interpolation outside a lens fan-out"));
+            }
+            LensInterpolation::SharedFanout => unreachable!(),
+        };
         if parts[1] == "id" {
             return Ok(Value::String(l.id.clone()));
         }
@@ -1944,6 +2114,20 @@ fn resolve_one(
             .ok_or_else(|| anyhow!("path beyond {}.{}", parts[0], parts[1]))?;
     }
     Ok(cur)
+}
+
+fn shared_fanout_lens_value(path: &[&str]) -> Value {
+    let field = path.first().copied().unwrap_or("");
+    match field {
+        "id" => Value::String("assigned lens".into()),
+        "investigate" => Value::String(
+            "Use the lens_instruction and parallel_lenses.your_lens fields for the assigned lens-specific review instructions.".into(),
+        ),
+        _ => Value::String(format!(
+            "Use parallel_lenses.your_lens.{} for the assigned lens-specific value.",
+            path.join(".")
+        )),
+    }
 }
 
 fn value_is_falsy(v: &Value) -> bool {
@@ -5418,6 +5602,91 @@ mod tests {
     }
 
     #[test]
+    fn shared_lens_fanout_interpolates_fix_review_prompt_without_specific_lens() {
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
+        let mut inputs = Map::new();
+        inputs.insert("assisted_by".into(), Value::String("kres test".into()));
+        let states = make_state(&[
+            (
+                "research",
+                1,
+                0,
+                json!({
+                    "research_status": "confirmed",
+                    "fix_plan": [{"title": "hold PSP device refs through post_doit"}]
+                }),
+            ),
+            (
+                "build",
+                1,
+                0,
+                json!({"result": "clean", "build_target": "net/psp/psp_nl.o"}),
+            ),
+            (
+                "compile-triage",
+                1,
+                0,
+                json!({"result": "clean", "analysis": ""}),
+            ),
+            (
+                "commit",
+                1,
+                0,
+                json!({"commit_sha": "HEAD", "commit_message": "net: psp: hold device refs"}),
+            ),
+        ]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+
+        let prompt = interpolate_for_shared_lens_fanout(
+            step.prompt.as_deref().unwrap(),
+            &wf,
+            &ctx,
+            Some("review"),
+        )
+        .unwrap();
+
+        assert!(prompt.contains("Apply the assigned lens review lens"));
+        assert!(prompt.contains("parallel_lenses.your_lens"));
+        assert!(!prompt.contains("{{lens."));
+    }
+
+    #[test]
+    fn shared_lens_fanout_preserves_arbitrary_lens_field_reference() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "lt",
+            "steps": [{
+                "id": "review",
+                "agent": "slow",
+                "prompt": "Extra: {{lens.extra.deep}}",
+                "lenses": [{"id": "memory", "extra": {"deep": "value"}}],
+                "outputs": {"analysis": {"type": "string"}}
+            }]
+        });
+        let wf = crate::workflow::parse_workflow(&wf_json.to_string()).unwrap();
+        let inputs = Map::new();
+        let states = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+
+        let prompt = interpolate_for_shared_lens_fanout(
+            wf.steps[0].prompt.as_deref().unwrap(),
+            &wf,
+            &ctx,
+            Some("review"),
+        )
+        .unwrap();
+
+        assert!(prompt.contains("parallel_lenses.your_lens.extra.deep"));
+    }
+
+    #[test]
     fn persist_code_output_writes_files_under_workspace() {
         let tmp = tempfile::tempdir().unwrap();
         let files = vec![
@@ -5685,6 +5954,99 @@ mod tests {
                 "what": "commit message contradicts the patch"
             }]))
         );
+    }
+
+    #[test]
+    fn structured_review_shared_fanout_rejects_incomplete_lens_json() {
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
+        let raw_response = "{\"clean\": true}";
+        let fanout = crate::pipeline::LensFanoutOutput {
+            outputs: vec![crate::pipeline::LensRunOutput {
+                lens_id: "memory".into(),
+                lens: json!({"id": "memory"}),
+                slow_model: Some("test-model".into()),
+                raw_response: raw_response.into(),
+                parsed: crate::response::parse_code_response(raw_response),
+            }],
+            failures: vec![],
+            fast_rounds: 1,
+            attempted: 1,
+            slow_variant_count: 1,
+        };
+
+        let err = structured_review_lens_outputs(step, fanout).unwrap_err();
+
+        assert!(err.contains("lens 'memory'"), "got: {err}");
+        assert!(err.contains("missing required output"), "got: {err}");
+        assert!(err.contains("defects"), "got: {err}");
+        assert!(err.contains("correction_step"), "got: {err}");
+    }
+
+    #[test]
+    fn structured_review_shared_fanout_reports_lens_failures() {
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
+        let fanout = crate::pipeline::LensFanoutOutput {
+            outputs: vec![],
+            failures: vec![crate::pipeline::LensRunFailure {
+                lens_id: "memory".into(),
+                slow_model: Some("test-model".into()),
+                error: "transport closed".into(),
+            }],
+            fast_rounds: 1,
+            attempted: 1,
+            slow_variant_count: 1,
+        };
+
+        let err = structured_review_lens_outputs(step, fanout).unwrap_err();
+
+        assert!(err.contains("failed 1 of 1"), "got: {err}");
+        assert!(err.contains("memory"), "got: {err}");
+        assert!(err.contains("test-model"), "got: {err}");
+        assert!(err.contains("transport closed"), "got: {err}");
+    }
+
+    #[test]
+    fn structured_review_shared_fanout_labels_multiple_slow_variants() {
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
+        let raw_response = r#"{
+            "clean": true,
+            "defects": [],
+            "analysis": "no defects found",
+            "correction_step": "write-patch"
+        }"#;
+        let fanout = crate::pipeline::LensFanoutOutput {
+            outputs: vec![
+                crate::pipeline::LensRunOutput {
+                    lens_id: "memory".into(),
+                    lens: json!({"id": "memory"}),
+                    slow_model: Some("sonnet".into()),
+                    raw_response: raw_response.into(),
+                    parsed: crate::response::parse_code_response(raw_response),
+                },
+                crate::pipeline::LensRunOutput {
+                    lens_id: "memory".into(),
+                    lens: json!({"id": "memory"}),
+                    slow_model: Some("opus".into()),
+                    raw_response: raw_response.into(),
+                    parsed: crate::response::parse_code_response(raw_response),
+                },
+            ],
+            failures: vec![],
+            fast_rounds: 1,
+            attempted: 2,
+            slow_variant_count: 2,
+        };
+
+        let labels: Vec<String> = structured_review_lens_outputs(step, fanout)
+            .unwrap()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+
+        assert_eq!(labels, vec!["memory@sonnet", "memory@opus"]);
     }
 
     #[test]

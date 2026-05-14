@@ -1,18 +1,17 @@
 //! Single-task orchestrator.
 //!
-//! Wires fast agent → main agent (data fetch) → slow agent in the same
-//! order as . Shutdown-aware (bugs.md#C2): every
+//! Wires fast agent → main agent (data fetch) → slow agent in order.
+//! Shutdown-aware: every
 //! await inside the loop is inside `tokio::select!` with the task's
 //! Shutdown, so /stop / /clear / --turns reaches the loop immediately.
 //!
-//! Phase 4b limits:
-//! - Single lens only (no parallel slow-agent fan-out yet — that's
-//!   Phase 5).
-//! - Main-agent data fetch is backed by a trait, so kres-repl can
-//!   inject the real semcode/grep/read backend without kres-agents
-//!   depending on kres-mcp.
+//! Lensed review paths gather source once, fan out slow-agent lenses
+//! over the same context, then consolidate or return structured
+//! per-lens results. Main-agent data fetch is backed by a trait, so
+//! kres-repl can inject the real semcode/grep/read backend without
+//! kres-agents depending on kres-mcp.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +36,8 @@ use crate::{
     prompt::CodePrompt,
     response::{parse_code_response, CodeResponse, ParseStrategy},
 };
+
+const GENERIC_LENS_REPAIR_RETRIES: usize = 1;
 
 /// CodePrompt fields that go into the cached-prefix block.
 ///
@@ -108,9 +109,72 @@ pub struct FetchResult {
     pub context: Vec<Value>,
 }
 
-/// No-op fetcher used in tests and in the Phase-4b sanity path. It
-/// returns empty results regardless of input — good enough to prove
-/// the orchestration plumbing without hitting any real backend.
+#[derive(Debug, Clone)]
+pub struct LensRunOutput {
+    pub lens_id: String,
+    pub lens: Value,
+    pub slow_model: Option<String>,
+    pub raw_response: String,
+    pub parsed: CodeResponse,
+}
+
+#[derive(Debug, Clone)]
+pub struct LensFanoutOutput {
+    pub outputs: Vec<LensRunOutput>,
+    pub failures: Vec<LensRunFailure>,
+    pub fast_rounds: u8,
+    pub attempted: usize,
+    pub slow_variant_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct LensRunFailure {
+    pub lens_id: String,
+    pub slow_model: Option<String>,
+    pub error: String,
+}
+
+impl LensRunFailure {
+    pub fn summary(&self) -> String {
+        let model = self.slow_model.as_deref().unwrap_or("unknown-model");
+        format!("{} ({model}): {}", self.lens_id, self.error)
+    }
+}
+
+impl LensFanoutOutput {
+    pub fn failure_summary(&self) -> String {
+        self.failures
+            .iter()
+            .map(LensRunFailure::summary)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+pub struct LensRepairPolicy<'a> {
+    pub max_retries: usize,
+    pub repair_instruction: &'a str,
+}
+
+struct PreparedLensFanout {
+    prompt: String,
+    shared_prefix: String,
+    warmed_prefixes: HashSet<String>,
+    slow_variants: Vec<SlowAgentVariant>,
+    trimmed_symbols: Vec<Value>,
+    trimmed_context: Vec<Value>,
+    trimmed_prev: Vec<Finding>,
+    live_skills: Option<Value>,
+    fast_rounds: u8,
+}
+
+type RawLensSuccess = (String, Value, String, String, CodeResponse);
+type RawLensFailure = (String, String, String);
+type RawLensResult = Option<Result<RawLensSuccess, RawLensFailure>>;
+
+/// No-op fetcher used in tests. It returns empty results regardless
+/// of input — good enough to prove the orchestration plumbing without
+/// hitting any real backend.
 pub struct NullFetcher;
 
 #[async_trait]
@@ -1036,10 +1100,10 @@ impl Orchestrator {
     /// Run a task with N parallel slow-agent lens calls over the
     /// same gathered symbols/context, then consolidate.
     ///
-    /// Closes bugs.md#H4 lens handling: a lens call that errors
-    /// yields an empty lens output rather than failing the whole
-    /// task, but its failure shows up in the returned per-lens
-    /// errors list so the operator can see it.
+    /// A lens that fails or returns no usable output is retried once
+    /// on the same gathered context. If it still fails, the whole
+    /// lensed review errors instead of consolidating a partial clean
+    /// result.
     pub async fn run_with_lenses(
         &self,
         prompt: &str,
@@ -1052,6 +1116,185 @@ impl Orchestrator {
         if lenses.is_empty() {
             return self.run_once_with_ctx(prompt, ctx, shutdown).await;
         }
+        let fanout = self
+            .run_lenses_shared_gather_repairing(
+                prompt,
+                lenses,
+                ctx,
+                shutdown,
+                LensRepairPolicy {
+                    max_retries: GENERIC_LENS_REPAIR_RETRIES,
+                    repair_instruction: "Your previous response for this review lens did not produce usable lens output. Reuse the same gathered source/context and reply with this lens's analysis, findings, or followups.",
+                },
+                validate_generic_lens_output,
+            )
+            .await?;
+        if !fanout.failures.is_empty() {
+            return Err(AgentError::Other(format!(
+                "shared lens fan-out failed {} of {} lens call(s): {}",
+                fanout.failures.len(),
+                fanout.attempted,
+                fanout.failure_summary()
+            )));
+        }
+        let empty_lenses: Vec<String> = fanout
+            .outputs
+            .iter()
+            .filter_map(|output| validate_generic_lens_output(output).err())
+            .collect();
+        if !empty_lenses.is_empty() {
+            return Err(AgentError::Other(format!(
+                "shared lens fan-out produced unusable output for {} lens call(s): {}",
+                empty_lenses.len(),
+                empty_lenses.join("; ")
+            )));
+        }
+
+        let mut outs: Vec<LensOutput<'_>> = Vec::new();
+        let mut all_followups: Vec<Followup> = Vec::new();
+        for output in &fanout.outputs {
+            let parsed = &output.parsed;
+            outs.push(LensOutput {
+                lens: &output.lens,
+                slow_model: output.slow_model.as_deref(),
+                analysis: &parsed.analysis,
+                findings: &parsed.findings,
+                followups: &parsed.followups,
+            });
+            all_followups.extend(parsed.followups.iter().cloned());
+        }
+
+        let finished = fanout.outputs.len();
+        let findings: usize = fanout
+            .outputs
+            .iter()
+            .map(|output| output.parsed.findings.len())
+            .sum();
+        kres_core::async_eprintln!(
+            "[review lenses] {} of {} complete across {} slow model(s), {} raw finding(s), {} followup(s)",
+            finished,
+            fanout.attempted,
+            fanout.slow_variant_count,
+            findings,
+            all_followups.len(),
+        );
+
+        let consolidated = consolidate_lenses_with_logger(
+            consolidator.client.clone(),
+            consolidator.model.clone(),
+            consolidator.system.as_deref(),
+            consolidator.max_tokens,
+            consolidator.max_input_tokens,
+            &ctx.task_brief,
+            &outs,
+            consolidate_rules,
+            self.logger.clone(),
+        )
+        .await?;
+        self.append_comparison_entry(
+            &ctx.task_brief,
+            &self.effective_slow_variants(),
+            &outs,
+            consolidated.comparison.clone(),
+        );
+        merge_followups(&mut all_followups, consolidated.followups);
+        Ok(TaskSummary {
+            raw_response: consolidated.analysis.clone(),
+            analysis: consolidated.analysis,
+            findings: consolidated.findings,
+            followups: all_followups,
+            fast_rounds: fanout.fast_rounds,
+            strategy: ParseStrategy::WholeBody,
+            mode: kres_core::TaskMode::Audit,
+            code_output: Vec::new(),
+            code_edits: Vec::new(),
+            // Lens fan-out runs N parallel slow calls; merging N
+            // plan rewrites would churn step ids. Audit-mode plan
+            // rewrites flow through the todo-agent's per-turn
+            // reevaluation path instead. Single-slow analysis tasks
+            // (lens count 0) still get plan rewrite via
+            // run_once_with_ctx above.
+            plan: None,
+        })
+    }
+
+    pub async fn run_lenses_shared_gather_repairing<F>(
+        &self,
+        prompt: &str,
+        lenses: &[LensSpec],
+        ctx: &RunContext,
+        shutdown: &Shutdown,
+        repair: LensRepairPolicy<'_>,
+        validate: F,
+    ) -> Result<LensFanoutOutput, AgentError>
+    where
+        F: Fn(&LensRunOutput) -> Result<(), String>,
+    {
+        let prepared = self.prepare_lens_fanout(prompt, ctx, shutdown).await?;
+        let mut fanout = self
+            .run_prepared_lens_fanout(&prepared, lenses, lenses, ctx, None, shutdown)
+            .await?;
+
+        for retry in 0..repair.max_retries {
+            let mut retry_lenses = BTreeSet::new();
+            for failure in &fanout.failures {
+                retry_lenses.insert(failure.lens_id.clone());
+            }
+            for output in &fanout.outputs {
+                if validate(output).is_err() {
+                    retry_lenses.insert(output.lens_id.clone());
+                }
+            }
+            if retry_lenses.is_empty() {
+                return Ok(fanout);
+            }
+
+            let repair_lenses: Vec<LensSpec> = lenses
+                .iter()
+                .filter(|lens| retry_lenses.contains(&lens.id))
+                .cloned()
+                .collect();
+            if repair_lenses.is_empty() {
+                return Err(AgentError::Other(format!(
+                    "shared lens fan-out selected unknown lens id(s) for repair: {}",
+                    retry_lenses.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+
+            kres_core::async_eprintln!(
+                "[review lenses] repairing {} lens output(s) on shared context (attempt {}/{})",
+                repair_lenses.len(),
+                retry + 1,
+                repair.max_retries,
+            );
+            let repaired = self
+                .run_prepared_lens_fanout(
+                    &prepared,
+                    &repair_lenses,
+                    lenses,
+                    ctx,
+                    Some(repair.repair_instruction),
+                    shutdown,
+                )
+                .await?;
+            fanout
+                .outputs
+                .retain(|output| !retry_lenses.contains(&output.lens_id));
+            fanout
+                .failures
+                .retain(|failure| !retry_lenses.contains(&failure.lens_id));
+            fanout.outputs.extend(repaired.outputs);
+            fanout.failures.extend(repaired.failures);
+        }
+        Ok(fanout)
+    }
+
+    async fn prepare_lens_fanout(
+        &self,
+        prompt: &str,
+        ctx: &RunContext,
+        shutdown: &Shutdown,
+    ) -> Result<PreparedLensFanout, AgentError> {
         let composed = prepend_original_prompt(prompt, &ctx.original_prompt);
         let prompt: &str = composed.as_str();
         let gather_composed;
@@ -1071,19 +1314,7 @@ impl Orchestrator {
         // followups are returned to the workflow layer; they are not
         // consumed inside this task. Review workflows use them as the
         // next-turn frontier.
-        let slow_variants = if self.slow_variants.is_empty() {
-            vec![SlowAgentVariant {
-                client: self.slow_client.clone(),
-                model: self.slow_model.clone(),
-                system: self.slow_system.clone(),
-                max_tokens: self.slow_max_tokens,
-                max_input_tokens: self.slow_max_input_tokens,
-                thinking: self.slow_thinking,
-                label: self.slow_model.id.clone(),
-            }]
-        } else {
-            self.slow_variants.clone()
-        };
+        let slow_variants = self.effective_slow_variants();
         // bugs.md#cache: all review lenses receive the same gathered
         // source/context. Warm that shared prefix once per slow
         // model/system before launching the parallel lens calls. On
@@ -1109,31 +1340,59 @@ impl Orchestrator {
             .warm_lens_shared_cache(&slow_variants, &shared_prefix, shutdown)
             .await;
 
-        let mut futures = Vec::with_capacity(lenses.len() * slow_variants.len());
-        for (idx, lens) in lenses.iter().enumerate() {
+        Ok(PreparedLensFanout {
+            prompt: prompt.to_string(),
+            shared_prefix,
+            warmed_prefixes,
+            slow_variants,
+            trimmed_symbols,
+            trimmed_context,
+            trimmed_prev,
+            live_skills,
+            fast_rounds,
+        })
+    }
+
+    async fn run_prepared_lens_fanout(
+        &self,
+        prepared: &PreparedLensFanout,
+        lenses: &[LensSpec],
+        all_lenses: &[LensSpec],
+        ctx: &RunContext,
+        extra_lens_instruction: Option<&str>,
+        shutdown: &Shutdown,
+    ) -> Result<LensFanoutOutput, AgentError> {
+        let mut futures = Vec::with_capacity(lenses.len() * prepared.slow_variants.len());
+        for lens in lenses.iter() {
             // §20b: send identity-only lens descriptors to the slow
             // agent.
             let parallel_lenses = json!({
                 "your_lens": lens_identity(lens),
-                "other_lenses": lenses
+                "other_lenses": all_lenses
                     .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != idx)
-                    .map(|(_, l)| lens_identity(l))
+                    .filter(|candidate| candidate.id != lens.id)
+                    .map(lens_identity)
                     .collect::<Vec<_>>(),
             });
             // §20a: in-prose "Apply this lens" imperative so the slow
             // agent doesn't have to infer the lens angle from the
             // parallel_lenses JSON alone.
             let lens_prompt_line = format!("[{}] {}", lens.kind, lens.name);
-            let mut lens_extra = format!("Apply this lens to your analysis:\n{lens_prompt_line}");
+            let mut lens_extra = String::new();
+            if let Some(extra) = extra_lens_instruction {
+                lens_extra.push_str(extra.trim_end());
+                lens_extra.push_str("\n\n");
+            }
+            lens_extra.push_str(&format!(
+                "Apply this lens to your analysis:\n{lens_prompt_line}"
+            ));
             if !lens.reason.is_empty() {
                 lens_extra.push_str(&format!("\n(why: {})", lens.reason));
             }
-            let mut lens_cp = CodePrompt::new(prompt)
-                .with_symbols(&trimmed_symbols)
-                .with_context(&trimmed_context)
-                .with_previous_findings(&trimmed_prev)
+            let mut lens_cp = CodePrompt::new(&prepared.prompt)
+                .with_symbols(&prepared.trimmed_symbols)
+                .with_context(&prepared.trimmed_context)
+                .with_previous_findings(&prepared.trimmed_prev)
                 .with_parallel_lenses(&parallel_lenses)
                 .with_lens_instruction(&lens_extra);
             // §cache: include skills in the lens prompt — same
@@ -1141,20 +1400,22 @@ impl Orchestrator {
             // post-gather `live_skills` so any skill files the fast
             // agent pulled in mid-gather reach the lens slow agents
             // too.
-            if let Some(sk) = &live_skills {
+            if let Some(sk) = &prepared.live_skills {
                 lens_cp = lens_cp.with_skills(sk);
             }
             if let Some(ref p) = ctx.plan {
                 lens_cp = lens_cp.with_plan(p);
             }
             let lens_suffix = lens_cp.to_cached_tail_json(LENS_SHARED_CACHE_FIELDS)?;
-            let lens_logged = format!("{shared_prefix}{lens_suffix}");
-            for variant in slow_variants.iter().cloned() {
+            let lens_logged = format!("{}{}", prepared.shared_prefix, lens_suffix);
+            let lens_id = lens.id.clone();
+            let lens_value = lens_identity(lens);
+            for variant in prepared.slow_variants.iter().cloned() {
                 let client = variant.client.clone();
                 let model = variant.model.clone();
                 let system = variant.system.clone();
                 let cache_key = lens_cache_key(&model.id, system.as_deref());
-                let use_warmed_prefix = warmed_prefixes.contains(&cache_key);
+                let use_warmed_prefix = prepared.warmed_prefixes.contains(&cache_key);
                 let max_tokens = variant.max_tokens;
                 let max_input_tokens = variant.max_input_tokens;
                 let thinking = variant.thinking;
@@ -1167,9 +1428,11 @@ impl Orchestrator {
                     "phase=slow-lens task={} lens={} model={model_label}",
                     ctx.task_brief, lens.id
                 );
-                let shared_prefix = shared_prefix.clone();
+                let shared_prefix = prepared.shared_prefix.clone();
                 let lens_suffix = lens_suffix.clone();
                 let lens_logged = lens_logged.clone();
+                let lens_id = lens_id.clone();
+                let lens_value = lens_value.clone();
                 futures.push(async move {
                     // Each lens fan-out is a one-shot slow call. Same
                     // reasoning as the single slow path above: avoid
@@ -1200,7 +1463,7 @@ impl Orchestrator {
                         lg.log_code_labeled("user", Some(&log_label), &lens_logged, None, None);
                     }
                     tokio::select! {
-                        _ = shutdown_c.cancelled() => None,
+                        _ = shutdown_c.cancelled() => Some(Err((lens_id, model_label, "cancelled".to_string()))),
                         r = client.messages_streaming(&cfg, &messages) => match r {
                             Ok(resp) => {
                                 record_usage(&usage, "slow", &model, &resp.usage);
@@ -1215,96 +1478,65 @@ impl Orchestrator {
                                         th.as_deref(),
                                     );
                                 }
-                                Some((idx, model_label, parse_code_response(&t)))
+                                let parsed = parse_code_response(&t);
+                                Some(Ok((lens_id, lens_value, model_label, t, parsed)))
                             }
                             Err(e) => {
                                 tracing::warn!(target: "kres_agents", "lens call failed: {e}");
-                                None
+                                Some(Err((lens_id, model_label, e.to_string())))
                             }
                         }
                     }
                 });
             }
         }
-        let raws: Vec<Option<(usize, String, CodeResponse)>> = join_all(futures).await;
+        let raws: Vec<RawLensResult> = join_all(futures).await;
 
-        // Build LensOutputs for the consolidator. Preserve only
-        // non-None results; a failed lens contributes nothing.
-        // §20c: filter lenses that produced no analysis, findings, or
-        // followups so the consolidator doesn't have to handle noise.
-        // §20e: per-lens descriptor is the reduced identity form, not
-        // the full LensSpec.
-        let lens_json: Vec<Value> = lenses.iter().map(lens_identity).collect();
-        let mut outs: Vec<LensOutput<'_>> = Vec::new();
-        let mut all_followups: Vec<Followup> = Vec::new();
-        for (i, model_label, parsed) in raws.iter().flatten() {
-            if parsed.analysis.is_empty()
-                && parsed.findings.is_empty()
-                && parsed.followups.is_empty()
-            {
-                continue;
+        let mut outputs = Vec::new();
+        let mut failures = Vec::new();
+        for raw in raws.into_iter().flatten() {
+            match raw {
+                Ok((lens_id, lens, model_label, raw_response, parsed)) => {
+                    outputs.push(LensRunOutput {
+                        lens_id,
+                        lens,
+                        slow_model: Some(model_label),
+                        raw_response,
+                        parsed,
+                    });
+                }
+                Err((lens_id, model_label, error)) => {
+                    failures.push(LensRunFailure {
+                        lens_id,
+                        slow_model: Some(model_label),
+                        error,
+                    });
+                }
             }
-            outs.push(LensOutput {
-                lens: &lens_json[*i],
-                slow_model: Some(model_label.as_str()),
-                analysis: &parsed.analysis,
-                findings: &parsed.findings,
-                followups: &parsed.followups,
-            });
-            all_followups.extend(parsed.followups.iter().cloned());
         }
-
-        let finished = raws.iter().flatten().count();
-        let findings: usize = raws
-            .iter()
-            .filter_map(|raw| raw.as_ref().map(|(_, _, parsed)| parsed.findings.len()))
-            .sum();
-        kres_core::async_eprintln!(
-            "[review lenses] {} of {} complete across {} slow model(s), {} raw finding(s), {} followup(s)",
-            finished,
-            lenses.len() * slow_variants.len(),
-            slow_variants.len(),
-            findings,
-            all_followups.len(),
-        );
-
-        let consolidated = consolidate_lenses_with_logger(
-            consolidator.client.clone(),
-            consolidator.model.clone(),
-            consolidator.system.as_deref(),
-            consolidator.max_tokens,
-            consolidator.max_input_tokens,
-            &ctx.task_brief,
-            &outs,
-            consolidate_rules,
-            self.logger.clone(),
-        )
-        .await?;
-        self.append_comparison_entry(
-            &ctx.task_brief,
-            &slow_variants,
-            &outs,
-            consolidated.comparison.clone(),
-        );
-        merge_followups(&mut all_followups, consolidated.followups);
-        Ok(TaskSummary {
-            raw_response: consolidated.analysis.clone(),
-            analysis: consolidated.analysis,
-            findings: consolidated.findings,
-            followups: all_followups,
-            fast_rounds,
-            strategy: ParseStrategy::WholeBody,
-            mode: kres_core::TaskMode::Audit,
-            code_output: Vec::new(),
-            code_edits: Vec::new(),
-            // Lens fan-out runs N parallel slow calls; merging N
-            // plan rewrites would churn step ids. Audit-mode plan
-            // rewrites flow through the todo-agent's per-turn
-            // reevaluation path instead. Single-slow analysis tasks
-            // (lens count 0) still get plan rewrite via
-            // run_once_with_ctx above.
-            plan: None,
+        Ok(LensFanoutOutput {
+            outputs,
+            failures,
+            fast_rounds: prepared.fast_rounds,
+            attempted: lenses.len() * prepared.slow_variants.len(),
+            slow_variant_count: prepared.slow_variants.len(),
         })
+    }
+
+    fn effective_slow_variants(&self) -> Vec<SlowAgentVariant> {
+        if self.slow_variants.is_empty() {
+            vec![SlowAgentVariant {
+                client: self.slow_client.clone(),
+                model: self.slow_model.clone(),
+                system: self.slow_system.clone(),
+                max_tokens: self.slow_max_tokens,
+                max_input_tokens: self.slow_max_input_tokens,
+                thinking: self.slow_thinking,
+                label: self.slow_model.id.clone(),
+            }]
+        } else {
+            self.slow_variants.clone()
+        }
     }
 
     async fn warm_lens_shared_cache(
@@ -1747,6 +1979,21 @@ fn merge_followups(dst: &mut Vec<Followup>, src: Vec<Followup>) {
         if seen.insert(fu.cache_key()) {
             dst.push(fu);
         }
+    }
+}
+
+fn validate_generic_lens_output(output: &LensRunOutput) -> Result<(), String> {
+    if output.parsed.analysis.trim().is_empty()
+        && output.parsed.findings.is_empty()
+        && output.parsed.followups.is_empty()
+    {
+        let model = output.slow_model.as_deref().unwrap_or("unknown-model");
+        Err(format!(
+            "{} ({model}): no analysis, findings, or followups",
+            output.lens_id
+        ))
+    } else {
+        Ok(())
     }
 }
 

@@ -362,6 +362,30 @@
         "status": {
           "type": "string"
         }
+      }
+    },
+    {
+      "id": "record-invalidation-results",
+      "title": "Record per-bug invalidation evidence in metadata.yaml",
+      "depends_on": [
+        "invalidate"
+      ],
+      "run_if": "research.research_status == 'invalid' && workflow.target_artifact_dir != '' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
+      "agent": "reaper",
+      "action": {
+        "type": "set-finding-results",
+        "args": {
+          "finding_dir": "{{workflow.target_artifact_dir}}",
+          "synthesize_invalidation_from": "research"
+        }
+      },
+      "outputs": {
+        "files_updated": {
+          "type": "array<string>"
+        },
+        "outcomes_written": {
+          "type": "integer"
+        }
       },
       "terminal_on_success": true
     },
@@ -391,10 +415,35 @@
       "terminal_on_success": true
     },
     {
+      "id": "record-bugs",
+      "title": "Write metadata.bugs from research.fix_plan",
+      "depends_on": [
+        "research"
+      ],
+      "run_if": "research.research_status == 'confirmed' && workflow.target_artifact_dir != ''",
+      "agent": "reaper",
+      "action": {
+        "type": "set-finding-bugs",
+        "args": {
+          "finding_dir": "{{workflow.target_artifact_dir}}",
+          "from": "research"
+        }
+      },
+      "outputs": {
+        "files_updated": {
+          "type": "array<string>"
+        },
+        "bugs_written": {
+          "type": "integer"
+        }
+      }
+    },
+    {
       "id": "write-patch",
       "title": "Write the patch",
       "depends_on": [
-        "research"
+        "research",
+        "record-bugs"
       ],
       "run_if": "research.research_status == 'confirmed'",
       "agent": "code",
@@ -942,6 +991,10 @@
         {
           "id": "maintainer",
           "investigate": "Antagonistic kernel-maintainer review: aggressively challenge whether this patch is acceptable for the kernel code base. Look for regressions, unnecessary churn, brittle assumptions, weak fixes, overbroad changes, hidden ABI or behavior changes, incomplete backportability, missing tests or validation, stale or contradicted documentation, and any place where the code agent failed to justify why this exact change is the minimal correct fix. Expect at least one set of corrections for every patch unless the gathered evidence proves the patch is already publication-ready. Do not accept a patch just because it builds or fixes the reported symptom. Force the patch to justify changed semantics, unchanged callers, locking and lifetime assumptions, error paths, commit-message claims, and the documentation/comments that describe changed contracts. Also enforce commit-message readability as a publication gate: the message must read like a human-readable kernel changelog, not a wall-of-text proof memo or review transcript. If the message buries the problem/fix in dense paragraphs, over-inventories callers or negative cases, or explains non-obvious ordering, callbacks, nested calls, state transitions, or racing CPUs without focused indented evidence blocks when they would be clearer, set clean=false and return a commit-message defect. Prefer call chains and ASCII call graphs over prose for multi-function control flow. If the patch changes accepted inputs, callback requirements, helper semantics, locking/lifetime rules, ordering, accounting, or any API contract without updating now-stale matching docs/comments, set clean=false and return a defect. If required proof is missing, set clean=false and return a defect describing the exact correction or evidence needed."
+        },
+        {
+          "id": "bug-coverage",
+          "investigate": "Verify the patch series actually addresses the bug as researched. Enumerate each bug from the original finding: when `metadata.bugs` is present in the finding directory, use that list as the authoritative bug enumeration; otherwise use `research.fix_plan` (one bug per todo). When neither is present treat the whole finding as one anonymous bug. For each bug, classify the outcome against `git diff HEAD~1` (plus prior commits in the current fix series): `fixed` when a concrete diff hunk addresses the bug's trigger path (cite the file:line in the diff or commit ref); `invalidated` when source or commit evidence proves the bug doesn't exist or is already handled (cite the file:line or commit; comments alone are not evidence); `deferred` when another todo in `research.fix_plan` owns this bug (cite the todo id); `unresolved` when the bug is still reachable and this series doesn't address it. Set clean=false on any `unresolved` outcome and emit a defect with where/what describing the missing coverage. Set clean=true only when every bug is `fixed`, `invalidated` with evidence, or `deferred` with a cited todo. Emit the per-bug classifications in the typed `outcomes[]` array with fields `bug`, `outcome`, and `evidence`. When the finding is anchored to a directory (workflow.target_artifact_dir is non-empty), read FINDING.md, summary.md, and metadata.yaml from that directory to anchor the bug enumeration; otherwise rely on research.fix_plan."
         }
       ],
       "aggregate": "consolidate",
@@ -1029,6 +1082,16 @@
             "write-commit-message"
           ],
           "description": "write-patch for source/build/behavior defects; write-commit-message for commit-message-only defects."
+        },
+        "outcomes": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "bug": "string",
+            "outcome": "string",
+            "evidence": "string"
+          },
+          "description": "Per-bug coverage outcomes from the bug-coverage lens. Each entry has a bug id (from metadata.bugs or research.fix_plan, may be empty for single-bug findings), an outcome (fixed | invalidated | deferred | unresolved), and evidence (file:line, commit ref, or todo id). Consumed by the record-results reaper step to persist per-bug results into the finding's metadata.yaml."
         }
       },
       "eval": {
@@ -1043,10 +1106,34 @@
       }
     },
     {
+      "id": "record-results",
+      "title": "Record per-bug outcomes into metadata.yaml",
+      "depends_on": [
+        "review"
+      ],
+      "run_if": "research.research_status == 'confirmed' && review.clean == true && workflow.target_artifact_dir != ''",
+      "agent": "reaper",
+      "action": {
+        "type": "set-finding-results",
+        "args": {
+          "finding_dir": "{{workflow.target_artifact_dir}}",
+          "from": "review"
+        }
+      },
+      "outputs": {
+        "files_updated": {
+          "type": "array<string>"
+        },
+        "outcomes_written": {
+          "type": "integer"
+        }
+      }
+    },
+    {
       "id": "publish",
       "title": "Publish the fix",
       "depends_on": [
-        "review"
+        "record-results"
       ],
       "run_if": "research.research_status == 'confirmed' && review.clean == true && workflow.target_artifact_dir != ''",
       "agent": "reaper",
@@ -1067,7 +1154,7 @@
   ],
   "completion": {
     "success_when_any": [
-      "invalidate.terminal_success",
+      "record-invalidation-results.terminal_success",
       "unconfirm.terminal_success",
       "research.research_status == 'invalid' && workflow.target_artifact_dir == '' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
       "research.research_status == 'unconfirmed' && workflow.target_artifact_dir == ''",

@@ -1063,6 +1063,123 @@ impl LlmDriver {
                 out.insert("status".into(), Value::String(status));
                 Ok(out)
             }
+            crate::workflow::ActionType::SetFindingResults => {
+                let args = action
+                    .args
+                    .as_ref()
+                    .and_then(|a| a.as_object())
+                    .ok_or_else(|| {
+                        format!("set-finding-results step '{}' missing args", step.id)
+                    })?;
+                let dir = args
+                    .get("finding_dir")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "set-finding-results step '{}' missing args.finding_dir",
+                            step.id
+                        )
+                    })?;
+                let dir = interpolate(dir, &self.workflow, ctx, Some(&step.id))
+                    .map_err(|e| format!("set-finding-results dir interpolation: {e}"))?;
+                let synthesize_from = args
+                    .get("synthesize_invalidation_from")
+                    .and_then(|v| v.as_str());
+                let results = if let Some(src) = synthesize_from {
+                    let src = interpolate(src, &self.workflow, ctx, Some(&step.id))
+                        .map_err(|e| {
+                            format!(
+                                "set-finding-results synthesize_invalidation_from interpolation: {e}"
+                            )
+                        })?;
+                    synthesize_invalidation_results(ctx, &src)?
+                } else {
+                    let source_step = args
+                        .get("from")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("review");
+                    let source_step = interpolate(source_step, &self.workflow, ctx, Some(&step.id))
+                        .map_err(|e| format!("set-finding-results from interpolation: {e}"))?;
+                    let outcomes = ctx
+                        .steps
+                        .get(&source_step)
+                        .and_then(|st| st.outputs.get("outcomes"))
+                        .cloned();
+                    parse_finding_results(outcomes.as_ref())?
+                };
+                let mut out = Map::new();
+                if results.is_empty() {
+                    // Same rationale as the SetFindingBugs handler:
+                    // do not wipe a prior `results:` block when the
+                    // source step produced nothing this run. The
+                    // synthesize path always emits at least one
+                    // anonymous entry, so this branch only fires for
+                    // the `from` path with missing/empty outcomes.
+                    out.insert("files_updated".into(), Value::Array(Vec::new()));
+                    out.insert("outcomes_written".into(), Value::Number(0u64.into()));
+                    return Ok(out);
+                }
+                let files_updated = run_set_finding_results(&dir, &results)?;
+                out.insert(
+                    "files_updated".into(),
+                    Value::Array(files_updated.into_iter().map(Value::String).collect()),
+                );
+                out.insert(
+                    "outcomes_written".into(),
+                    Value::Number((results.len() as u64).into()),
+                );
+                Ok(out)
+            }
+            crate::workflow::ActionType::SetFindingBugs => {
+                let args = action
+                    .args
+                    .as_ref()
+                    .and_then(|a| a.as_object())
+                    .ok_or_else(|| format!("set-finding-bugs step '{}' missing args", step.id))?;
+                let dir = args
+                    .get("finding_dir")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        format!(
+                            "set-finding-bugs step '{}' missing args.finding_dir",
+                            step.id
+                        )
+                    })?;
+                let dir = interpolate(dir, &self.workflow, ctx, Some(&step.id))
+                    .map_err(|e| format!("set-finding-bugs dir interpolation: {e}"))?;
+                let source_step = args
+                    .get("from")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("research");
+                let source_step = interpolate(source_step, &self.workflow, ctx, Some(&step.id))
+                    .map_err(|e| format!("set-finding-bugs from interpolation: {e}"))?;
+                let fix_plan = ctx
+                    .steps
+                    .get(&source_step)
+                    .and_then(|st| st.outputs.get("fix_plan"))
+                    .cloned();
+                let bugs = parse_finding_bugs(fix_plan.as_ref())?;
+                let mut out = Map::new();
+                if bugs.is_empty() {
+                    // Empty fix_plan: do not touch metadata.bugs.
+                    // An operator-authored `bugs:` block must survive
+                    // a research run that decided not to split a
+                    // finding into multiple todos.
+                    out.insert("files_updated".into(), Value::Array(Vec::new()));
+                    out.insert("bugs_written".into(), Value::Number(0u64.into()));
+                    return Ok(out);
+                }
+                let files_updated = run_set_finding_bugs(&dir, &bugs)?;
+                out.insert(
+                    "files_updated".into(),
+                    Value::Array(files_updated.into_iter().map(Value::String).collect()),
+                );
+                out.insert(
+                    "bugs_written".into(),
+                    Value::Number((bugs.len() as u64).into()),
+                );
+                Ok(out)
+            }
             other => Err(format!(
                 "reaper step '{}' action.type {other:?} not supported by LlmDriver",
                 step.id
@@ -1736,6 +1853,9 @@ fn consolidate_structured_review(
     let mut analyses = Vec::new();
     let mut all_clean = true;
     let mut dirty_correction_steps = Vec::new();
+    // bug-coverage lens emits `outcomes`; merge by bug id, last lens
+    // wins so a later lens can correct an earlier one.
+    let mut outcomes: Vec<Value> = Vec::new();
 
     for (lens, output) in per_lens {
         let lens_clean = output
@@ -1844,6 +1964,27 @@ fn consolidate_structured_review(
                 dirty_correction_steps.push(step.to_string());
             }
         }
+
+        if let Some(items) = output.get("outcomes").and_then(Value::as_array) {
+            for item in items {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                let bug = obj
+                    .get("bug")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                outcomes.retain(|existing| {
+                    existing
+                        .as_object()
+                        .and_then(|o| o.get("bug").and_then(Value::as_str))
+                        .map(|b| b != bug)
+                        .unwrap_or(true)
+                });
+                outcomes.push(Value::Object(obj.clone()));
+            }
+        }
     }
 
     let commit_message_only = (!defects.is_empty() && source_defects.is_empty())
@@ -1876,6 +2017,7 @@ fn consolidate_structured_review(
         "correction_step".into(),
         Value::String(correction_step.to_string()),
     );
+    out.insert("outcomes".into(), Value::Array(outcomes));
     Ok(out)
 }
 
@@ -2926,25 +3068,174 @@ fn tail_lossy(bytes: &[u8], max: usize) -> String {
     )
 }
 
-fn run_set_finding_status(
-    finding_dir: &str,
-    status: &str,
-    analysis: Option<&str>,
-    invalid_evidence: Option<&str>,
-) -> Result<Vec<String>, String> {
+fn parse_finding_results(value: Option<&Value>) -> Result<Vec<kres_core::FindingResult>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "outcomes must be an array".to_string())?;
+    let mut results = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("outcomes[{idx}] must be an object"))?;
+        let bug = obj
+            .get("bug")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let outcome = obj
+            .get("outcome")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("outcomes[{idx}] missing 'outcome'"))?
+            .to_string();
+        if !matches!(
+            outcome.as_str(),
+            "fixed" | "invalidated" | "deferred" | "unresolved"
+        ) {
+            return Err(format!(
+                "outcomes[{idx}] has invalid outcome {outcome:?} (must be fixed | invalidated | deferred | unresolved)"
+            ));
+        }
+        let evidence = obj
+            .get("evidence")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        results.push(kres_core::FindingResult {
+            bug,
+            outcome,
+            evidence,
+        });
+    }
+    Ok(results)
+}
+
+/// Validate that `finding_dir` is an absolute path and run `op` on
+/// the resolved `Path`. `verb` is folded into the error message
+/// (`"<verb> in <dir>: <e>"`) so callers don't repeat the
+/// boilerplate path-check + path-vec-to-string conversion.
+fn run_finding_io<F>(finding_dir: &str, verb: &str, op: F) -> Result<Vec<String>, String>
+where
+    F: FnOnce(&Path) -> std::io::Result<Vec<PathBuf>>,
+{
     let dir = PathBuf::from(finding_dir);
     if !dir.is_absolute() {
         return Err(format!("finding_dir must be absolute: {finding_dir}"));
     }
-    let mut files: Vec<String> = kres_core::set_finding_status_files(&dir, status)
+    op(&dir)
         .map(|paths| {
             paths
                 .into_iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect()
         })
-        .map_err(|e| format!("update status in {finding_dir}: {e}"))?;
+        .map_err(|e| format!("{verb} in {finding_dir}: {e}"))
+}
+
+fn run_set_finding_results(
+    finding_dir: &str,
+    results: &[kres_core::FindingResult],
+) -> Result<Vec<String>, String> {
+    run_finding_io(finding_dir, "write results", |dir| {
+        kres_core::set_finding_results(dir, results)
+    })
+}
+
+fn parse_finding_bugs(value: Option<&Value>) -> Result<Vec<kres_core::FindingBug>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let arr = value
+        .as_array()
+        .ok_or_else(|| "fix_plan must be an array".to_string())?;
+    let mut bugs = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| format!("fix_plan[{idx}] must be an object"))?;
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("fix_plan[{idx}] missing or empty 'id'"))?
+            .to_string();
+        // Prefer `title`; fall back to `rationale` or `description`
+        // so older plans without a `title` still produce a useful
+        // bug description.
+        let description = obj
+            .get("title")
+            .and_then(Value::as_str)
+            .or_else(|| obj.get("description").and_then(Value::as_str))
+            .or_else(|| obj.get("rationale").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        bugs.push(kres_core::FindingBug { id, description });
+    }
+    Ok(bugs)
+}
+
+fn run_set_finding_bugs(
+    finding_dir: &str,
+    bugs: &[kres_core::FindingBug],
+) -> Result<Vec<String>, String> {
+    run_finding_io(finding_dir, "write bugs", |dir| {
+        kres_core::set_finding_bugs(dir, bugs)
+    })
+}
+
+/// Build invalidation results from a research-style step's outputs.
+/// Each `fix_plan` entry becomes an `invalidated` outcome carrying
+/// the research step's `invalid_evidence` string; when the source
+/// step has no `fix_plan`, emit one anonymous entry so the
+/// metadata.yaml `results:` block records the determination.
+fn synthesize_invalidation_results(
+    ctx: &ExecContext<'_>,
+    source_step: &str,
+) -> Result<Vec<kres_core::FindingResult>, String> {
+    let evidence = ctx
+        .steps
+        .get(source_step)
+        .and_then(|st| st.outputs.get("invalid_evidence"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let fix_plan = ctx
+        .steps
+        .get(source_step)
+        .and_then(|st| st.outputs.get("fix_plan"))
+        .cloned();
+    let bugs = parse_finding_bugs(fix_plan.as_ref())?;
+    if bugs.is_empty() {
+        return Ok(vec![kres_core::FindingResult {
+            bug: String::new(),
+            outcome: "invalidated".to_string(),
+            evidence,
+        }]);
+    }
+    Ok(bugs
+        .into_iter()
+        .map(|b| kres_core::FindingResult {
+            bug: b.id,
+            outcome: "invalidated".to_string(),
+            evidence: evidence.clone(),
+        })
+        .collect())
+}
+
+fn run_set_finding_status(
+    finding_dir: &str,
+    status: &str,
+    analysis: Option<&str>,
+    invalid_evidence: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut files = run_finding_io(finding_dir, "update status", |dir| {
+        kres_core::set_finding_status_files(dir, status)
+    })?;
     if status == "invalidated" {
+        let dir = PathBuf::from(finding_dir);
         let path = kres_core::write_invalidation_artifact(
             &dir,
             analysis.unwrap_or_default(),
@@ -2952,6 +3243,13 @@ fn run_set_finding_status(
         )
         .map_err(|e| format!("write invalidation.md in {finding_dir}: {e}"))?;
         files.push(path.to_string_lossy().into_owned());
+        // Rename any previously-published fixes alongside the status
+        // change so the on-disk artifacts match the new state. No-op
+        // when no prior fix exists.
+        let renamed = run_finding_io(finding_dir, "rename invalidated fixes", |dir| {
+            kres_core::mark_fixes_invalidated(dir)
+        })?;
+        files.extend(renamed);
     }
     Ok(files)
 }

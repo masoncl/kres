@@ -251,6 +251,10 @@ pub enum ActionType {
     CommitFix,
     #[serde(rename = "set-finding-status")]
     SetFindingStatus,
+    #[serde(rename = "set-finding-results")]
+    SetFindingResults,
+    #[serde(rename = "set-finding-bugs")]
+    SetFindingBugs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -905,7 +909,7 @@ mod tests {
         // Research plus deterministic status/commit/build/publish
         // steps around the LLM-authored patch/provenance/message/review
         // steps.
-        assert_eq!(wf.steps.len(), 11, "fix workflow has 11 steps");
+        assert_eq!(wf.steps.len(), 14, "fix workflow has 14 steps");
         let research = wf.steps.iter().find(|s| s.id == "research").unwrap();
         let research_eval = research.eval.as_ref().expect("research eval");
         assert_eq!(research_eval.kind, EvalKind::Builtin);
@@ -991,9 +995,16 @@ mod tests {
             fixes.outputs.contains_key("unproven_fixes_candidates"),
             "fixes-tag-search must preserve plausible unproven candidates"
         );
-        // Invalidate is a terminal-on-success short-circuit.
+        // Invalidate now hands off to record-invalidation-results,
+        // which is the terminal-on-success short-circuit.
         let inv = wf.steps.iter().find(|s| s.id == "invalidate").unwrap();
-        assert!(inv.terminal_on_success);
+        assert!(!inv.terminal_on_success);
+        let rec_inv = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "record-invalidation-results")
+            .unwrap();
+        assert!(rec_inv.terminal_on_success);
         let write_commit_message = wf
             .steps
             .iter()
@@ -1024,7 +1035,7 @@ mod tests {
                 ][..]
             )
         );
-        assert_eq!(review.lenses.len(), 7);
+        assert_eq!(review.lenses.len(), 8);
         assert_eq!(review.aggregate, Some(Aggregate::Consolidate));
         assert!(review.consolidate.is_some());
         let review_prompt = review.prompt.as_deref().unwrap_or("");

@@ -5151,7 +5151,7 @@ mod tests {
         eprintln!("{}", trace.pretty());
         assert_eq!(
             trace.status,
-            WorkflowStatus::TerminalSuccess("invalidate".to_string())
+            WorkflowStatus::TerminalSuccess("record-invalidation-results".to_string())
         );
 
         // Steps that must NOT have run.

@@ -92,6 +92,7 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 impl Effort {
@@ -100,6 +101,7 @@ impl Effort {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::XHigh => "xhigh",
         }
     }
 }

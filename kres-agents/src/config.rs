@@ -110,6 +110,8 @@ pub enum AgentThinkingEffort {
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
 }
 
 impl AgentThinkingConfig {
@@ -134,6 +136,7 @@ impl From<AgentThinkingEffort> for Effort {
             AgentThinkingEffort::Low => Effort::Low,
             AgentThinkingEffort::Medium => Effort::Medium,
             AgentThinkingEffort::High => Effort::High,
+            AgentThinkingEffort::XHigh => Effort::XHigh,
         }
     }
 }
@@ -460,6 +463,22 @@ mod tests {
             Some(ThinkingBudget::Adaptive(Effort::High))
         );
         assert!(c.system.as_deref().unwrap().contains("fast agent"));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn loads_adaptive_xhigh_effort() {
+        let p = write_tmp(
+            r#"{
+                "api_key": "sk-x",
+                "thinking": {"type": "adaptive", "effort": "xhigh"}
+            }"#,
+        );
+        let c = AgentConfig::load(&p).unwrap();
+        assert_eq!(
+            c.thinking.as_ref().map(|t| t.to_budget(128000)),
+            Some(ThinkingBudget::Adaptive(Effort::XHigh))
+        );
         std::fs::remove_file(&p).ok();
     }
 

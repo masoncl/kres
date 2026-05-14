@@ -46,7 +46,7 @@ pub use findings::{
     Finding, FindingDetail, FindingsFile, FindingsStore, Severity, Status,
 };
 pub use lens::LensSpec;
-pub use log::{LoggedUsage, TurnLogger};
+pub use log::{LoggedUsage, RequestMeta, TurnLogger};
 pub use mode::{CodeEdit, CodeFile, TaskMode};
 pub use plan::{extract_embedded_plan, Plan, PlanRewrite, PlanStep, PlanStepStatus};
 pub use session_state::{SessionState, SessionStateError};

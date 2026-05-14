@@ -276,6 +276,12 @@ for the fast + slow agent pipeline. Fields:
   cache_creation}` token counts.
 - `thinking` (assistant only, when extended thinking is enabled)
   — extracted thinking-block text.
+- `request` (user only, on slow and lens calls) — wire-relevant
+  request config: `{model, max_tokens, thinking, effort,
+  budget_tokens}`. `thinking` is the API's `type` value
+  (`"adaptive"` or `"enabled"`); `effort` is present for adaptive
+  thinking (`"low"` / `"medium"` / `"high"` / `"xhigh"`);
+  `budget_tokens` is present for explicit-budget thinking.
 
 A slow agent response that starts with `[INVALID]` is the agent's
 signal that the bug was determined not real. Review-step lens

@@ -435,7 +435,15 @@ fn build_lens_call_future(
             lens_label,
         );
         if let Some(lg) = &logger {
-            lg.log_code_labeled("user", Some(&log_label), &lens_logged, None, None);
+            let meta = cfg.request_meta();
+            lg.log_code_labeled_with_request(
+                "user",
+                Some(&log_label),
+                &lens_logged,
+                None,
+                None,
+                Some(&meta),
+            );
         }
         tokio::select! {
             _ = shutdown.cancelled() => Err((lens_id, model_label, "cancelled".to_string())),
@@ -891,7 +899,15 @@ impl Orchestrator {
         }
         if let Some(lg) = &self.logger {
             let label = format!("phase=slow task={log_task}");
-            lg.log_code_labeled("user", Some(&label), &slow_logged, None, None);
+            let meta = cfg.request_meta();
+            lg.log_code_labeled_with_request(
+                "user",
+                Some(&label),
+                &slow_logged,
+                None,
+                None,
+                Some(&meta),
+            );
         }
         kres_core::async_eprintln!(
             "[slow] analyzing with {} symbol(s), {} context item(s), {} previous finding(s)",

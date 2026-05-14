@@ -32,7 +32,9 @@ const NAMESPACE_OID: Uuid = Uuid::from_bytes([
 
 /// One row in a log file. `usage` carries the server-reported token
 /// breakdown; `thinking` captures the slow agent's reasoning stream
-/// when it is available.
+/// when it is available; `request` snapshots wire-relevant request
+/// config (model, max_tokens, thinking shape) for user-side records
+/// so log readers can confirm what was actually asked of the model.
 #[derive(Debug, Serialize)]
 struct LogEntry<'a> {
     role: &'a str,
@@ -43,6 +45,25 @@ struct LogEntry<'a> {
     usage: Option<LoggedUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request: Option<&'a RequestMeta>,
+}
+
+/// Wire-relevant request config snapshot. Populated on user-side
+/// log records for calls that go to a Claude / OpenAI completion
+/// endpoint. Fields that don't apply (e.g. `effort` for a
+/// non-adaptive thinking shape, `budget_tokens` for adaptive) are
+/// omitted via `skip_serializing_if`.
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct RequestMeta {
+    pub model: String,
+    pub max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, Default)]
@@ -130,7 +151,23 @@ impl TurnLogger {
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
     ) {
-        if let Err(e) = self.write(true, role, label, content, usage, thinking) {
+        self.log_code_labeled_with_request(role, label, content, usage, thinking, None);
+    }
+
+    /// Like `log_code_labeled` but also serialises a `request` block
+    /// describing the wire-format request config (model, max_tokens,
+    /// thinking shape). Use this from call sites that go straight to
+    /// a completion endpoint so reviewers can verify what was asked.
+    pub fn log_code_labeled_with_request(
+        &self,
+        role: &str,
+        label: Option<&str>,
+        content: &str,
+        usage: Option<LoggedUsage>,
+        thinking: Option<&str>,
+        request: Option<&RequestMeta>,
+    ) {
+        if let Err(e) = self.write(true, role, label, content, usage, thinking, request) {
             tracing::warn!(target: "kres_core::log", "code log write failed: {e}");
         }
     }
@@ -143,11 +180,12 @@ impl TurnLogger {
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
     ) {
-        if let Err(e) = self.write(false, role, None, content, usage, thinking) {
+        if let Err(e) = self.write(false, role, None, content, usage, thinking, None) {
             tracing::warn!(target: "kres_core::log", "main log write failed: {e}");
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
         is_code: bool,
@@ -156,6 +194,7 @@ impl TurnLogger {
         content: &str,
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
+        request: Option<&RequestMeta>,
     ) -> io::Result<()> {
         let entry = LogEntry {
             role,
@@ -163,6 +202,7 @@ impl TurnLogger {
             content,
             usage,
             thinking,
+            request,
         };
         let line = serde_json::to_string(&entry).map_err(io::Error::other)?;
         let mut guard = self.inner.lock().unwrap();
@@ -273,6 +313,49 @@ mod tests {
         let s = std::fs::read_to_string(session.join("code.jsonl")).unwrap();
         assert!(!s.contains("cache_creation"));
         assert!(!s.contains("cache_read"));
+    }
+
+    #[test]
+    fn code_log_emits_request_meta_when_provided() {
+        let dir = tempdir().unwrap();
+        let log = TurnLogger::new(dir.path()).unwrap();
+        let meta = RequestMeta {
+            model: "claude-x".into(),
+            max_tokens: 128_000,
+            thinking: Some("adaptive".into()),
+            effort: Some("xhigh".into()),
+            budget_tokens: None,
+        };
+        log.log_code_labeled_with_request(
+            "user",
+            Some("phase=slow task=research"),
+            "{}",
+            None,
+            None,
+            Some(&meta),
+        );
+        // No-meta path should omit the field entirely.
+        log.log_code_labeled("user", Some("phase=fast-gather"), "{}", None, None);
+        drop(log);
+
+        let logs = dir.path().join(".kres").join("logs");
+        let session = std::fs::read_dir(&logs)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let s = std::fs::read_to_string(session.join("code.jsonl")).unwrap();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // First line carries the request block with xhigh.
+        assert!(lines[0].contains("\"request\":"));
+        assert!(lines[0].contains("\"effort\":\"xhigh\""));
+        assert!(lines[0].contains("\"thinking\":\"adaptive\""));
+        assert!(lines[0].contains("\"model\":\"claude-x\""));
+        assert!(!lines[0].contains("\"budget_tokens\""));
+        // Second line (no meta) must NOT carry a request block.
+        assert!(!lines[1].contains("\"request\":"));
     }
 
     #[test]

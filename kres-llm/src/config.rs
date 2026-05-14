@@ -96,6 +96,31 @@ impl CallConfig {
         self.stream_label = Some(label.into());
         self
     }
+
+    /// Snapshot the wire-relevant request fields for log-side
+    /// auditing. Captured: model id, max_tokens, the thinking
+    /// shape (`enabled`/`adaptive`), `effort` for adaptive, and
+    /// `budget_tokens` for explicit-budget. Fields that don't
+    /// apply remain `None` so the resulting `RequestMeta`
+    /// serialises cleanly via `skip_serializing_if`.
+    pub fn request_meta(&self) -> kres_core::RequestMeta {
+        let (thinking, effort, budget_tokens) = match self.thinking {
+            ThinkingBudget::Disabled => (None, None, None),
+            ThinkingBudget::ExplicitBudget(n) => (Some("enabled".to_string()), None, Some(n)),
+            ThinkingBudget::Adaptive(effort) => (
+                Some("adaptive".to_string()),
+                Some(effort.as_str().to_string()),
+                None,
+            ),
+        };
+        kres_core::RequestMeta {
+            model: self.model.id.clone(),
+            max_tokens: self.max_tokens,
+            thinking,
+            effort,
+            budget_tokens,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +144,39 @@ mod tests {
         // bugs.md#R2: quarter-reservation rule must still hold.
         assert!(tb <= 32_000);
         assert!(c.max_tokens - tb >= c.max_tokens / 4);
+    }
+
+    #[test]
+    fn request_meta_carries_xhigh_effort() {
+        let cfg = CallConfig::defaults_for(Model::opus_4_7())
+            .with_max_tokens(64_000)
+            .with_thinking(ThinkingBudget::Adaptive(crate::model::Effort::XHigh));
+        let meta = cfg.request_meta();
+        assert_eq!(meta.model, "claude-opus-4-7");
+        assert_eq!(meta.max_tokens, 64_000);
+        assert_eq!(meta.thinking.as_deref(), Some("adaptive"));
+        assert_eq!(meta.effort.as_deref(), Some("xhigh"));
+        assert!(meta.budget_tokens.is_none());
+    }
+
+    #[test]
+    fn request_meta_carries_explicit_budget() {
+        let cfg = CallConfig::defaults_for(Model::sonnet_4_6())
+            .with_thinking(ThinkingBudget::ExplicitBudget(8_000));
+        let meta = cfg.request_meta();
+        assert_eq!(meta.thinking.as_deref(), Some("enabled"));
+        assert_eq!(meta.budget_tokens, Some(8_000));
+        assert!(meta.effort.is_none());
+    }
+
+    #[test]
+    fn request_meta_omits_thinking_when_disabled() {
+        let cfg =
+            CallConfig::defaults_for(Model::sonnet_4_6()).with_thinking(ThinkingBudget::Disabled);
+        let meta = cfg.request_meta();
+        assert!(meta.thinking.is_none());
+        assert!(meta.effort.is_none());
+        assert!(meta.budget_tokens.is_none());
     }
 
     #[test]

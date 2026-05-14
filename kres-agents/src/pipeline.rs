@@ -72,7 +72,7 @@ const GENERIC_LENS_REPAIR_RETRIES: usize = 1;
 /// For fast-agent gather rounds the tail still cache-hits on round
 /// 2+ via the `Message::cache` flag. Non-lensed slow-agent calls do
 /// not use this cache at all; review lenses use the separate
-/// `LENS_SHARED_CACHE_FIELDS` prefix and warmup path below.
+/// `LENS_SHARED_CACHE_FIELDS` prefix below.
 const CACHED_PREFIX_FIELDS: &[&str] = &["skills"];
 const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
     "question",
@@ -82,7 +82,6 @@ const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
     "skills",
     "plan",
 ];
-const MIN_LENS_CACHE_WARM_PREFIX_CHARS: usize = 4096;
 
 /// Abstraction over the main-agent's data-fetch capability.
 /// Implementations route followups to MCP tools, grep, read, git.
@@ -159,7 +158,6 @@ pub struct LensRepairPolicy<'a> {
 struct PreparedLensFanout {
     prompt: String,
     shared_prefix: String,
-    warmed_prefixes: HashSet<String>,
     slow_variants: Vec<SlowAgentVariant>,
     trimmed_symbols: Vec<Value>,
     trimmed_context: Vec<Value>,
@@ -170,7 +168,28 @@ struct PreparedLensFanout {
 
 type RawLensSuccess = (String, Value, String, String, CodeResponse);
 type RawLensFailure = (String, String, String);
-type RawLensResult = Option<Result<RawLensSuccess, RawLensFailure>>;
+type RawLensResult = Result<RawLensSuccess, RawLensFailure>;
+
+#[derive(Clone)]
+struct LensCallSpec {
+    lens_id: String,
+    lens_value: Value,
+    lens_name: String,
+    lens_suffix: String,
+}
+
+#[derive(Clone, Copy)]
+enum CacheMode {
+    /// Try a sequential seed call with `cache_control` to prime the
+    /// shared prefix, then fan out the rest with `cache_control`. If
+    /// the seed call fails, rerun every lens in parallel with no
+    /// `cache_control` so a single transient error can't stall the
+    /// whole fan-out.
+    PrimeThenParallel,
+    /// Skip cache priming entirely: run every lens in parallel with
+    /// no `cache_control`. Used by the repair retry path.
+    Parallel,
+}
 
 /// No-op fetcher used in tests. It returns empty results regardless
 /// of input — good enough to prove the orchestration plumbing without
@@ -355,6 +374,95 @@ fn slow_variant_call_config(
         cfg = cfg.with_max_input_tokens(n);
     }
     cfg
+}
+
+/// Build a single lens-call future. `use_cache=true` sends the
+/// shared prefix as a `cache_control: ephemeral` block; `use_cache=false`
+/// folds the prefix into plain content so the request carries no
+/// cache breakpoint at all. Same byte-identical prompt either way —
+/// only the wire framing changes.
+#[allow(clippy::too_many_arguments)]
+fn build_lens_call_future(
+    spec: LensCallSpec,
+    variant: SlowAgentVariant,
+    shared_prefix: String,
+    use_cache: bool,
+    task_brief: String,
+    shutdown: Shutdown,
+    usage: Option<Arc<UsageTracker>>,
+    logger: Option<Arc<TurnLogger>>,
+) -> impl std::future::Future<Output = RawLensResult> + Send + 'static {
+    let LensCallSpec {
+        lens_id,
+        lens_value,
+        lens_name,
+        lens_suffix,
+    } = spec;
+    let SlowAgentVariant {
+        client,
+        model,
+        system,
+        max_tokens,
+        max_input_tokens,
+        thinking,
+        label: model_label,
+    } = variant;
+    let lens_label = format!("lens {lens_name} ({model_label})");
+    let log_label = format!("phase=slow-lens task={task_brief} lens={lens_id} model={model_label}");
+    let lens_logged = format!("{shared_prefix}{lens_suffix}");
+    async move {
+        let messages = if use_cache {
+            vec![Message {
+                role: "user".into(),
+                content: lens_suffix,
+                cache: false,
+                cached_prefix: Some(shared_prefix),
+            }]
+        } else {
+            vec![Message {
+                role: "user".into(),
+                content: lens_logged.clone(),
+                cache: false,
+                cached_prefix: None,
+            }]
+        };
+        let cfg = slow_variant_call_config(
+            model.clone(),
+            max_tokens,
+            max_input_tokens,
+            thinking,
+            system,
+            lens_label,
+        );
+        if let Some(lg) = &logger {
+            lg.log_code_labeled("user", Some(&log_label), &lens_logged, None, None);
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => Err((lens_id, model_label, "cancelled".to_string())),
+            r = client.messages_streaming(&cfg, &messages) => match r {
+                Ok(resp) => {
+                    record_usage(&usage, "slow", &model, &resp.usage);
+                    let t = extract_text(&resp);
+                    if let Some(lg) = &logger {
+                        let th = extract_thinking(&resp);
+                        lg.log_code_labeled(
+                            "assistant",
+                            Some(&log_label),
+                            &t,
+                            Some(log_usage(&resp.usage)),
+                            th.as_deref(),
+                        );
+                    }
+                    let parsed = parse_code_response(&t);
+                    Ok((lens_id, lens_value, model_label, t, parsed))
+                }
+                Err(e) => {
+                    tracing::warn!(target: "kres_agents", "lens call failed: {e}");
+                    Err((lens_id, model_label, e.to_string()))
+                }
+            }
+        }
+    }
 }
 
 /// Extract the concatenated "thinking" block text from a response, if
@@ -701,12 +809,12 @@ impl Orchestrator {
         let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
         let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
         let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
-        // Non-lensed slow calls are one-shot. Do not use prompt
-        // cache split/warmup here: there is no parallel fan-out to
-        // amortize the cache write, and repeated workflow correction
-        // passes should not keep paying to create slow-agent cache
-        // entries. Review paths that actually benefit from a shared
-        // context prefix go through run_with_lenses below.
+        // Non-lensed slow calls are one-shot. Do not split off a
+        // cached prefix here: there is no parallel fan-out to amortize
+        // the cache write, and repeated workflow correction passes
+        // should not keep paying to create slow-agent cache entries.
+        // Review paths that actually benefit from a shared context
+        // prefix go through run_with_lenses below.
         let mut slow_cp = CodePrompt::new(prompt)
             .with_symbols(&trimmed_symbols)
             .with_context(&trimmed_context)
@@ -1232,7 +1340,15 @@ impl Orchestrator {
     {
         let prepared = self.prepare_lens_fanout(prompt, ctx, shutdown).await?;
         let mut fanout = self
-            .run_prepared_lens_fanout(&prepared, lenses, lenses, ctx, None, shutdown)
+            .run_prepared_lens_fanout(
+                &prepared,
+                lenses,
+                lenses,
+                ctx,
+                None,
+                CacheMode::PrimeThenParallel,
+                shutdown,
+            )
             .await?;
 
         for retry in 0..repair.max_retries {
@@ -1274,6 +1390,7 @@ impl Orchestrator {
                     lenses,
                     ctx,
                     Some(repair.repair_instruction),
+                    CacheMode::Parallel,
                     shutdown,
                 )
                 .await?;
@@ -1310,17 +1427,16 @@ impl Orchestrator {
             .gather(gather_prompt, ctx.plan.as_ref(), shutdown)
             .await?;
 
-        // Fan out N slow-agent calls in parallel. Slow-agent
-        // followups are returned to the workflow layer; they are not
-        // consumed inside this task. Review workflows use them as the
-        // next-turn frontier.
+        // All review lenses share the same gathered source/context.
+        // `run_prepared_lens_fanout` runs the first lens sequentially
+        // with `cache_control` to prime the Anthropic prompt cache,
+        // then fans the rest out in parallel so they cache_read the
+        // same prefix. If the seed call fails it falls back to
+        // running every lens in parallel without `cache_control` —
+        // we lose caching but the fan-out survives. This function
+        // just stages the shared-prefix bytes; all dispatch logic
+        // lives downstream.
         let slow_variants = self.effective_slow_variants();
-        // bugs.md#cache: all review lenses receive the same gathered
-        // source/context. Warm that shared prefix once per slow
-        // model/system before launching the parallel lens calls. On
-        // Anthropic this writes the explicit ephemeral prompt cache;
-        // on GPT/OpenAI deployments it gives provider-side automatic
-        // prefix caching a single stable request to match.
         let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
         let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
         let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
@@ -1336,14 +1452,10 @@ impl Orchestrator {
             shared_cp = shared_cp.with_plan(p);
         }
         let (shared_prefix, _) = shared_cp.to_cached_split_json(LENS_SHARED_CACHE_FIELDS)?;
-        let warmed_prefixes = self
-            .warm_lens_shared_cache(&slow_variants, &shared_prefix, shutdown)
-            .await;
 
         Ok(PreparedLensFanout {
             prompt: prompt.to_string(),
             shared_prefix,
-            warmed_prefixes,
             slow_variants,
             trimmed_symbols,
             trimmed_context,
@@ -1353,6 +1465,7 @@ impl Orchestrator {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_prepared_lens_fanout(
         &self,
         prepared: &PreparedLensFanout,
@@ -1360,9 +1473,13 @@ impl Orchestrator {
         all_lenses: &[LensSpec],
         ctx: &RunContext,
         extra_lens_instruction: Option<&str>,
+        cache_mode: CacheMode,
         shutdown: &Shutdown,
     ) -> Result<LensFanoutOutput, AgentError> {
-        let mut futures = Vec::with_capacity(lenses.len() * prepared.slow_variants.len());
+        // Build per-lens specs once; the same specs feed every slow
+        // variant and may be reused across the cache-prime attempt
+        // and the no-cache fallback.
+        let mut lens_specs: Vec<LensCallSpec> = Vec::with_capacity(lenses.len());
         for lens in lenses.iter() {
             // §20b: send identity-only lens descriptors to the slow
             // agent.
@@ -1407,94 +1524,96 @@ impl Orchestrator {
                 lens_cp = lens_cp.with_plan(p);
             }
             let lens_suffix = lens_cp.to_cached_tail_json(LENS_SHARED_CACHE_FIELDS)?;
-            let lens_logged = format!("{}{}", prepared.shared_prefix, lens_suffix);
-            let lens_id = lens.id.clone();
-            let lens_value = lens_identity(lens);
-            for variant in prepared.slow_variants.iter().cloned() {
-                let client = variant.client.clone();
-                let model = variant.model.clone();
-                let system = variant.system.clone();
-                let cache_key = lens_cache_key(&model.id, system.as_deref());
-                let use_warmed_prefix = prepared.warmed_prefixes.contains(&cache_key);
-                let max_tokens = variant.max_tokens;
-                let max_input_tokens = variant.max_input_tokens;
-                let thinking = variant.thinking;
-                let model_label = variant.label.clone();
-                let shutdown_c = shutdown.clone();
-                let usage = self.usage.clone();
-                let logger = self.logger.clone();
-                let lens_label = format!("lens {} ({model_label})", lens.name);
-                let log_label = format!(
-                    "phase=slow-lens task={} lens={} model={model_label}",
-                    ctx.task_brief, lens.id
-                );
-                let shared_prefix = prepared.shared_prefix.clone();
-                let lens_suffix = lens_suffix.clone();
-                let lens_logged = lens_logged.clone();
-                let lens_id = lens_id.clone();
-                let lens_value = lens_value.clone();
-                futures.push(async move {
-                    // Each lens fan-out is a one-shot slow call. Same
-                    // reasoning as the single slow path above: avoid
-                    // caching the volatile tail, keep the exact warmed
-                    // shared prefix separate when this model/system
-                    // successfully warmed it, and otherwise fold the
-                    // same prefix bytes into the plain content.
-                    let (content, cached_prefix) = if use_warmed_prefix {
-                        (lens_suffix, Some(shared_prefix))
-                    } else {
-                        (format!("{shared_prefix}{lens_suffix}"), None)
-                    };
-                    let messages = vec![Message {
-                        role: "user".into(),
-                        content,
-                        cache: false,
-                        cached_prefix,
-                    }];
-                    let cfg = slow_variant_call_config(
-                        model.clone(),
-                        max_tokens,
-                        max_input_tokens,
-                        thinking,
-                        system,
-                        lens_label,
-                    );
-                    if let Some(lg) = &logger {
-                        lg.log_code_labeled("user", Some(&log_label), &lens_logged, None, None);
-                    }
-                    tokio::select! {
-                        _ = shutdown_c.cancelled() => Some(Err((lens_id, model_label, "cancelled".to_string()))),
-                        r = client.messages_streaming(&cfg, &messages) => match r {
-                            Ok(resp) => {
-                                record_usage(&usage, "slow", &model, &resp.usage);
-                                let t = extract_text(&resp);
-                                if let Some(lg) = &logger {
-                                    let th = extract_thinking(&resp);
-                                    lg.log_code_labeled(
-                                        "assistant",
-                                        Some(&log_label),
-                                        &t,
-                                        Some(log_usage(&resp.usage)),
-                                        th.as_deref(),
-                                    );
-                                }
-                                let parsed = parse_code_response(&t);
-                                Some(Ok((lens_id, lens_value, model_label, t, parsed)))
+            lens_specs.push(LensCallSpec {
+                lens_id: lens.id.clone(),
+                lens_value: lens_identity(lens),
+                lens_name: lens.name.clone(),
+                lens_suffix,
+            });
+        }
+        // Each slow variant has its own prompt cache (cache key
+        // includes model + system + prefix bytes), so each variant
+        // runs its own sequence concurrently. PrimeThenParallel
+        // serializes one cache-priming call per variant and falls
+        // back to no-cache parallel on seed failure; Parallel skips
+        // priming entirely.
+        let variant_runs = prepared.slow_variants.iter().cloned().map(|variant| {
+            let lens_specs = lens_specs.clone();
+            let shared_prefix = prepared.shared_prefix.clone();
+            let task_brief = ctx.task_brief.clone();
+            let shutdown = shutdown.clone();
+            let usage = self.usage.clone();
+            let logger = self.logger.clone();
+            async move {
+                let make_future = |spec: LensCallSpec, use_cache: bool| {
+                    build_lens_call_future(
+                        spec,
+                        variant.clone(),
+                        shared_prefix.clone(),
+                        use_cache,
+                        task_brief.clone(),
+                        shutdown.clone(),
+                        usage.clone(),
+                        logger.clone(),
+                    )
+                };
+                match cache_mode {
+                    CacheMode::PrimeThenParallel => {
+                        let Some((first_spec, rest_specs)) = lens_specs.split_first() else {
+                            return Vec::<RawLensResult>::new();
+                        };
+                        let seed = make_future(first_spec.clone(), true).await;
+                        match &seed {
+                            Ok(_) => {
+                                let rest: Vec<_> = rest_specs
+                                    .iter()
+                                    .map(|s| make_future(s.clone(), true))
+                                    .collect();
+                                let mut raws = Vec::with_capacity(1 + rest.len());
+                                raws.push(seed);
+                                raws.extend(join_all(rest).await);
+                                raws
                             }
-                            Err(e) => {
-                                tracing::warn!(target: "kres_agents", "lens call failed: {e}");
-                                Some(Err((lens_id, model_label, e.to_string())))
+                            Err(_) => {
+                                // Seed failed: give up on caching and
+                                // run every lens (including the one
+                                // that just failed) in parallel with
+                                // no `cache_control`. A single
+                                // transient seed failure must not
+                                // stall or shrink the fan-out.
+                                //
+                                // Exception: if shutdown is already
+                                // cancelled, every fallback future
+                                // would just re-error with
+                                // "cancelled" — return the seed
+                                // result alone instead of spamming N
+                                // duplicate cancellation entries.
+                                if shutdown.is_cancelled() {
+                                    return vec![seed];
+                                }
+                                let fallback: Vec<_> = lens_specs
+                                    .iter()
+                                    .map(|s| make_future(s.clone(), false))
+                                    .collect();
+                                join_all(fallback).await
                             }
                         }
                     }
-                });
+                    CacheMode::Parallel => {
+                        let futs: Vec<_> = lens_specs
+                            .iter()
+                            .map(|s| make_future(s.clone(), false))
+                            .collect();
+                        join_all(futs).await
+                    }
+                }
             }
-        }
-        let raws: Vec<RawLensResult> = join_all(futures).await;
+        });
+        let raws: Vec<RawLensResult> = join_all(variant_runs).await.into_iter().flatten().collect();
 
         let mut outputs = Vec::new();
         let mut failures = Vec::new();
-        for raw in raws.into_iter().flatten() {
+        for raw in raws.into_iter() {
             match raw {
                 Ok((lens_id, lens, model_label, raw_response, parsed)) => {
                     outputs.push(LensRunOutput {
@@ -1537,95 +1656,6 @@ impl Orchestrator {
         } else {
             self.slow_variants.clone()
         }
-    }
-
-    async fn warm_lens_shared_cache(
-        &self,
-        slow_variants: &[SlowAgentVariant],
-        shared_prefix: &str,
-        shutdown: &Shutdown,
-    ) -> HashSet<String> {
-        let mut warmed = HashSet::new();
-        if shared_prefix.len() < MIN_LENS_CACHE_WARM_PREFIX_CHARS {
-            return warmed;
-        }
-
-        let mut attempted = HashSet::new();
-        let mut attempts = 0usize;
-        let mut successes = 0usize;
-        for variant in slow_variants {
-            let key = lens_cache_key(&variant.model.id, variant.system.as_deref());
-            if !attempted.insert(key.clone()) {
-                continue;
-            }
-            if shutdown.is_cancelled() {
-                return warmed;
-            }
-            attempts += 1;
-            let messages = vec![Message {
-                role: "user".into(),
-                content: concat!(
-                    "  \"_cache_warm\": true,\n",
-                    "  \"_cache_warm_instruction\": \"Do not analyze this payload. Reply with a single period.\"\n",
-                    "}\n"
-                )
-                .to_string(),
-                cache: false,
-                cached_prefix: Some(shared_prefix.to_string()),
-            }];
-            let cfg = slow_variant_call_config(
-                variant.model.clone(),
-                variant.max_tokens,
-                variant.max_input_tokens,
-                variant.thinking,
-                variant.system.clone(),
-                format!("lens cache warm ({})", variant.label),
-            );
-            let log_label = format!(
-                "phase=slow-lens-cache-warm model={} label={}",
-                variant.model.id, variant.label
-            );
-            let warm_logged = format!("{}{}", shared_prefix, messages[0].content);
-            if let Some(lg) = &self.logger {
-                lg.log_code_labeled("user", Some(&log_label), &warm_logged, None, None);
-            }
-            let result = tokio::select! {
-                _ = shutdown.cancelled() => return warmed,
-                r = variant.client.messages_streaming(&cfg, &messages) => r,
-            };
-            match result {
-                Ok(resp) => {
-                    record_usage(&self.usage, "slow", &variant.model, &resp.usage);
-                    if let Some(lg) = &self.logger {
-                        let text = extract_text(&resp);
-                        let thinking = extract_thinking(&resp);
-                        lg.log_code_labeled(
-                            "assistant",
-                            Some(&log_label),
-                            &text,
-                            Some(log_usage(&resp.usage)),
-                            thinking.as_deref(),
-                        );
-                    }
-                    successes += 1;
-                    warmed.insert(key);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "kres_agents",
-                        model = %variant.model.id,
-                        "lens shared cache warm failed: {e}"
-                    );
-                }
-            }
-        }
-        if attempts > 0 {
-            kres_core::async_eprintln!(
-                "[review lenses] warmed shared context cache: {successes}/{attempts} model/system prefix(es), {}k chars",
-                shared_prefix.len() / 1000,
-            );
-        }
-        warmed
     }
 
     /// Helper that runs the fast→main loop and returns accumulated
@@ -2012,10 +2042,6 @@ fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn lens_cache_key(model_id: &str, system: Option<&str>) -> String {
-    format!("{}\0{}", model_id, system.unwrap_or(""))
-}
-
 fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
     let mut out = String::new();
     for block in &resp.content {
@@ -2030,35 +2056,6 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 mod tests {
     use super::*;
     use crate::followup::Followup;
-
-    #[test]
-    fn lens_cache_warm_uses_same_slow_request_shape_as_lens_call() {
-        let model = Model::from_id("claude-sonnet-4-6");
-        let thinking = Some(ThinkingBudget::Adaptive(kres_llm::model::Effort::Medium));
-        let warm = slow_variant_call_config(
-            model.clone(),
-            64_000,
-            Some(900_000),
-            thinking,
-            Some("slow system".to_string()),
-            "lens cache warm".to_string(),
-        );
-        let lens = slow_variant_call_config(
-            model,
-            64_000,
-            Some(900_000),
-            thinking,
-            Some("slow system".to_string()),
-            "lens memory".to_string(),
-        );
-
-        assert_eq!(warm.model.id, lens.model.id);
-        assert_eq!(warm.max_tokens, lens.max_tokens);
-        assert_eq!(warm.max_input_tokens, lens.max_input_tokens);
-        assert_eq!(warm.thinking, lens.thinking);
-        assert_eq!(warm.system, lens.system);
-        assert_eq!(warm.system_cached, lens.system_cached);
-    }
 
     #[tokio::test]
     async fn null_fetcher_returns_empty() {

@@ -166,8 +166,8 @@ impl<'a> CodePrompt<'a> {
 
     /// Return only the tail that belongs after a cached prefix built
     /// from `static_keys`. Use this when the caller already has the
-    /// exact prefix bytes to send, e.g. a cache-warm call that must
-    /// be reused verbatim by all fan-out requests.
+    /// exact prefix bytes to send and wants every fan-out request to
+    /// reuse them verbatim.
     pub fn to_cached_tail_json(&self, static_keys: &[&str]) -> serde_json::Result<String> {
         let (static_map, volatile_map) = self.split_static_volatile(static_keys)?;
         if static_map.is_empty() {

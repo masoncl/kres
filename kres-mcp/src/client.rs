@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use crate::{
     config::ServerConfig,
     error::McpError,
-    message::{JsonRpcError, Notification, Request, Response, ResponseResult},
+    message::{Notification, Request, Response, ResponseResult},
     transport::Transport,
 };
 
@@ -303,15 +303,6 @@ fn decode_result(server: &str, resp: Response) -> Result<Value, McpError> {
             code: error.code,
             message: error.message,
         }),
-    }
-}
-
-#[allow(dead_code)]
-fn reexport_jsonrpc_error() -> JsonRpcError {
-    JsonRpcError {
-        code: 0,
-        message: String::new(),
-        data: None,
     }
 }
 

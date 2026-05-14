@@ -101,6 +101,22 @@ User prompt → Task created → Task thread starts
   Prose may be preserved for humans and logs, but it must not be a hidden
   control channel.
 
+### Lints
+- The pre-commit hook runs `cargo clippy --workspace --all-targets
+  -- -D warnings`. Do not silence a clippy diagnostic with
+  `#[allow(clippy::...)]` (or any other lint-suppression attribute)
+  to make the hook pass. Fix the underlying issue instead:
+  `clippy::too_many_arguments` → bundle related args into a struct
+  or split the function; `clippy::while_let_loop` → rewrite as the
+  suggested form; `clippy::needless_clone` → drop the clone; and so
+  on. Suppressions are only acceptable when there is a concrete
+  reason the lint is wrong for that call site, in which case a
+  one-line comment above the attribute must say why. A `#[allow]`
+  with no explanation is treated the same as an unfixed warning.
+- This rule applies even when an existing `#[allow]` is already in
+  the file. Pre-existing suppressions are technical debt, not a
+  precedent.
+
 ### Async REPL
 - Input runs in a separate thread (readline → queue)
 - Main loop: 100ms poll cycle checking input queue + servicing tasks

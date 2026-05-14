@@ -409,9 +409,6 @@ pub fn parse_read_spec(spec: &str) -> Result<ReadArgs, AgentError> {
     })
 }
 
-#[allow(dead_code)]
-fn _ensure_path_compiles(_: &Path) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1363,15 +1363,17 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         let built = build_orchestrator(
             fc,
             sc,
-            slow_agent_specs.iter().skip(1).cloned().collect(),
             workspace,
             fetcher,
-            skills_value,
-            usage.clone(),
-            args.gather_turns,
-            logger.clone(),
-            Some(results_dir.join("comparison.json")),
             &settings,
+            kres_repl::OrchestratorBuildOptions {
+                extra_slow_cfgs: slow_agent_specs.iter().skip(1).cloned().collect(),
+                skills: skills_value,
+                usage: usage.clone(),
+                gather_turns: args.gather_turns,
+                logger: logger.clone(),
+                comparison_path: Some(results_dir.join("comparison.json")),
+            },
         )
         .await?;
         let orc = built.orchestrator;
@@ -1789,15 +1791,16 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         let built = kres_repl::build_orchestrator(
             &fast_path,
             &slow_path,
-            Vec::new(),
             args.workspace.clone(),
             fetcher,
-            None,
-            Some(usage.clone()),
-            5,
-            logger.clone(),
-            args.results.as_ref().map(|d| d.join("comparison.json")),
             &settings,
+            kres_repl::OrchestratorBuildOptions {
+                usage: Some(usage.clone()),
+                gather_turns: 5,
+                logger: logger.clone(),
+                comparison_path: args.results.as_ref().map(|d| d.join("comparison.json")),
+                ..Default::default()
+            },
         )
         .await?;
         driver = driver

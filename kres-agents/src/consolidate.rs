@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use kres_core::findings::Finding;
 use kres_core::log::{LoggedUsage, TurnLogger};
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{config::CallConfig, request::Message};
 
 use crate::{error::AgentError, followup::Followup, response::parse_code_response};
 
@@ -65,36 +65,17 @@ pub struct ConsolidatedTask {
 /// Falls back to a naive concat + findings-union on any failure so
 /// a flaky consolidator call doesn't kill the task's output.
 pub async fn consolidate_lenses(
-    client: Arc<Client>,
-    model: Model,
-    system: Option<&str>,
-    max_tokens: u32,
+    consolidator: &crate::pipeline::ConsolidatorClient,
     task_brief: &str,
     lens_outputs: &[LensOutput<'_>],
 ) -> Result<ConsolidatedTask, AgentError> {
-    consolidate_lenses_with_logger(
-        client,
-        model,
-        system,
-        max_tokens,
-        None,
-        task_brief,
-        lens_outputs,
-        None,
-        None,
-    )
-    .await
+    consolidate_lenses_with_logger(consolidator, task_brief, lens_outputs, None, None).await
 }
 
 /// Same as [`consolidate_lenses`] but appends user+assistant turns
 /// to the provided TurnLogger's code.jsonl.
-#[allow(clippy::too_many_arguments)]
 pub async fn consolidate_lenses_with_logger(
-    client: Arc<Client>,
-    model: Model,
-    system: Option<&str>,
-    max_tokens: u32,
-    max_input_tokens: Option<u32>,
+    consolidator: &crate::pipeline::ConsolidatorClient,
     task_brief: &str,
     lens_outputs: &[LensOutput<'_>],
     workflow_rules: Option<&str>,
@@ -108,6 +89,11 @@ pub async fn consolidate_lenses_with_logger(
             comparison: None,
         });
     }
+    let client = consolidator.client.clone();
+    let model = consolidator.model.clone();
+    let system = consolidator.system.as_deref();
+    let max_tokens = consolidator.max_tokens;
+    let max_input_tokens = consolidator.max_input_tokens;
 
     // caps task_brief at 300 chars when it reaches the
     // consolidator. This prevents a long operator prompt from
@@ -314,6 +300,7 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 mod tests {
     use super::*;
     use kres_core::findings::{Finding, Severity, Status};
+    use kres_llm::{client::Client, Model};
     use serde_json::json;
 
     fn f(id: &str) -> Finding {
@@ -430,8 +417,14 @@ mod tests {
     #[test]
     fn consolidate_empty_input_returns_empty() {
         let _ct = futures::executor::block_on(async {
-            let c = Arc::new(Client::new("sk-unused").unwrap());
-            consolidate_lenses(c, Model::opus_4_7(), None, 32_000, "test", &[]).await
+            let consolidator = crate::pipeline::ConsolidatorClient {
+                client: Arc::new(Client::new("sk-unused").unwrap()),
+                model: Model::opus_4_7(),
+                system: None,
+                max_tokens: 32_000,
+                max_input_tokens: None,
+            };
+            consolidate_lenses(&consolidator, "test", &[]).await
         })
         .unwrap();
     }

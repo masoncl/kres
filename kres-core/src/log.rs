@@ -167,7 +167,15 @@ impl TurnLogger {
         thinking: Option<&str>,
         request: Option<&RequestMeta>,
     ) {
-        if let Err(e) = self.write(true, role, label, content, usage, thinking, request) {
+        let entry = LogEntry {
+            role,
+            label,
+            content,
+            usage,
+            thinking,
+            request,
+        };
+        if let Err(e) = self.write(true, &entry) {
             tracing::warn!(target: "kres_core::log", "code log write failed: {e}");
         }
     }
@@ -180,31 +188,21 @@ impl TurnLogger {
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
     ) {
-        if let Err(e) = self.write(false, role, None, content, usage, thinking, None) {
+        let entry = LogEntry {
+            role,
+            label: None,
+            content,
+            usage,
+            thinking,
+            request: None,
+        };
+        if let Err(e) = self.write(false, &entry) {
             tracing::warn!(target: "kres_core::log", "main log write failed: {e}");
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn write(
-        &self,
-        is_code: bool,
-        role: &str,
-        label: Option<&str>,
-        content: &str,
-        usage: Option<LoggedUsage>,
-        thinking: Option<&str>,
-        request: Option<&RequestMeta>,
-    ) -> io::Result<()> {
-        let entry = LogEntry {
-            role,
-            label,
-            content,
-            usage,
-            thinking,
-            request,
-        };
-        let line = serde_json::to_string(&entry).map_err(io::Error::other)?;
+    fn write(&self, is_code: bool, entry: &LogEntry<'_>) -> io::Result<()> {
+        let line = serde_json::to_string(entry).map_err(io::Error::other)?;
         let mut guard = self.inner.lock().unwrap();
         let f = if is_code {
             &mut guard.code

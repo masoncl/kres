@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -152,11 +152,6 @@ async fn drain_stderr(
     // best-effort file close
     let _ = writer.into_inner();
     Ok(())
-}
-
-#[allow(dead_code)]
-async fn file_exists(p: &Path) -> bool {
-    File::open(p).await.is_ok()
 }
 
 #[cfg(test)]

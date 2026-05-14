@@ -178,6 +178,17 @@ struct LensCallSpec {
     lens_suffix: String,
 }
 
+/// Per-fanout, lens-independent state threaded through every
+/// `build_lens_call_future` invocation. Keeps the call-builder
+/// signature narrow.
+struct LensCallContext {
+    shared_prefix: String,
+    task_brief: String,
+    shutdown: Shutdown,
+    usage: Option<Arc<UsageTracker>>,
+    logger: Option<Arc<TurnLogger>>,
+}
+
 #[derive(Clone, Copy)]
 enum CacheMode {
     /// Try a sequential seed call with `cache_control` to prime the
@@ -189,6 +200,17 @@ enum CacheMode {
     /// Skip cache priming entirely: run every lens in parallel with
     /// no `cache_control`. Used by the repair retry path.
     Parallel,
+}
+
+/// Per-invocation arguments for `Orchestrator::run_prepared_lens_fanout`.
+/// `lenses` is the subset to run this pass (e.g. just the failing
+/// lens-ids on a repair retry); `all_lenses` is the full slate, used
+/// to populate each lens's `parallel_lenses.other_lenses` descriptor.
+struct LensFanoutCall<'a> {
+    lenses: &'a [LensSpec],
+    all_lenses: &'a [LensSpec],
+    extra_lens_instruction: Option<&'a str>,
+    cache_mode: CacheMode,
 }
 
 /// No-op fetcher used in tests. It returns empty results regardless
@@ -381,16 +403,11 @@ fn slow_variant_call_config(
 /// folds the prefix into plain content so the request carries no
 /// cache breakpoint at all. Same byte-identical prompt either way —
 /// only the wire framing changes.
-#[allow(clippy::too_many_arguments)]
 fn build_lens_call_future(
     spec: LensCallSpec,
     variant: SlowAgentVariant,
-    shared_prefix: String,
+    ctx: LensCallContext,
     use_cache: bool,
-    task_brief: String,
-    shutdown: Shutdown,
-    usage: Option<Arc<UsageTracker>>,
-    logger: Option<Arc<TurnLogger>>,
 ) -> impl std::future::Future<Output = RawLensResult> + Send + 'static {
     let LensCallSpec {
         lens_id,
@@ -407,6 +424,13 @@ fn build_lens_call_future(
         thinking,
         label: model_label,
     } = variant;
+    let LensCallContext {
+        shared_prefix,
+        task_brief,
+        shutdown,
+        usage,
+        logger,
+    } = ctx;
     let lens_label = format!("lens {lens_name} ({model_label})");
     let log_label = format!("phase=slow-lens task={task_brief} lens={lens_id} model={model_label}");
     let lens_logged = format!("{shared_prefix}{lens_suffix}");
@@ -1304,11 +1328,7 @@ impl Orchestrator {
         );
 
         let consolidated = consolidate_lenses_with_logger(
-            consolidator.client.clone(),
-            consolidator.model.clone(),
-            consolidator.system.as_deref(),
-            consolidator.max_tokens,
-            consolidator.max_input_tokens,
+            consolidator,
             &ctx.task_brief,
             &outs,
             consolidate_rules,
@@ -1358,11 +1378,13 @@ impl Orchestrator {
         let mut fanout = self
             .run_prepared_lens_fanout(
                 &prepared,
-                lenses,
-                lenses,
+                LensFanoutCall {
+                    lenses,
+                    all_lenses: lenses,
+                    extra_lens_instruction: None,
+                    cache_mode: CacheMode::PrimeThenParallel,
+                },
                 ctx,
-                None,
-                CacheMode::PrimeThenParallel,
                 shutdown,
             )
             .await?;
@@ -1402,11 +1424,13 @@ impl Orchestrator {
             let repaired = self
                 .run_prepared_lens_fanout(
                     &prepared,
-                    &repair_lenses,
-                    lenses,
+                    LensFanoutCall {
+                        lenses: &repair_lenses,
+                        all_lenses: lenses,
+                        extra_lens_instruction: Some(repair.repair_instruction),
+                        cache_mode: CacheMode::Parallel,
+                    },
                     ctx,
-                    Some(repair.repair_instruction),
-                    CacheMode::Parallel,
                     shutdown,
                 )
                 .await?;
@@ -1481,17 +1505,19 @@ impl Orchestrator {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run_prepared_lens_fanout(
         &self,
         prepared: &PreparedLensFanout,
-        lenses: &[LensSpec],
-        all_lenses: &[LensSpec],
+        call: LensFanoutCall<'_>,
         ctx: &RunContext,
-        extra_lens_instruction: Option<&str>,
-        cache_mode: CacheMode,
         shutdown: &Shutdown,
     ) -> Result<LensFanoutOutput, AgentError> {
+        let LensFanoutCall {
+            lenses,
+            all_lenses,
+            extra_lens_instruction,
+            cache_mode,
+        } = call;
         // Build per-lens specs once; the same specs feed every slow
         // variant and may be reused across the cache-prime attempt
         // and the no-cache fallback.
@@ -1562,16 +1588,14 @@ impl Orchestrator {
             let logger = self.logger.clone();
             async move {
                 let make_future = |spec: LensCallSpec, use_cache: bool| {
-                    build_lens_call_future(
-                        spec,
-                        variant.clone(),
-                        shared_prefix.clone(),
-                        use_cache,
-                        task_brief.clone(),
-                        shutdown.clone(),
-                        usage.clone(),
-                        logger.clone(),
-                    )
+                    let ctx = LensCallContext {
+                        shared_prefix: shared_prefix.clone(),
+                        task_brief: task_brief.clone(),
+                        shutdown: shutdown.clone(),
+                        usage: usage.clone(),
+                        logger: logger.clone(),
+                    };
+                    build_lens_call_future(spec, variant.clone(), ctx, use_cache)
                 };
                 match cache_mode {
                     CacheMode::PrimeThenParallel => {

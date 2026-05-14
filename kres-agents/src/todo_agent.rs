@@ -25,7 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use kres_core::lens::LensSpec;
@@ -76,44 +76,41 @@ pub struct TodoUpdate {
     pub plan: Option<kres_core::PlanRewrite>,
 }
 
+/// Per-call inputs threaded into the todo agent. Bundles the
+/// caller-side context so the public function signatures stay narrow.
+pub struct TodoAgentInputs<'a> {
+    pub completed_query: &'a str,
+    pub analysis_summary: &'a str,
+    pub new_followups: &'a [Value],
+    pub current_todo: &'a [TodoItem],
+    pub lenses: &'a [LensSpec],
+    pub plan: Option<&'a kres_core::Plan>,
+}
+
 /// Run the todo agent. Returns an updated todo list plus an
-/// optionally-rewritten plan. Matches
-#[allow(clippy::too_many_arguments)]
+/// optionally-rewritten plan.
 pub async fn update_todo_via_agent(
     tc: &TodoClient,
-    completed_query: &str,
-    analysis_summary: &str,
-    new_followups: &[Value],
-    current_todo: &[TodoItem],
-    lenses: &[LensSpec],
-    plan: Option<&kres_core::Plan>,
+    inputs: TodoAgentInputs<'_>,
 ) -> Result<TodoUpdate, AgentError> {
-    update_todo_via_agent_with_logger(
-        tc,
+    update_todo_via_agent_with_logger(tc, inputs, None).await
+}
+
+/// Same as `update_todo_via_agent` but also logs the user+assistant
+/// turns to the provided TurnLogger's `main.jsonl`
+pub async fn update_todo_via_agent_with_logger(
+    tc: &TodoClient,
+    inputs: TodoAgentInputs<'_>,
+    logger: Option<Arc<TurnLogger>>,
+) -> Result<TodoUpdate, AgentError> {
+    let TodoAgentInputs {
         completed_query,
         analysis_summary,
         new_followups,
         current_todo,
         lenses,
         plan,
-        None,
-    )
-    .await
-}
-
-/// Same as `update_todo_via_agent` but also logs the user+assistant
-/// turns to the provided TurnLogger's `main.jsonl`
-#[allow(clippy::too_many_arguments)]
-pub async fn update_todo_via_agent_with_logger(
-    tc: &TodoClient,
-    completed_query: &str,
-    analysis_summary: &str,
-    new_followups: &[Value],
-    current_todo: &[TodoItem],
-    lenses: &[LensSpec],
-    plan: Option<&kres_core::Plan>,
-    logger: Option<Arc<TurnLogger>>,
-) -> Result<TodoUpdate, AgentError> {
+    } = inputs;
     // --- Prepare inputs ------------------------------------------------
     let mut todo_list = current_todo.to_vec();
     assign_ids(&mut todo_list);
@@ -1066,12 +1063,6 @@ fn truncate(s: &str, n: usize) -> String {
         return s.to_string();
     }
     s.chars().take(n).collect()
-}
-
-#[derive(Debug, Serialize)]
-#[allow(dead_code)]
-struct _KeepsDepsOn {
-    x: Vec<String>,
 }
 
 #[cfg(test)]

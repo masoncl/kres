@@ -76,6 +76,17 @@ struct PromoteRequest<'a> {
     instructions: &'a str,
 }
 
+/// Per-call inputs threaded into `promote_prose_bugs_with_logger`.
+/// Bundles the auditing-side parameters so the function signature
+/// stays focused on the endpoint config (client/model/system/limits).
+pub struct PromoteInputs<'a> {
+    pub task_brief: &'a str,
+    pub analysis: &'a str,
+    pub prose_relevant_existing: &'a [Finding],
+    pub dedup_against: &'a [Finding],
+    pub cancel: Option<Arc<Notify>>,
+}
+
 /// Run the promotion pass against a configured fast-agent client.
 ///
 /// - `prose_relevant_existing`: the findings sent to the LLM as
@@ -101,20 +112,22 @@ struct PromoteRequest<'a> {
 /// Same-id invalidations and reactivations are preserved so the
 /// store can update the existing row. Returns an empty list when
 /// cancelled — abandonment is a safe, non-fatal outcome.
-#[allow(clippy::too_many_arguments)]
 pub async fn promote_prose_bugs_with_logger(
     client: Arc<Client>,
     model: Model,
     system: Option<&str>,
     max_tokens: u32,
     max_input_tokens: Option<u32>,
-    task_brief: &str,
-    analysis: &str,
-    prose_relevant_existing: &[Finding],
-    dedup_against: &[Finding],
-    cancel: Option<Arc<Notify>>,
+    inputs: PromoteInputs<'_>,
     logger: Option<Arc<TurnLogger>>,
 ) -> Result<Vec<Finding>, AgentError> {
+    let PromoteInputs {
+        task_brief,
+        analysis,
+        prose_relevant_existing,
+        dedup_against,
+        cancel,
+    } = inputs;
     // Prose nothing to audit.
     if analysis.trim().is_empty() {
         return Ok(vec![]);
@@ -368,11 +381,13 @@ mod tests {
             None,
             8_000,
             None,
-            "brief",
-            "",
-            &[],
-            &[],
-            None,
+            PromoteInputs {
+                task_brief: "brief",
+                analysis: "",
+                prose_relevant_existing: &[],
+                dedup_against: &[],
+                cancel: None,
+            },
             None,
         )
         .await
@@ -404,11 +419,13 @@ mod tests {
             None,
             8_000,
             None,
-            "brief",
-            "some prose naming cpu_mask in lib/cpumask.c:42",
-            &[],
-            &[],
-            Some(notify),
+            PromoteInputs {
+                task_brief: "brief",
+                analysis: "some prose naming cpu_mask in lib/cpumask.c:42",
+                prose_relevant_existing: &[],
+                dedup_against: &[],
+                cancel: Some(notify),
+            },
             None,
         )
         .await

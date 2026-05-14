@@ -56,5 +56,5 @@ pub use symbol::{
 };
 pub use todo_agent::{
     dedup_tokens, extract_citations, parse_todo_response, update_todo_via_agent,
-    update_todo_via_agent_with_logger, TodoClient, TodoUpdate,
+    update_todo_via_agent_with_logger, TodoAgentInputs, TodoClient, TodoUpdate,
 };

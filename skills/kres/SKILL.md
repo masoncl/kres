@@ -1,6 +1,6 @@
 ---
-name: kres-findings
-description: Navigate a kres export tree of Linux-kernel bug findings. Covers per-finding layout (metadata.yaml, FINDING.md, summary.md, fix-state diff files), the findings-index.py search syntax, and the kres runtime directories (~/.kres config, <cwd>/.kres logs). Load when a directory contains `findings/`, `INDEX.md`, and `findings-index.py`.
+name: kres
+description: Navigate a kres export tree of Linux-kernel bug findings. Covers per-finding layout (metadata.yaml, FINDING.md, summary.md, fix-state diff files), the findings-index.py search syntax, and the kres runtime directories (~/.kres config, <cwd>/.kres logs). Load when (a) a directory contains `findings/`, `INDEX.md`, and `findings-index.py`; (b) the cwd matches `*/kres/linux.<tag>` or `*/working/kres/linux.<tag>` — these are linux worktrees mirroring a finding at `~/local/kernel-bugs-staging/findings/<tag>/`; or (c) the user mentions a kres finding, the kernel-bugs-staging tree, or asks to reproduce / verify / debug / read a finding.
 invocation_policy: manual
 ---
 

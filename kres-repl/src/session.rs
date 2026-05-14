@@ -1284,11 +1284,13 @@ impl Session {
                                 Some(kres_agents::promote::PROMOTE_SYSTEM),
                                 promoter.max_tokens,
                                 promoter.max_input_tokens,
-                                &r.name,
-                                &effective_analysis,
-                                &prose_relevant,
-                                &all_known_for_dedup,
-                                Some(stop_notify_for_reaper.clone()),
+                                kres_agents::promote::PromoteInputs {
+                                    task_brief: &r.name,
+                                    analysis: &effective_analysis,
+                                    prose_relevant_existing: &prose_relevant,
+                                    dedup_against: &all_known_for_dedup,
+                                    cancel: Some(stop_notify_for_reaper.clone()),
+                                },
                                 logger_for_reaper.clone(),
                             )
                             .await
@@ -1564,12 +1566,14 @@ impl Session {
                         let lenses_snapshot = lenses_for_reaper.read().await.clone();
                         match kres_agents::update_todo_via_agent_with_logger(
                             tc,
-                            &completed_query,
-                            &analysis,
-                            &followups_for_todo,
-                            &current,
-                            &lenses_snapshot,
-                            plan_for_todo.as_ref(),
+                            kres_agents::TodoAgentInputs {
+                                completed_query: &completed_query,
+                                analysis_summary: &analysis,
+                                new_followups: &followups_for_todo,
+                                current_todo: &current,
+                                lenses: &lenses_snapshot,
+                                plan: plan_for_todo.as_ref(),
+                            },
                             logger_for_reaper.clone(),
                         )
                         .await
@@ -1828,12 +1832,14 @@ impl Session {
                                             lenses_for_reaper.read().await.clone();
                                         match kres_agents::update_todo_via_agent_with_logger(
                                             tc,
-                                            &completed_query,
-                                            "",
-                                            &missing_fus,
-                                            &current,
-                                            &lenses_snapshot,
-                                            plan_for_todo.as_ref(),
+                                            kres_agents::TodoAgentInputs {
+                                                completed_query: &completed_query,
+                                                analysis_summary: "",
+                                                new_followups: &missing_fus,
+                                                current_todo: &current,
+                                                lenses: &lenses_snapshot,
+                                                plan: plan_for_todo.as_ref(),
+                                            },
                                             logger_for_reaper.clone(),
                                         )
                                         .await
@@ -4095,20 +4101,35 @@ pub struct BuiltAgents {
     pub consolidator: Arc<kres_agents::ConsolidatorClient>,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Optional knobs threaded into `build_orchestrator`. Splitting them
+/// out keeps the call site readable and the function signature
+/// narrow.
+#[derive(Default)]
+pub struct OrchestratorBuildOptions {
+    pub extra_slow_cfgs: Vec<(PathBuf, Option<String>)>,
+    pub skills: Option<serde_json::Value>,
+    pub usage: Option<Arc<UsageTracker>>,
+    pub gather_turns: u8,
+    pub logger: Option<Arc<TurnLogger>>,
+    pub comparison_path: Option<PathBuf>,
+}
+
 pub async fn build_orchestrator(
     fast_cfg_path: &Path,
     slow_cfg_path: &Path,
-    extra_slow_cfgs: Vec<(PathBuf, Option<String>)>,
     workspace: impl Into<PathBuf>,
     fetcher: Arc<dyn DataFetcher>,
-    skills: Option<serde_json::Value>,
-    usage: Option<Arc<UsageTracker>>,
-    gather_turns: u8,
-    logger: Option<Arc<TurnLogger>>,
-    comparison_path: Option<PathBuf>,
     settings: &crate::settings::Settings,
+    options: OrchestratorBuildOptions,
 ) -> Result<BuiltAgents> {
+    let OrchestratorBuildOptions {
+        extra_slow_cfgs,
+        skills,
+        usage,
+        gather_turns,
+        logger,
+        comparison_path,
+    } = options;
     let fast_cfg = AgentConfig::load_for_role(fast_cfg_path, AgentKind::Fast)
         .with_context(|| format!("loading fast agent config {}", fast_cfg_path.display()))?;
     let slow_cfg = AgentConfig::load_for_role(slow_cfg_path, AgentKind::Slow)

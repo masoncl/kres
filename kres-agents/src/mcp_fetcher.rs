@@ -229,11 +229,6 @@ impl DataFetcher for McpFetcher {
 }
 
 impl McpFetcher {
-    #[allow(dead_code)]
-    async fn try_call_mcp(&self, label: &str, tool: &str, name: &str) -> Option<Value> {
-        self.try_call_mcp_result(label, tool, name).await.ok()
-    }
-
     /// Call an MCP tool and return the raw (already-capped) text —
     /// used by the `source` path so the caller can parse it into a
     /// semcode symbol. Returns Err(error_text) on failure so the

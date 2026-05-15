@@ -44,6 +44,15 @@ fn fake_messages_response(text: &str) -> Value {
     })
 }
 
+/// Mock orchestrator response picking the given next step. The
+/// orchestrator runs on review.clean==false and routes via its
+/// next_step output.
+fn orchestrator_picks(next_step: &str) -> Value {
+    fake_messages_response(&format!(
+        "Orchestrator pick.\n{{\"next_step\": \"{next_step}\", \"instruction\": \"\", \"rationale\": \"test fixture\"}}"
+    ))
+}
+
 fn review_ledger_response(kind: &str, status: &str) -> Value {
     fake_messages_response(&format!(
         "{{\"ledger\": [{{\"id\": \"R1\", \"kind\": \"{kind}\", \"status\": \"{status}\", \
@@ -65,6 +74,14 @@ struct ResearchFixture<'a> {
 }
 
 fn research_response(lead: &str, fixture: ResearchFixture<'_>) -> Value {
+    research_response_with_latent(lead, fixture, false)
+}
+
+fn research_response_with_latent(
+    lead: &str,
+    fixture: ResearchFixture<'_>,
+    is_latent: bool,
+) -> Value {
     let body = json!({
         "research_status": fixture.status,
         "valid": fixture.valid,
@@ -83,6 +100,7 @@ fn research_response(lead: &str, fixture: ResearchFixture<'_>) -> Value {
             "depends_on": []
         }],
         "research_decision": fixture.research_decision,
+        "is_latent": is_latent,
         "analysis": fixture.analysis,
     });
     fake_messages_response(&format!(
@@ -114,6 +132,19 @@ fn confirmed_research_response(
             }),
             analysis,
         },
+    )
+}
+
+/// Canonical empty-result for the lore-search step. The fix workflow
+/// runs this between research and write-patch; tests that don't care
+/// about lore findings still need an entry in the mock queue so
+/// write-patch sees its own response.
+fn empty_lore_search_response() -> Value {
+    fake_messages_response(
+        "No upstream patch found.\n\
+         {\"existing_patches\": [], \
+          \"duplicate_proven\": false, \
+          \"analysis\": \"Lore search returned no matching threads.\"}",
     )
 }
 
@@ -180,6 +211,19 @@ fn dirty_source_review_responses(workflow: &kres_agents::workflow::Workflow) -> 
               \"correction_step\": \"write-patch\"}",
         ));
     }
+    // Consolidate LLM call (semantic dedup of typed lists; routing
+    // fields are overridden deterministically afterwards).
+    responses.push(fake_messages_response(
+        "Consolidate dirty source review.\n\
+         {\"clean\": false, \
+          \"defects\": [{\"where\": \"a.c\", \"what\": \"use the reviewed correction\", \"lens\": \"lifetime\"}], \
+          \"source_defects\": [{\"where\": \"a.c\", \"what\": \"use the reviewed correction\", \"lens\": \"lifetime\"}], \
+          \"commit_message_defects\": [], \
+          \"unresolved_risks\": [], \
+          \"outcomes\": [], \
+          \"analysis\": \"consolidated\", \
+          \"correction_step\": \"write-patch\"}",
+    ));
     responses
 }
 
@@ -207,6 +251,17 @@ fn dirty_commit_message_review_responses(workflow: &kres_agents::workflow::Workf
               \"correction_step\": \"write-patch\"}",
         ));
     }
+    responses.push(fake_messages_response(
+        "Consolidate dirty commit-message review.\n\
+         {\"clean\": false, \
+          \"defects\": [{\"where\": \"commit message\", \"what\": \"rewrite the stale claim\", \"lens\": \"maintainer\"}], \
+          \"source_defects\": [], \
+          \"commit_message_defects\": [{\"where\": \"commit message\", \"what\": \"rewrite the stale claim\", \"lens\": \"maintainer\"}], \
+          \"unresolved_risks\": [], \
+          \"outcomes\": [], \
+          \"analysis\": \"consolidated\", \
+          \"correction_step\": \"write-commit-message\"}",
+    ));
     responses
 }
 
@@ -340,6 +395,7 @@ async fn fix_workflow_runs_end_to_end_against_mock_llm() {
             &["f"],
             "I traced the bug. Reasoning here.",
         ),
+        empty_lore_search_response(),
         fake_messages_response(
             "Wrote the fix.\n\
              {\"build_target\": \"a.o\", \
@@ -482,6 +538,332 @@ async fn fix_workflow_runs_end_to_end_against_mock_llm() {
     }
 }
 
+/// When lore-search reports an existing upstream patch, the
+/// duplicate_proven + existing_patches outputs must reach the
+/// write-patch step's prompt so the patch author can cite the
+/// upstream Message-ID. Also confirm the bug-coverage lens prompt
+/// sees the same data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lore_search_findings_thread_through_write_patch_prompt() {
+    let workflow = parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap();
+    // Distinctive msgid + URL we can grep for in the recorded
+    // write-patch request body to prove the interpolation worked.
+    let lore_response = fake_messages_response(
+        "Found an upstream patch.\n\
+         {\"existing_patches\": [\
+            {\"msgid\": \"<20260514.testlore-canary@example.org>\", \
+             \"subject\": \"a: fix the same bug upstream\", \
+             \"url\": \"https://lore.kernel.org/r/20260514.testlore-canary@example.org\", \
+             \"relevance\": \"same site, same semantic change\"}], \
+          \"duplicate_proven\": true, \
+          \"analysis\": \"Body search for `f` returned a thread proposing the same edit.\"}",
+    );
+    let mut responses = VecDeque::from(vec![
+        confirmed_research_response(
+            "Bug is real, but we'll see if upstream beat us to it.",
+            &["a.c"],
+            &["f"],
+            "Patch is the cpu_possible guard.",
+        ),
+        lore_response,
+        fake_messages_response(
+            "Wrote the fix.\n\
+             {\"build_target\": \"a.o\", \
+              \"code_edits\": [{\"file_path\": \"a.c\", \
+              \"old_string\": \"int x = 1;\\n\", \
+              \"new_string\": \"int x = 2;\\n\"}]}",
+        ),
+        fake_messages_response(
+            "No introducing commit found.\n\
+             {\"fixes_sha\": \"\", \"fixes_subject\": \"\", \
+              \"fixes_evidence\": \"\", \"unproven_fixes_candidates\": [], \
+              \"analysis\": \"empty\"}",
+        ),
+        fake_messages_response(
+            "Wrote the commit message.\n\
+             {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
+              \"content\": \"a: fix the bug\\n\\nBody.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"purpose\": \"commit message\"}]}",
+        ),
+    ]);
+    responses.extend(clean_review_responses(&workflow));
+    let (port, requests) = spawn_recording_mock(responses).await;
+
+    let mut inputs = Map::new();
+    inputs.insert("target".into(), Value::String("freeform bug prose".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    let inputs = derive_inputs(&workflow, inputs);
+
+    let (_guard, workspace) = fresh_git_repo();
+    let mut driver = LlmDriver::new(workspace, workflow.clone())
+        .with_fast(fast_env_pointing_at(port))
+        .with_slow(slow_env_pointing_at(port))
+        .with_code(slow_env_pointing_at(port));
+
+    let trace = run(&workflow, &mut driver, inputs).await;
+    eprintln!("{}", trace.pretty());
+    assert!(
+        matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ),
+        "expected Success or TerminalSuccess, got {:?}",
+        trace.status
+    );
+
+    // lore-search produced typed outputs.
+    let lore = trace
+        .events
+        .iter()
+        .find_map(|e| match e {
+            kres_agents::workflow_exec::TraceEvent::StepProduced { id, outputs, .. }
+                if id == "lore-search" =>
+            {
+                Some(outputs.clone())
+            }
+            _ => None,
+        })
+        .expect("lore-search must produce outputs");
+    assert_eq!(lore.get("duplicate_proven"), Some(&json!(true)));
+    let patches = lore
+        .get("existing_patches")
+        .and_then(Value::as_array)
+        .expect("existing_patches must be an array");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(
+        patches[0].get("msgid"),
+        Some(&json!("<20260514.testlore-canary@example.org>"))
+    );
+
+    // The write-patch request must have seen the lore findings in
+    // its prompt body. Find the request whose URL is /v1/messages
+    // and whose body contains the write-patch step marker plus the
+    // lore-canary string.
+    let all_requests = requests.lock().await.clone();
+    let write_patch_request_carried_lore = all_requests
+        .iter()
+        .any(|r| r.contains("Step 2: WRITE PATCH ONLY") && r.contains("testlore-canary"));
+    assert!(
+        write_patch_request_carried_lore,
+        "write-patch request body must include the lore-search msgid"
+    );
+
+    // The lens-fanout review calls also see the lore findings via
+    // the review prompt's LORE-SEARCH section (one substitution
+    // pass, shared across every lens), so the bug-coverage lens
+    // can classify a bug as `duplicate`. Spot-check by confirming
+    // at least one request whose body contains both the
+    // bug-coverage lens marker AND the lore canary.
+    let lens_saw_lore = all_requests
+        .iter()
+        .any(|r| r.contains("bug-coverage") && r.contains("testlore-canary"));
+    assert!(
+        lens_saw_lore,
+        "bug-coverage lens request must include the lore-search msgid"
+    );
+}
+
+/// When the model's first write-patch response has an old_string
+/// that doesn't match the file, the runner must re-prompt the model
+/// with the apply error instead of failing the step. The second
+/// response — with a correct old_string — is then applied and the
+/// workflow completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_patch_retries_when_code_edits_apply_fails() {
+    let workflow = parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap();
+    let mut responses = VecDeque::from(vec![
+        confirmed_research_response("Bug is real.", &["a.c"], &["f"], "Patch a.c."),
+        empty_lore_search_response(),
+        // First write-patch reply: old_string does not exist in a.c.
+        fake_messages_response(
+            "First attempt — wrong old_string.\n\
+             {\"build_target\": \"a.o\", \
+              \"code_edits\": [{\"file_path\": \"a.c\", \
+              \"old_string\": \"int y = 99;\\n\", \
+              \"new_string\": \"int x = 2;\\n\"}]}",
+        ),
+        // Second write-patch reply: correct old_string.
+        fake_messages_response(
+            "Second attempt — corrected.\n\
+             {\"build_target\": \"a.o\", \
+              \"code_edits\": [{\"file_path\": \"a.c\", \
+              \"old_string\": \"int x = 1;\\n\", \
+              \"new_string\": \"int x = 2;\\n\"}]}",
+        ),
+        fake_messages_response(
+            "No introducing commit.\n\
+             {\"fixes_sha\": \"\", \"fixes_subject\": \"\", \
+              \"fixes_evidence\": \"\", \"unproven_fixes_candidates\": [], \
+              \"analysis\": \"empty\"}",
+        ),
+        fake_messages_response(
+            "Wrote the commit message.\n\
+             {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
+              \"content\": \"a: fix the bug\\n\\nBody.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"purpose\": \"commit message\"}]}",
+        ),
+    ]);
+    responses.extend(clean_review_responses(&workflow));
+    let (port, requests) = spawn_recording_mock(responses).await;
+
+    let mut inputs = Map::new();
+    inputs.insert("target".into(), Value::String("freeform bug prose".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    let inputs = derive_inputs(&workflow, inputs);
+
+    let (_guard, workspace) = fresh_git_repo();
+    let mut driver = LlmDriver::new(workspace.clone(), workflow.clone())
+        .with_fast(fast_env_pointing_at(port))
+        .with_slow(slow_env_pointing_at(port))
+        .with_code(slow_env_pointing_at(port));
+
+    let trace = run(&workflow, &mut driver, inputs).await;
+    assert!(
+        matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ),
+        "expected Success or TerminalSuccess (the retry should succeed), got {:?}",
+        trace.status
+    );
+
+    // The retry prompt for the second write-patch attempt MUST contain
+    // the apply error from the first attempt so the model knows why
+    // its old_string was rejected.
+    let all_requests = requests.lock().await.clone();
+    let retry_with_apply_err = all_requests.iter().any(|r| {
+        r.contains("Step 2: WRITE PATCH ONLY")
+            && r.contains("code_edits failed to apply")
+            && r.contains("old_string not found")
+    });
+    assert!(
+        retry_with_apply_err,
+        "second write-patch request must include the apply error from the first attempt"
+    );
+
+    // And the file on disk reflects the SECOND (correct) edit.
+    let body = std::fs::read_to_string(workspace.join("a.c")).unwrap();
+    assert_eq!(body, "int x = 2;\n");
+}
+
+/// When research reports is_latent=true, the write-commit-message
+/// prompt must carry both the literal latent line and the interpolated
+/// is_latent flag so the agent renders the notice as the first body
+/// paragraph (after the subject and the blank line). The notice MUST
+/// NOT land on line 1: git treats line 1 as the commit subject and
+/// `git log --oneline`/`git format-patch` would surface the notice
+/// instead of the real subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn latent_research_threads_into_commit_message_prompt() {
+    let workflow = parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap();
+    let latent_research = research_response_with_latent(
+        "Bug is real but no caller reaches it today.",
+        ResearchFixture {
+            status: "confirmed",
+            valid: true,
+            invalid_evidence: "",
+            invalid_evidence_kind: "none",
+            affected_files: &["a.c"],
+            affected_symbols: &["f"],
+            research_decision: json!({
+                "bug_proven": true,
+                "fix_contract_proven": true,
+                "invalidity_proven": false,
+                "needs_more_audit": false,
+            }),
+            analysis: "Contract violation in dead branch; latent.",
+        },
+        true,
+    );
+    let mut responses = VecDeque::from(vec![
+        latent_research,
+        empty_lore_search_response(),
+        fake_messages_response(
+            "Wrote the fix.\n\
+             {\"build_target\": \"a.o\", \
+              \"code_edits\": [{\"file_path\": \"a.c\", \
+              \"old_string\": \"int x = 1;\\n\", \
+              \"new_string\": \"int x = 2;\\n\"}]}",
+        ),
+        fake_messages_response(
+            "No introducing commit found.\n\
+             {\"fixes_sha\": \"\", \"fixes_subject\": \"\", \
+              \"fixes_evidence\": \"\", \"unproven_fixes_candidates\": [], \
+              \"analysis\": \"empty\"}",
+        ),
+        fake_messages_response(
+            "Wrote the commit message.\n\
+             {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
+              \"content\": \"a: fix the bug\\n\\nNote: This fixes a latent bug with no known triggers in the kernel today.\\n\\nBody.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"purpose\": \"commit message\"}]}",
+        ),
+    ]);
+    responses.extend(clean_review_responses(&workflow));
+    let (port, requests) = spawn_recording_mock(responses).await;
+
+    let mut inputs = Map::new();
+    inputs.insert("target".into(), Value::String("freeform bug prose".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    let inputs = derive_inputs(&workflow, inputs);
+
+    let (_guard, workspace) = fresh_git_repo();
+    let mut driver = LlmDriver::new(workspace, workflow.clone())
+        .with_fast(fast_env_pointing_at(port))
+        .with_slow(slow_env_pointing_at(port))
+        .with_code(slow_env_pointing_at(port));
+
+    let trace = run(&workflow, &mut driver, inputs).await;
+    assert!(
+        matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ),
+        "expected Success or TerminalSuccess, got {:?}",
+        trace.status
+    );
+
+    // research must have produced is_latent=true.
+    let research = trace
+        .events
+        .iter()
+        .find_map(|e| match e {
+            kres_agents::workflow_exec::TraceEvent::StepProduced { id, outputs, .. }
+                if id == "research" =>
+            {
+                Some(outputs.clone())
+            }
+            _ => None,
+        })
+        .expect("research must produce outputs");
+    assert_eq!(research.get("is_latent"), Some(&json!(true)));
+
+    // The write-commit-message request body must carry the latent flag
+    // and the literal notice line so the agent emits it verbatim.
+    let all_requests = requests.lock().await.clone();
+    let commit_msg_body = all_requests
+        .iter()
+        .find(|r| r.contains("Step 4: WRITE COMMIT MESSAGE ONLY"))
+        .expect("write-commit-message request must be recorded");
+    assert!(
+        commit_msg_body.contains("research.is_latent for this run: true"),
+        "commit-message prompt must show is_latent=true"
+    );
+    assert!(
+        commit_msg_body
+            .contains("Note: This fixes a latent bug with no known triggers in the kernel today."),
+        "commit-message prompt must include the verbatim latent notice"
+    );
+    // The prompt must explicitly forbid putting the notice on line 1 —
+    // git treats line 1 as the commit subject, and any wording that
+    // lets the model write the notice as the subject reintroduces the
+    // ndisc_redirect_rcv-style slip-through where `git log --oneline`
+    // shows the notice instead of the real fix subject.
+    assert!(
+        commit_msg_body.contains("do not put the notice on") && commit_msg_body.contains("line 1"),
+        "commit-message prompt must explicitly forbid putting the latent notice on line 1"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fix_workflow_commits_write_patch_files_when_research_file_list_is_empty() {
     let workflow = parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap();
@@ -492,6 +874,7 @@ async fn fix_workflow_commits_write_patch_files_when_research_file_list_is_empty
             &[],
             "Patch a.c even though research did not return affected_files.",
         ),
+        empty_lore_search_response(),
         fake_messages_response(
             "Wrote the fix.\n\
              {\"build_target\": \"a.o\", \
@@ -578,6 +961,7 @@ async fn fix_workflow_accepts_review_added_patch_file_outside_research_list() {
             &["f"],
             "Patch requires a related header contract update.",
         ),
+        empty_lore_search_response(),
         fake_messages_response(
             "Updated the related header.\n\
              {\"build_target\": \"a.o\", \
@@ -657,6 +1041,7 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
     let workflow = parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap();
     let mut responses = VecDeque::from(vec![
         confirmed_research_response("Research found the file.", &["a.c"], &["f"], "Change a.c."),
+        empty_lore_search_response(),
         fake_messages_response(
             "First patch.\n\
              {\"build_target\": \"a.o\", \
@@ -681,6 +1066,7 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
     ]);
     responses.extend(dirty_source_review_responses(&workflow));
     responses.push_back(review_ledger_response("source", "open"));
+    responses.push_back(orchestrator_picks("write-patch"));
     responses.push_back(fake_messages_response(
         "Corrected patch.\n\
          {\"build_target\": \"a.o\", \
@@ -689,22 +1075,16 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
           \"new_string\": \"int x = 3;\\n\"}]}",
     ));
     responses.push_back(review_ledger_response("source", "addressed"));
-    responses.extend(vec![
-        fake_messages_response(
-            "No proven introducing commit.\n\
-             {\"fixes_sha\": \"\", \
-              \"fixes_subject\": \"\", \
-              \"fixes_evidence\": \"\", \
-              \"unproven_fixes_candidates\": [], \
-              \"analysis\": \"No relevant provenance in toy repo.\"}",
-        ),
-        fake_messages_response(
-            "Second commit message.\n\
-             {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"subsystem: corrected patch\\n\\nBody explaining the corrected fix.\\n\\nAssisted-by: kres (test)\\n\", \
-             \"purpose\": \"commit message\"}]}",
-        ),
-    ]);
+    // fixes-tag-search is skipped on the orchestrator-driven retry
+    // (its run_if pins it to attempt == 0), so the next mock response
+    // consumed after write-patch attempt 2 is the commit-message
+    // response — no spurious fixes-tag-search response queued.
+    responses.push_back(fake_messages_response(
+        "Second commit message.\n\
+         {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
+          \"content\": \"subsystem: corrected patch\\n\\nBody explaining the corrected fix.\\n\\nAssisted-by: kres (test)\\n\", \
+          \"purpose\": \"commit message\"}]}",
+    ));
     responses.extend(clean_review_responses(&workflow));
     responses.push_back(review_ledger_response("source", "resolved"));
     let (port, requests) = spawn_recording_mock(responses).await;
@@ -759,6 +1139,7 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
     let workflow = parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap();
     let mut responses = VecDeque::from(vec![
         confirmed_research_response("Research found the file.", &["a.c"], &["f"], "Change a.c."),
+        empty_lore_search_response(),
         fake_messages_response(
             "Patch.\n\
              {\"build_target\": \"a.o\", \
@@ -783,6 +1164,7 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
     ]);
     responses.extend(dirty_commit_message_review_responses(&workflow));
     responses.push_back(review_ledger_response("commit_message", "open"));
+    responses.push_back(orchestrator_picks("write-commit-message"));
     responses.extend(vec![fake_messages_response(
         "Rewritten commit message.\n\
          {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \

@@ -212,7 +212,7 @@ fn consolidator_instructions(workflow_rules: Option<&str>) -> String {
 ///
 /// keeps duplicate findings so the consolidator's
 /// DEDUP-ACROSS-LENSES rule fires; we dedup here to
-/// match the kres orchestrator's "consolidator-optional" design where
+/// match the kres AgentRunner's "consolidator-optional" design where
 /// the fallback result is what actually reaches the operator. If you
 /// switch to calling an LLM consolidator unconditionally, drop this
 /// dedup so duplicates reach the merge step.
@@ -368,6 +368,7 @@ mod tests {
             name: "kernel/a.c:1+20".into(),
             reason: "needed by lens".into(),
             path: None,
+            nice_to_have: false,
         };
         let f2 = f1.clone();
         let f3 = Followup {
@@ -375,6 +376,7 @@ mod tests {
             name: "foo".into(),
             reason: "needed by lens".into(),
             path: None,
+            nice_to_have: false,
         };
         let empty_findings = Vec::new();
         let lens1_followups = vec![f1, f3.clone()];

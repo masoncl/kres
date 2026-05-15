@@ -57,14 +57,18 @@ caching. Use it to pair interleaved lensed user/assistant records
 instead of relying on adjacent JSONL lines.
 
 If an LLM response does not produce a parseable JSON object matching the
-step schema, the runner retries that LLM step with a one-line JSON
-repair prefix. It tries the original response plus three repair retries.
-If the driver still cannot map the response and the workflow step has an
-eval retry budget, the executor repeats that same step instead of
-terminating the workflow immediately. Side effects are applied only
-after the response has been mapped, and `code_edits` are staged in memory
-before any file is written, so a malformed or partially matching coding
-response does not leave partial edits behind before the retry.
+step schema, the runner retries that LLM step with the JSON repair
+prefix plus the specific validator/parse error from the previous
+attempt (e.g. "findings is not array<Finding>", "missing required
+output 'analysis'") so the model knows which field tripped the schema
+instead of guessing. It tries the original response plus three repair
+retries. If the driver still cannot map the response and the workflow
+step has an eval retry budget, the executor repeats that same step
+instead of terminating the workflow immediately. Side effects are
+applied only after the response has been mapped, and `code_edits` are
+staged in memory before any file is written, so a malformed or
+partially matching coding response does not leave partial edits behind
+before the retry.
 
 After side-effect and machine-populated outputs are added, the runner
 validates that every required workflow output is present. A step that
@@ -197,9 +201,12 @@ the bug still exists at the current workspace HEAD.
      `needs_more_audit`. These booleans must agree with
      `research_status`; routing never depends on wording inside
      `analysis`.
-   - `followups_empty`: machine-populated boolean. A research result is
-     terminal only when the slow agent emitted no typed followups for
-     missing source, callers, history, locking, or API context.
+   - `followups`: typed data requests. A blocking followup (default
+     `nice_to_have: false`) is a request for another gather round. Any
+     blocking followup makes the eval fail and triggers a retry that
+     gathers the requested evidence. A nice-to-have followup
+     (`nice_to_have: true`) is a deferred audit suggestion that does
+     not block — it may ride alongside any terminal status.
    - `affected_files`: paths the patch will touch.
    - `affected_symbols`: relevant symbols.
 
@@ -208,35 +215,44 @@ the bug still exists at the current workspace HEAD.
    - `analysis`: research narrative and fix sketch for later steps.
 
    The research step has a structural `builtin` eval named
-   `fix_research_status`. It accepts only one of these typed states:
+   `fix_research_status`. It accepts only one of these typed states,
+   and in all three cases the `followups` array must have no blocking
+   entries:
 
    - confirmed: `research_status=confirmed`, `valid=true`,
      `invalid_evidence=""`, and `invalid_evidence_kind=none`.
      `research_decision` must say the bug and fix contract are both
-     proven, invalidity is not proven, no more audit is needed, and
-     `followups_empty=true`.
+     proven, invalidity is not proven, and no more audit is needed.
    - invalid: `research_status=invalid`, `valid=false`, non-empty
      `invalid_evidence`, and
      `invalid_evidence_kind=source_or_commit_evidence`.
      `research_decision` must say invalidity is proven while the bug and
-     fix contract are not, and `followups_empty=true`.
+     fix contract are not.
    - unconfirmed: `research_status=unconfirmed`, `valid=false`,
      `invalid_evidence=""`, and `invalid_evidence_kind=none`.
      `research_decision` must say invalidity is not proven and either the
      bug, the fix contract, or both remain unproven, or more audit is
-     needed, and `followups_empty=true`.
+     needed.
 
-   Malformed JSON, missing required outputs, or inconsistent typed
-   fields consume the research eval retry budget and rerun research
-   instead of routing prose into later workflow steps.
-
-   If the slow agent emits typed followups, research is incomplete even
-   if it also emits `research_status=unconfirmed`. The eval fails rather
-   than letting `unconfirm` update a finding based on missing evidence.
+   Malformed JSON, missing required outputs, inconsistent typed fields,
+   or a blocking followup all consume the research eval retry budget
+   and rerun research instead of routing prose into later workflow
+   steps.
 
    Only `research_status=confirmed` reaches `write-patch`. If research
    cannot prove a concrete bug and fix contract, it must not set
    `confirmed` just to keep the fix pipeline moving.
+
+   On eval-fail repeats, the runner snapshots the failing attempt's
+   outputs into `StepState.prior_attempts` before clearing them. The
+   next attempt's prompt sees that list through the
+   `{{<step>.prior_attempts}}` interpolation token (a JSON-rendered
+   array of prior output maps, oldest first). The fix-workflow
+   research prompt uses this so the slow agent can read its earlier
+   `fix_plan` / `research_decision` and either commit to one of those
+   shapes by gathering specific evidence, or justify a different shape
+   with concrete source/commit evidence — instead of cycling through
+   plausible-but-different proposals every retry.
 
    Proving a concrete bug requires proving the alleged state is valid and
    reachable, not merely that one local function would mishandle that
@@ -378,10 +394,17 @@ the bug still exists at the current workspace HEAD.
    Missing `build_target` is valid
    for header-only, documentation-only, Kconfig-only, or other non-object
    changes; the deterministic build step skips cleanly when no enabled
-   object target can be derived from the actual git diff. `write-patch`
-   gets six eval attempts before the workflow fails, so transient
-   no-op/edit-shape mistakes have more room to self-correct before
-   review.
+   object target can be derived from the actual git diff. When the eval
+   fails (no edits and no dispute), `write-patch` does not blind-repeat;
+   `on_fail.action = branch_to orchestrator`, so the orchestrator sees
+   the failed attempt in `prior_attempts` and decides whether to
+   re-instruct `write-patch` (e.g. point at the specific source the prior
+   attempt was missing, or correct a protocol mistake like a followup
+   kind outside the step's actions allowlist) or to exit failure.
+   `write-patch.max_attempts=12` is a backstop floor; the routing budget
+   is owned by the orchestrator. `write-commit-message` uses the same
+   shape: if `commit_message_written != true`, it branches to the
+   orchestrator rather than retrying blindly.
 
    A review dispute does not publish or self-clear. Because the committed
    patch did not change, fixes-tag-search/commit/build/compile-triage are
@@ -606,31 +629,28 @@ the bug still exists at the current workspace HEAD.
    The one supported shape for `/fix` review is the `review` step in
    `configs/workflows/fix.json` with a non-empty `lenses` array and
    `aggregate: "consolidate"`. Each lens emits the typed review contract:
-   `clean`, `defects`, `correction_step`, and `analysis`. The runner then
-   merges those typed lens results deterministically: no extra LLM is
-   needed to decide whether any lens failed or which defects survive.
-   Routing is simple: when a lens emits either split array,
-   `commit_message_defects[]` and `source_defects[]` are authoritative;
-   the generic `defects[]` copy from that same lens is schema
-   compatibility only and is not reinterpreted into another bucket. If a
-   legacy lens emits only `defects[]`, the runner routes those defects by
-   that lens's explicit `correction_step`, not by scanning defect prose.
-   If every authoritative defect is commit-message-only, review branches
-   to `write-commit-message`; otherwise it branches to `write-patch`. If a
-   failing lens emitted no structured defect, the runner uses that lens's
-   explicit `correction_step`. A non-empty authoritative defect bucket always makes
-   the consolidated review dirty even if a lens accidentally set
-   `clean=true`. If every lens reports `clean=true` and every authoritative
-   defect bucket is empty, review is clean; prose in `analysis` is
-   preserved for humans but is not interpreted by the runner as a routing
-   or retry signal. The JSON
-   `consolidate.prompt` remains the
-   human-editable policy for how lenses should think about merging and
-   correction targets, but the boolean fan-in is not allowed to depend on
-   another model producing valid JSON. Do not add a second review step, a
-   markdown prompt/template fallback, or an in-prompt checklist of
-   lenses. If fix review behavior is wrong, change this JSON lensed step
-   and the shared typed fan-in.
+   `clean`, `defects`, `source_defects[]`, `commit_message_defects[]`,
+   `unresolved_risks[]`, `correction_step`, `outcomes[]`, and `analysis`.
+   The runner validates each lens output as JSON shape (declared fields
+   present, required fields non-empty); malformed or missing-field lens
+   responses are retried with the JSON repair instruction (which carries
+   the parse error for that lens by id). The runner does not validate
+   cross-field invariants — those are the consolidator's job. Once every
+   lens has produced a parseable structured output, the per-lens outputs
+   are handed to the LLM consolidator (`consolidate.prompt`) which
+   produces the single consolidated structured result for the step:
+   `clean`, `correction_step`, deduped `defects[]`, `source_defects[]`,
+   `commit_message_defects[]`, `unresolved_risks[]`, `outcomes[]`, and
+   `analysis`. That consolidated output is the single source of truth
+   for routing — no Rust-side override, no parallel deterministic
+   consolidator. Prose in `analysis` is preserved for humans but is
+   never interpreted by the runner as a routing or retry signal because
+   the runner reads only typed fields. The JSON `consolidate.prompt` is
+   the human-editable policy for how the consolidator should merge typed
+   lens fields and pick the correction target. Do not add a second
+   review step, a markdown prompt/template fallback, an in-prompt
+   checklist of lenses, or a parallel deterministic consolidator. If
+   fix review behavior is wrong, change this JSON lensed step.
 
    The maintainer lens is a hard quality gate. It aggressively looks for
    regressions, unnecessary churn, brittle assumptions, weak or overbroad

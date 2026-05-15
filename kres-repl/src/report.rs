@@ -71,11 +71,21 @@ fn render_finding(out: &mut String, f: &Finding) {
         }
     }
 
-    out.push_str("**Reproducer**\n\n");
-    out.push_str(&f.reproducer_sketch);
-    out.push_str("\n\n**Impact**\n\n");
-    out.push_str(&f.impact);
-    out.push_str("\n\n");
+    // reproducer_sketch and impact are `#[serde(default)]` on
+    // `Finding`, so a slow agent that omits them yields an empty
+    // string here. Mirror the mechanism_detail / fix_sketch
+    // pattern: skip the section entirely when the field is empty
+    // instead of emitting a bare `**Reproducer**\n\n\n\n` heading.
+    if !f.reproducer_sketch.is_empty() {
+        out.push_str("**Reproducer**\n\n");
+        out.push_str(&f.reproducer_sketch);
+        out.push_str("\n\n");
+    }
+    if !f.impact.is_empty() {
+        out.push_str("**Impact**\n\n");
+        out.push_str(&f.impact);
+        out.push_str("\n\n");
+    }
 
     if let Some(ref fx) = f.fix_sketch {
         if !fx.is_empty() {
@@ -206,6 +216,28 @@ mod tests {
         assert!(md.contains("cache a bool"));
         assert!(md.contains("is x verified?"));
         assert!(md.contains("Related:"));
+    }
+
+    #[test]
+    fn skips_empty_reproducer_and_impact_sections() {
+        // Finding's reproducer_sketch / impact serde-default to "",
+        // so a slow agent that omits them yields empty strings.
+        // Render must not emit bare `**Reproducer**` / `**Impact**`
+        // headers above empty bodies.
+        let mut f = finding("x", Severity::High);
+        f.reproducer_sketch.clear();
+        f.impact.clear();
+        let md = render_findings_markdown(&[f]);
+        assert!(
+            !md.contains("**Reproducer**"),
+            "should omit empty Reproducer section: {md}"
+        );
+        assert!(
+            !md.contains("**Impact**"),
+            "should omit empty Impact section: {md}"
+        );
+        // Summary still renders.
+        assert!(md.contains("**Summary**"), "summary always rendered");
     }
 
     #[test]

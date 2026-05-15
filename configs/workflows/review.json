@@ -226,9 +226,7 @@
           "",
           "Drop anything that is not a concrete bug. Sort high severity first, then medium, then",
           "low. Return full Finding records using the tool schema; do not add ad hoc `file`, `what`, or `lenses`",
-          "fields. Return followups for unresolved concrete suspicions; do not return",
-          "`followups_empty: true` unless there are no followups and no unresolved-risk language",
-          "left in analysis."
+          "fields. Return followups for unresolved concrete suspicions."
         ]
       },
       "outputs": {
@@ -243,10 +241,6 @@
         "followups": {
           "type": "array<Followup>",
           "description": "Unresolved data requests from consolidation. A successful review should leave this empty."
-        },
-        "followups_empty": {
-          "type": "boolean",
-          "description": "Machine-populated summary bit for reports; true only when followups is empty. It must not drive workflow-local retry."
         }
       },
       "eval": {

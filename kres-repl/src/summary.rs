@@ -114,7 +114,7 @@ pub fn default_output_path(results_dir: Option<&Path>, filename: Option<&str>) -
 
 /// Build a minimal fast-agent LLM client from a fast-code-agent config
 /// file. `kres --summary` uses this so it can issue the summary calls
-/// without spinning up the full orchestrator. The summariser runs on
+/// without spinning up the full AgentRunner. The summariser runs on
 /// the fast agent — per-task condensation and per-batch rendering are
 /// both formatting work that the slow agent would be overkill for.
 pub fn load_fast_for_summary(

@@ -245,6 +245,7 @@ pub enum ActionType {
     Make,
     Edit,
     Bash,
+    Lore,
     #[serde(rename = "publish-fix")]
     PublishFix,
     #[serde(rename = "commit-fix")]
@@ -580,11 +581,21 @@ fn resolve_prompt_path(raw_path: &str, base_dir: Option<&Path>) -> PathBuf {
     }
 }
 
+// Output names the interpolation engines (`resolve_one` /
+// `resolve`) read directly from `StepState` rather than from
+// `outputs`. A step that declares an output by one of these names
+// would be silently unreachable via `{{<step>.<name>}}` because the
+// special-case branch fires first. Reject the workflow at parse
+// time so the collision is loud instead.
+const RESERVED_STEP_OUTPUT_NAMES: &[&str] = &["attempt", "eval_failures", "prior_attempts"];
+
 /// Cross-field invariants the schema cannot express:
 /// - every step id is unique
 /// - every `depends_on` id resolves to a real step
 /// - every literal `eval.on_fail.branch_to` and every entry of
 ///   `eval.on_fail.rerun` resolves to a real step
+/// - no step declares an output whose name is in
+///   [`RESERVED_STEP_OUTPUT_NAMES`]
 fn validate_cross_field(wf: &Workflow) -> Result<()> {
     let ids: BTreeSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
     if ids.len() != wf.steps.len() {
@@ -598,6 +609,17 @@ fn validate_cross_field(wf: &Workflow) -> Result<()> {
         return Err(anyhow!("duplicate step id: {dup}"));
     }
     for step in &wf.steps {
+        for reserved in RESERVED_STEP_OUTPUT_NAMES {
+            if step.outputs.contains_key(*reserved) {
+                return Err(anyhow!(
+                    "step '{}' declares output '{}', which is reserved for the interpolation \
+                     engine (`{{{{<step>.{}}}}}` reads it from StepState, not from outputs)",
+                    step.id,
+                    reserved,
+                    reserved
+                ));
+            }
+        }
         for dep in &step.depends_on {
             if !ids.contains(dep.as_str()) {
                 return Err(anyhow!(
@@ -662,9 +684,39 @@ fn validate_cross_field(wf: &Workflow) -> Result<()> {
     Ok(())
 }
 
+/// Substring match against a prompt that has been joined from a
+/// JSON `[…]` array (workflow prompts use `PromptValue::into_string`
+/// to `\n`-join the array). Both haystack and needle are
+/// whitespace-flattened (every run of whitespace collapsed to a
+/// single space) before the contains check, so a phrase that the
+/// JSON file happens to wrap across two array elements still
+/// matches. Use this instead of bare `str::contains` whenever the
+/// assertion is checking semantic prompt content (rather than
+/// exact tokenization). Test-only.
+#[cfg(test)]
+pub(crate) fn prompt_contains_phrase(prompt: &str, phrase: &str) -> bool {
+    fn flatten(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    flatten(prompt).contains(&flatten(phrase))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_contains_phrase_collapses_whitespace() {
+        // Phrase wrapped across newlines and extra indent must still
+        // match a single-line needle.
+        let wrapped = "line one\n  line  two\n\t\tline three";
+        assert!(prompt_contains_phrase(
+            wrapped,
+            "line one line two line three"
+        ));
+        // Tokenization that disagrees still misses.
+        assert!(!prompt_contains_phrase(wrapped, "line four"));
+    }
 
     /// The shipped fix workflow is the canonical example. It must
     /// validate against the embedded schema AND deserialise into
@@ -908,8 +960,9 @@ mod tests {
         assert_eq!(wf.schema_version, 1);
         // Research plus deterministic status/commit/build/publish
         // steps around the LLM-authored patch/provenance/message/review
-        // steps.
-        assert_eq!(wf.steps.len(), 14, "fix workflow has 14 steps");
+        // steps, plus the post-review orchestrator that routes the
+        // next step when review is not clean.
+        assert_eq!(wf.steps.len(), 16, "fix workflow has 16 steps");
         let research = wf.steps.iter().find(|s| s.id == "research").unwrap();
         let research_eval = research.eval.as_ref().expect("research eval");
         assert_eq!(research_eval.kind, EvalKind::Builtin);
@@ -925,24 +978,44 @@ mod tests {
             write_patch.outputs.contains_key("review_dispute"),
             "write-patch must expose a typed review dispute path"
         );
-        assert!(
-            write_patch.outputs.contains_key("review_dispute_allowed"),
-            "write-patch must expose the machine dispute gate"
-        );
+        // write-patch keeps a minimal sanity-check eval — it must
+        // either emit code changes or fill in review_dispute. Routing
+        // decisions live in the post-review orchestrator; this eval
+        // only catches a model that returned nothing useful so the
+        // chain doesn't proceed to commit-fix with an empty diff.
         let write_patch_eval = write_patch
             .eval
             .as_ref()
-            .expect("write-patch eval must be configured");
+            .expect("write-patch must have a sanity-check eval");
+        assert_eq!(write_patch_eval.kind, EvalKind::FieldCheck);
         assert_eq!(
-            write_patch_eval.kind,
-            EvalKind::Builtin,
-            "write-patch eval must use a named validator"
+            write_patch_eval.expr.as_deref(),
+            Some("code_changes_emitted == true || review_dispute != ''"),
+            "write-patch sanity check must accept either real edits or a non-empty dispute"
         );
+        assert_eq!(write_patch_eval.on_fail.action, OnFailAction::BranchTo);
         assert_eq!(
-            write_patch_eval.name.as_deref(),
-            Some("fix_write_patch_output"),
-            "write-patch eval must validate edits/disputes without JSON boolean algebra"
+            write_patch_eval.on_fail.branch_to.as_deref(),
+            Some("orchestrator"),
+            "write-patch eval failure must route to the orchestrator so retry decisions are LLM-owned, not blind repeats"
         );
+        assert_eq!(write_patch_eval.on_fail.max_attempts, Some(12));
+        let write_commit = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "write-commit-message")
+            .unwrap();
+        let write_commit_eval = write_commit
+            .eval
+            .as_ref()
+            .expect("write-commit-message must have a sanity-check eval");
+        assert_eq!(write_commit_eval.on_fail.action, OnFailAction::BranchTo);
+        assert_eq!(
+            write_commit_eval.on_fail.branch_to.as_deref(),
+            Some("orchestrator"),
+            "write-commit-message eval failure must route to the orchestrator, not blind repeat"
+        );
+        assert_eq!(write_commit_eval.on_fail.max_attempts, Some(12));
         assert!(wf.steps.iter().any(|s| s.id == "unconfirm"));
         assert!(wf.steps.iter().any(|s| s.id == "fixes-tag-search"));
         assert!(wf.steps.iter().any(|s| s.id == "publish"));
@@ -995,6 +1068,47 @@ mod tests {
             fixes.outputs.contains_key("unproven_fixes_candidates"),
             "fixes-tag-search must preserve plausible unproven candidates"
         );
+        // lore-search runs between research and write-patch and must
+        // allow the `lore` followup kind so the fast agent can call
+        // the semcode lore_search MCP tool.
+        let lore = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "lore-search")
+            .expect("fix workflow must include lore-search step");
+        assert_eq!(lore.agent, Some(Agent::Fast));
+        assert_eq!(lore.mode, Some(Mode::Audit));
+        let lore_actions = lore
+            .actions
+            .as_ref()
+            .expect("lore-search must list actions");
+        assert!(
+            lore_actions.contains(&ActionType::Lore),
+            "lore-search must allow the `lore` followup kind"
+        );
+        assert!(
+            lore.outputs.contains_key("existing_patches")
+                && lore.outputs.contains_key("duplicate_proven"),
+            "lore-search must declare existing_patches and duplicate_proven outputs"
+        );
+        // write-patch must depend on lore-search so its prompt can
+        // interpolate the upstream-patches block.
+        let write_patch = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "write-patch")
+            .expect("fix workflow must include write-patch step");
+        assert!(
+            write_patch.depends_on.iter().any(|d| d == "lore-search"),
+            "write-patch must depend_on lore-search"
+        );
+        let write_patch_prompt = write_patch.prompt.as_deref().unwrap_or("");
+        assert!(
+            write_patch_prompt.contains("{{lore-search.existing_patches")
+                && write_patch_prompt.contains("{{lore-search.duplicate_proven"),
+            "write-patch prompt must interpolate the lore-search outputs"
+        );
+
         // Invalidate now hands off to record-invalidation-results,
         // which is the terminal-on-success short-circuit.
         let inv = wf.steps.iter().find(|s| s.id == "invalidate").unwrap();
@@ -1085,21 +1199,39 @@ mod tests {
             .map(|c| c.prompt.as_str())
             .unwrap_or("");
         assert!(
-            consolidate.contains("declarations, kerneldoc, comments, or docs are stale")
-                && consolidate.contains("contradicted, incomplete, or misleading")
+            consolidate.contains("stale/contradicted/incomplete/misleading declarations")
                 && consolidate.contains("clean=false"),
             "fix review consolidator must preserve stale-doc contract defects"
         );
         assert!(
-            consolidate.contains("Commit-message readability defects")
-                && consolidate.contains("wall-of-text proof memo")
-                && consolidate.contains("write-commit-message"),
+            consolidate.contains("unresolved_risks")
+                && consolidate.contains("typed lens fields")
+                && consolidate.contains("trust the typed buckets"),
+            "fix review consolidator must derive routing from typed fields, not prose"
+        );
+        let review_prompt = review.prompt.as_deref().unwrap_or("");
+        assert!(
+            review_prompt.contains("unresolved_risks[]")
+                && review_prompt.contains("inconsistent with a"),
+            "fix review step prompt must require typed unresolved_risks for concerns that lack proof"
+        );
+        let review_outputs = &review.outputs;
+        assert!(
+            review_outputs.contains_key("unresolved_risks"),
+            "fix review step must declare unresolved_risks in its output schema"
+        );
+        assert!(
+            consolidate.contains("wall-of-text proof memo")
+                && consolidate.contains("commit-message defects"),
             "fix review consolidator must preserve maintainer readability defects"
         );
         let on_fail = &review.eval.as_ref().unwrap().on_fail;
         assert_eq!(on_fail.action, OnFailAction::BranchTo);
-        assert_eq!(on_fail.branch_to.as_deref(), None);
-        assert_eq!(on_fail.branch_to_output.as_deref(), Some("correction_step"));
+        // Review now hands off to the orchestrator step; the
+        // orchestrator owns the next-step decision and dispatches
+        // based on its own next_step output.
+        assert_eq!(on_fail.branch_to.as_deref(), Some("orchestrator"));
+        assert_eq!(on_fail.branch_to_output.as_deref(), None);
     }
 
     #[test]
@@ -1141,6 +1273,35 @@ mod tests {
         }"#;
         let err = parse_workflow(body).unwrap_err().to_string();
         assert!(err.contains("schema validation failed"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_reserved_step_output_name() {
+        // A step declaring an output named `attempt`, `eval_failures`,
+        // or `prior_attempts` collides with the interpolation engine,
+        // which reads those names from StepState ahead of any
+        // declared output. Parse-time refusal keeps the collision
+        // loud.
+        for reserved in ["attempt", "eval_failures", "prior_attempts"] {
+            let body = format!(
+                r#"{{
+                    "$schema_version": 1,
+                    "id": "x",
+                    "steps": [{{
+                        "id": "s",
+                        "agent": "fast",
+                        "prompt": "do",
+                        "outputs": {{"{reserved}": {{"type": "string"}}}}
+                    }}]
+                }}"#
+            );
+            let err = parse_workflow(&body).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("declares output '{reserved}'")),
+                "expected reserved-output error for {reserved}, got: {err}"
+            );
+            assert!(err.contains("reserved for the interpolation"), "got: {err}");
+        }
     }
 
     #[test]

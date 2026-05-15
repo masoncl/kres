@@ -737,7 +737,7 @@ fn apply_workflow_model_overrides(settings: &mut kres_repl::Settings, args: &Run
 async fn run_repl(args: ReplArgs) -> Result<()> {
     use kres_agents::WorkspaceFetcher;
     use kres_core::TaskManager;
-    use kres_repl::{build_orchestrator, ReplConfig, Session};
+    use kres_repl::{build_agent_runner, ReplConfig, Session};
     use std::sync::Arc;
 
     // Per-user settings (~/.kres/settings.json). Carries the default
@@ -839,7 +839,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // defaults above). Output is `summary.txt` (or `summary.md` with
     // --summary-markdown), living in the results dir when --results
     // was set and the cwd otherwise. Exits right after the file is
-    // written; no REPL, no MCP, no orchestrator, no turn logger.
+    // written; no REPL, no MCP, no AgentRunner, no turn logger.
     if summary_mode {
         let fast_cfg_path = match fast_agent.as_ref() {
             Some(p) => p.clone(),
@@ -917,7 +917,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // --- --export DIR: per-finding folder tree -------------------
     // Iterates findings.json (honouring --results / --findings),
     // writes DIR/<tag>/meta.yaml + DIR/<tag>/FINDING.md for every
-    // finding, then exits. No REPL, no MCP, no orchestrator.
+    // finding, then exits. No REPL, no MCP, no AgentRunner.
     if let Some(ref export_dir) = args.export {
         let findings_path = match findings_base.as_ref() {
             Some(p) if p.exists() => p.clone(),
@@ -1360,13 +1360,13 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             },
             None => None,
         };
-        let built = build_orchestrator(
+        let built = build_agent_runner(
             fc,
             sc,
             workspace,
             fetcher,
             &settings,
-            kres_repl::OrchestratorBuildOptions {
+            kres_repl::AgentRunnerBuildOptions {
                 extra_slow_cfgs: slow_agent_specs.iter().skip(1).cloned().collect(),
                 skills: skills_value,
                 usage: usage.clone(),
@@ -1376,10 +1376,10 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             },
         )
         .await?;
-        let orc = built.orchestrator;
+        let orc = built.agent_runner;
         let consolidator = built.consolidator;
         session = session
-            .with_orchestrator(orc)
+            .with_agent_runner(orc)
             .with_consolidator(consolidator);
 
         // Optional todo agent.
@@ -1408,10 +1408,10 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 Err(e) => kres_core::async_eprintln!("todo agent config load: {e}"),
             }
         }
-        kres_core::async_eprintln!("orchestrator: ready (gather_turns={})", args.gather_turns);
+        kres_core::async_eprintln!("AgentRunner: ready (gather_turns={})", args.gather_turns);
     } else {
         kres_core::async_eprintln!(
-            "orchestrator: not configured (pass --fast-agent/--slow-agent or configure matching ~/.kres/models/*.json files)"
+            "AgentRunner: not configured (pass --fast-agent/--slow-agent or configure matching ~/.kres/models/*.json files)"
         );
     }
     if let Some(ref raw_arg) = args.prompt {
@@ -1735,7 +1735,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         ));
     }
 
-    // Build a full Orchestrator when both fast and slow agents are wired.
+    // Build a full AgentRunner when both fast and slow agents are wired.
     // This reuses the same builder the REPL uses, so model selection,
     // prompt loading, rate-limit sharing, gather-turn handling, and lens
     // consolidation setup stay in one place.
@@ -1788,13 +1788,13 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
             workspace_fetcher.clone()
         };
 
-        let built = kres_repl::build_orchestrator(
+        let built = kres_repl::build_agent_runner(
             &fast_path,
             &slow_path,
             args.workspace.clone(),
             fetcher,
             &settings,
-            kres_repl::OrchestratorBuildOptions {
+            kres_repl::AgentRunnerBuildOptions {
                 usage: Some(usage.clone()),
                 gather_turns: 5,
                 logger: logger.clone(),
@@ -1804,15 +1804,15 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         )
         .await?;
         driver = driver
-            .with_orchestrator(built.orchestrator)
+            .with_agent_runner(built.agent_runner)
             .with_consolidator(built.consolidator);
         eprintln!(
-            "orchestrator: wired via REPL builder (WorkspaceFetcher in {}; lens fan-out shares gather via run_with_lenses)",
+            "AgentRunner: wired via REPL builder (WorkspaceFetcher in {}; lens fan-out shares gather via run_with_lenses)",
             args.workspace.display()
         );
     } else {
         eprintln!(
-            "orchestrator: not wired (need both fast+slow model configs); falling back to single-shot LLM calls — followups WILL NOT be gathered"
+            "AgentRunner: not wired (need both fast+slow model configs); falling back to single-shot LLM calls — followups WILL NOT be gathered"
         );
     }
 

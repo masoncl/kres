@@ -11,6 +11,14 @@ pub enum AgentError {
     #[error("agent response contains no parseable JSON")]
     NoJson,
 
+    /// Provider reported (or kres preemptively detected) that the
+    /// input exceeds the model's per-request token limit. Surfaced
+    /// when the caller set `CallConfig::surface_over_input_limit`,
+    /// so an upstream retry loop (e.g. the workflow runner's
+    /// prior_attempts prune-and-retry) can shrink and reissue.
+    #[error("input over limit: actual={actual} limit={limit}")]
+    OverInputLimit { actual: u64, limit: u64 },
+
     #[error("{0}")]
     Other(String),
 }

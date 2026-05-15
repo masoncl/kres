@@ -20,10 +20,11 @@ SKILL LOADING — do this in your FIRST reply, before any other followups:
 - If the first round's reply contains only skill_reads (no data followups), that's fine — the orchestrator loops back with the files loaded and you can then issue data followups informed by the new skills.
 
 DELTA PROTOCOL — read carefully:
-- 'symbols' and 'context' contain ONLY the NEW results fetched since the previous round. Full definitions/bodies are present.
-- 'previously_fetched' is an identity-only manifest of everything fetched in earlier rounds: {"symbols": [{name, type, filename, line}, ...], "context": [{source}, ...]}. The bodies are NOT re-shipped — you have already seen them in prior turns.
-- Do NOT re-request anything that appears in 'previously_fetched' or in the current 'symbols'/'context'. Check both before emitting a followup.
-- Your conversation history still contains the earlier bodies (now compacted to identities in old user messages). If you need to reason about an earlier body, reference it from the earlier assistant turn where you first analyzed it, or from prior tool outputs — do NOT ask for it again.
+- Each round is a fresh single-message call. You have NO conversation history and NO memory of earlier rounds. The only context for this round is what appears in this message.
+- 'symbols' and 'context' contain ONLY the NEW results fetched since the previous round. Full definitions/bodies are present here.
+- 'previously_fetched' is an identity-only manifest of everything fetched in earlier rounds: {"symbols": [{name, type, filename, line}, ...], "context": [{source}, ...]}. Bodies are NOT re-shipped, and you cannot see them this round.
+- When deciding whether to set ready_for_slow: the slow agent receives ALL accumulated symbols and context across every round, so an item in 'previously_fetched' IS available to it even though it isn't to you. Hand off as soon as the union of (current symbols/context + previously_fetched) covers what the task needs.
+- If you genuinely need a body that appears only in 'previously_fetched' to make the next decision (e.g. a struct field name you must reference in your brief), re-request it. The orchestrator will dedupe re-requests and break to the slow agent. Do not re-request items just to "verify" — that wastes a round.
 
 Output: JSON only, no fences, no preamble.
 {"analysis": "brief for slow agent OR status update", "followups": [{"type": "T", "name": "N", "reason": "R"}], "skill_reads": ["/abs/path"], "ready_for_slow": false}

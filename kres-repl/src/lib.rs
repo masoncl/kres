@@ -32,7 +32,7 @@ pub mod workflow;
 pub use commands::{parse_command, Command};
 pub use export::{run_export, run_export_index, ExportInputs};
 pub use report::{append_task_section, render_findings_markdown, write_findings_to_file};
-pub use session::{build_orchestrator, OrchestratorBuildOptions, ReplConfig, Session};
+pub use session::{build_agent_runner, AgentRunnerBuildOptions, ReplConfig, Session};
 pub use settings::{pick_model, ModelRole, Settings};
 pub use summary::{default_output_path, run_summary, SummaryInputs};
 pub use workflow::{

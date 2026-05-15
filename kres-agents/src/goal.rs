@@ -540,39 +540,16 @@ fn extract_json_with_key<T: for<'de> Deserialize<'de>>(text: &str, key: &str) ->
             return serde_json::from_value(v).ok();
         }
     }
-    // Brace-match for the first `{...}` containing "<key>":
-    let bytes = text.as_bytes();
+    // Brace-match for the first `{...}` containing "<key>". The
+    // shared scanner is string-aware and clamps a stray `}` so
+    // prose preambles with code snippets don't desync it.
     let marker = format!("\"{key}\"");
-    let mut depth = 0i32;
-    let mut start: Option<usize> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start {
-                        let slice = &text[s..=i];
-                        if slice.contains(&marker) {
-                            if let Ok(t) = serde_json::from_str(slice) {
-                                return Some(t);
-                            }
-                        }
-                        start = None;
-                    }
-                }
-            }
-            _ => {}
+    kres_core::brace::first_top_level_brace(text, |slice| {
+        if !slice.contains(&marker) {
+            return None;
         }
-        i += 1;
-    }
-    None
+        serde_json::from_str(slice).ok()
+    })
 }
 
 fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {

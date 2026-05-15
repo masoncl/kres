@@ -44,8 +44,7 @@ pub use kres_core::TaskMode;
 pub use main_agent::{parse_actions, MainAgent, DEFAULT_MAX_MAIN_TURNS};
 pub use mcp_fetcher::{McpFetcher, McpMethodMap};
 pub use pipeline::{
-    ConsolidatorClient, DataFetcher, FetchResult, NullFetcher, Orchestrator, RunContext,
-    TaskSummary,
+    AgentRunner, ConsolidatorClient, DataFetcher, FetchResult, NullFetcher, RunContext, TaskSummary,
 };
 pub use prompt_file::{parse as parse_prompt_file, PromptFile};
 pub use response::{parse_code_response, CodeResponse};

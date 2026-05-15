@@ -8,6 +8,14 @@ pub enum LlmError {
     #[error("API returned status {status}: {body}")]
     ApiStatus { status: u16, body: String },
 
+    /// Provider reported (or kres preemptively detected) that the
+    /// input exceeds the model's per-request token limit. Returned
+    /// only when the caller set `CallConfig::surface_over_input_limit`;
+    /// otherwise the client internally shrinks the last user
+    /// message and retries.
+    #[error("input over limit: actual={actual} limit={limit}")]
+    OverInputLimit { actual: u64, limit: u64 },
+
     #[error("SSE stream error: {0}")]
     Sse(String),
 

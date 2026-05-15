@@ -1031,10 +1031,8 @@ mod tests {
                 id: "research".to_string(),
                 status: StepStatus::Done,
                 attempt: 1,
-                eval_failures: 0,
                 outputs,
-                preserved_outputs_on_skip: Map::new(),
-                lens_outputs: Map::new(),
+                ..StepState::default()
             },
         );
         Trace {

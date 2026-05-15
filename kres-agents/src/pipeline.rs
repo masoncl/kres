@@ -1,4 +1,4 @@
-//! Single-task orchestrator.
+//! Single-task AgentRunner.
 //!
 //! Wires fast agent → main agent (data fetch) → slow agent in order.
 //! Shutdown-aware: every
@@ -202,7 +202,7 @@ enum CacheMode {
     Parallel,
 }
 
-/// Per-invocation arguments for `Orchestrator::run_prepared_lens_fanout`.
+/// Per-invocation arguments for `AgentRunner::run_prepared_lens_fanout`.
 /// `lenses` is the subset to run this pass (e.g. just the failing
 /// lens-ids on a repair retry); `all_lenses` is the full slate, used
 /// to populate each lens's `parallel_lenses.other_lenses` descriptor.
@@ -214,7 +214,7 @@ struct LensFanoutCall<'a> {
 }
 
 /// No-op fetcher used in tests. It returns empty results regardless
-/// of input — good enough to prove the orchestration plumbing without
+/// of input — good enough to prove the agent-runner plumbing without
 /// hitting any real backend.
 pub struct NullFetcher;
 
@@ -229,8 +229,21 @@ impl DataFetcher for NullFetcher {
     }
 }
 
-/// Orchestrator for one Task turn.
-pub struct Orchestrator {
+/// Per-Task-turn fast-gather + slow-synthesis engine.
+///
+/// Holds the fast and slow LLM clients, a data fetcher (gating
+/// followups to a per-step allowlist when wired by
+/// `workflow_runner::agent_runner_with_gated_fetcher`), the loaded
+/// skills payload, and per-call accounting. Built once per REPL
+/// session by `kres-repl::session::build_agent_runner`.
+///
+/// Not to be confused with the `orchestrator` step in
+/// `configs/workflows/fix.json` — that is a workflow step whose
+/// inference call happens to run through this struct, but it is a
+/// separate concept (the LLM-driven routing decision step inside the
+/// fix workflow). This struct is the inference engine; the step is a
+/// JSON-described worker that uses it.
+pub struct AgentRunner {
     pub fast_client: Arc<Client>,
     pub fast_model: Model,
     pub fast_system: Option<String>,
@@ -277,6 +290,19 @@ pub struct Orchestrator {
     /// ideal for free-form questions).
     pub slow_generic_system: Option<String>,
 
+    /// System prompt for fast-routed synthesis calls — workflow
+    /// steps tagged `agent: fast` in fix.json (orchestrator,
+    /// research, lore-search, fixes-tag-search, compile-triage).
+    /// Loaded from `configs/prompts/routing-agent.system.md`. Says
+    /// "you are a routing/decision agent; the user message is
+    /// authoritative; emit only the JSON it specifies." Replaces
+    /// the fast-gather system prompt (which is written for the
+    /// gather role and tells the model to emit followups and set
+    /// `ready_for_slow=true` — wrong shape for a synthesis call
+    /// that needs typed JSON). When `None`, falls back to
+    /// `fast_system`.
+    pub routing_system: Option<String>,
+
     pub fetcher: Arc<dyn DataFetcher>,
 
     /// Max rounds of fast↔main before forcing the slow agent.
@@ -307,8 +333,8 @@ pub struct SlowAgentVariant {
     pub label: String,
 }
 
-/// Inputs to one run that vary per-task. Separated from Orchestrator
-/// so a single Orchestrator can run many tasks in parallel, each with
+/// Inputs to one run that vary per-task. Separated from AgentRunner
+/// so a single AgentRunner can run many tasks in parallel, each with
 /// its own previous_findings / task_brief / original_prompt.
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
@@ -345,6 +371,31 @@ pub struct RunContext {
     /// plan in its response; subsequent pipeline-driven tasks keep
     /// this false so plan churn stays bounded.
     pub allow_plan_rewrite: bool,
+    /// When true, the slow agent's LLM call asks the client to
+    /// surface `LlmError::OverInputLimit` instead of internally
+    /// shrinking the user-message text on a 429-with-over-limit.
+    /// Lets the caller perform structured shrinking (e.g. prune a
+    /// workflow step's prior_attempts) and re-issue the run. Other
+    /// callers leave this false and keep the existing auto-shrink.
+    pub surface_over_input_limit: bool,
+    /// Route the synthesis call (the one after the fast-gather loop)
+    /// to the fast client instead of the slow client. Used by
+    /// workflow steps declared `agent: fast` in fix.json so a
+    /// routing/classification step (orchestrator, compile-triage,
+    /// fixes-tag-search, etc.) doesn't burn Opus output time on a
+    /// decision Sonnet can make. When false (default), the slow
+    /// client runs the synthesis call as before.
+    pub synthesis_use_fast: bool,
+    /// Use the dedicated routing-agent system prompt for this
+    /// synthesis call. ONLY for the orchestrator workflow step in
+    /// fix.json — that step is pure routing over typed inputs, with
+    /// no code analysis or context gathering, and the routing prompt
+    /// matches that shape. Other fast-tagged steps (research,
+    /// lore-search, fixes-tag-search, compile-triage) DO analyze
+    /// gathered code/history and keep the fast-gather system prompt
+    /// at synthesis time. Default false preserves the existing
+    /// fast_system / slow_system selection.
+    pub synthesis_use_routing_prompt: bool,
 }
 
 fn record_usage(
@@ -546,7 +597,7 @@ pub struct TaskSummary {
     pub plan: Option<kres_core::PlanRewrite>,
 }
 
-impl Orchestrator {
+impl AgentRunner {
     /// Convenience wrapper with an empty RunContext.
     pub async fn run_once(
         &self,
@@ -872,57 +923,106 @@ impl Orchestrator {
             cache: false,
             cached_prefix: None,
         }];
-        let mut cfg = CallConfig::defaults_for(self.slow_model.clone())
-            .with_max_tokens(self.slow_max_tokens)
-            .with_stream_label(match ctx.mode {
-                kres_core::TaskMode::Audit => "slow",
-                kres_core::TaskMode::Generic => "slow (generic)",
-                kres_core::TaskMode::Coding => "slow (coding)",
+        // Route the synthesis call to the fast client when the
+        // caller (typically a workflow step declared `agent: fast`)
+        // asked for it. Default is slow — coding/review/deep-audit
+        // work needs Opus. Routing/classification steps
+        // (orchestrator, compile-triage, fixes-tag-search,
+        // lore-search) pay Opus output time unnecessarily today;
+        // synthesis_use_fast lets fix.json's `agent: fast` actually
+        // mean fast.
+        let use_fast = ctx.synthesis_use_fast;
+        let log_phase = if use_fast { "fast-synth" } else { "slow" };
+        let (
+            synth_client,
+            synth_model,
+            synth_max_tokens,
+            synth_max_in,
+            synth_thinking,
+            label_prefix,
+        ) = if use_fast {
+            (
+                &self.fast_client,
+                self.fast_model.clone(),
+                self.fast_max_tokens,
+                self.fast_max_input_tokens,
+                self.fast_thinking,
+                "fast-synth",
+            )
+        } else {
+            (
+                &self.slow_client,
+                self.slow_model.clone(),
+                self.slow_max_tokens,
+                self.slow_max_input_tokens,
+                self.slow_thinking,
+                "slow",
+            )
+        };
+        let mut cfg = CallConfig::defaults_for(synth_model.clone())
+            .with_max_tokens(synth_max_tokens)
+            .with_stream_label(match (use_fast, ctx.mode) {
+                (true, _) => format!("{label_prefix} ({:?})", ctx.mode).to_lowercase(),
+                (false, kres_core::TaskMode::Audit) => "slow".into(),
+                (false, kres_core::TaskMode::Generic) => "slow (generic)".into(),
+                (false, kres_core::TaskMode::Coding) => "slow (coding)".into(),
             });
-        if let Some(thinking) = self.slow_thinking {
+        if let Some(thinking) = synth_thinking {
             cfg = cfg.with_thinking(thinking);
         }
-        // Coding-mode tasks want a different system prompt: one that
-        // tells the slow agent to emit `code_output` rather than
-        // findings. Fall back to slow_system if the coding prompt
-        // wasn't loaded (fresh install pre-setup.sh), noisily — the
-        // audit prompt will still produce something, just not a
-        // useful code artifact. Audit and Generic share
-        // slow_system; the difference between them is handled at the
-        // dispatch level (lens fan-out vs single call), not in the
-        // per-call system prompt.
-        let slow_system_for_call = match ctx.mode {
-            kres_core::TaskMode::Coding => {
-                if self.slow_coding_system.is_some() {
-                    self.slow_coding_system.as_ref()
-                } else {
-                    kres_core::async_eprintln!(
-                        "[slow] coding-mode task but no slow_coding_system loaded — falling back to audit prompt"
-                    );
-                    self.slow_system.as_ref()
+        // System prompt selection:
+        // - synthesis_use_routing_prompt (orchestrator step only):
+        //   use the dedicated routing-agent system prompt. That step
+        //   is pure routing over typed inputs and the routing prompt
+        //   matches that shape.
+        // - else use_fast (other fast-tagged steps): use the
+        //   fast-gather system prompt. Those steps (research,
+        //   lore-search, fixes-tag-search, compile-triage) DO
+        //   analyze gathered code/history and the fast-gather prompt
+        //   is the operator's chosen system prompt for `agent: fast`.
+        // - else: per-mode slow system prompt (coding/generic/audit).
+        let system_for_call = if ctx.synthesis_use_routing_prompt {
+            self.routing_system.as_ref().or(self.fast_system.as_ref())
+        } else if use_fast {
+            self.fast_system.as_ref()
+        } else {
+            match ctx.mode {
+                kres_core::TaskMode::Coding => {
+                    if self.slow_coding_system.is_some() {
+                        self.slow_coding_system.as_ref()
+                    } else {
+                        kres_core::async_eprintln!(
+                            "[{log_phase}] coding-mode task but no slow_coding_system loaded — falling back to audit prompt"
+                        );
+                        self.slow_system.as_ref()
+                    }
                 }
-            }
-            kres_core::TaskMode::Generic => {
-                if self.slow_generic_system.is_some() {
-                    self.slow_generic_system.as_ref()
-                } else {
-                    // Fall back quietly — audit prompt still
-                    // produces reasonable output for most free-form
-                    // questions, it just trends toward defect
-                    // phrasing.
-                    self.slow_system.as_ref()
+                kres_core::TaskMode::Generic => {
+                    if self.slow_generic_system.is_some() {
+                        self.slow_generic_system.as_ref()
+                    } else {
+                        self.slow_system.as_ref()
+                    }
                 }
+                kres_core::TaskMode::Audit => self.slow_system.as_ref(),
             }
-            kres_core::TaskMode::Audit => self.slow_system.as_ref(),
         };
-        if let Some(s) = slow_system_for_call {
+        if let Some(s) = system_for_call {
             cfg = cfg.with_system(s.clone());
         }
-        if let Some(n) = self.slow_max_input_tokens {
+        if let Some(n) = synth_max_in {
             cfg = cfg.with_max_input_tokens(n);
         }
+        if ctx.surface_over_input_limit {
+            cfg = cfg.with_surface_over_input_limit(true);
+        }
+        // Log label reflects which model actually ran the synthesis
+        // so trace consumers (and grep'ing operators) can see whether
+        // a fast-routed step actually used Sonnet. log_phase is set
+        // above (next to use_fast) so it's available for in-loop
+        // error messages and for the post-call logger.
         if let Some(lg) = &self.logger {
-            let label = format!("phase=slow task={log_task}");
+            let label = format!("phase={log_phase} task={log_task}");
             let meta = cfg.request_meta();
             lg.log_code_labeled_with_request(
                 "user",
@@ -934,22 +1034,28 @@ impl Orchestrator {
             );
         }
         kres_core::async_eprintln!(
-            "[slow] analyzing with {} symbol(s), {} context item(s), {} previous finding(s)",
+            "[{log_phase}] analyzing with {} symbol(s), {} context item(s), {} previous finding(s)",
             trimmed_symbols.len(),
             trimmed_context.len(),
             trimmed_prev.len(),
         );
+        let synth_role_for_usage = if use_fast { "fast" } else { "slow" };
         let text = tokio::select! {
             _ = shutdown.cancelled() => {
-                return Err(AgentError::Other("cancelled during slow call".into()));
+                return Err(AgentError::Other(format!("cancelled during {log_phase} call")));
             }
-            r = self.slow_client.messages_streaming(&cfg, &messages) => {
-                let resp = r.map_err(|e| AgentError::Other(e.to_string()))?;
-                record_usage(&self.usage, "slow", &self.slow_model, &resp.usage);
+            r = synth_client.messages_streaming(&cfg, &messages) => {
+                let resp = r.map_err(|e| match e {
+                    kres_llm::LlmError::OverInputLimit { actual, limit } => {
+                        AgentError::OverInputLimit { actual, limit }
+                    }
+                    other => AgentError::Other(other.to_string()),
+                })?;
+                record_usage(&self.usage, synth_role_for_usage, &synth_model, &resp.usage);
                 let t = extract_text(&resp);
                 if let Some(lg) = &self.logger {
                     let thinking = extract_thinking(&resp);
-                    let label = format!("phase=slow task={log_task}");
+                    let label = format!("phase={log_phase} task={log_task}");
                     lg.log_code_labeled(
                         "assistant",
                         Some(&label),
@@ -1173,7 +1279,7 @@ impl Orchestrator {
     }
 }
 
-impl Orchestrator {
+impl AgentRunner {
     fn append_comparison_entry(
         &self,
         task_brief: &str,
@@ -1390,18 +1496,24 @@ impl Orchestrator {
             .await?;
 
         for retry in 0..repair.max_retries {
-            let mut retry_lenses = BTreeSet::new();
+            // Collect per-lens errors so we can surface the specific
+            // validator/transport message to each retried lens — the
+            // generic repair instruction alone does not tell the model
+            // why its output was rejected.
+            let mut retry_errors: Vec<(String, String)> = Vec::new();
             for failure in &fanout.failures {
-                retry_lenses.insert(failure.lens_id.clone());
+                retry_errors.push((failure.lens_id.clone(), failure.error.clone()));
             }
             for output in &fanout.outputs {
-                if validate(output).is_err() {
-                    retry_lenses.insert(output.lens_id.clone());
+                if let Err(e) = validate(output) {
+                    retry_errors.push((output.lens_id.clone(), e));
                 }
             }
-            if retry_lenses.is_empty() {
+            if retry_errors.is_empty() {
                 return Ok(fanout);
             }
+            let retry_lenses: BTreeSet<String> =
+                retry_errors.iter().map(|(id, _)| id.clone()).collect();
 
             let repair_lenses: Vec<LensSpec> = lenses
                 .iter()
@@ -1421,13 +1533,20 @@ impl Orchestrator {
                 retry + 1,
                 repair.max_retries,
             );
+            let mut detailed_repair = repair.repair_instruction.trim_end().to_string();
+            detailed_repair.push_str(
+                "\n\nValidator error(s) from the previous attempt (find the entry tagged with your lens id):",
+            );
+            for (lens_id, err) in &retry_errors {
+                detailed_repair.push_str(&format!("\n- lens '{lens_id}': {err}"));
+            }
             let repaired = self
                 .run_prepared_lens_fanout(
                     &prepared,
                     LensFanoutCall {
                         lenses: &repair_lenses,
                         all_lenses: lenses,
-                        extra_lens_instruction: Some(repair.repair_instruction),
+                        extra_lens_instruction: Some(&detailed_repair),
                         cache_mode: CacheMode::Parallel,
                     },
                     ctx,
@@ -2068,7 +2187,7 @@ fn validate_generic_lens_output(output: &LensRunOutput) -> Result<(), String> {
 }
 
 /// Cut a string to `n` chars with an ellipsis. Used by the verbose
-/// orchestrator printouts so a long followup name doesn't flood the
+/// AgentRunner printouts so a long followup name doesn't flood the
 /// REPL line.
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
@@ -2107,6 +2226,7 @@ mod tests {
                     name: "x".into(),
                     reason: String::new(),
                     path: None,
+                    nice_to_have: false,
                 }],
                 None,
             )
@@ -2117,7 +2237,7 @@ mod tests {
     }
 
     /// Unit-test the loop-back decision table. We can't easily run
-    /// the whole orchestrator without a live API, but we can test
+    /// the whole AgentRunner without a live API, but we can test
     /// the key condition that caused the Phase-1 "did nothing" bug.
     #[test]
     fn parse_only_skill_reads_triggers_loopback() {
@@ -2132,7 +2252,7 @@ mod tests {
         assert!(r.followups.is_empty());
         assert!(!r.ready_for_slow);
         assert!(!r.skill_reads.is_empty());
-        // Orchestrator's decision: only_skill_reads = true, so loop back.
+        // AgentRunner's decision: only_skill_reads = true, so loop back.
         let only_skill_reads =
             r.followups.is_empty() && !r.ready_for_slow && !r.skill_reads.is_empty();
         assert!(only_skill_reads);
@@ -2140,7 +2260,7 @@ mod tests {
 
     #[test]
     fn parse_empty_triggers_slow_handoff() {
-        // No followups, no skill_reads, not ready — the orchestrator
+        // No followups, no skill_reads, not ready — the AgentRunner
         // should break out and still run the slow agent.
         let r = parse_code_response(r#"{"analysis": "no work needed"}"#);
         let only_skill_reads =
@@ -2159,7 +2279,7 @@ mod tests {
 
     /// Mirrors the new early-exit rule in `run_once_with_ctx` and
     /// `gather`: if every followup has kind=="question", the fetcher
-    /// can't produce data for any of them, so the orchestrator
+    /// can't produce data for any of them, so the AgentRunner
     /// breaks out instead of spinning another round.
     #[test]
     fn question_only_followups_trip_early_exit() {

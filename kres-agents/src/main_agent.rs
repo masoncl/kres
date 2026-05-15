@@ -62,7 +62,7 @@ pub struct MainAgent {
     pub max_input_tokens: Option<u32>,
     pub max_main_turns: u8,
     /// Per-fetch "user query" — the top-level prompt that spawned the
-    /// current task. Set by the orchestrator via a per-task clone
+    /// current task. Set by the AgentRunner via a per-task clone
     /// (future work); defaults to empty for now.
     pub user_query: String,
     /// Per-task brief — short human label for the current todo item.
@@ -485,6 +485,7 @@ fn mcp_semcode_fallback_followup(
         name,
         reason: "MCP semcode lookup was unavailable, incomplete, or unparseable; using local grep/read fallback".into(),
         path: None,
+        nice_to_have: false,
     })
 }
 

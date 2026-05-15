@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use kres_agents::{AgentConfig, AgentKind, DataFetcher, Orchestrator, RunContext};
+use kres_agents::{AgentConfig, AgentKind, AgentRunner, DataFetcher, RunContext};
 use kres_core::log::TurnLogger;
 use kres_core::{format_usage_summary, FindingsStore, TaskManager, TaskState, UsageTracker};
 use kres_llm::{client::Client, RateLimiter};
@@ -196,7 +196,7 @@ pub use kres_core::io::async_println;
 pub struct Session {
     mgr: Arc<TaskManager>,
     cfg: ReplConfig,
-    orchestrator: Option<Arc<Orchestrator>>,
+    agent_runner: Option<Arc<AgentRunner>>,
     consolidator: Option<Arc<kres_agents::ConsolidatorClient>>,
     todo_client: Option<Arc<kres_agents::TodoClient>>,
     goal_client: Option<Arc<kres_agents::GoalClient>>,
@@ -213,7 +213,7 @@ pub struct Session {
     /// first submit_prompt observes a non-empty previous_findings.
     pending_bootstrap: Vec<kres_core::findings::Finding>,
     /// Per-session turn logger. Created lazily by `with_logger` or
-    /// implicitly in `with_orchestrator` when the caller hasn't set
+    /// implicitly in `with_agent_runner` when the caller hasn't set
     /// one.
     logger: Option<Arc<TurnLogger>>,
     /// Per-task completion goals, keyed by TaskId. define_goal's
@@ -437,7 +437,7 @@ impl Session {
             return Self {
                 mgr,
                 cfg,
-                orchestrator: None,
+                agent_runner: None,
                 consolidator: None,
                 todo_client: None,
                 goal_client: None,
@@ -468,7 +468,7 @@ impl Session {
         Self {
             mgr,
             cfg,
-            orchestrator: None,
+            agent_runner: None,
             consolidator: None,
             todo_client: None,
             goal_client: None,
@@ -515,7 +515,7 @@ impl Session {
     }
 
     /// Return the session's TurnLogger (if any) — exposed so the
-    /// orchestrator builder can splice it into Orchestrator.logger.
+    /// AgentRunner builder can splice it into AgentRunner.logger.
     pub fn logger(&self) -> Option<Arc<TurnLogger>> {
         self.logger.clone()
     }
@@ -676,8 +676,8 @@ impl Session {
         self.usage.clone()
     }
 
-    pub fn with_orchestrator(mut self, o: Arc<Orchestrator>) -> Self {
-        self.orchestrator = Some(o);
+    pub fn with_agent_runner(mut self, o: Arc<AgentRunner>) -> Self {
+        self.agent_runner = Some(o);
         self
     }
 
@@ -2244,7 +2244,7 @@ impl Session {
                 Command::Quit => {
                     kres_core::async_eprintln!("bye");
                     // Fast-path teardown. Cancel root so every reaper /
-                    // orchestrator / task future awaiting cancellation
+                    // AgentRunner / task future awaiting cancellation
                     // wakes up now (instead of waiting for stop_all to
                     // individually poke each per-task token). Use a
                     // short grace — a stuck task shouldn't hold up the
@@ -2424,8 +2424,8 @@ impl Session {
         step_id: Option<String>,
         forced_mode: Option<kres_agents::TaskMode>,
     ) {
-        let Some(orc) = self.orchestrator.clone() else {
-            kres_core::async_eprintln!("(no orchestrator configured — prompt dropped)");
+        let Some(orc) = self.agent_runner.clone() else {
+            kres_core::async_eprintln!("(no AgentRunner configured — prompt dropped)");
             kres_core::async_eprintln!(
                 "hint: rerun `kres repl` with agent configs to enable prompt handling"
             );
@@ -2719,6 +2719,9 @@ impl Session {
                     mode: task_mode,
                     plan: plan_for_ctx,
                     allow_plan_rewrite,
+                    surface_over_input_limit: false,
+                    synthesis_use_fast: false,
+                    synthesis_use_routing_prompt: false,
                 };
                 // Dispatch by mode:
                 //   Coding  → single slow call with slow_coding_system;
@@ -3382,9 +3385,9 @@ impl Session {
     /// result through the bug-summary template in batches that fit
     /// the fast agent's context window.
     async fn cmd_summary(&self, filename: Option<String>, markdown: bool) {
-        let Some(orc) = self.orchestrator.as_ref() else {
+        let Some(orc) = self.agent_runner.as_ref() else {
             async_println(
-                "/summary: orchestrator not configured (need --fast-agent and --slow-agent)",
+                "/summary: AgentRunner not configured (need --fast-agent and --slow-agent)",
             );
             return;
         };
@@ -3509,7 +3512,7 @@ impl Session {
     /// workflow with id `<name>` exists (operator override at
     /// `~/.kres/workflows/<name>.json` wins; otherwise the
     /// embedded copy), build an [`LlmDriver`] with the session's
-    /// orchestrator and run the workflow with `target=<target>`
+    /// AgentRunner and run the workflow with `target=<target>`
     /// as the input. Trace events stream to the REPL via
     /// async_println.
     ///
@@ -3531,9 +3534,9 @@ impl Session {
             }
         };
 
-        let Some(orch) = self.orchestrator.clone() else {
+        let Some(orch) = self.agent_runner.clone() else {
             async_println(format!(
-                "/{name}: workflow '{name}' is loaded but the REPL has no orchestrator wired. \
+                "/{name}: workflow .{name}. is loaded but the REPL has no AgentRunner wired. \
                  Restart kres with --fast-agent <path> AND --slow-agent <path> (or --slow <tag>) \
                  to enable workflow dispatch.",
             ));
@@ -3559,7 +3562,7 @@ impl Session {
         ));
 
         // Build a fresh LlmDriver against the session's
-        // orchestrator + workspace. Skills are loaded on a
+        // AgentRunner + workspace. Skills are loaded on a
         // best-effort basis from ~/.kres/skills.
         // Fix #8: thread the session's root shutdown into the
         // workflow runner so ctrl-C in the REPL cancels the
@@ -3570,7 +3573,7 @@ impl Session {
             self.cfg.workspace.clone(),
             workflow.clone(),
         )
-        .with_orchestrator(orch)
+        .with_agent_runner(orch)
         .with_shutdown(workflow_shutdown);
         let skills_dir = dirs::home_dir().map(|h| h.join(".kres").join("skills"));
         let mut driver = match skills_dir.as_ref() {
@@ -3889,13 +3892,13 @@ impl Session {
             );
             return;
         }
-        let Some(orc) = self.orchestrator.as_ref() else {
-            kres_core::async_eprintln!("/compact: no orchestrator configured");
+        let Some(orc) = self.agent_runner.as_ref() else {
+            kres_core::async_eprintln!("/compact: no AgentRunner configured");
             return;
         };
         // Build the inference request: feed every accumulated entry
         // to the fast agent and ask for a terse single-paragraph
-        // summary. Reuse the fast client the orchestrator already
+        // summary. Reuse the fast client the AgentRunner already
         // holds — cheapest call in the pipeline.
         let mut joined = String::new();
         for (i, e) in entries.iter().enumerate() {
@@ -4087,25 +4090,29 @@ fn load_slow_generic_system() -> Option<String> {
     load_prompt_disk_then_embedded("slow-code-agent-generic.system.md")
 }
 
-/// Convenience: build an Orchestrator from paths to agent configs and
+fn load_routing_system() -> Option<String> {
+    load_prompt_disk_then_embedded("routing-agent.system.md")
+}
+
+/// Convenience: build an AgentRunner from paths to agent configs and
 /// a workspace directory. The DataFetcher is a WorkspaceFetcher over
 /// the given workspace; MCP integration is a Phase 8 add-on.
 /// Built components from a pair of agent configs.
 ///
-/// The Orchestrator is the task runner; the ConsolidatorClient is the
+/// The AgentRunner is the task runner; the ConsolidatorClient is the
 /// fast-agent-flavoured LLM handle used by `run_with_lenses` to merge
 /// N parallel lens outputs into a unified analysis + deduplicated
 /// findings list.
 pub struct BuiltAgents {
-    pub orchestrator: Arc<Orchestrator>,
+    pub agent_runner: Arc<AgentRunner>,
     pub consolidator: Arc<kres_agents::ConsolidatorClient>,
 }
 
-/// Optional knobs threaded into `build_orchestrator`. Splitting them
+/// Optional knobs threaded into `build_agent_runner`. Splitting them
 /// out keeps the call site readable and the function signature
 /// narrow.
 #[derive(Default)]
-pub struct OrchestratorBuildOptions {
+pub struct AgentRunnerBuildOptions {
     pub extra_slow_cfgs: Vec<(PathBuf, Option<String>)>,
     pub skills: Option<serde_json::Value>,
     pub usage: Option<Arc<UsageTracker>>,
@@ -4114,15 +4121,15 @@ pub struct OrchestratorBuildOptions {
     pub comparison_path: Option<PathBuf>,
 }
 
-pub async fn build_orchestrator(
+pub async fn build_agent_runner(
     fast_cfg_path: &Path,
     slow_cfg_path: &Path,
     workspace: impl Into<PathBuf>,
     fetcher: Arc<dyn DataFetcher>,
     settings: &crate::settings::Settings,
-    options: OrchestratorBuildOptions,
+    options: AgentRunnerBuildOptions,
 ) -> Result<BuiltAgents> {
-    let OrchestratorBuildOptions {
+    let AgentRunnerBuildOptions {
         extra_slow_cfgs,
         skills,
         usage,
@@ -4262,7 +4269,8 @@ pub async fn build_orchestrator(
 
     let slow_coding_system = load_slow_coding_system();
     let slow_generic_system = load_slow_generic_system();
-    let orchestrator = Arc::new(Orchestrator {
+    let routing_system = load_routing_system();
+    let agent_runner = Arc::new(AgentRunner {
         fast_client,
         fast_model: fast_model.clone(),
         fast_system: fast_cfg.system,
@@ -4280,6 +4288,7 @@ pub async fn build_orchestrator(
         comparison_lock: Arc::new(std::sync::Mutex::new(())),
         slow_coding_system,
         slow_generic_system,
+        routing_system,
         fetcher,
         max_fast_rounds: gather_turns,
         skills,
@@ -4288,7 +4297,7 @@ pub async fn build_orchestrator(
     });
 
     Ok(BuiltAgents {
-        orchestrator,
+        agent_runner,
         consolidator,
     })
 }
@@ -5463,13 +5472,13 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn session_without_orchestrator_drops_prompt() {
+    async fn session_without_agent_runner_drops_prompt() {
         let mgr = TaskManager::new();
         let s = Session::new(mgr, ReplConfig::default()).await;
         // We can't easily exercise submit_prompt from a unit test
         // without stdin plumbing, but we can assert construction
-        // leaves `orchestrator` unset.
-        assert!(s.orchestrator.is_none());
+        // leaves `agent_runner` unset.
+        assert!(s.agent_runner.is_none());
     }
 
     #[tokio::test]

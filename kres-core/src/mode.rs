@@ -5,7 +5,7 @@
 //! `Audit` — the defect-review flow. Workflow `/review` uses the
 //! review workflow's lensed step, shared gather, parallel slow
 //! calls, and consolidator. Non-workflow audit tasks use the same
-//! orchestrator primitives when explicitly configured with lenses.
+//! AgentRunner primitives when explicitly configured with lenses.
 //!
 //! `Generic` — just the main/fast/slow/goal loop, no lens fan-out.
 //! One slow call per task, findings still merge into the cumulative

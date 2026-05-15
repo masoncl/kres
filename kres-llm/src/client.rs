@@ -282,6 +282,17 @@ impl Client {
                         if over_limit { "over-limit" } else { "wait" },
                     );
                     if over_limit {
+                        // Caller opted into structured shrinking
+                        // (e.g. prune the workflow step's
+                        // `prior_attempts`): surface the condition
+                        // and let them re-issue. No internal shrink,
+                        // no wait — the caller decides next steps.
+                        if cfg.surface_over_input_limit {
+                            return Err(LlmError::OverInputLimit {
+                                actual: exact.unwrap_or(0),
+                                limit: limit.unwrap_or(0) as u64,
+                            });
+                        }
                         let target_tokens = (limit.unwrap() as u64 * 9) / 10;
                         let target_chars = (target_tokens as usize).saturating_mul(4);
                         if let Some((before, after)) =
@@ -528,6 +539,17 @@ impl Client {
                         if over_limit { "over-limit" } else { "wait" },
                     );
                     if over_limit {
+                        // Caller opted into structured shrinking
+                        // (see CallConfig::surface_over_input_limit):
+                        // surface the condition and let them prune
+                        // (e.g. a workflow step's prior_attempts)
+                        // before reissuing.
+                        if cfg.surface_over_input_limit {
+                            return Err(LlmError::OverInputLimit {
+                                actual: exact.unwrap_or(0),
+                                limit: limit.unwrap_or(0) as u64,
+                            });
+                        }
                         let target_tokens = (limit.unwrap() as u64 * 9) / 10;
                         let target_chars = (target_tokens as usize).saturating_mul(4);
                         if let Some((before, after)) =

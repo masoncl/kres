@@ -167,6 +167,17 @@
         "CURRENT FIX TODO, IF THIS IS A PER-TODO RUN:",
         "{{workflow.current_fix_todo || ''}}",
         "",
+        "PRIOR RESEARCH ATTEMPTS FROM THIS RUN (oldest first; empty on first attempt):",
+        "{{research.prior_attempts || ''}}",
+        "If non-empty, each entry is a previous slow-agent JSON output for this same step that",
+        "failed the eval. For ambiguous bugs with several plausible fix shapes, do not propose a",
+        "fourth different shape every retry — that is fix-shape thrashing, not progress.",
+        "Read the prior fix_plan and prior research_decision; commit to one of the proposed",
+        "shapes by gathering the specific evidence that would prove its fix_contract, OR",
+        "explicitly justify in analysis why a new shape is now correct (cite concrete source",
+        "or commit evidence that ruled the prior shape out). If a prior attempt's blocking",
+        "followups were not gathered, finish gathering them before proposing a new shape.",
+        "",
         "Research has two modes:",
         "- Planning mode: when CURRENT FIX TODO is empty, determine whether the input contains",
         "  one bug or multiple independently committable bugs. Create fix_plan as an ordered",
@@ -199,6 +210,20 @@
         "HEAD may differ. If the affected symbols changed since that sha, verify the bug still",
         "exists. If those files cannot be read, do not declare the bug invalid; request the",
         "missing read access/context instead.",
+        "",
+        "metadata.yaml status: a metadata.yaml that says `status: invalidated` (or `confirmed`,",
+        "`unconfirmed`, `confirmed_latent`, etc.) is a stale snapshot written by an earlier run.",
+        "It is informational, not authoritative. The authoritative source of truth is current",
+        "code at workspace HEAD plus reachable in-tree history. If you verify the alleged bug",
+        "is present in the source at workspace HEAD, set research_status=confirmed and proceed",
+        "with the fix even when metadata.yaml says `invalidated` — the publish step rewrites",
+        "metadata.yaml when the patch lands, so the yaml will end up reflecting the new",
+        "reality. Only set research_status=invalid when source or commit evidence (not the yaml",
+        "status field) proves the bug does not exist. Cite the specific file:line or commit SHA",
+        "in invalid_evidence. Treating the yaml status as invalidating evidence is the failure",
+        "mode where a bug really fixed by a prior run gets re-invalidated on every subsequent",
+        "audit instead of being recognised as already-fixed (which is a different invalidation",
+        "shape: cite the actual fix commit, not the yaml).",
         "",
         "If KIND is prose, treat the target text as the problem description and gather code",
         "context yourself via source/read/git followups.",
@@ -238,18 +263,37 @@
         "set research_status=unconfirmed unless source/commit evidence proves the state is",
         "impossible or already fixed, in which case set research_status=invalid.",
         "",
+        "is_latent flags a real-but-unreachable bug. Set is_latent=true ONLY when (a) the",
+        "code is wrong by its own contract or API rules and the fix is worth taking, AND",
+        "(b) no caller, configuration, or runtime path in the current tree reaches the",
+        "wrong-state condition. Typical cases: dead-but-incorrect helper, defensive cleanup",
+        "for a branch the current callers never take, or a contract violation that only a",
+        "future caller would expose. A latent bug still requires bug_proven=true; the",
+        "concrete trigger requirement above is relaxed to \"contract violation\" only when",
+        "is_latent=true. Cite the absence of triggers in analysis (e.g. \"only caller X",
+        "always passes Y, so the bad branch is unreachable today\"). Leave is_latent=false",
+        "when any reachable trigger exists, even an unusual or hard-to-hit one. Latent bugs",
+        "get a prominent \"latent bug\" notice as the first body paragraph of the commit",
+        "message by write-commit-message; do not set is_latent=true to soften a normal fix.",
+        "",
         "Use invalid_evidence=\"\" and invalid_evidence_kind=none when research_status is",
         "confirmed or unconfirmed, or whenever you do not have source/commit proof that the",
         "bug is invalid.",
         "",
         "research_decision is the structured rationale for routing. Keep it consistent with",
         "research_status:",
-        "- confirmed: bug_proven=true, fix_contract_proven=true, invalidity_proven=false, needs_more_audit=false, and no remaining typed followups.",
-        "- invalid: bug_proven=false, fix_contract_proven=false, invalidity_proven=true, needs_more_audit=false, and no remaining typed followups.",
-        "- unconfirmed: invalidity_proven=false, no remaining typed followups, and at least one of bug_proven/fix_contract_proven is false or needs_more_audit=true.",
-        "If more source, callers, history, locking, or API context is needed, emit typed",
-        "followups for that evidence. Do not pair research_status=unconfirmed with concrete",
-        "followups; that is incomplete research, not a terminal status update.",
+        "- confirmed: bug_proven=true, fix_contract_proven=true, invalidity_proven=false, needs_more_audit=false.",
+        "- invalid: bug_proven=false, fix_contract_proven=false, invalidity_proven=true, needs_more_audit=false.",
+        "- unconfirmed: invalidity_proven=false, and at least one of bug_proven/fix_contract_proven is false or needs_more_audit=true.",
+        "",
+        "Followups have a single workflow meaning: a blocking followup (`nice_to_have` omitted",
+        "or false) is a request for another gather round. Emitting one fails this step's eval",
+        "regardless of status, and the runner re-runs research with the gathered evidence; that",
+        "is how you ask for more rounds. A nice-to-have followup (`nice_to_have: true`) is a",
+        "deferred audit suggestion that does not block the eval — use this for the \"would be",
+        "nice to double-check later\" notes you would otherwise hide in analysis prose, and",
+        "ship them alongside any terminal status. Reach a terminal status only when you have",
+        "no blocking followups left.",
         "Do not use words like confirmed, verified, proved, or definitely in analysis for an",
         "unconfirmed result; say evidence suggests or not proven instead. Rust routes only",
         "from structured fields, but the prose should not contradict them.",
@@ -300,14 +344,9 @@
           "type": "array<string>"
         },
         "followups": {
-          "type": "array<object>",
+          "type": "array<Followup>",
           "optional": true,
-          "description": "Machine-populated typed followups emitted by the slow agent for missing evidence."
-        },
-        "followups_empty": {
-          "type": "boolean",
-          "optional": true,
-          "description": "Machine-populated true only when research emitted no typed followups."
+          "description": "Typed followups emitted by the slow agent. Each entry must satisfy the Followup schema (kind/name required). Set `nice_to_have: true` on entries that are deferred audits (would be nice to double-check, but the current verdict does not depend on them). Omit or set `nice_to_have: false` for blocking evidence requests; the eval rejects any terminal status while a blocking followup is present."
         },
         "fix_plan": {
           "type": "array<object>",
@@ -323,6 +362,11 @@
             "needs_more_audit": "boolean"
           },
           "description": "Structured routing rationale. Must agree with research_status and valid; do not rely on analysis prose for routing."
+        },
+        "is_latent": {
+          "type": "boolean",
+          "optional": true,
+          "description": "True only when the bug is real (the code violates its own contract) but no reachable caller, config, or runtime path triggers it in the current tree. Causes write-commit-message to insert a 'latent bug with no known triggers' notice as the first body paragraph (after the subject and blank line)."
         },
         "analysis": {
           "type": "string",
@@ -439,11 +483,100 @@
       }
     },
     {
+      "id": "lore-search",
+      "title": "Check kernel mailing-list archive for an existing fix",
+      "depends_on": [
+        "research"
+      ],
+      "run_if": "research.research_status == 'confirmed' && lore-search.attempt == 0",
+      "preserve_outputs_on_skip": true,
+      "agent": "fast",
+      "mode": "audit",
+      "actions": [
+        "lore",
+        "read",
+        "git",
+        "grep"
+      ],
+      "prompt": [
+        "Step LORE: SEARCH FOR EXISTING PATCHES.",
+        "",
+        "Search the kernel mailing-list archive (lore) for a recent patch that already",
+        "fixes this bug. The lore tool runs a body regex search restricted to the last",
+        "30 days (the runner sets the date window automatically; you do not need to pass it).",
+        "",
+        "BUG INPUT: {{workflow.target}}",
+        "KIND: {{workflow.target_kind}}",
+        "",
+        "RESEARCH ANALYSIS:",
+        "{{research.analysis || ''}}",
+        "",
+        "AFFECTED FILES:",
+        "{{research.affected_files}}",
+        "",
+        "AFFECTED SYMBOLS:",
+        "{{research.affected_symbols}}",
+        "",
+        "BUGS (from metadata.bugs / research.fix_plan):",
+        "{{research.fix_plan || ''}}",
+        "",
+        "Pick 2-4 short body-search queries. Each query should target ONE of:",
+        "- an affected function or struct name from research.affected_symbols",
+        "- a distinctive helper or API call that the buggy code path uses",
+        "- a short phrase combining the subsystem and the observed symptom",
+        "",
+        "Avoid one-word generic queries (`cpu`, `bpf`) and avoid full sentences. Each",
+        "query is passed as a regex body pattern; plain identifiers and short phrases",
+        "match themselves, but escape regex metacharacters (`.`, `(`, `[`, `+`, `?`)",
+        "if you want them literal. Issue each query as a `lore` followup. Inspect the",
+        "returned threads — read the patch hunks via `read`",
+        "or `git` followups if needed — and decide whether any thread proposes the same",
+        "fix this run is about to write.",
+        "",
+        "Return an analysis paragraph describing what queries you ran, what threads you",
+        "inspected, and which (if any) propose the same fix. Populate existing_patches[]",
+        "with one entry per plausible match. duplicate_proven=true ONLY when a posted",
+        "patch addresses the same code site with the same semantic change and is plainly",
+        "intended to fix this bug (not a related one); cite a msgid + subject so a human",
+        "can verify. Do not block the workflow on uncertain matches — set",
+        "duplicate_proven=false and put the candidate(s) in existing_patches[] with a",
+        "relevance score so write-patch can still see them.",
+        "",
+        "If lore is unavailable (the MCP tool returns an error or the server isn't",
+        "wired), record that in the analysis and return empty existing_patches[] +",
+        "duplicate_proven=false. Do not invent threads."
+      ],
+      "outputs": {
+        "existing_patches": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "msgid": "string",
+            "subject": "string",
+            "url": "string",
+            "relevance": "string"
+          },
+          "description": "Lore threads that may propose the same fix. msgid is the Message-ID; url is the lore.kernel.org permalink if available; relevance is a short prose note about why this thread matches."
+        },
+        "duplicate_proven": {
+          "type": "boolean",
+          "optional": true,
+          "description": "True only when a posted upstream patch demonstrably proposes the same fix at the same site. Triggers a `duplicate` outcome entry in metadata.yaml.results, but does NOT block the workflow — write-patch still runs."
+        },
+        "analysis": {
+          "type": "string",
+          "optional": true,
+          "description": "Free-text summary of queries run and what was inspected."
+        }
+      }
+    },
+    {
       "id": "write-patch",
       "title": "Write the patch",
       "depends_on": [
         "research",
-        "record-bugs"
+        "record-bugs",
+        "lore-search"
       ],
       "run_if": "research.research_status == 'confirmed'",
       "agent": "code",
@@ -462,6 +595,18 @@
       "prompt": [
         "Step 2: WRITE PATCH ONLY.",
         "",
+        "ORCHESTRATOR INSTRUCTION (if non-empty, follow it verbatim — the orchestrator routed back to write-patch with this guidance):",
+        "{{orchestrator.instruction || ''}}",
+        "",
+        "GATHER REQUIREMENT FOR ORCHESTRATOR-NAMED SYMBOLS — read before deciding ready_for_slow:",
+        "When the ORCHESTRATOR INSTRUCTION above names specific functions, helpers, structs, fields, or file:line callsites, the fast-gather phase MUST have the verbatim source of those symbols in its accumulated context before setting `ready_for_slow=true`. The orchestrator can only PROSE-describe what a function does or what a struct contains; that description is unverifiable from the slow-agent's seat without the actual code. Without source in context, the slow agent guesses at lifetime, refcount, locking, ordering, or ABI semantics and emits kerneldoc/comment/changelog claims that look plausible but are factually wrong. Each such wrong claim costs a full review fan-out + orchestrator cycle to catch and re-route; repeated misses can exhaust the orchestrator's attempt budget on a single defect.",
+        "",
+        "Concretely, for every distinct symbol the instruction names:",
+        "1. Check `previously_fetched` first — if its body is already in there, you're done for that symbol.",
+        "2. Otherwise emit `source:<symbol>` (or `type:<name>` for a struct/union/typedef). If semcode returns nothing, fall back to `read:<file>:<line>+<lines>` using a file path the instruction gave you (or the affected_files list).",
+        "3. Do NOT set `ready_for_slow=true` until the union of (current symbols/context + previously_fetched) covers every symbol the instruction named.",
+        "Trust the orchestrator's prose for routing intent (which defect to fix, what shape the fix should take); verify its factual claims about a symbol's body by fetching that body.",
+        "",
         "RESEARCH RESULT:",
         "- affected files: {{research.affected_files}}",
         "- affected symbols: {{research.affected_symbols}}",
@@ -474,6 +619,25 @@
         "",
         "RESEARCH ANALYSIS / FIX SKETCH:",
         "{{research.analysis || ''}}",
+        "",
+        "EXISTING UPSTREAM PATCHES, IF ANY (from the lore-search step):",
+        "- duplicate proven: {{lore-search.duplicate_proven || 'false'}}",
+        "- matching threads: {{lore-search.existing_patches || '[]'}}",
+        "- analysis: {{lore-search.analysis || ''}}",
+        "Use this to AVOID inventing a different fix than the upstream community already",
+        "settled on. When duplicate_proven is true, you may still write the patch (the",
+        "operator wants the local artifact), but cite the upstream Message-ID in the",
+        "commit message so the trailer carries `Link: <lore url>`.",
+        "",
+        "PRIOR WRITE-PATCH ATTEMPTS IN THIS RUN (oldest first; empty on first attempt):",
+        "{{write-patch.prior_attempts || ''}}",
+        "If non-empty, each entry is a previous slow-agent output for this same step that the",
+        "workflow rejected (eval failure, build failure, or review-driven branch back). Read",
+        "what was tried and why it was rejected; do not propose a structurally different patch",
+        "shape on every retry — that is fix-shape thrashing, not progress. Address the latest",
+        "concrete defect rather than abandoning the prior approach. If a fundamentally new shape",
+        "is genuinely needed, explicitly justify it in analysis with cited source or review",
+        "evidence that rules the prior shape out.",
         "",
         "PATCH FEEDBACK FROM PRIOR BUILD OR REVIEW ATTEMPT, IF ANY:",
         "{{compile-triage.analysis || ''}}",
@@ -535,19 +699,29 @@
         },
         "review_dispute": {
           "type": "string",
-          "description": "Empty for normal patch writes. Non-empty only when prior review source_defects are incorrect and no source change is needed; include evidence for review adjudication."
+          "description": "Empty for normal patch writes. Non-empty when the model rejected the prior review's source-defect on evidence (no edits needed). The orchestrator reads this when deciding whether to keep iterating or publish."
         },
-        "review_dispute_allowed": {
-          "type": "boolean",
-          "description": "Machine-populated true only when this write-patch attempt is correcting prior review source_defects and not a compile-triage patch error."
+        "analysis": {
+          "type": "string",
+          "description": "Slow agent's own narrative for this attempt. Carried into prior_attempts so the next retry can recognize the prior shape it tried. The orchestrator reads this on a failed attempt to understand WHY the worker produced nothing — without it, an eval-fail looks like silence."
+        },
+        "code_edits": {
+          "type": "array<object>",
+          "description": "The verbatim file_path/old_string/new_string edits the slow agent emitted. Carried into prior_attempts so the next retry can see the verbatim patch shapes already tried and avoid restating them. Pruned oldest-first when the prior_attempts payload exceeds the soft cap."
+        },
+        "followups": {
+          "type": "array<Followup>",
+          "optional": true,
+          "description": "Typed followups the slow agent emitted alongside its (possibly empty) edits. Surfaced to the orchestrator so a worker that refused to patch because of missing context can name the concrete reads/sources/grep it needs. Slow-agent followups do not trigger another gather round on their own; the orchestrator decides whether to re-run write-patch with an instruction that incorporates them."
         }
       },
       "eval": {
-        "type": "builtin",
-        "name": "fix_write_patch_output",
+        "type": "field_check",
+        "expr": "code_changes_emitted == true || review_dispute != ''",
         "on_fail": {
-          "action": "repeat",
-          "max_attempts": 6,
+          "action": "branch_to",
+          "branch_to": "orchestrator",
+          "max_attempts": 12,
           "on_exhausted": "exit_failure"
         }
       }
@@ -661,7 +835,7 @@
       "depends_on": [
         "fixes-tag-search"
       ],
-      "run_if": "research.research_status == 'confirmed' && (write-patch.review_dispute == '' || review.correction_step == 'write-commit-message')",
+      "run_if": "research.research_status == 'confirmed' && write-patch.code_changes_emitted == true && (write-patch.review_dispute == '' || orchestrator.next_step == 'write-commit-message')",
       "agent": "code",
       "mode": "coding",
       "actions": [
@@ -674,6 +848,9 @@
       ],
       "prompt": [
         "Step 4: WRITE COMMIT MESSAGE ONLY.",
+        "",
+        "ORCHESTRATOR INSTRUCTION (if non-empty, follow it verbatim — the orchestrator routed back to write-commit-message with this guidance):",
+        "{{orchestrator.instruction || ''}}",
         "",
         "Use readonly git diff/show/log followups if you need to inspect the patch. Write",
         ".kres-commit-msg.tmp via code_output in this turn. Do not edit kernel source in this",
@@ -709,9 +886,24 @@
         "  `Assisted-by: {{workflow.assisted_by}}`",
         "- Do not emit any other Assisted-by value.",
         "",
+        "LATENT BUG NOTICE:",
+        "- research.is_latent for this run: {{research.is_latent || 'false'}}",
+        "- When research.is_latent is true, the commit body's FIRST paragraph",
+        "  (immediately after the subject line and the blank line that follows it) MUST",
+        "  consist of exactly this verbatim line, on its own, with no prefix, suffix, or",
+        "  rewording:",
+        "    `Note: This fixes a latent bug with no known triggers in the kernel today.`",
+        "  A blank line follows that paragraph, then the regular body continues. The",
+        "  subject line itself is the normal kernel subject — do not put the notice on",
+        "  line 1, because git treats line 1 as the subject and `git log --oneline`,",
+        "  `git format-patch`, and lore archives would then show the notice instead of",
+        "  the actual fix.",
+        "- When research.is_latent is false or absent, omit the latent notice entirely.",
+        "  Do not add it to non-latent fixes.",
+        "",
         "COMMIT MESSAGE RULES:",
         "- Subject and body follow COMMIT MESSAGE STYLE.",
-        "- The raw git commit subject MUST be <=55 chars including the subsystem prefix, so the full generated `Subject: [PATCH] <subject>` line is <=72 chars including the literal word `Subject`.",
+        "- The raw git commit subject (line 1) MUST be <=55 chars including the subsystem prefix, so the full generated `Subject: [PATCH] <subject>` line is <=72 chars including the literal word `Subject`. This cap applies to every commit, latent or not; the latent notice does not move or replace the subject.",
         "- HARD WRAP prose at 75 columns. Trailers and indented code are exempt.",
         "- No paragraph >5 prose lines.",
         "- Write a human-readable kernel changelog, not a dense proof memo. Prefer 2-4 short paragraphs that state the failing path, the consequence, the key mechanism, and the fix.",
@@ -731,14 +923,30 @@
         "commit_message_written": {
           "type": "boolean",
           "description": "Machine-populated true when this attempt wrote .kres-commit-msg.tmp via code_output."
+        },
+        "code_changes_emitted": {
+          "type": "boolean",
+          "optional": true,
+          "description": "Machine-populated true when this attempt also emitted source code_edits (write-commit-message runs in coding mode and can fold doc-only or comment-only source edits into a commit-message rewrite). Used by review lens skip_if to decide whether source-correctness lenses must re-run: when the orchestrator routes here AND this is false, source did not change this cycle and the source lenses can skip."
+        },
+        "analysis": {
+          "type": "string",
+          "optional": true,
+          "description": "Slow agent's narrative for this attempt. Surfaced to the orchestrator on a failed attempt so it can see WHY no commit message was written — empty bool + empty analysis really is silence, but a populated analysis often names the missing piece."
+        },
+        "followups": {
+          "type": "array<Followup>",
+          "optional": true,
+          "description": "Typed followups the slow agent emitted when it could not write the message. Surfaced to the orchestrator so a worker that refused can name concrete missing context (the patch diff, a related commit, etc.) for the next instruction."
         }
       },
       "eval": {
         "type": "field_check",
         "expr": "commit_message_written == true",
         "on_fail": {
-          "action": "repeat",
-          "max_attempts": 6,
+          "action": "branch_to",
+          "branch_to": "orchestrator",
+          "max_attempts": 12,
           "on_exhausted": "exit_failure"
         }
       }
@@ -749,7 +957,7 @@
       "depends_on": [
         "write-commit-message"
       ],
-      "run_if": "research.research_status == 'confirmed' && (write-patch.review_dispute == '' || review.correction_step == 'write-commit-message')",
+      "run_if": "research.research_status == 'confirmed' && write-commit-message.commit_message_written == true && (write-patch.review_dispute == '' || orchestrator.next_step == 'write-commit-message')",
       "agent": "reaper",
       "action": {
         "type": "commit-fix",
@@ -774,7 +982,7 @@
       "depends_on": [
         "commit"
       ],
-      "run_if": "research.research_status == 'confirmed' && write-patch.review_dispute == ''",
+      "run_if": "research.research_status == 'confirmed' && write-commit-message.commit_message_written == true && write-patch.review_dispute == ''",
       "agent": "reaper",
       "action": {
         "type": "make",
@@ -848,16 +1056,6 @@
         "analysis": {
           "type": "string"
         }
-      },
-      "eval": {
-        "type": "field_check",
-        "expr": "result == 'preexisting_error'",
-        "on_fail": {
-          "action": "branch_to",
-          "branch_to": "write-patch",
-          "max_attempts": 10,
-          "on_exhausted": "exit_failure"
-        }
       }
     },
     {
@@ -867,7 +1065,7 @@
         "build",
         "compile-triage"
       ],
-      "run_if": "research.research_status == 'confirmed'",
+      "run_if": "research.research_status == 'confirmed' && (build.result == 'clean' || write-patch.review_dispute != '' || compile-triage.result == 'preexisting_error')",
       "agent": "slow",
       "mode": "review",
       "actions": [
@@ -907,6 +1105,13 @@
         "Compile triage: {{compile-triage.result || 'not needed'}}",
         "{{compile-triage.analysis || ''}}",
         "",
+        "LORE-SEARCH UPSTREAM PATCHES (from the lore-search step):",
+        "- duplicate proven: {{lore-search.duplicate_proven || 'false'}}",
+        "- matching threads: {{lore-search.existing_patches || '[]'}}",
+        "- analysis: {{lore-search.analysis || ''}}",
+        "Use this to classify any bug as `duplicate` from the bug-coverage lens; cite",
+        "the Message-ID when you do.",
+        "",
         "Commit SHA: {{commit.commit_sha || 'current HEAD'}}",
         "Commit message:",
         "{{commit.commit_message || ''}}",
@@ -932,6 +1137,15 @@
         "Do not stop after the first defect. If this lens finds any defect, set clean=false and",
         "populate defects[]. If this lens is clean, set clean=true and explain what evidence made",
         "the lens confident.",
+        "",
+        "Unresolved-risk routing requirement: if you notice a concrete risk to a specific code",
+        "path, object, field, callback, allocator, lock, lifetime, state transition, cleanup",
+        "path, or commit-message claim that you cannot prove or disprove from the gathered",
+        "evidence, either run it down in this lens with cited source or emit an entry in",
+        "`unresolved_risks[]` with `where`, `what`, and `evidence_needed`. `clean=true` is",
+        "inconsistent with a non-empty `unresolved_risks[]`. Analysis prose is preserved for",
+        "humans but is not a routing signal — the post-review orchestrator reads the typed",
+        "buckets and decides the next step.",
         "",
         "When classifying defects, put each source/build/behavior/documentation/test defect in",
         "source_defects[] and each commit-message/trailer-only defect in commit_message_defects[].",
@@ -965,27 +1179,33 @@
       "lenses": [
         {
           "id": "lifetime",
+          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
           "investigate": "Object lifetime: pointer ownership, refcounting, RCU grace periods, free ordering, copied pointers, and shared object lifetime."
         },
         {
           "id": "memory",
+          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
           "investigate": "Memory safety: leaks, use-after-free, double-free, memory corruption, and allocator API misuse."
         },
         {
           "id": "bounds",
+          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
           "investigate": "Bounds and sizes: array/index correctness, trusted versus untrusted indexes, integer overflow, truncation, and size calculation mistakes."
         },
         {
           "id": "races",
+          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
           "investigate": "Concurrency: lock coverage, ordering, missed wakeups, shared-state races, and protection of accessed fields."
         },
         {
           "id": "general",
+          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
           "investigate": "General correctness: NULL dereferences, missing error checks, semantic bugs, and concrete defects not covered by the other lenses."
         },
         {
           "id": "assertions",
           "run_if": "write-patch.review_dispute != '' || commit.commit_sha != ''",
+          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
           "investigate": "Commit assertion audit: try to disprove every assertion and statement made by the commit message, by comments added or modified by the commit, and by existing declarations, kerneldoc, comments, or docs that describe any contract changed by the commit. Treat each factual sentence, causal claim, safety claim, scope claim, negative claim, and justification as a hypothesis that must be proven from source, diff, callers, history, or documented API behavior. If the patch changes accepted inputs, callback requirements, helper semantics, locking/lifetime rules, ordering, accounting, or any API contract, inspect unchanged documentation/comments for stale, misleading, incomplete, or overbroad claims. If any assertion is unsupported, contradicted, too broad, missing important conditions, unverifiable from gathered evidence, or made stale by the patch, set clean=false and return a defect describing the exact correction or evidence needed. A clean result requires cited evidence that the commit message, changed comments, and relevant unchanged contract documentation accurately describe the code and semantic change."
         },
         {
@@ -994,60 +1214,47 @@
         },
         {
           "id": "bug-coverage",
-          "investigate": "Verify the patch series actually addresses the bug as researched. Enumerate each bug from the original finding: when `metadata.bugs` is present in the finding directory, use that list as the authoritative bug enumeration; otherwise use `research.fix_plan` (one bug per todo). When neither is present treat the whole finding as one anonymous bug. For each bug, classify the outcome against `git diff HEAD~1` (plus prior commits in the current fix series): `fixed` when a concrete diff hunk addresses the bug's trigger path (cite the file:line in the diff or commit ref); `invalidated` when source or commit evidence proves the bug doesn't exist or is already handled (cite the file:line or commit; comments alone are not evidence); `deferred` when another todo in `research.fix_plan` owns this bug (cite the todo id); `unresolved` when the bug is still reachable and this series doesn't address it. Set clean=false on any `unresolved` outcome and emit a defect with where/what describing the missing coverage. Set clean=true only when every bug is `fixed`, `invalidated` with evidence, or `deferred` with a cited todo. Emit the per-bug classifications in the typed `outcomes[]` array with fields `bug`, `outcome`, and `evidence`. When the finding is anchored to a directory (workflow.target_artifact_dir is non-empty), read FINDING.md, summary.md, and metadata.yaml from that directory to anchor the bug enumeration; otherwise rely on research.fix_plan."
+          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
+          "investigate": "Verify the patch series actually addresses the bug as researched. Enumerate each bug from the original finding: when `metadata.bugs` is present in the finding directory, use that list as the authoritative bug enumeration; otherwise use `research.fix_plan` (one bug per todo). When neither is present treat the whole finding as one anonymous bug. For each bug, classify the outcome against `git diff HEAD~1` (plus prior commits in the current fix series): `fixed` when a concrete diff hunk addresses the bug's trigger path (cite the file:line in the diff or commit ref); `invalidated` when source or commit evidence proves the bug doesn't exist or is already handled (cite the file:line or commit; comments alone are not evidence); `deferred` when another todo in `research.fix_plan` owns this bug (cite the todo id); `duplicate` when an upstream patch in the LORE-SEARCH UPSTREAM PATCHES section above already proposes the same fix (cite the lore Message-ID or URL); `unresolved` when the bug is still reachable and neither this series nor an upstream patch addresses it. Set clean=false on any `unresolved` outcome and emit a defect with where/what describing the missing coverage. Set clean=true only when every bug is `fixed`, `invalidated` with evidence, `deferred` with a cited todo, or `duplicate` with a cited lore Message-ID. Emit the per-bug classifications in the typed `outcomes[]` array with fields `bug`, `outcome`, and `evidence`. When the finding is anchored to a directory (workflow.target_artifact_dir is non-empty), read FINDING.md, summary.md, and metadata.yaml from that directory to anchor the bug enumeration; otherwise rely on research.fix_plan."
         }
       ],
       "aggregate": "consolidate",
       "consolidate": {
         "agent": "fast",
         "prompt": [
-          "Merge the parallel fix-review lens outputs into one workflow review result.",
+          "Merge the parallel fix-review lens outputs into one consolidated review result.",
+          "Read only typed lens fields; analysis prose is preserved for humans but is never a",
+          "routing or retry signal.",
           "",
-          "Each lens output may contain `clean`, `defects`, and `analysis`. The consolidated",
-          "result is clean when every lens reports clean=true and every authoritative defect",
-          "bucket is empty. If a lens has a concrete unresolved concern, it must report",
-          "clean=false with a typed defect. Prose in analysis is preserved for humans but is",
-          "not interpreted by the runner as a routing or retry signal.",
+          "Set consolidated `clean=true` if and only if every lens's `clean=true`, every lens's",
+          "`source_defects[]` and `commit_message_defects[]` (or fallback `defects[]`) are empty,",
+          "and every lens's `unresolved_risks[]` is empty. If any lens self-contradicts (for",
+          "example clean=true with a non-empty typed bucket), trust the typed buckets and set",
+          "consolidated `clean=false`.",
           "",
-          "Deduplicate defects that describe the same root cause. Preserve the lens name for",
-          "each defect, or merge multiple lens names into the `lens` string when several lenses",
-          "found the same issue. Keep `where` and `what` concrete and actionable so the next",
-          "correction attempt knows exactly what to correct or what evidence to gather.",
+          "Build the consolidated typed lists by deduping the union of every lens's entries:",
+          "merge entries that describe the same root cause at the same `where`, combine their",
+          "`lens` field into a comma-separated list, and keep the most concrete `what` and",
+          "`evidence_needed`. Forward `unresolved_risks[]` and `outcomes[]` the same way.",
           "",
-          "If a lens emits source_defects[] or commit_message_defects[], treat those split arrays",
-          "as authoritative for routing. The generic defects[] copy is schema compatibility only",
-          "and must not be reinterpreted into a different correction bucket.",
+          "When a lens emits split `source_defects[]` / `commit_message_defects[]`, those are",
+          "authoritative; the generic `defects[]` copy is schema compatibility only and must not",
+          "be re-bucketed.",
           "",
-          "Treat the maintainer lens as a hard quality gate. Do not discard maintainer objections",
-          "as style concerns when they identify regression risk, missing justification, behavior",
-          "changes, incomplete error-path/lifetime/locking proof, inadequate commit-message proof,",
-          "stale or contradicted documentation for a changed contract, or correction requests",
-          "needed before publication.",
+          "Treat the maintainer lens as a hard quality gate: regression risk, missing",
+          "justification, behavior changes, incomplete error-path/lifetime/locking proof, stale",
+          "documentation for a changed contract, or unmet publication requirements are real",
+          "defects, not style notes. Maintainer commit-message readability objections — a",
+          "wall-of-text proof memo, dense prose hiding the problem/fix, over-inventoried",
+          "callers, missing indented evidence blocks for non-obvious ordering/callbacks/state",
+          "transitions/racing CPUs — are commit-message defects.",
           "",
-          "Commit-message readability defects from the maintainer lens are also hard defects.",
-          "If the message is a wall-of-text proof memo, hides the problem/fix in dense prose,",
-          "over-inventories callers or negative cases, or should use focused indented evidence",
-          "blocks to explain non-obvious ordering, callbacks, nested calls, state transitions,",
-          "or racing CPUs, keep clean=false and classify it as",
-          "correction_step=\"write-commit-message\" unless another defect also requires source",
-          "changes.",
+          "If any lens reports stale/contradicted/incomplete/misleading declarations, kerneldoc,",
+          "comments, or docs for a contract this patch changed, consolidated `clean=false` —",
+          "don't downgrade to analysis-only just because runtime behavior is fixed.",
           "",
-          "If any lens reports that declarations, kerneldoc, comments, or docs are stale,",
-          "contradicted, incomplete, or misleading because the patch changed a contract, the",
-          "consolidated result must be clean=false. Do not downgrade this to analysis-only just",
-          "because the runtime bug is fixed.",
-          "",
-          "Classify the correction target:",
-          "- correction_step=\"write-commit-message\" only when every defect is solely about the",
-          "  commit message/trailers and no source, build, runtime behavior, or test/validation",
-          "  change is requested.",
-          "- correction_step=\"write-patch\" for any source-code defect, build defect, behavioral",
-          "  regression, missing validation that requires changing the patch, or mixed source +",
-          "  commit-message defect set.",
-          "",
-          "If all lenses are clean, return clean=true, defects=[], and an analysis summarizing the",
-          "evidence checked by the lenses and correction_step=\"write-patch\". Otherwise return",
-          "clean=false with the deduped defects and the correction_step classification."
+          "Return the consolidated typed JSON. When every lens is clean and every bucket is",
+          "empty, set clean=true with empty lists."
         ]
       },
       "outputs": {
@@ -1072,16 +1279,19 @@
           "optional": true,
           "description": "Review defects that are solely about the commit message or trailers."
         },
+        "unresolved_risks": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "lens": "string",
+            "where": "string",
+            "what": "string",
+            "evidence_needed": "string"
+          },
+          "description": "Concrete risks the lens noticed but could not run down from gathered evidence. clean=true is incompatible with a non-empty unresolved_risks[]. Read as input by the post-review orchestrator."
+        },
         "analysis": {
           "type": "string"
-        },
-        "correction_step": {
-          "type": "enum",
-          "values": [
-            "write-patch",
-            "write-commit-message"
-          ],
-          "description": "write-patch for source/build/behavior defects; write-commit-message for commit-message-only defects."
         },
         "outcomes": {
           "type": "array<object>",
@@ -1099,7 +1309,121 @@
         "expr": "clean == true",
         "on_fail": {
           "action": "branch_to",
-          "branch_to_output": "correction_step",
+          "branch_to": "orchestrator",
+          "max_attempts": 10,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "orchestrator",
+      "title": "Pick the next step based on review + prior-attempt history",
+      "depends_on": [
+        "review"
+      ],
+      "run_if": "research.research_status == 'confirmed' && ((write-patch.code_changes_emitted == false && write-patch.review_dispute == '') || write-commit-message.commit_message_written == false || review.clean == false || build.result == 'failed')",
+      "agent": "fast",
+      "mode": "audit",
+      "actions": [
+        "read",
+        "source",
+        "grep"
+      ],
+      "prompt": [
+        "You are the workflow-step orchestrator. You decide what the run does next when the previous step produced a signal the workflow cannot route deterministically: worker eval failures, build failures, review defects, and ambiguous conditions where the right move depends on weighing several outputs against each other. The goal is a correct fix shipped — which sometimes means re-instructing a worker, sometimes means publishing despite a non-success signal (e.g. a preexisting build break), and sometimes means exit-failure.",
+        "",
+        "Correctness comes first. Never pick publish to silence a reviewer concern you can't disprove from cited source. Never pick exit-failure to escape tedium. Repeated valid concerns stay valid — repetition does not turn a real defect into an aesthetic one. Disproof requires a specific file:line, commit ref, or prior-attempt fact, not a vibe.",
+        "",
+        "You are invoked whenever the workflow needs a judgment call about what to do next. That happens in several distinct situations, and they do not all mean the patch is wrong:",
+        "- write-patch produced neither code_edits nor a review_dispute. The worker may have hit a protocol/context gap; the patch may still be reachable with a sharper instruction.",
+        "- write-commit-message did not write a commit message file. The source patch may still be correct.",
+        "- review reported defects (review.clean == false). The defect may be real, or the prior write-patch attempt may already satisfy it (worth weighing review.source_defects and write-patch.prior_attempts together).",
+        "- the build failed (build.result == 'failed'). Read compile-triage.result: patch_error means the patch broke the build and write-patch needs another pass; preexisting_error means the tree was already broken for unrelated reasons and the patch itself can ship.",
+        "Treat the available signals as evidence, not as a verdict. The right next_step depends on what the signals collectively say, and that includes picking publish when the worker signal is non-success but the underlying patch is correct. Use the worker's prior_attempts to distinguish a recoverable protocol/context gap (re-instruct the worker with concrete missing context and tell it which step-allowed followup mechanisms to use; the worker's prompt enumerates the followup kinds its step actually allows) from a structural blocker (pick exit-failure and explain why in rationale).",
+        "",
+        "Your two levers:",
+        "- next_step: re-route to a worker (write-patch, write-commit-message) so it can take another pass, or finish the run (publish, exit-failure).",
+        "- instruction: free-form guidance that the next worker reads verbatim before producing its output. Use this to break deadlocks — name the concrete defect, point at the file/function/line, and tell the worker what the prior attempt missed or got wrong.",
+        "",
+        "Batch every defect a single worker pass can cover. Every routing decision costs an entire downstream cycle (rebuild + multi-lens review fan-out + consolidate). When you pick a worker, scan ALL open review defects (review.defects, review.source_defects, review.commit_message_defects, review_ledger entries) and pack into one instruction every item the chosen worker can address in this pass — including doc-only or comment-only source edits adjacent to the primary fix. write-patch and write-commit-message both run in coding mode and can emit code_edits, so even when the primary motivator for a write-commit-message routing is the changelog rewrite, fold in any in-scope source-comment edits whose correction does not depend on the changelog. Do not defer items as 'follow-up if the reviewer insists' when the same worker call can handle them now; the reviewer will keep flagging them and you will pay the next review-cycle cost for the deferral.",
+        "",
+        "AVAILABLE NEXT STEPS:",
+        "- write-patch: source/build/behavior still needs to change, or the prior write-patch attempt produced nothing. Use instruction to spell out what the next patch must do (which function, which contract, which path) and, when the prior attempt emitted no edits, to point at the specific source the worker needs to fetch and the followup kinds it must use to fetch it. Include any source-comment defects that should be fixed alongside the patch.",
+        "- write-commit-message: the source patch is correct but the commit message is wrong, or the prior attempt produced no message file. Use instruction to specify the false/overstated/missing claim and what the rewritten message must say. A commit-message defect is real until you disprove it; don't downgrade it. write-commit-message also runs in coding mode (its actions list includes `edit`); if open source-comment defects can be fixed alongside the commit-message rewrite without changing executable code, include them in the instruction and call out that the worker must emit both code_edits (for the comments) and code_output (for the rewritten message) in one response.",
+        "- publish: ship the fix. Pick this only when review.clean is true, OR you can cite specific evidence (file:line, commit ref, prior-attempt fact) that disproves every remaining review concern.",
+        "- exit-failure: end the run unsuccessfully. Pick this only when you can name a defect that no available worker step can resolve — e.g. the fix requires changes beyond this workflow's scope, or you cannot author an instruction that would unblock the worker. Not for \"I'm tired of iterating.\"",
+        "",
+        "Worker output snapshot (null/empty means the step was skipped or never ran on this cycle):",
+        "- write-patch.code_changes_emitted: {{write-patch.code_changes_emitted || 'unset'}}",
+        "- write-patch.review_dispute: {{write-patch.review_dispute || ''}}",
+        "- write-commit-message.commit_message_written: {{write-commit-message.commit_message_written || 'unset'}}",
+        "- build.result: {{build.result || ''}}",
+        "- review.clean: {{review.clean || 'unset'}}",
+        "- compile-triage.result: {{compile-triage.result || ''}}",
+        "",
+        "REVIEW CONSOLIDATE OUTPUT:",
+        "- analysis: {{review.analysis || ''}}",
+        "- defects: {{review.defects || '[]'}}",
+        "- source_defects: {{review.source_defects || '[]'}}",
+        "- commit_message_defects: {{review.commit_message_defects || '[]'}}",
+        "- unresolved_risks: {{review.unresolved_risks || '[]'}}",
+        "- outcomes: {{review.outcomes || '[]'}}",
+        "",
+        "COMPILE TRIAGE OUTPUT:",
+        "- result: {{compile-triage.result || ''}}",
+        "- analysis: {{compile-triage.analysis || ''}}",
+        "- build stdout: {{build.stdout || ''}}",
+        "- build stderr: {{build.stderr || ''}}",
+        "",
+        "REVIEW LEDGER (cross-attempt complaint history):",
+        "{{review_ledger.ledger || ''}}",
+        "",
+        "CURRENT WRITE-PATCH OUTPUT (the most recent attempt's prose and typed followups; prior_attempts is empty on the first orchestrator invocation after a failed attempt, so read this section to learn WHY a worker just produced empty code_edits):",
+        "- analysis: {{write-patch.analysis || ''}}",
+        "- followups: {{write-patch.followups || '[]'}}",
+        "",
+        "WRITE-PATCH PRIOR ATTEMPTS:",
+        "{{write-patch.prior_attempts || ''}}",
+        "",
+        "CURRENT WRITE-COMMIT-MESSAGE OUTPUT:",
+        "- analysis: {{write-commit-message.analysis || ''}}",
+        "- followups: {{write-commit-message.followups || '[]'}}",
+        "",
+        "WRITE-COMMIT-MESSAGE PRIOR ATTEMPTS:",
+        "{{write-commit-message.prior_attempts || ''}}",
+        "",
+        "YOUR PRIOR VERDICTS AND INSTRUCTIONS:",
+        "{{orchestrator.prior_attempts || ''}}",
+        "",
+        "If a prior verdict's instruction did not unblock the worker, refine the instruction with new evidence. Reissuing the same instruction verbatim wastes the next attempt. Capitulating to publish/exit-failure when the underlying concern is still real is worse.",
+        "",
+        "Emit ONE JSON object and nothing else. No prose preamble. No Markdown fences (no ```json, no closing ```). No explanation outside the JSON. The `rationale` field IS where you put your reasoning — do not duplicate it as prose around the object. Shape: {\"next_step\": \"write-patch\" | \"write-commit-message\" | \"publish\" | \"exit-failure\", \"instruction\": \"<concrete guidance the next worker reads; empty for publish/exit-failure>\", \"rationale\": \"<why this pick advances toward correctness; cite file:line, commit ref, or prior-attempt facts>\"}."
+      ],
+      "outputs": {
+        "next_step": {
+          "type": "enum",
+          "values": [
+            "write-patch",
+            "write-commit-message",
+            "publish",
+            "exit-failure"
+          ],
+          "description": "Workflow-step verb the orchestrator routes to. publish continues the chain to record-results; exit-failure is caught by completion.failure_when_any; write-patch/write-commit-message branch back."
+        },
+        "instruction": {
+          "type": "string",
+          "description": "Free-form guidance the next worker step reads verbatim before producing output. Used to break deadlocks by adjusting the worker's instructions instead of accepting an incorrect result."
+        },
+        "rationale": {
+          "type": "string"
+        }
+      },
+      "eval": {
+        "type": "builtin",
+        "name": "orchestrator_dispatch",
+        "on_fail": {
+          "action": "branch_to",
+          "branch_to_output": "next_step",
           "max_attempts": 10,
           "on_exhausted": "exit_failure"
         }
@@ -1111,7 +1435,7 @@
       "depends_on": [
         "review"
       ],
-      "run_if": "research.research_status == 'confirmed' && review.clean == true && workflow.target_artifact_dir != ''",
+      "run_if": "research.research_status == 'confirmed' && (review.clean == true || orchestrator.next_step == 'publish') && workflow.target_artifact_dir != ''",
       "agent": "reaper",
       "action": {
         "type": "set-finding-results",
@@ -1135,7 +1459,7 @@
       "depends_on": [
         "record-results"
       ],
-      "run_if": "research.research_status == 'confirmed' && review.clean == true && workflow.target_artifact_dir != ''",
+      "run_if": "research.research_status == 'confirmed' && (review.clean == true || orchestrator.next_step == 'publish') && workflow.target_artifact_dir != ''",
       "agent": "reaper",
       "action": {
         "type": "publish-fix",
@@ -1159,11 +1483,13 @@
       "research.research_status == 'invalid' && workflow.target_artifact_dir == '' && research.invalid_evidence_kind == 'source_or_commit_evidence' && research.invalid_evidence != ''",
       "research.research_status == 'unconfirmed' && workflow.target_artifact_dir == ''",
       "publish.completed",
-      "review.clean == true && workflow.target_artifact_dir == ''"
+      "review.clean == true && workflow.target_artifact_dir == ''",
+      "orchestrator.next_step == 'publish' && workflow.target_artifact_dir == ''"
     ],
     "failure_when_any": [
       "workflow.fix_run_mode == 'todo' && research.research_status != 'confirmed'",
-      "research.research_status == 'invalid' && (research.invalid_evidence_kind != 'source_or_commit_evidence' || research.invalid_evidence == '')"
+      "research.research_status == 'invalid' && (research.invalid_evidence_kind != 'source_or_commit_evidence' || research.invalid_evidence == '')",
+      "orchestrator.next_step == 'exit-failure'"
     ]
   },
   "persistence": {

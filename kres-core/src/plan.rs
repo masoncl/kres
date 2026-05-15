@@ -220,106 +220,56 @@ pub fn normalize_steps(steps: Vec<PlanStep>) -> Vec<PlanStep> {
 /// from the text and the steps are returned. On parse failure or
 /// missing marker, returns the original text and None.
 pub fn extract_embedded_plan(text: &str) -> (String, Option<Vec<PlanStep>>) {
-    let marker_pos = text
-        .lines()
-        .enumerate()
-        .find(|(_, line)| line.trim().starts_with("PLAN:"))
-        .map(|(i, _)| i);
-    let Some(marker_line) = marker_pos else {
+    // Hand the suffix after the PLAN: marker to the shared
+    // string-aware, depth-clamped brace scanner. The offset-aware
+    // variant tells us where the opening `{` is, so we don't need
+    // a separate `text.find('{')` (which is not string-aware and
+    // would point at a literal `{` inside a quoted prose preamble).
+    // Parsing PlanRewrite inside the visitor means a prose `{...}`
+    // snippet that isn't a PlanRewrite is skipped and the scanner
+    // keeps looking for the real envelope.
+    let Some(plan_marker) = text.find("PLAN:") else {
         return (text.to_string(), None);
     };
-
-    let lines: Vec<&str> = text.lines().collect();
-    let after_marker = lines[marker_line]
-        .trim()
-        .strip_prefix("PLAN:")
-        .unwrap()
-        .trim();
-
-    let json_start_line;
-    let json_text_start;
-    if after_marker.starts_with('{') {
-        json_start_line = marker_line;
-        json_text_start = text.find("PLAN:").unwrap() + "PLAN:".len();
-        let rest = &text[json_text_start..];
-        let trimmed_offset = rest.len() - rest.trim_start().len();
-        let json_text_start = json_text_start + trimmed_offset;
-        let _ = json_text_start; // used below
-    } else {
-        json_start_line = marker_line + 1;
-    }
-    let _ = json_start_line;
-
-    // Find the JSON by scanning for balanced braces from the first '{' after PLAN:
-    let plan_marker = text.find("PLAN:").unwrap();
-    let rest = &text[plan_marker + "PLAN:".len()..];
-    let brace_offset = match rest.find('{') {
-        Some(o) => o,
-        None => return (text.to_string(), None),
-    };
-    let json_start = plan_marker + "PLAN:".len() + brace_offset;
-    let mut depth = 0i32;
-    let mut json_end = json_start;
-    for (i, ch) in text[json_start..].char_indices() {
-        match ch {
-            '{' | '[' => depth += 1,
-            '}' | ']' => {
-                depth -= 1;
-                if depth == 0 {
-                    json_end = json_start + i + ch.len_utf8();
-                    break;
-                }
-            }
-            _ => {}
+    let after_marker_offset = plan_marker + "PLAN:".len();
+    let suffix = &text[after_marker_offset..];
+    let hit = crate::brace::first_top_level_brace_with_offset(suffix, |offset, slice| {
+        let rewrite: PlanRewrite = serde_json::from_str(slice).ok()?;
+        if rewrite.steps.is_empty() {
+            return None;
         }
-    }
-    if depth != 0 {
-        tracing::warn!(
-            target: "kres_core",
-            "PLAN: block has unbalanced braces; ignoring embedded plan"
-        );
+        Some((offset, slice.len(), rewrite))
+    });
+    let Some((opener_offset, slice_len, rewrite)) = hit else {
+        if suffix.contains('{') {
+            tracing::warn!(
+                target: "kres_core",
+                "PLAN: block has no parseable JSON object with non-empty steps; ignoring"
+            );
+        }
         return (text.to_string(), None);
-    }
+    };
+    let json_start = after_marker_offset + opener_offset;
+    let json_end = json_start + slice_len;
 
-    let json_str = &text[json_start..json_end];
-    let parsed: Result<PlanRewrite, _> = serde_json::from_str(json_str);
-    match parsed {
-        Ok(rewrite) if !rewrite.steps.is_empty() => {
-            // Strip the PLAN: line and the JSON block from the text.
-            // Find the full block boundaries (PLAN: marker through end of JSON).
-            let block_start = plan_marker;
-            let mut block_end = json_end;
-            // Consume trailing whitespace/newlines after the JSON.
-            while block_end < text.len()
-                && text
-                    .as_bytes()
-                    .get(block_end)
-                    .is_some_and(|b| b.is_ascii_whitespace())
-            {
-                block_end += 1;
-            }
-            let mut stripped = String::with_capacity(text.len());
-            stripped.push_str(&text[..block_start]);
-            stripped.push_str(&text[block_end..]);
-            // Trim trailing whitespace from the join point.
-            let stripped = stripped.trim_end().to_string();
-            (stripped, Some(rewrite.steps))
-        }
-        Ok(_) => {
-            tracing::warn!(
-                target: "kres_core",
-                "PLAN: block parsed but contains no steps; ignoring"
-            );
-            (text.to_string(), None)
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "kres_core",
-                "PLAN: block JSON parse failed: {e}; ignoring embedded plan"
-            );
-            (text.to_string(), None)
-        }
+    // Strip the PLAN: line and the JSON block from the returned
+    // text. Boundaries cover the marker through end of JSON plus
+    // trailing whitespace so the surrounding prompt joins cleanly.
+    let block_start = plan_marker;
+    let mut block_end = json_end;
+    while block_end < text.len()
+        && text
+            .as_bytes()
+            .get(block_end)
+            .is_some_and(|b| b.is_ascii_whitespace())
+    {
+        block_end += 1;
     }
+    let mut stripped = String::with_capacity(text.len());
+    stripped.push_str(&text[..block_start]);
+    stripped.push_str(&text[block_end..]);
+    let stripped = stripped.trim_end().to_string();
+    (stripped, Some(rewrite.steps))
 }
 
 /// Produce a kebab-case slug from a step title, truncated to 60
@@ -771,6 +721,30 @@ More text after."#;
         let (stripped, steps) = extract_embedded_plan(text);
         assert!(steps.is_none());
         assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn extract_embedded_plan_tolerates_brackets_in_string_values() {
+        // Regression: the old hand-rolled brace counter tracked `[`
+        // and `]` toward depth without string-awareness, so a JSON
+        // value containing a literal `]` (or `}`) inside a quoted
+        // string desynced depth and either truncated json_end or
+        // logged "PLAN: block has unbalanced braces". The shared
+        // first_top_level_brace scanner is string-aware.
+        let text = r#"PLAN:
+{
+  "steps": [
+    {"id": "s1", "title": "describe brackets [in] title and braces { } too"}
+  ]
+}
+Rest."#;
+        let (stripped, steps) = extract_embedded_plan(text);
+        let steps = steps.expect("string-aware scanner should accept this");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, "s1");
+        assert!(steps[0].title.contains("[in]"));
+        assert!(stripped.contains("Rest."));
+        assert!(!stripped.contains("PLAN:"));
     }
 
     #[test]

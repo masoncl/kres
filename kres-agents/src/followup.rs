@@ -20,6 +20,18 @@ pub struct Followup {
     /// Optional scoping path for search/file types.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// `true` marks a deferred / nice-to-have audit that does not
+    /// block terminal classification. `false` (default) marks a
+    /// blocking evidence request that must be gathered before the
+    /// workflow can produce a terminal status. Workflow evals that
+    /// require "no remaining followups" before declaring a terminal
+    /// status only count entries with `nice_to_have == false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nice_to_have: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Followup {
@@ -34,6 +46,28 @@ impl Followup {
     }
 }
 
+/// `true` when no entry in the slice is a blocking followup
+/// (i.e. every entry has `nice_to_have == true`).
+pub fn no_blocking_followups(items: &[Followup]) -> bool {
+    items.iter().all(|f| f.nice_to_have)
+}
+
+/// Same check against a `serde_json::Value` array, for code paths
+/// that receive untyped JSON (e.g. the consolidator-output path).
+/// A non-array value is treated as "no blocking followups".
+pub fn no_blocking_followups_json(value: Option<&serde_json::Value>) -> bool {
+    let Some(items) = value.and_then(|v| v.as_array()) else {
+        return true;
+    };
+    !items.iter().any(|item| {
+        item.as_object()
+            .and_then(|obj| obj.get("nice_to_have"))
+            .and_then(serde_json::Value::as_bool)
+            .map(|b| !b) // nice_to_have=false → blocking
+            .unwrap_or(true) // missing/non-bool → blocking
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,10 +79,81 @@ mod tests {
             name: "foo.*bar".into(),
             reason: "[EXTEND] see what calls this".into(),
             path: Some("drivers/net".into()),
+            nice_to_have: true,
         };
         let s = serde_json::to_string(&f).unwrap();
         let back: Followup = serde_json::from_str(&s).unwrap();
         assert_eq!(back, f);
+    }
+
+    #[test]
+    fn nice_to_have_defaults_false_on_legacy_payload() {
+        let f: Followup =
+            serde_json::from_str(r#"{"type":"source","name":"foo","reason":"why"}"#).unwrap();
+        assert!(!f.nice_to_have);
+    }
+
+    #[test]
+    fn nice_to_have_false_is_omitted_from_wire() {
+        let f = Followup {
+            kind: "source".into(),
+            name: "foo".into(),
+            reason: "".into(),
+            path: None,
+            nice_to_have: false,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(!s.contains("nice_to_have"), "serialized: {s}");
+    }
+
+    #[test]
+    fn no_blocking_followups_recognizes_all_nice_to_have() {
+        let items = vec![
+            Followup {
+                kind: "source".into(),
+                name: "a".into(),
+                reason: "".into(),
+                path: None,
+                nice_to_have: true,
+            },
+            Followup {
+                kind: "git".into(),
+                name: "log".into(),
+                reason: "".into(),
+                path: None,
+                nice_to_have: true,
+            },
+        ];
+        assert!(no_blocking_followups(&items));
+        let mut mixed = items.clone();
+        mixed.push(Followup {
+            kind: "source".into(),
+            name: "b".into(),
+            reason: "".into(),
+            path: None,
+            nice_to_have: false,
+        });
+        assert!(!no_blocking_followups(&mixed));
+    }
+
+    #[test]
+    fn no_blocking_followups_json_handles_missing_and_legacy() {
+        let none = serde_json::json!([]);
+        assert!(no_blocking_followups_json(Some(&none)));
+        let legacy = serde_json::json!([{"type":"source","name":"x"}]);
+        assert!(!no_blocking_followups_json(Some(&legacy)));
+        let nth = serde_json::json!([
+            {"type":"source","name":"x","nice_to_have":true},
+            {"type":"git","name":"log","nice_to_have":true}
+        ]);
+        assert!(no_blocking_followups_json(Some(&nth)));
+        let mixed = serde_json::json!([
+            {"type":"source","name":"x","nice_to_have":true},
+            {"type":"source","name":"y","nice_to_have":false}
+        ]);
+        assert!(!no_blocking_followups_json(Some(&mixed)));
+        // No followups field at all — empty.
+        assert!(no_blocking_followups_json(None));
     }
 
     #[test]
@@ -58,6 +163,7 @@ mod tests {
             name: "x".into(),
             reason: "".into(),
             path: Some("dir".into()),
+            nice_to_have: false,
         };
         assert_eq!(f.cache_key(), "search::x::dir");
         let mut f2 = f.clone();

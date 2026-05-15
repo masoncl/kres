@@ -32,6 +32,13 @@ pub struct CallConfig {
     /// updates its token counters from `message_start` /
     /// `message_delta` events. None = silent call.
     pub stream_label: Option<String>,
+    /// When true, the non-streaming `messages` retry path returns
+    /// `LlmError::OverInputLimit` instead of internally shrinking
+    /// the last user message text on a 429-with-over-limit. Lets
+    /// the caller perform structured shrinking (e.g. prune the
+    /// workflow step's `prior_attempts`) and re-issue the call.
+    /// Default false preserves the existing auto-shrink behavior.
+    pub surface_over_input_limit: bool,
 }
 
 impl CallConfig {
@@ -50,7 +57,13 @@ impl CallConfig {
             system_cached: true,
             max_input_tokens: None,
             stream_label: None,
+            surface_over_input_limit: false,
         }
+    }
+
+    pub fn with_surface_over_input_limit(mut self, surface: bool) -> Self {
+        self.surface_over_input_limit = surface;
+        self
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {

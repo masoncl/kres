@@ -709,11 +709,19 @@ fn write_finding_md(
         }
     }
 
-    m.push_str("## Reproducer\n\n");
-    m.push_str(&f.reproducer_sketch);
-    m.push_str("\n\n## Impact\n\n");
-    m.push_str(&f.impact);
-    m.push_str("\n\n");
+    // Mirror the report.rs treatment: gate on !is_empty() so a
+    // Finding that omits these (Finding's serde defaults allow it)
+    // doesn't render empty `## Reproducer` / `## Impact` sections.
+    if !f.reproducer_sketch.is_empty() {
+        m.push_str("## Reproducer\n\n");
+        m.push_str(&f.reproducer_sketch);
+        m.push_str("\n\n");
+    }
+    if !f.impact.is_empty() {
+        m.push_str("## Impact\n\n");
+        m.push_str(&f.impact);
+        m.push_str("\n\n");
+    }
 
     if let Some(ref fx) = f.fix_sketch {
         if !fx.is_empty() {

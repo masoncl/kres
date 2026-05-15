@@ -960,35 +960,14 @@ fn parse_todo_update_full(text: &str) -> Option<(Vec<TodoItem>, Option<kres_core
             return Some((items, r.plan));
         }
     }
-    let bytes = text.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut depth: i32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start.take() {
-                        if let Ok(r) = serde_json::from_str::<TodoUpdateResponse>(&text[s..=i]) {
-                            if let Some(items) = todo_list_from_value(r.todo) {
-                                return Some((items, r.plan));
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    // The shared scanner is string-aware and clamps stray `}` so a
+    // JSON value containing `}` or a prose preamble with an
+    // unbalanced close doesn't hide the canonical envelope.
+    kres_core::brace::first_top_level_brace(text, |slice| {
+        let r: TodoUpdateResponse = serde_json::from_str(slice).ok()?;
+        let items = todo_list_from_value(r.todo)?;
+        Some((items, r.plan))
+    })
 }
 
 /// Extract the `todo` array from the agent's response text. Tries
@@ -999,37 +978,11 @@ pub fn parse_todo_response(text: &str) -> Option<Vec<TodoItem>> {
             return Some(items);
         }
     }
-    // Try to find an embedded `{"todo": [...]}` object via brace-match.
-    let bytes = text.as_bytes();
-    let mut start: Option<usize> = None;
-    let mut depth: i32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match c {
-            b'{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start.take() {
-                        if let Ok(r) = serde_json::from_str::<TodoUpdateResponse>(&text[s..=i]) {
-                            if let Some(items) = todo_list_from_value(r.todo) {
-                                return Some(items);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    // Same shared scanner as parse_todo_response_with_plan.
+    kres_core::brace::first_top_level_brace(text, |slice| {
+        let r: TodoUpdateResponse = serde_json::from_str(slice).ok()?;
+        todo_list_from_value(r.todo)
+    })
 }
 
 fn todo_list_from_value(v: Value) -> Option<Vec<TodoItem>> {

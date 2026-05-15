@@ -15,6 +15,7 @@
 //!   directly off the ordered task list.
 
 pub mod artifact;
+pub mod brace;
 pub mod consent;
 pub mod cost;
 pub mod findings;

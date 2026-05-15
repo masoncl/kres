@@ -31,6 +31,10 @@ const TABLE: &[(&str, &str)] = &[
         include_str!("../../configs/prompts/fast-code-agent.system.md"),
     ),
     (
+        "routing-agent.system.md",
+        include_str!("../../configs/prompts/routing-agent.system.md"),
+    ),
+    (
         "main-agent.system.md",
         include_str!("../../configs/prompts/main-agent.system.md"),
     ),

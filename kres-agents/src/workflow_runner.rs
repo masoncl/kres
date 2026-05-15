@@ -2,17 +2,17 @@
 //!
 //! ## Two execution paths
 //!
-//! ### Orchestrator path (production)
+//! ### AgentRunner path (production)
 //!
-//! When [`LlmDriver::with_orchestrator`] has wired a fully-built
-//! [`crate::pipeline::Orchestrator`], every step's LLM call goes
-//! through `Orchestrator::run_once_with_ctx`. That gives the
+//! When [`LlmDriver::with_agent_runner`] has wired a fully-built
+//! [`crate::pipeline::AgentRunner`], every step's LLM call goes
+//! through `AgentRunner::run_once_with_ctx`. That gives the
 //! workflow framework the same behaviour as the standard fast/slow
 //! pipeline:
 //!
 //! 1. **Fast-rounds gather loop**: the fast agent emits
 //!    `followups` (typed: `read`, `source`, `type`, `search`, `git`,
-//!    `bash`, `callers`, `question`); the orchestrator's
+//!    `bash`, `callers`, `question`); the AgentRunner's
 //!    [`crate::pipeline::DataFetcher`] resolves them into
 //!    `symbols` + `context`; the next fast round sees the
 //!    accumulated context plus a `previously_fetched` manifest.
@@ -30,21 +30,22 @@
 //!    JSON blocks like `{"result": "preexisting_error"}` from
 //!    fix.json's compile-triage step).
 //!
-//! Lensed `aggregate: consolidate` steps use the orchestrator's
+//! Lensed `aggregate: consolidate` steps use the AgentRunner's
 //! shared-gather fan-out path when possible: gather once, run each
 //! slow lens against the same source/context, then consolidate. Fix
-//! review steps with `clean`/`defects`/`correction_step` keep the
-//! same shared gather but use deterministic Rust fan-in so routing
-//! between source and commit-message correction is not inferred from
-//! prose. If that optimized path is unavailable, the executor falls
-//! back to per-lens `run_once_with_ctx` calls.
+//! review steps with `clean`/`defects` add a JSON-shape repair
+//! pass on each lens (so the consolidator gets parseable typed
+//! inputs) and then run the same LLM consolidator used by every
+//! other lensed step. If that optimized path is
+//! unavailable, the executor falls back to per-lens
+//! `run_once_with_ctx` calls.
 //!
 //! ### AgentEnv fallback (tests)
 //!
-//! When no orchestrator is wired, the driver uses per-role
+//! When no AgentRunner is wired, the driver uses per-role
 //! [`AgentEnv`]s for one-shot LLM calls (no gather loop). Used by
 //! the integration test against a single-shot HTTP mock; the
-//! orchestrator path needs SSE for `messages_streaming` which the
+//! AgentRunner path needs SSE for `messages_streaming` which the
 //! mock doesn't speak. Findings/followups are still surfaced (via
 //! `parse_code_response` on the response body) for declared
 //! outputs that name them.
@@ -56,6 +57,8 @@
 //!
 //! - `{{step_id.field}}` → that step's output field
 //! - `{{step_id.attempt}}` / `{{step_id.eval_failures}}` → counters
+//! - `{{step_id.prior_attempts}}` → JSON-rendered list of this
+//!   step's prior failed-attempt output maps (oldest first)
 //! - `{{workflow.field}}` → workflow-input or derived field
 //! - `{{globals.key}}` → the workflow's `globals` table
 //! - `{{a || b}}` → first truthy value (empty string and null are
@@ -113,6 +116,7 @@ use async_trait::async_trait;
 use kres_core::findings::Finding;
 use serde_json::{Map, Value};
 
+use kres_core::brace::extract_brace_objects;
 use kres_core::cost::UsageTracker;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
@@ -122,13 +126,13 @@ use crate::workflow_exec::{Driver, ExecContext, LensFanOutConsolidate, REVIEW_LE
 
 const JSON_REPAIR_RETRIES: usize = 3;
 const JSON_REPAIR_PREFIX: &str = "IMPORTANT: This step requires a valid JSON object matching OUTPUT SCHEMA; reply with that JSON object as the last top-level JSON in this response.";
+const CODE_EDIT_REPAIR_PREFIX: &str = "IMPORTANT: The previous reply's code_edits failed to apply. Re-read the file you intend to edit using a `read` followup before re-emitting code_edits. Every `old_string` MUST be copied verbatim from the current file contents byte-for-byte — match tabs vs spaces and column alignment exactly. If you are uncertain about indentation, widen the snippet so the surrounding lines anchor the exact byte sequence.\nApply error from the previous attempt:";
 const FAST_GATHER_ALLOWED_FIELDS: &str = "analysis, followups, skill_reads, ready_for_slow";
 const DEFAULT_GATHER_DISALLOWED_FIELDS: &[&str] = &[
     "clean",
     "defects",
     "source_defects",
     "commit_message_defects",
-    "correction_step",
     "valid",
     "result",
     "code_output",
@@ -137,11 +141,10 @@ const DEFAULT_GATHER_DISALLOWED_FIELDS: &[&str] = &[
 const LENS_GATHER_DISALLOWED_FIELDS: &[&str] = &[
     "clean",
     "defects",
-    "correction_step",
     "source_defects",
     "commit_message_defects",
+    "unresolved_risks",
     "findings",
-    "followups_empty",
 ];
 
 type StructuredLensOutputs = Vec<(String, Map<String, Value>)>;
@@ -207,10 +210,10 @@ impl AgentEnv {
 }
 
 /// Production driver. Holds either a fully-wired
-/// [`crate::pipeline::Orchestrator`] (which runs the fast-gather →
+/// [`crate::pipeline::AgentRunner`] (which runs the fast-gather →
 /// slow-synthesize loop with a [`crate::pipeline::DataFetcher`]) or
 /// a per-role [`AgentEnv`] for the simpler one-shot path used by
-/// tests. When the orchestrator is wired it wins — that's the path
+/// tests. When the AgentRunner is wired it wins — that's the path
 /// that actually services followups, accumulates symbols/context
 /// across rounds, and surfaces typed findings.
 pub struct LlmDriver {
@@ -218,19 +221,19 @@ pub struct LlmDriver {
     pub slow: Option<AgentEnv>,
     pub code: Option<AgentEnv>,
     /// When set, every step's LLM call delegates to
-    /// `orchestrator.run_once_with_ctx`. The orchestrator owns the
+    /// `agent_runner.run_once_with_ctx`. The AgentRunner owns the
     /// fast-rounds gather loop, fetches followups via its
     /// `DataFetcher`, and returns a `TaskSummary` carrying findings
     /// + followups + code_output + analysis.
-    pub orchestrator: Option<Arc<crate::pipeline::Orchestrator>>,
-    /// When set alongside [`Self::orchestrator`], non-structured
+    pub agent_runner: Option<Arc<crate::pipeline::AgentRunner>>,
+    /// When set alongside [`Self::agent_runner`], non-structured
     /// lensed steps with `aggregate: consolidate` delegate to
-    /// `Orchestrator::run_with_lenses` (one shared gather + N
+    /// `AgentRunner::run_with_lenses` (one shared gather + N
     /// parallel slow calls + this consolidator). Structured fix
-    /// review outputs use the same shared gather but deterministic
-    /// Rust fan-in, so they do not require this client. Without it,
-    /// non-structured lensed steps fall back to independent
-    /// orchestrator calls.
+    /// review outputs run the same shared gather then call the
+    /// workflow-runner's own consolidate LLM path, so they do not
+    /// require this client. Without it, non-structured lensed steps
+    /// fall back to independent AgentRunner calls.
     pub consolidator: Option<Arc<crate::pipeline::ConsolidatorClient>>,
     pub workspace: PathBuf,
     pub workflow: Workflow,
@@ -244,8 +247,8 @@ pub struct LlmDriver {
     /// pair to `code.jsonl`.
     logger: Option<Arc<TurnLogger>>,
     /// Optional token accounting sink for LLM calls made directly by
-    /// the workflow driver. Calls delegated to the orchestrator are
-    /// recorded by the orchestrator itself; this covers judge,
+    /// the workflow driver. Calls delegated to the AgentRunner are
+    /// recorded by the AgentRunner itself; this covers judge,
     /// consolidate, review-ledger, and AgentEnv fallback calls.
     usage: Option<Arc<UsageTracker>>,
     /// Optional shutdown handle. When set, every LLM call awaits
@@ -261,7 +264,7 @@ impl LlmDriver {
             fast: None,
             slow: None,
             code: None,
-            orchestrator: None,
+            agent_runner: None,
             consolidator: None,
             workspace,
             workflow,
@@ -274,7 +277,7 @@ impl LlmDriver {
 
     /// Wire the ConsolidatorClient used by lensed
     /// `aggregate: consolidate` steps to share gather + fan out
-    /// via [`crate::pipeline::Orchestrator::run_with_lenses`].
+    /// via [`crate::pipeline::AgentRunner::run_with_lenses`].
     pub fn with_consolidator(
         mut self,
         consolidator: Arc<crate::pipeline::ConsolidatorClient>,
@@ -292,13 +295,13 @@ impl LlmDriver {
         self
     }
 
-    /// Wire a fully-built [`crate::pipeline::Orchestrator`]. When
+    /// Wire a fully-built [`crate::pipeline::AgentRunner`]. When
     /// set, every LLM step delegates to `run_once_with_ctx`,
-    /// inheriting the orchestrator's fast-rounds gather loop +
+    /// inheriting the AgentRunner's fast-rounds gather loop +
     /// fetcher. The simpler per-role AgentEnv path is then a fallback
     /// only.
-    pub fn with_orchestrator(mut self, orch: Arc<crate::pipeline::Orchestrator>) -> Self {
-        self.orchestrator = Some(orch);
+    pub fn with_agent_runner(mut self, runner: Arc<crate::pipeline::AgentRunner>) -> Self {
+        self.agent_runner = Some(runner);
         self
     }
 
@@ -386,7 +389,7 @@ impl LlmDriver {
 
     /// Same shape as `config_for_call` but takes a base CallConfig
     /// directly so the caller can come from either an AgentEnv or
-    /// the orchestrator. Fix #13: Mode::Review now picks the audit
+    /// the AgentRunner. Fix #13: Mode::Review now picks the audit
     /// prompt (our review pipeline runs the audit-flavoured slow
     /// agent and the consolidator does the review-specific
     /// merging on top). When a future system-prompt arrives that
@@ -427,10 +430,10 @@ impl LlmDriver {
         let (client, base_cfg) = match self.pick(AgentRole::Fast) {
             Ok(env) => (env.client.clone(), env.config.clone()),
             Err(_) => self
-                .fallback_client_cfg_from_orchestrator(AgentRole::Fast)
+                .fallback_client_cfg_from_agent_runner(AgentRole::Fast)
                 .ok_or_else(|| {
                     format!(
-                        "step '{}' review ledger: no fast AgentEnv and no orchestrator fast client",
+                        "step '{}' review ledger: no fast AgentEnv and no AgentRunner fast client",
                         step.id
                     )
                 })?,
@@ -504,33 +507,33 @@ impl LlmDriver {
         ))
     }
 
-    /// Fallback for when no AgentEnv is wired but the orchestrator
+    /// Fallback for when no AgentEnv is wired but the AgentRunner
     /// has clients for the requested role. Returns
     /// `(client, base_call_config)` matching what AgentEnv would
     /// have provided. Used by [`Self::consolidate`] / [`Self::judge`]
     /// so they don't require a separate AgentEnv when the
-    /// orchestrator alone wires the LLM clients.
-    fn fallback_client_cfg_from_orchestrator(
+    /// AgentRunner alone wires the LLM clients.
+    fn fallback_client_cfg_from_agent_runner(
         &self,
         role: AgentRole,
     ) -> Option<(Arc<Client>, CallConfig)> {
-        let orch = self.orchestrator.as_ref()?;
+        let runner = self.agent_runner.as_ref()?;
         let (client, model, system, max_tokens, max_input_tokens, thinking) = match role {
             AgentRole::Fast => (
-                orch.fast_client.clone(),
-                orch.fast_model.clone(),
-                orch.fast_system.clone(),
-                orch.fast_max_tokens,
-                orch.fast_max_input_tokens,
-                orch.fast_thinking,
+                runner.fast_client.clone(),
+                runner.fast_model.clone(),
+                runner.fast_system.clone(),
+                runner.fast_max_tokens,
+                runner.fast_max_input_tokens,
+                runner.fast_thinking,
             ),
             AgentRole::Slow | AgentRole::Code => (
-                orch.slow_client.clone(),
-                orch.slow_model.clone(),
-                orch.slow_system.clone(),
-                orch.slow_max_tokens,
-                orch.slow_max_input_tokens,
-                orch.slow_thinking,
+                runner.slow_client.clone(),
+                runner.slow_model.clone(),
+                runner.slow_system.clone(),
+                runner.slow_max_tokens,
+                runner.slow_max_input_tokens,
+                runner.slow_thinking,
             ),
             AgentRole::Reaper => return None,
         };
@@ -606,12 +609,12 @@ impl LlmDriver {
             Some(l) => format!("\nlens: {}", l.id),
             None => String::new(),
         };
-        // Avoid double-including skills. The orchestrator path
+        // Avoid double-including skills. The AgentRunner path
         // serializes its own `skills` field into the CodePrompt
-        // envelope, so when an orchestrator is wired and has skills
+        // envelope, so when an AgentRunner is wired and has skills
         // set, the text prelude would duplicate them.
         let skip_prelude = self
-            .orchestrator
+            .agent_runner
             .as_ref()
             .map(|o| o.skills.is_some())
             .unwrap_or(false);
@@ -651,7 +654,7 @@ impl LlmDriver {
         ctx: &ExecContext<'_>,
         role: AgentRole,
         lens: Option<&crate::workflow::Lens>,
-    ) -> Result<Map<String, Value>, String> {
+    ) -> Result<Map<String, Value>, crate::workflow_exec::DriverError> {
         let prompt_texts = self
             .build_step_prompt_texts(
                 step,
@@ -663,22 +666,28 @@ impl LlmDriver {
             )
             .await?;
 
-        // Orchestrator path — runs the fast-rounds gather loop with
+        // AgentRunner path — runs the fast-rounds gather loop with
         // followups → fetcher → accumulated symbols/context, then
         // synthesises via the slow agent. Returns a TaskSummary
         // carrying findings + followups + analysis + code edits.
         //
         // Fix #1: the per-step action allowlist now gates which
         // followup kinds the gather loop is allowed to dispatch.
-        // We wrap the base orchestrator's fetcher in a per-step
+        // We wrap the base AgentRunner's fetcher in a per-step
         // GatingFetcher rather than mutating the shared one.
-        if let Some(orch_base) = &self.orchestrator {
+        if let Some(runner_base) = &self.agent_runner {
             let mut last_parse_err: Option<String> = None;
+            let mut last_apply_err: Option<String> = None;
             for json_retry in 0..=JSON_REPAIR_RETRIES {
-                let user_text = with_json_repair_prefix(&prompt_texts.user_text_base, json_retry);
+                let user_text = build_retry_user_text(
+                    &prompt_texts.user_text_base,
+                    json_retry,
+                    &mut last_apply_err,
+                    &mut last_parse_err,
+                );
                 let allowed = effective_actions(step, &self.workflow);
-                let orch = orchestrator_with_gated_fetcher(orch_base, allowed);
-                let orch = &orch;
+                let runner = agent_runner_with_gated_fetcher(runner_base, allowed);
+                let runner = &runner;
                 let mode = match self.mode_for(step) {
                     Some(crate::workflow::Mode::Coding) => kres_core::TaskMode::Coding,
                     Some(crate::workflow::Mode::Generic) => kres_core::TaskMode::Generic,
@@ -687,6 +696,17 @@ impl LlmDriver {
                     }
                     None => kres_core::TaskMode::Audit,
                 };
+                // Honor step.agent for the synthesis call (the one
+                // after the fast-gather loop). `agent: fast` on a
+                // workflow step means "run the synthesis with the
+                // fast client too" — routing/classification steps
+                // (orchestrator, compile-triage, fixes-tag-search,
+                // lore-search) declare this and shouldn't be paying
+                // Opus output time. `agent: slow` and `agent: code`
+                // keep the historical slow-client synthesis.
+                let synthesis_use_fast = matches!(role, AgentRole::Fast);
+                let synthesis_use_routing_prompt =
+                    use_routing_prompt_for_synth(&step.id, synthesis_use_fast);
                 let task_brief = match lens {
                     Some(l) => format!("{}|{}", step.id, l.id),
                     None => step.id.clone(),
@@ -695,12 +715,27 @@ impl LlmDriver {
                     task_brief,
                     mode,
                     gather_prompt: Some(prompt_texts.gather_user_text_base.clone()),
+                    surface_over_input_limit: true,
+                    synthesis_use_fast,
+                    synthesis_use_routing_prompt,
                     ..crate::pipeline::RunContext::default()
                 };
-                let summary = orch
+                let summary = runner
                     .run_once_with_ctx(&user_text, &rctx, &self.shutdown)
                     .await
-                    .map_err(|e| format!("step '{}' orchestrator run: {e}", step.id))?;
+                    .map_err(|e| match e {
+                        crate::AgentError::OverInputLimit { actual, limit } => {
+                            crate::workflow_exec::DriverError::OverInputLimit {
+                                step: step.id.clone(),
+                                actual,
+                                limit,
+                            }
+                        }
+                        other => crate::workflow_exec::DriverError::Other(format!(
+                            "step '{}' AgentRunner run: {other}",
+                            step.id
+                        )),
+                    })?;
 
                 // Map TaskSummary fields onto step.outputs before
                 // applying side effects. If the model failed to
@@ -713,7 +748,7 @@ impl LlmDriver {
                         continue;
                     }
                     Err(e) => {
-                        return Err(format!("step '{}' output mapping: {e}", step.id));
+                        return Err(format!("step '{}' output mapping: {e}", step.id).into());
                     }
                 };
 
@@ -723,8 +758,15 @@ impl LlmDriver {
                         .map_err(|e| format!("step '{}' code_output persist: {e}", step.id))?;
                 }
                 if !summary.code_edits.is_empty() {
-                    apply_code_edits(&self.workspace, &summary.code_edits)
-                        .map_err(|e| format!("step '{}' code_edits apply: {e}", step.id))?;
+                    if let Err(e) = apply_code_edits(&self.workspace, &summary.code_edits) {
+                        match classify_apply_failure(e, &step.id, json_retry) {
+                            ApplyFailure::Retry(msg) => {
+                                last_apply_err = Some(msg);
+                                continue;
+                            }
+                            ApplyFailure::Fatal(msg) => return Err(msg.into()),
+                        }
+                    }
                 }
 
                 add_side_effect_outputs(
@@ -744,7 +786,7 @@ impl LlmDriver {
                         last_parse_err = Some(e.to_string());
                         continue;
                     }
-                    return Err(format!("step '{}' output validation: {e}", step.id));
+                    return Err(format!("step '{}' output validation: {e}", step.id).into());
                 }
                 return Ok(outputs);
             }
@@ -753,7 +795,8 @@ impl LlmDriver {
                 step.id,
                 JSON_REPAIR_RETRIES,
                 last_parse_err.unwrap_or_else(|| "unknown parse error".into())
-            ));
+            )
+            .into());
         }
 
         // AgentEnv fallback — single LLM call, no gather loop. Used
@@ -761,8 +804,14 @@ impl LlmDriver {
         let env = self.pick(role)?;
         let call_cfg = self.config_for_call(env, self.mode_for(step));
         let mut last_parse_err: Option<String> = None;
+        let mut last_apply_err: Option<String> = None;
         for json_retry in 0..=JSON_REPAIR_RETRIES {
-            let user_text = with_json_repair_prefix(&prompt_texts.user_text_base, json_retry);
+            let user_text = build_retry_user_text(
+                &prompt_texts.user_text_base,
+                json_retry,
+                &mut last_apply_err,
+                &mut last_parse_err,
+            );
             let messages = vec![Message::plain("user", user_text.clone())];
             let log_user = match lens {
                 Some(l) => format!(
@@ -790,7 +839,7 @@ impl LlmDriver {
 
             let resp = tokio::select! {
                 _ = self.shutdown.cancelled() => {
-                    return Err(format!("step '{}' cancelled before LLM call returned", step.id));
+                    return Err(format!("step '{}' cancelled before LLM call returned", step.id).into());
                 }
                 r = env.client.messages(&call_cfg, &messages) => {
                     r.map_err(|e| format!("step '{}' LLM call: {e}", step.id))?
@@ -840,7 +889,7 @@ impl LlmDriver {
                     last_parse_err = Some(e.to_string());
                     continue;
                 }
-                Err(e) => return Err(format!("step '{}' output extraction: {e}", step.id)),
+                Err(e) => return Err(format!("step '{}' output extraction: {e}", step.id).into()),
             };
 
             // Now that the response yielded parseable workflow
@@ -850,8 +899,15 @@ impl LlmDriver {
                     .map_err(|e| format!("step '{}' code_output persist: {e}", step.id))?;
             }
             if !code_response.code_edits.is_empty() {
-                apply_code_edits(&self.workspace, &code_response.code_edits)
-                    .map_err(|e| format!("step '{}' code_edits apply: {e}", step.id))?;
+                if let Err(e) = apply_code_edits(&self.workspace, &code_response.code_edits) {
+                    match classify_apply_failure(e, &step.id, json_retry) {
+                        ApplyFailure::Retry(msg) => {
+                            last_apply_err = Some(msg);
+                            continue;
+                        }
+                        ApplyFailure::Fatal(msg) => return Err(msg.into()),
+                    }
+                }
             }
 
             if step.outputs.contains_key("findings") && !outputs.contains_key("findings") {
@@ -863,14 +919,6 @@ impl LlmDriver {
                 if let Ok(v) = serde_json::to_value(&code_response.followups) {
                     outputs.insert("followups".to_string(), v);
                 }
-            }
-            if step.outputs.contains_key("followups_empty")
-                && !outputs.contains_key("followups_empty")
-            {
-                outputs.insert(
-                    "followups_empty".to_string(),
-                    Value::Bool(code_response.followups.is_empty()),
-                );
             }
             if step.outputs.contains_key("analysis") && !outputs.contains_key("analysis") {
                 outputs.insert(
@@ -911,7 +959,7 @@ impl LlmDriver {
                     last_parse_err = Some(e.to_string());
                     continue;
                 }
-                return Err(format!("step '{}' output validation: {e}", step.id));
+                return Err(format!("step '{}' output validation: {e}", step.id).into());
             }
             return Ok(outputs);
         }
@@ -920,7 +968,8 @@ impl LlmDriver {
             step.id,
             JSON_REPAIR_RETRIES,
             last_parse_err.unwrap_or_else(|| "unknown parse error".into())
-        ))
+        )
+        .into())
     }
 
     async fn run_reaper(
@@ -1196,10 +1245,15 @@ impl Driver for LlmDriver {
         attempt: u32,
         ctx: &ExecContext<'_>,
         lens: Option<&crate::workflow::Lens>,
-    ) -> Result<Map<String, Value>, String> {
-        let role = self.role_for(step)?;
+    ) -> Result<Map<String, Value>, crate::workflow_exec::DriverError> {
+        let role = self
+            .role_for(step)
+            .map_err(crate::workflow_exec::DriverError::Other)?;
         if matches!(role, AgentRole::Reaper) {
-            return self.run_reaper(step, ctx).await;
+            return self
+                .run_reaper(step, ctx)
+                .await
+                .map_err(crate::workflow_exec::DriverError::Other);
         }
         self.run_llm_step(step, attempt, ctx, role, lens).await
     }
@@ -1272,10 +1326,10 @@ impl Driver for LlmDriver {
         let (client, base_cfg) = match self.pick(role) {
             Ok(env) => (env.client.clone(), env.config.clone()),
             Err(_) => self
-                .fallback_client_cfg_from_orchestrator(role)
+                .fallback_client_cfg_from_agent_runner(role)
                 .ok_or_else(|| {
                     format!(
-                    "step '{}' judge_llm: no AgentEnv for role {role:?} and no orchestrator wired",
+                    "step '{}' judge_llm: no AgentEnv for role {role:?} and no AgentRunner wired",
                     step.id
                 )
                 })?,
@@ -1354,30 +1408,24 @@ impl Driver for LlmDriver {
         ))
     }
 
-    /// Consolidate per-lens outputs. Review-quality gates that already
-    /// emit `clean`/`defects`/`correction_step` are merged
-    /// deterministically; other lensed workflows still use the LLM
-    /// consolidator.
+    /// Consolidate per-lens outputs via the step's LLM consolidator.
     ///
-    /// LLM-backed semantic consolidation builds a prompt that
-    /// names each lens, dumps its outputs, appends the step's
-    /// `consolidate.prompt` (the dedup rules), and an OUTPUT
-    /// SCHEMA tail. Sends to the configured agent
-    /// (`step.consolidate.agent` or `step.agent` as fallback).
+    /// Builds a prompt that names each lens, dumps its outputs,
+    /// appends the step's `consolidate.prompt` (the merge/dedup
+    /// rules), and an OUTPUT SCHEMA tail. Sends to the configured
+    /// agent (`step.consolidate.agent` or `step.agent` as fallback).
     /// The response is parsed by `extract_outputs` against the
-    /// step's declared outputs — same path as a normal step,
-    /// since the consolidator's job is to emit the step's final
-    /// shape from the merged inputs.
+    /// step's declared outputs — same path as a normal step, since
+    /// the consolidator's job is to emit the step's final shape
+    /// from the merged inputs. The consolidator output is the
+    /// single source of truth for the step; the runner reads only
+    /// its typed fields.
     async fn consolidate(
         &self,
         step: &Step,
         ctx: &ExecContext<'_>,
         per_lens: &[(String, serde_json::Map<String, serde_json::Value>)],
-    ) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-        if uses_structured_review_outputs(step) {
-            return consolidate_structured_review(per_lens);
-        }
-
+    ) -> Result<serde_json::Map<String, serde_json::Value>, crate::workflow_exec::DriverError> {
         let cfg = step.consolidate.as_ref().ok_or_else(|| {
             format!(
                 "step '{}' has aggregate=consolidate but no consolidate config",
@@ -1391,17 +1439,19 @@ impl Driver for LlmDriver {
             .ok_or_else(|| format!("step '{}' consolidate has no agent role", step.id))?;
         // Fix #11: pick an LLM client. Prefer the AgentEnv when
         // wired (carries per-call-config tuning); fall back to the
-        // orchestrator's client for the role so a workflow runner
-        // built with only the orchestrator (the production path)
+        // AgentRunner's client for the role so a workflow runner
+        // built with only the AgentRunner (the production path)
         // can still consolidate.
         let (client, base_cfg) = match self.pick(role) {
             Ok(env) => (env.client.clone(), env.config.clone()),
-            Err(_) => self.fallback_client_cfg_from_orchestrator(role).ok_or_else(|| {
-                format!(
-                    "step '{}' consolidate: no AgentEnv for role {role:?} and no orchestrator wired",
+            Err(_) => self
+                .fallback_client_cfg_from_agent_runner(role)
+                .ok_or_else(|| {
+                    format!(
+                    "step '{}' consolidate: no AgentEnv for role {role:?} and no AgentRunner wired",
                     step.id
                 )
-            })?,
+                })?,
         };
 
         // Render the per-lens outputs as a deterministic JSON
@@ -1420,7 +1470,7 @@ impl Driver for LlmDriver {
 
         let schema_tail = build_output_schema_tail(step);
         let skip_skills_prelude = self
-            .orchestrator
+            .agent_runner
             .as_ref()
             .map(|o| o.skills.is_some())
             .unwrap_or(false);
@@ -1465,7 +1515,8 @@ impl Driver for LlmDriver {
                 return Err(format!(
                     "step '{}' consolidate cancelled before LLM call returned",
                     step.id
-                ));
+                )
+                .into());
             }
             r = client.messages(&call_cfg, &messages) => {
                 r.map_err(|e| format!("step '{}' consolidate LLM call: {e}", step.id))?
@@ -1488,17 +1539,8 @@ impl Driver for LlmDriver {
                 None,
             );
         }
-        let mut outputs = extract_outputs(&text, step)
+        let outputs = extract_outputs(&text, step)
             .map_err(|e| format!("step '{}' consolidate output extraction: {e}", step.id))?;
-        if step.outputs.contains_key("followups_empty") && !outputs.contains_key("followups_empty")
-        {
-            let empty = outputs
-                .get("followups")
-                .and_then(|v| v.as_array())
-                .map(|a| a.is_empty())
-                .unwrap_or(true);
-            outputs.insert("followups_empty".to_string(), Value::Bool(empty));
-        }
         Ok(outputs)
     }
 
@@ -1510,12 +1552,12 @@ impl Driver for LlmDriver {
         step: &Step,
         ctx: &ExecContext<'_>,
     ) -> Result<LensFanOutConsolidate, String> {
-        let Some(orch) = self.orchestrator.as_ref() else {
+        let Some(runner) = self.agent_runner.as_ref() else {
             return Ok(LensFanOutConsolidate::Unsupported);
         };
-        // Same per-step gating as the regular orchestrator path.
+        // Same per-step gating as the regular AgentRunner path.
         let allowed = effective_actions(step, &self.workflow);
-        let orch = orchestrator_with_gated_fetcher(orch, allowed);
+        let runner = agent_runner_with_gated_fetcher(runner, allowed);
 
         let lenses: Vec<kres_core::LensSpec> = step
             .lenses
@@ -1553,7 +1595,7 @@ impl Driver for LlmDriver {
                  Reuse the same gathered source/context. Reply only with the required JSON object for this \
                  lens; do not request more gathering unless the missing evidence is truly unavailable."
             );
-            let fanout = orch
+            let fanout = runner
                 .run_lenses_shared_gather_repairing(
                     &prompt_texts.user_text_base,
                     &lenses,
@@ -1568,8 +1610,13 @@ impl Driver for LlmDriver {
                 .await
                 .map_err(|e| format!("step '{}' shared lens fan-out: {e}", step.id))?;
             let per_lens = structured_review_lens_outputs(step, fanout)?;
-            let outputs = consolidate_structured_review(&per_lens)
-                .map_err(|e| format!("step '{}' structured lens consolidate: {e}", step.id))?;
+            // Run the same LLM consolidator used by every other lensed
+            // step. The consolidator output is the single source of
+            // truth for routing.
+            let outputs = self
+                .consolidate(step, ctx, &per_lens)
+                .await
+                .map_err(|e| e.to_string())?;
             return Ok(LensFanOutConsolidate::Outputs(outputs));
         }
 
@@ -1584,7 +1631,7 @@ impl Driver for LlmDriver {
             ),
             None => None,
         };
-        let summary = orch
+        let summary = runner
             .run_with_lenses(
                 &prompt_texts.user_text_base,
                 &lenses,
@@ -1762,9 +1809,15 @@ fn preserve_lens_analysis_for_consolidate(
 }
 
 fn uses_structured_review_outputs(step: &Step) -> bool {
-    step.outputs.contains_key("clean")
-        && step.outputs.contains_key("defects")
-        && step.outputs.contains_key("correction_step")
+    // A lensed review step whose typed outputs include clean +
+    // defects is the structured-fix-review shape. correction_step
+    // was part of the original signature but the AgentRunner now
+    // owns next-step routing, so it's no longer required to
+    // identify the structured shape — the gate below would
+    // otherwise fall back to the generic lensed consolidate path
+    // which discards typed fields like `clean` and breaks
+    // review.eval (`clean == true`).
+    step.outputs.contains_key("clean") && step.outputs.contains_key("defects")
 }
 
 fn structured_review_lens_outputs(
@@ -1842,215 +1895,6 @@ fn validate_structured_review_lens_output(
     output: &crate::pipeline::LensRunOutput,
 ) -> Result<(), String> {
     parse_structured_review_lens_output(step, output).map(|_| ())
-}
-
-fn consolidate_structured_review(
-    per_lens: &[(String, Map<String, Value>)],
-) -> Result<Map<String, Value>, String> {
-    let mut defects = Vec::new();
-    let mut source_defects = Vec::new();
-    let mut commit_message_defects = Vec::new();
-    let mut analyses = Vec::new();
-    let mut all_clean = true;
-    let mut dirty_correction_steps = Vec::new();
-    // bug-coverage lens emits `outcomes`; merge by bug id, last lens
-    // wins so a later lens can correct an earlier one.
-    let mut outcomes: Vec<Value> = Vec::new();
-
-    for (lens, output) in per_lens {
-        let lens_clean = output
-            .get("clean")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let analysis = output
-            .get("analysis")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
-        if !analysis.trim().is_empty() {
-            analyses.push(format!("## Lens: {lens}\n\n{}", analysis.trim()));
-        }
-
-        let mut lens_dirty = !lens_clean;
-        let mut saw_split_array = false;
-        let mut emitted_structured_defect = false;
-        for (key, bucket) in [
-            ("source_defects", "source"),
-            ("commit_message_defects", "commit-message"),
-        ] {
-            if let Some(items) = output.get(key).and_then(Value::as_array) {
-                saw_split_array = true;
-                if !items.is_empty() {
-                    lens_dirty = true;
-                    emitted_structured_defect = true;
-                }
-                for item in items {
-                    let mut obj = review_defect_object(lens, item);
-                    obj.insert("_review_bucket".into(), Value::String(bucket.to_string()));
-                    push_review_defect(
-                        &mut defects,
-                        &mut source_defects,
-                        &mut commit_message_defects,
-                        obj,
-                    );
-                }
-            }
-        }
-
-        match output.get("defects").and_then(Value::as_array) {
-            Some(items) if !items.is_empty() && !saw_split_array => {
-                lens_dirty = true;
-                let bucket = match output.get("correction_step").and_then(Value::as_str) {
-                    Some("write-commit-message") => "commit-message",
-                    _ => "source",
-                };
-                for item in items {
-                    let mut obj = review_defect_object(lens, item);
-                    obj.insert("_review_bucket".into(), Value::String(bucket.to_string()));
-                    push_review_defect(
-                        &mut defects,
-                        &mut source_defects,
-                        &mut commit_message_defects,
-                        obj,
-                    );
-                }
-            }
-            _ if lens_dirty && !emitted_structured_defect => {
-                let correction_step = output
-                    .get("correction_step")
-                    .and_then(Value::as_str)
-                    .unwrap_or("write-patch");
-                let mut obj = Map::new();
-                obj.insert("lens".into(), Value::String(lens.clone()));
-                obj.insert(
-                    "what".into(),
-                    Value::String(
-                        if analysis.trim().is_empty() {
-                            "lens reported clean=false without a defects array"
-                        } else {
-                            analysis.trim()
-                        }
-                        .to_string(),
-                    ),
-                );
-                obj.insert(
-                    "correction_step".into(),
-                    Value::String(correction_step.to_string()),
-                );
-                obj.insert(
-                    "_review_bucket".into(),
-                    Value::String(
-                        if correction_step == "write-commit-message" {
-                            "commit-message"
-                        } else {
-                            "source"
-                        }
-                        .to_string(),
-                    ),
-                );
-                push_review_defect(
-                    &mut defects,
-                    &mut source_defects,
-                    &mut commit_message_defects,
-                    obj,
-                );
-            }
-            _ => {}
-        }
-
-        if lens_dirty {
-            all_clean = false;
-            if let Some(step) = output.get("correction_step").and_then(Value::as_str) {
-                dirty_correction_steps.push(step.to_string());
-            }
-        }
-
-        if let Some(items) = output.get("outcomes").and_then(Value::as_array) {
-            for item in items {
-                let Some(obj) = item.as_object() else {
-                    continue;
-                };
-                let bug = obj
-                    .get("bug")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                outcomes.retain(|existing| {
-                    existing
-                        .as_object()
-                        .and_then(|o| o.get("bug").and_then(Value::as_str))
-                        .map(|b| b != bug)
-                        .unwrap_or(true)
-                });
-                outcomes.push(Value::Object(obj.clone()));
-            }
-        }
-    }
-
-    let commit_message_only = (!defects.is_empty() && source_defects.is_empty())
-        || (defects.is_empty()
-            && !dirty_correction_steps.is_empty()
-            && dirty_correction_steps
-                .iter()
-                .all(|step| step == "write-commit-message"));
-    let correction_step = if all_clean {
-        "write-patch"
-    } else if commit_message_only {
-        "write-commit-message"
-    } else {
-        "write-patch"
-    };
-
-    let mut out = Map::new();
-    out.insert("clean".into(), Value::Bool(all_clean));
-    out.insert("defects".into(), Value::Array(defects));
-    out.insert("source_defects".into(), Value::Array(source_defects));
-    out.insert(
-        "commit_message_defects".into(),
-        Value::Array(commit_message_defects),
-    );
-    out.insert(
-        "analysis".into(),
-        Value::String(analyses.join("\n\n---\n\n")),
-    );
-    out.insert(
-        "correction_step".into(),
-        Value::String(correction_step.to_string()),
-    );
-    out.insert("outcomes".into(), Value::Array(outcomes));
-    Ok(out)
-}
-
-fn review_defect_object(lens: &str, item: &Value) -> Map<String, Value> {
-    let mut obj = item.as_object().cloned().unwrap_or_else(|| {
-        let mut m = Map::new();
-        m.insert("what".into(), item.clone());
-        m
-    });
-    obj.entry("lens")
-        .or_insert_with(|| Value::String(lens.to_string()));
-    obj
-}
-
-fn push_review_defect(
-    defects: &mut Vec<Value>,
-    source_defects: &mut Vec<Value>,
-    commit_message_defects: &mut Vec<Value>,
-    mut obj: Map<String, Value>,
-) {
-    let bucket = obj
-        .remove("_review_bucket")
-        .and_then(|value| value.as_str().map(str::to_string));
-    let defect = Value::Object(obj);
-    if defects.iter().any(|existing| existing == &defect) {
-        return;
-    }
-    match bucket.as_deref() {
-        Some("commit-message") => commit_message_defects.push(defect.clone()),
-        Some("source") => source_defects.push(defect.clone()),
-        _ => source_defects.push(defect.clone()),
-    }
-    defects.push(defect);
 }
 
 /// Interpolate `{{...}}` references in `src` against the workflow
@@ -2180,52 +2024,32 @@ fn resolve_one(
         if parts[1] == "id" {
             return Ok(Value::String(l.id.clone()));
         }
-        let mut cur = l
+        let start = l
             .fields
             .get(parts[1])
             .cloned()
             .ok_or_else(|| anyhow!("lens.{} not in lens fields", parts[1]))?;
-        for p in &parts[2..] {
-            cur = cur
-                .get(p)
-                .cloned()
-                .ok_or_else(|| anyhow!("path beyond lens.{}", parts[1]))?;
-        }
-        return Ok(cur);
+        return crate::workflow_exec::walk_dotted_path(start, &parts[2..])
+            .map_err(|failing| anyhow!("lens.{}.{failing} not found", parts[1]));
     }
     if parts[0] == "globals" {
-        let mut cur = Value::Object(workflow.globals.clone());
-        for p in &parts[1..] {
-            cur = cur
-                .get(p)
-                .cloned()
-                .ok_or_else(|| anyhow!("globals.{p} not found"))?;
-        }
-        return Ok(cur);
+        let start = Value::Object(workflow.globals.clone());
+        return crate::workflow_exec::walk_dotted_path(start, &parts[1..])
+            .map_err(|failing| anyhow!("globals.{failing} not found"));
     }
     if parts[0] == "workflow" {
-        let mut cur = Value::Object(ctx.workflow_inputs.clone());
-        for p in &parts[1..] {
-            cur = cur
-                .get(p)
-                .cloned()
-                .ok_or_else(|| anyhow!("workflow.{p} not found"))?;
-        }
-        return Ok(cur);
+        let start = Value::Object(ctx.workflow_inputs.clone());
+        return crate::workflow_exec::walk_dotted_path(start, &parts[1..])
+            .map_err(|failing| anyhow!("workflow.{failing} not found"));
     }
-    // Bare ident → current step's output (mirrors expr::eval).
+    // Bare ident → current step's StepState (attempt/eval_failures/
+    // prior_attempts) or its declared outputs. See
+    // StepState::lookup_field for the canonical lookup.
     if parts.len() == 1 {
         if let Some(cur) = current_step {
             if let Some(st) = ctx.steps.get(cur) {
-                let name = parts[0];
-                if name == "attempt" {
-                    return Ok(Value::Number(st.attempt.into()));
-                }
-                if name == "eval_failures" {
-                    return Ok(Value::Number(st.eval_failures.into()));
-                }
-                if let Some(v) = st.outputs.get(name) {
-                    return Ok(v.clone());
+                if let Some(v) = st.lookup_field(parts[0]) {
+                    return Ok(v);
                 }
             }
         }
@@ -2238,24 +2062,11 @@ fn resolve_one(
         .steps
         .get(parts[0])
         .ok_or_else(|| anyhow!("step '{}' not in context", parts[0]))?;
-    if parts.len() == 2 && parts[1] == "attempt" {
-        return Ok(Value::Number(st.attempt.into()));
-    }
-    if parts.len() == 2 && parts[1] == "eval_failures" {
-        return Ok(Value::Number(st.eval_failures.into()));
-    }
-    let mut cur = st
-        .outputs
-        .get(parts[1])
-        .cloned()
+    let start = st
+        .lookup_field(parts[1])
         .ok_or_else(|| anyhow!("{}.{} not in outputs", parts[0], parts[1]))?;
-    for p in &parts[2..] {
-        cur = cur
-            .get(p)
-            .cloned()
-            .ok_or_else(|| anyhow!("path beyond {}.{}", parts[0], parts[1]))?;
-    }
-    Ok(cur)
+    crate::workflow_exec::walk_dotted_path(start, &parts[2..])
+        .map_err(|failing| anyhow!("{}.{}.{failing} not found", parts[0], parts[1]))
 }
 
 fn shared_fanout_lens_value(path: &[&str]) -> Value {
@@ -2272,11 +2083,18 @@ fn shared_fanout_lens_value(path: &[&str]) -> Value {
     }
 }
 
+/// Template fallback (`{{a || b || c}}`) treats a value as falsy when
+/// it is null, an empty string, an empty array, or zero. A literal
+/// `Bool(false)` is NOT falsy here: the orchestrator (and any future
+/// prompt rendering boolean status fields) needs to be able to
+/// distinguish "the field is present with value false" from "the
+/// step was skipped and the field is null". Falling through on
+/// `false` would collapse both cases to the default and hide a real
+/// failure-mode signal.
 fn value_is_falsy(v: &Value) -> bool {
     match v {
         Value::Null => true,
         Value::String(s) => s.is_empty(),
-        Value::Bool(false) => true,
         Value::Number(n) => n.as_f64().map(|f| f == 0.0).unwrap_or(false),
         Value::Array(a) => a.is_empty(),
         _ => false,
@@ -2287,18 +2105,24 @@ fn value_to_string(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
-        // Arrays interpolate as space-separated bare values, so
-        // `git add {{research.affected_files}}` expands to
+        // Arrays render one element per line so structured records
+        // (prior_attempts, lens defects, etc.) are legible in a
+        // prompt instead of running together as `{...} {...}`.
+        // Arrays of bare strings join with " " so existing usages
+        // like `git add {{research.affected_files}}` expand to
         // `git add fs/foo.c fs/bar.c` rather than the JSON list
         // `["fs/foo.c","fs/bar.c"]`.
-        Value::Array(a) => a
-            .iter()
-            .map(|x| match x {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(" "),
+        Value::Array(a) => {
+            let all_strings = a.iter().all(Value::is_string);
+            let sep = if all_strings { " " } else { "\n" };
+            a.iter()
+                .map(|x| match x {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(sep)
+        }
         other => other.to_string(),
     }
 }
@@ -2355,11 +2179,82 @@ Do not emit final workflow output fields such as {}. Those fields are accepted o
     )
 }
 
-fn with_json_repair_prefix(base: &str, json_retry: usize) -> String {
+fn with_json_repair_prefix(base: &str, json_retry: usize, validator_err: Option<&str>) -> String {
     if json_retry == 0 {
-        base.to_string()
+        return base.to_string();
+    }
+    match validator_err {
+        Some(err) if !err.is_empty() => format!(
+            "{JSON_REPAIR_PREFIX}\n\
+             Validator error from the previous attempt: {err}\n\
+             {base}"
+        ),
+        _ => format!("{JSON_REPAIR_PREFIX}\n{base}"),
+    }
+}
+
+/// Build the user-text for a retry that follows a code_edits apply
+/// failure. Includes the apply error verbatim so the model can see
+/// exactly which file path was rejected and what the underlying
+/// reason was (e.g. "old_string not found", "old_string is not
+/// unique"), and instructs the model to re-read the file before
+/// re-emitting code_edits.
+///
+/// The retry-loop drains `last_parse_err` alongside `last_apply_err`
+/// before calling this, so a parse error from an earlier iteration
+/// cannot bleed in. We deliberately do NOT include the parse error
+/// here even if one were also pending: the apply failure is the
+/// specific actionable diagnostic for this retry, and a JSON-shape
+/// lecture would compete for the model's attention instead of
+/// reinforcing "re-read the file, match bytes exactly".
+fn with_code_edit_repair_prefix(base: &str, apply_err: &str) -> String {
+    format!("{CODE_EDIT_REPAIR_PREFIX}\n{apply_err}\n{base}")
+}
+
+/// Build the user_text for one iteration of the step's inner repair
+/// loop. A pending apply error wins over the generic JSON repair
+/// prefix; both slots are cleared after use so a subsequent
+/// non-apply / non-parse failure does not re-prompt with stale
+/// context. A pending parse/validation error is surfaced verbatim
+/// so the model knows which field tripped the schema (e.g.
+/// "findings is not array<Finding>") instead of guessing.
+fn build_retry_user_text(
+    base: &str,
+    json_retry: usize,
+    last_apply_err: &mut Option<String>,
+    last_parse_err: &mut Option<String>,
+) -> String {
+    // Drain both slots even when only one is used, so a stale value
+    // from an earlier iteration cannot bleed into a later retry as
+    // false context.
+    let apply_err = last_apply_err.take();
+    let parse_err = last_parse_err.take();
+    if let Some(apply_err) = apply_err {
+        return with_code_edit_repair_prefix(base, &apply_err);
+    }
+    with_json_repair_prefix(base, json_retry, parse_err.as_deref())
+}
+
+/// Caller-side classification of an `apply_code_edits` failure inside
+/// the per-step repair loop.
+enum ApplyFailure {
+    /// Budget remains: caller should stash the error and `continue`.
+    Retry(String),
+    /// Budget exhausted: caller should `return Err` with this message.
+    Fatal(String),
+}
+
+fn classify_apply_failure(err: anyhow::Error, step_id: &str, json_retry: usize) -> ApplyFailure {
+    if json_retry < JSON_REPAIR_RETRIES {
+        tracing::warn!(
+            target: "kres_agents",
+            step = %step_id,
+            json_retry,
+            "code_edits apply failed; re-prompting model with apply error: {err}"
+        );
+        ApplyFailure::Retry(err.to_string())
     } else {
-        format!("{JSON_REPAIR_PREFIX}\n{base}")
+        ApplyFailure::Fatal(format!("step '{step_id}' code_edits apply: {err}"))
     }
 }
 
@@ -2409,49 +2304,10 @@ pub fn extract_outputs(text: &str, step: &Step) -> Result<Map<String, Value>> {
     Ok(out)
 }
 
-/// Find every top-level `{...}` substring in `text`, ignoring
-/// braces inside double-quoted strings. Brace-matching variant of
-/// the same logic in [`crate::response`].
-pub fn extract_brace_objects(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut start: Option<usize> = None;
-    for (i, ch) in text.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if in_string {
-            match ch {
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start.take() {
-                        out.push(text[s..=i].to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}
+// The brace-scanner lives in kres_core::brace; this file imports
+// `extract_brace_objects` at the top alongside the other kres_core
+// uses, and the other kres-agents callers (response, goal,
+// todo_agent) reach the helpers via `kres_core::brace::*` directly.
 
 /// Apply the workflow's `inputs.*.derive` rules to a user-supplied
 /// inputs map. Known derives:
@@ -3092,10 +2948,10 @@ fn parse_finding_results(value: Option<&Value>) -> Result<Vec<kres_core::Finding
             .to_string();
         if !matches!(
             outcome.as_str(),
-            "fixed" | "invalidated" | "deferred" | "unresolved"
+            "fixed" | "invalidated" | "deferred" | "duplicate" | "unresolved"
         ) {
             return Err(format!(
-                "outcomes[{idx}] has invalid outcome {outcome:?} (must be fixed | invalidated | deferred | unresolved)"
+                "outcomes[{idx}] has invalid outcome {outcome:?} (must be fixed | invalidated | deferred | duplicate | unresolved)"
             ));
         }
         let evidence = obj
@@ -3452,7 +3308,7 @@ fn embedded_workflow_include(path: &str) -> Option<&'static str> {
     None
 }
 
-/// Map a `TaskSummary` (from `Orchestrator::run_once_with_ctx`)
+/// Map a `TaskSummary` (from `AgentRunner::run_once_with_ctx`)
 /// onto a step's declared outputs. The mapping fills in well-known
 /// keys (`analysis`, `findings`, `followups`, `code_output`,
 /// `code_edits`) directly from the summary, and falls back to
@@ -3477,9 +3333,6 @@ pub fn map_task_summary_to_outputs(
             "followups" => {
                 out.insert(key.clone(), serde_json::to_value(&summary.followups)?);
             }
-            "followups_empty" => {
-                out.insert(key.clone(), Value::Bool(summary.followups.is_empty()));
-            }
             "code_output" => {
                 out.insert(key.clone(), serde_json::to_value(&summary.code_output)?);
             }
@@ -3491,7 +3344,7 @@ pub fn map_task_summary_to_outputs(
     }
     // For any declared output not yet populated, look in the raw
     // slow-agent text first, then in the parsed analysis. The
-    // orchestrator path projects slow replies into the standard kres
+    // AgentRunner path projects slow replies into the standard kres
     // response envelope (`analysis`, `findings`, `followups`, ...). Workflow
     // steps may instead emit a schema-specific object like
     // `{ "valid": true }`; parsing that as a kres envelope leaves
@@ -3526,16 +3379,29 @@ pub fn map_task_summary_to_outputs(
 }
 
 fn only_machine_populated_outputs(step: &Step) -> bool {
-    !step.outputs.is_empty()
-        && step.outputs.keys().all(|k| {
-            matches!(
-                k.as_str(),
-                "code_changes_emitted"
-                    | "commit_message_written"
-                    | "affected_files_changed"
-                    | "summary_written"
-            )
-        })
+    if step.outputs.is_empty() {
+        return false;
+    }
+    step.outputs.iter().all(|(k, def)| {
+        let machine_populated = matches!(
+            k.as_str(),
+            "code_changes_emitted"
+                | "commit_message_written"
+                | "affected_files_changed"
+                | "summary_written"
+        );
+        if machine_populated {
+            return true;
+        }
+        // Optional outputs may legitimately be missing from a slow
+        // agent's JSON envelope (e.g. write-commit-message declares
+        // optional `analysis`/`followups` so the orchestrator can read
+        // why a worker refused; the typical happy-path response is
+        // just `{"code_output": [...]}` and never mentions them).
+        def.get("optional")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    })
 }
 
 fn validate_required_outputs(step: &Step, outputs: &Map<String, Value>) -> Result<()> {
@@ -3627,7 +3493,7 @@ async fn add_side_effect_outputs(
     step: &Step,
     outputs: &mut Map<String, Value>,
     workspace: &Path,
-    ctx: &ExecContext<'_>,
+    _ctx: &ExecContext<'_>,
     code_output: &[kres_core::CodeFile],
     code_edits: &[kres_core::CodeEdit],
 ) -> Result<(), String> {
@@ -3675,12 +3541,6 @@ async fn add_side_effect_outputs(
     if step.outputs.contains_key("review_dispute") && !outputs.contains_key("review_dispute") {
         outputs.insert("review_dispute".into(), Value::String(String::new()));
     }
-    if step.outputs.contains_key("review_dispute_allowed") {
-        outputs.insert(
-            "review_dispute_allowed".into(),
-            Value::Bool(review_dispute_is_allowed(step, ctx)),
-        );
-    }
     Ok(())
 }
 
@@ -3713,12 +3573,25 @@ fn emitted_code_paths(
         .chain(code_output.iter().map(|f| f.path.as_str()))
     {
         let path = path.trim();
-        if path.is_empty() || path == ".kres-commit-msg.tmp" || paths.iter().any(|p| p == path) {
+        if path.is_empty() || is_kres_aux_path(path) || paths.iter().any(|p| p == path) {
             continue;
         }
         paths.push(path.to_string());
     }
     paths
+}
+
+/// Workspace paths reserved for kres-internal hand-off files. The
+/// commit reaper must not try to `git add` these — they are gitignored
+/// and exist only for one workflow step to pass data to the next
+/// (canonical: `.kres-commit-msg.tmp`; the slow agent occasionally
+/// invents siblings like `.kres-commit-msg.suggested` when an
+/// orchestrator instruction asks it to pre-author a commit-message
+/// rewrite alongside a source fix). Anything matching this predicate
+/// is excluded from `changed_files` so it never reaches `git add`.
+fn is_kres_aux_path(path: &str) -> bool {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    base.starts_with(".kres-")
 }
 
 fn commit_message_written(code_output: &[kres_core::CodeFile], workspace: &Path) -> bool {
@@ -3813,20 +3686,28 @@ async fn correction_context_for_step(
 }
 
 fn write_patch_is_being_corrected(step: &Step, ctx: &ExecContext<'_>) -> bool {
-    step.id == "write-patch"
-        && (step_array_nonempty(ctx, "review", "source_defects")
-            || compile_triage_result_is(ctx, "patch_error"))
-}
-
-fn review_dispute_is_allowed(step: &Step, ctx: &ExecContext<'_>) -> bool {
-    step.id == "write-patch"
-        && step_array_nonempty(ctx, "review", "source_defects")
-        && !compile_triage_result_is(ctx, "patch_error")
+    if step.id != "write-patch" {
+        return false;
+    }
+    // Re-entered via the orchestrator? Include the previous-patch
+    // diff regardless of which review buckets are still in outputs
+    // (the reset cascade may have cleared review.outputs on the
+    // orchestrator→write-patch branch).
+    if step_string_is(ctx, "orchestrator", "next_step", "write-patch") {
+        return true;
+    }
+    step_array_nonempty(ctx, "review", "source_defects")
+        || compile_triage_result_is(ctx, "patch_error")
 }
 
 fn commit_message_is_being_corrected(step: &Step, ctx: &ExecContext<'_>) -> bool {
-    step.id == "write-commit-message"
-        && step_array_nonempty(ctx, "review", "commit_message_defects")
+    if step.id != "write-commit-message" {
+        return false;
+    }
+    if step_string_is(ctx, "orchestrator", "next_step", "write-commit-message") {
+        return true;
+    }
+    step_array_nonempty(ctx, "review", "commit_message_defects")
 }
 
 fn review_dispute_is_being_adjudicated(step: &Step, ctx: &ExecContext<'_>) -> bool {
@@ -4009,6 +3890,7 @@ fn action_kind_to_type(kind: &str) -> Option<crate::workflow::ActionType> {
         "make" => Some(ActionType::Make),
         "edit" => Some(ActionType::Edit),
         "bash" => Some(ActionType::Bash),
+        "lore" => Some(ActionType::Lore),
         // 'find' isn't a separate ActionType; treated as grep-like
         // file lookup gated by the same allowlist entry.
         "find" => Some(ActionType::Grep),
@@ -4078,17 +3960,39 @@ fn is_mutating_git_followup(command: &str) -> bool {
     )
 }
 
-/// Build a fresh `Arc<Orchestrator>` whose fetcher is the existing
+/// Build a fresh `Arc<AgentRunner>` whose fetcher is the existing
 /// one wrapped in a [`GatingFetcher`] gated by `allowed`. All other
 /// fields cloned (mostly Arc-bumps). Per-step so the gather loop
 /// sees the right per-step allowlist when dispatching followups.
-fn orchestrator_with_gated_fetcher(
-    base: &Arc<crate::pipeline::Orchestrator>,
+/// True iff this step's fast-routed synthesis should use the
+/// dedicated routing-agent system prompt (vs the fast-gather
+/// system prompt that other fast-tagged steps want).
+///
+/// The routing-agent prompt is narrow: "you are a workflow
+/// routing/decision agent; the user message is authoritative;
+/// emit only the JSON it specifies." That fits the orchestrator
+/// step (pure routing over already-typed inputs) and only that
+/// step. Research, lore-search, fixes-tag-search, and
+/// compile-triage are all `agent: fast` too, but they analyze
+/// gathered code or history and need the fast-gather system
+/// prompt at synthesis time — the routing prompt would tell them
+/// "you are not analyzing code," which contradicts their own
+/// user-message prompts.
+///
+/// Hardcoded by step id because today the orchestrator is the
+/// only pure-routing step. If more arrive, replace this with a
+/// typed step field (e.g. `synthesis_system: "routing-agent"`).
+fn use_routing_prompt_for_synth(step_id: &str, synthesis_use_fast: bool) -> bool {
+    synthesis_use_fast && step_id == "orchestrator"
+}
+
+fn agent_runner_with_gated_fetcher(
+    base: &Arc<crate::pipeline::AgentRunner>,
     allowed: Vec<crate::workflow::ActionType>,
-) -> Arc<crate::pipeline::Orchestrator> {
+) -> Arc<crate::pipeline::AgentRunner> {
     let inner = base.fetcher.clone();
     let gated: Arc<dyn crate::pipeline::DataFetcher> = Arc::new(GatingFetcher { inner, allowed });
-    Arc::new(crate::pipeline::Orchestrator {
+    Arc::new(crate::pipeline::AgentRunner {
         fast_client: base.fast_client.clone(),
         fast_model: base.fast_model.clone(),
         fast_system: base.fast_system.clone(),
@@ -4106,6 +4010,7 @@ fn orchestrator_with_gated_fetcher(
         comparison_lock: base.comparison_lock.clone(),
         slow_coding_system: base.slow_coding_system.clone(),
         slow_generic_system: base.slow_generic_system.clone(),
+        routing_system: base.routing_system.clone(),
         fetcher: gated,
         max_fast_rounds: base.max_fast_rounds,
         skills: base.skills.clone(),
@@ -4547,8 +4452,7 @@ mod tests {
                         attempt: *attempt,
                         eval_failures: *fails,
                         outputs: m,
-                        preserved_outputs_on_skip: serde_json::Map::new(),
-                        lens_outputs: serde_json::Map::new(),
+                        ..StepState::default()
                     },
                 )
             })
@@ -4586,6 +4490,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s, "Fixes: abc123");
+    }
+
+    #[test]
+    fn interpolate_false_boolean_does_not_fall_through_template_fallback() {
+        // The orchestrator prompt renders boolean status fields like
+        // `{{write-patch.code_changes_emitted || 'unset'}}` to tell
+        // the orchestrator whether a step ran and reported false vs.
+        // was skipped (null). `Bool(false)` must therefore render
+        // literally, not fall through to the default — otherwise the
+        // orchestrator cannot distinguish "step ran and the eval
+        // signal is false" from "step did not run on this cycle".
+        let wf = fix_workflow();
+        let inputs = Map::new();
+        let states = make_state(&[("write-patch", 1, 1, json!({"code_changes_emitted": false}))]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        let rendered = interpolate(
+            "code_changes_emitted: {{write-patch.code_changes_emitted || 'unset'}}",
+            &wf,
+            &ctx,
+            Some("orchestrator"),
+        )
+        .unwrap();
+        assert_eq!(rendered, "code_changes_emitted: false");
+
+        // Null still falls through so a skipped step is visibly
+        // distinguished from a false result.
+        let states_skipped = make_state(&[("write-patch", 0, 0, json!({}))]);
+        let ctx_skipped = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states_skipped,
+        };
+        let rendered_skipped = interpolate(
+            "code_changes_emitted: {{write-patch.code_changes_emitted || 'unset'}}",
+            &wf,
+            &ctx_skipped,
+            Some("orchestrator"),
+        )
+        .unwrap();
+        assert_eq!(rendered_skipped, "code_changes_emitted: unset");
+    }
+
+    #[test]
+    fn interpolate_prior_attempts_renders_json_array() {
+        // Verify the typed `prior_attempts` field on StepState reaches
+        // a prompt via `{{<step>.prior_attempts}}` as JSON-rendered
+        // text. Empty prior_attempts renders as "[]" so the prompt
+        // shows "no prior attempts" cleanly.
+        let wf = fix_workflow();
+        let inputs = Map::new();
+        let mut states = make_state(&[("research", 2, 1, json!({"analysis": "second try"}))]);
+        let mut prior1 = Map::new();
+        prior1.insert("analysis".into(), json!("first try"));
+        prior1.insert(
+            "research_decision".into(),
+            json!({"bug_proven": true, "fix_contract_proven": false}),
+        );
+        states.get_mut("research").unwrap().prior_attempts = vec![prior1];
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+
+        let s = interpolate(
+            "Prior: {{research.prior_attempts}}",
+            &wf,
+            &ctx,
+            Some("research"),
+        )
+        .unwrap();
+        assert!(s.contains("\"analysis\":\"first try\""), "got: {s}");
+        assert!(s.contains("\"fix_contract_proven\":false"), "got: {s}");
+
+        // Empty prior_attempts renders as the empty string (same as
+        // any other empty Value::Array), matching how the prompt's
+        // `{{research.prior_attempts || ''}}` short-circuits to the
+        // fallback on first-attempt invocations.
+        let inputs2 = Map::new();
+        let states2 = make_state(&[("research", 1, 0, json!({}))]);
+        let ctx2 = ExecContext {
+            workflow_inputs: &inputs2,
+            steps: &states2,
+        };
+        let s2 = interpolate(
+            "Prior: {{research.prior_attempts}}",
+            &wf,
+            &ctx2,
+            Some("research"),
+        )
+        .unwrap();
+        assert_eq!(s2, "Prior: ");
     }
 
     #[test]
@@ -4632,6 +4629,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s, "review failed");
+    }
+
+    #[test]
+    fn value_to_string_separates_object_arrays_by_newline() {
+        // Arrays of bare strings stay space-joined so existing
+        // `git add {{research.affected_files}}` style usages keep
+        // working.
+        let strs = json!(["fs/foo.c", "fs/bar.c"]);
+        assert_eq!(value_to_string(&strs), "fs/foo.c fs/bar.c");
+
+        // Arrays of objects (prior_attempts, defect records, …)
+        // are newline-joined so the prompt does not run them
+        // together as `{...} {...}`.
+        let objs = json!([
+            {"attempt": 1, "verdict": "unconfirmed"},
+            {"attempt": 2, "verdict": "unconfirmed"}
+        ]);
+        let s = value_to_string(&objs);
+        assert!(
+            s.contains('\n'),
+            "expected newline between object array elements: {s:?}"
+        );
+        let lines: Vec<&str> = s.split('\n').collect();
+        assert_eq!(lines.len(), 2, "expected one line per object: {s:?}");
+        assert!(
+            lines[0].contains("\"attempt\":1"),
+            "first line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("\"attempt\":2"),
+            "second line: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn json_repair_prefix_surfaces_validator_error_on_retry() {
+        // The first attempt sends the prompt verbatim; the JSON
+        // repair prefix is only added on retries. When a retry has
+        // a specific validator/parse error, the prompt must name
+        // it so the model knows which contract was violated.
+        let base = "do the thing";
+
+        // Attempt 0: bare prompt, no prefix.
+        let s = with_json_repair_prefix(base, 0, None);
+        assert_eq!(s, "do the thing");
+        let s = with_json_repair_prefix(base, 0, Some("ignored on attempt 0"));
+        assert_eq!(s, "do the thing");
+
+        // Retry without a specific error: generic prefix only.
+        let s = with_json_repair_prefix(base, 1, None);
+        assert!(s.starts_with("IMPORTANT: This step requires a valid JSON object"));
+        assert!(s.ends_with("\ndo the thing"));
+        assert!(!s.contains("Validator error"));
+
+        // Retry with a specific error: prefix + validator line + base.
+        let s = with_json_repair_prefix(base, 1, Some("findings is not array<Finding>"));
+        assert!(s.contains("IMPORTANT: This step requires a valid JSON object"));
+        assert!(
+            s.contains("Validator error from the previous attempt: findings is not array<Finding>")
+        );
+        assert!(s.ends_with("\ndo the thing"));
+    }
+
+    #[test]
+    fn build_retry_user_text_consumes_apply_then_parse_errors() {
+        // Apply errors win over parse errors on the same iteration
+        // (a code_edits failure means the workspace state changed and
+        // the apply-specific re-read instruction is more useful than
+        // a JSON schema lecture). Both slots are consumed by the
+        // call so the next iteration starts clean.
+        let base = "step prompt";
+
+        let mut apply = Some("old_string not found in fs/foo.c".to_string());
+        let mut parse = Some("findings is not array<Finding>".to_string());
+        let s = build_retry_user_text(base, 1, &mut apply, &mut parse);
+        assert!(s.contains("apply"));
+        assert!(s.contains("old_string not found"));
+        assert!(apply.is_none(), "apply slot must be consumed");
+        // Apply path wins, so the parse error is also drained so it
+        // does not bleed into a subsequent retry as stale context.
+        assert!(parse.is_none(), "parse slot must be consumed");
+
+        // Parse-only retry: apply is None, parse is Some; output
+        // includes the JSON repair prefix and names the parse error.
+        let mut apply = None;
+        let mut parse = Some("missing required output 'analysis'".to_string());
+        let s = build_retry_user_text(base, 2, &mut apply, &mut parse);
+        assert!(s.contains("Validator error from the previous attempt"));
+        assert!(s.contains("missing required output 'analysis'"));
+        assert!(parse.is_none(), "parse slot must be consumed");
     }
 
     #[test]
@@ -4731,52 +4820,6 @@ mod tests {
             steps: &states,
         };
         assert!(!write_patch_is_being_corrected(write_patch, &ctx));
-    }
-
-    #[test]
-    fn review_dispute_allowed_only_for_prior_source_review_defect() {
-        let wf = fix_workflow();
-        let write_patch = wf.steps.iter().find(|s| s.id == "write-patch").unwrap();
-        let inputs = Map::new();
-        let states = make_state(&[(
-            "review",
-            1,
-            1,
-            json!({
-                "source_defects": [{"where": "mm/foo.c", "what": "wrong"}]
-            }),
-        )]);
-        let ctx = ExecContext {
-            workflow_inputs: &inputs,
-            steps: &states,
-        };
-        assert!(review_dispute_is_allowed(write_patch, &ctx));
-
-        let states = make_state(&[(
-            "compile-triage",
-            1,
-            1,
-            json!({"result": "patch_error", "analysis": "patch broke the build"}),
-        )]);
-        let ctx = ExecContext {
-            workflow_inputs: &inputs,
-            steps: &states,
-        };
-        assert!(!review_dispute_is_allowed(write_patch, &ctx));
-
-        let states = make_state(&[(
-            "review",
-            1,
-            1,
-            json!({
-                "source_defects": []
-            }),
-        )]);
-        let ctx = ExecContext {
-            workflow_inputs: &inputs,
-            steps: &states,
-        };
-        assert!(!review_dispute_is_allowed(write_patch, &ctx));
     }
 
     #[test]
@@ -4963,7 +5006,7 @@ mod tests {
         assert!(rendered.contains("123456789abc (\"subsystem: add sync helper\")"));
         assert!(rendered.contains("do not mention unproven Fixes candidates"));
         assert!(rendered.contains("Fixes: <sha> (\"<subject>\")"));
-        assert!(rendered.contains("raw git commit subject MUST be <=55 chars"));
+        assert!(rendered.contains("raw git commit subject (line 1) MUST be <=55 chars"));
         assert!(rendered.contains("Subject: [PATCH] <subject>"));
         assert!(rendered.contains("<=72 chars including the literal word `Subject`"));
         assert!(rendered.contains("Assisted-by: kres (claude-test)"));
@@ -5351,6 +5394,46 @@ mod tests {
         assert_eq!(m.get("fixes_sha"), Some(&json!("abc123def456")));
     }
 
+    // Tests for first_top_level_brace itself live in
+    // kres_core::brace::tests; the kres-agents callers exercise the
+    // helper indirectly through extract_outputs and parse_code_response.
+
+    #[test]
+    fn extract_outputs_finds_envelope_after_stray_closing_brace_in_prose() {
+        // Real-run regression (linux.coredump_dump_head_double_handoff
+        // session 18827a26): the slow agent quoted the tail of a C
+        // function with a closing `}` whose opening `{` was elided.
+        // Without depth clamping the scanner went to -1 and missed
+        // the canonical JSON envelope further down, so the validator
+        // reported every declared field as missing. Verify the
+        // canonical envelope is now found.
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "research").unwrap();
+        let body = "Looking at workspace HEAD:\n\
+                    ```c\n\
+                    dev_coredumpv(&hdev->dev, hdev->dump.head, size, GFP_KERNEL);\n\
+                    }\n\
+                    /* alias not cleared */\n\
+                    ```\n\
+                    Now the structured output:\n\
+                    {\"research_status\": \"confirmed\", \
+                     \"valid\": true, \
+                     \"invalid_evidence\": \"\", \
+                     \"invalid_evidence_kind\": \"none\", \
+                     \"affected_files\": [\"net/bluetooth/coredump.c\"], \
+                     \"affected_symbols\": [\"hci_devcd_dump\"], \
+                     \"research_decision\": {\"bug_proven\": true, \
+                                              \"fix_contract_proven\": true, \
+                                              \"invalidity_proven\": false, \
+                                              \"needs_more_audit\": false}, \
+                     \"analysis\": \"verified at HEAD\"}";
+        let m = extract_outputs(body, step).unwrap();
+        assert_eq!(m.get("research_status"), Some(&json!("confirmed")));
+        assert_eq!(m.get("valid"), Some(&json!(true)));
+        assert_eq!(m.get("invalid_evidence_kind"), Some(&json!("none")));
+        assert!(m.get("research_decision").is_some());
+    }
+
     #[test]
     fn extract_outputs_errors_when_no_declared_key() {
         let wf = fix_workflow();
@@ -5386,11 +5469,11 @@ mod tests {
 
     #[test]
     fn fast_gather_contract_is_not_a_workflow_output_schema() {
-        let contract = fast_gather_contract(&["clean", "defects", "correction_step"]);
+        let contract = fast_gather_contract(&["clean", "defects", "source_defects"]);
 
         assert!(contract.contains("FAST GATHER CONTRACT"));
         assert!(contract.contains("analysis, followups, skill_reads, ready_for_slow"));
-        assert!(contract.contains("clean, defects, correction_step"));
+        assert!(contract.contains("clean, defects, source_defects"));
         assert!(!contract.contains("OUTPUT SCHEMA"));
     }
 
@@ -6220,471 +6303,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_review_consolidate_routes_message_only_defects_to_commit_message() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(false));
-        lens.insert(
-            "analysis".into(),
-            json!("message says helper takes a ref, code requires caller ref"),
-        );
-        lens.insert(
-            "defects".into(),
-            json!([{
-                "where": "commit message",
-                "what": "commit message contradicts the patch"
-            }]),
-        );
-        lens.insert("correction_step".into(), json!("write-commit-message"));
-
-        let out = consolidate_structured_review(&[("assertions".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(false)));
-        assert_eq!(
-            out.get("correction_step"),
-            Some(&json!("write-commit-message"))
-        );
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(
-            out.get("commit_message_defects"),
-            Some(&json!([{
-                "lens": "assertions",
-                "where": "commit message",
-                "what": "commit message contradicts the patch"
-            }]))
-        );
-    }
-
-    #[test]
-    fn structured_review_shared_fanout_rejects_incomplete_lens_json() {
-        let wf = fix_workflow();
-        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
-        let raw_response = "{\"clean\": true}";
-        let fanout = crate::pipeline::LensFanoutOutput {
-            outputs: vec![crate::pipeline::LensRunOutput {
-                lens_id: "memory".into(),
-                lens: json!({"id": "memory"}),
-                slow_model: Some("test-model".into()),
-                raw_response: raw_response.into(),
-                parsed: crate::response::parse_code_response(raw_response),
-            }],
-            failures: vec![],
-            fast_rounds: 1,
-            attempted: 1,
-            slow_variant_count: 1,
-        };
-
-        let err = structured_review_lens_outputs(step, fanout).unwrap_err();
-
-        assert!(err.contains("lens 'memory'"), "got: {err}");
-        assert!(err.contains("missing required output"), "got: {err}");
-        assert!(err.contains("defects"), "got: {err}");
-        assert!(err.contains("correction_step"), "got: {err}");
-    }
-
-    #[test]
-    fn structured_review_shared_fanout_reports_lens_failures() {
-        let wf = fix_workflow();
-        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
-        let fanout = crate::pipeline::LensFanoutOutput {
-            outputs: vec![],
-            failures: vec![crate::pipeline::LensRunFailure {
-                lens_id: "memory".into(),
-                slow_model: Some("test-model".into()),
-                error: "transport closed".into(),
-            }],
-            fast_rounds: 1,
-            attempted: 1,
-            slow_variant_count: 1,
-        };
-
-        let err = structured_review_lens_outputs(step, fanout).unwrap_err();
-
-        assert!(err.contains("failed 1 of 1"), "got: {err}");
-        assert!(err.contains("memory"), "got: {err}");
-        assert!(err.contains("test-model"), "got: {err}");
-        assert!(err.contains("transport closed"), "got: {err}");
-    }
-
-    #[test]
-    fn structured_review_shared_fanout_labels_multiple_slow_variants() {
-        let wf = fix_workflow();
-        let step = wf.steps.iter().find(|s| s.id == "review").unwrap();
-        let raw_response = r#"{
-            "clean": true,
-            "defects": [],
-            "analysis": "no defects found",
-            "correction_step": "write-patch"
-        }"#;
-        let fanout = crate::pipeline::LensFanoutOutput {
-            outputs: vec![
-                crate::pipeline::LensRunOutput {
-                    lens_id: "memory".into(),
-                    lens: json!({"id": "memory"}),
-                    slow_model: Some("sonnet".into()),
-                    raw_response: raw_response.into(),
-                    parsed: crate::response::parse_code_response(raw_response),
-                },
-                crate::pipeline::LensRunOutput {
-                    lens_id: "memory".into(),
-                    lens: json!({"id": "memory"}),
-                    slow_model: Some("opus".into()),
-                    raw_response: raw_response.into(),
-                    parsed: crate::response::parse_code_response(raw_response),
-                },
-            ],
-            failures: vec![],
-            fast_rounds: 1,
-            attempted: 2,
-            slow_variant_count: 2,
-        };
-
-        let labels: Vec<String> = structured_review_lens_outputs(step, fanout)
-            .unwrap()
-            .into_iter()
-            .map(|(label, _)| label)
-            .collect();
-
-        assert_eq!(labels, vec!["memory@sonnet", "memory@opus"]);
-    }
-
-    #[test]
-    fn structured_review_consolidate_routes_source_defects_to_write_patch() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(false));
-        lens.insert("analysis".into(), json!("stale kerneldoc"));
-        lens.insert(
-            "defects".into(),
-            json!([{
-                "where": "mm/example.c kerneldoc",
-                "what": "kerneldoc documents the old locking contract"
-            }]),
-        );
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("maintainer".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(false)));
-        assert_eq!(out.get("correction_step"), Some(&json!("write-patch")));
-        assert_eq!(
-            out.get("source_defects"),
-            Some(&json!([{
-                "lens": "maintainer",
-                "where": "mm/example.c kerneldoc",
-                "what": "kerneldoc documents the old locking contract"
-            }]))
-        );
-        assert_eq!(out.get("commit_message_defects"), Some(&json!([])));
-    }
-
-    #[test]
-    fn structured_review_consolidate_uses_lens_correction_step_without_defects() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(false));
-        lens.insert(
-            "analysis".into(),
-            json!("The source patch is correct, but the commit message says the wrong helper."),
-        );
-        lens.insert("defects".into(), json!([]));
-        lens.insert("correction_step".into(), json!("write-commit-message"));
-
-        let out = consolidate_structured_review(&[("assertions".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(false)));
-        assert_eq!(
-            out.get("correction_step"),
-            Some(&json!("write-commit-message"))
-        );
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(
-            out.get("commit_message_defects")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn structured_review_consolidate_defects_override_clean_true() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert(
-            "analysis".into(),
-            json!("analysis says clean, but defects disagree"),
-        );
-        lens.insert(
-            "defects".into(),
-            json!([{
-                "where": "mm/example.c",
-                "what": "source defect must fail review even when clean=true"
-            }]),
-        );
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("maintainer".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(false)));
-        assert_eq!(out.get("correction_step"), Some(&json!("write-patch")));
-        assert_eq!(
-            out.get("source_defects")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn structured_review_consolidate_clean_true_ignores_unrouted_prose() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert(
-            "analysis".into(),
-            json!("No defect proven yet, but this needs verification before review is clean."),
-        );
-        lens.insert("defects".into(), json!([]));
-        lens.insert("correction_step".into(), json!("write-commit-message"));
-
-        let out = consolidate_structured_review(&[("assertions".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(true)));
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(out.get("commit_message_defects"), Some(&json!([])));
-        assert_eq!(out.get("defects"), Some(&json!([])));
-        assert_eq!(out.get("correction_step"), Some(&json!("write-patch")));
-    }
-
-    #[test]
-    fn structured_review_consolidate_flagged_preexisting_note_stays_clean() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert(
-            "analysis".into(),
-            json!(
-                "Patch is clean. [FLAG -> other lens] pgtable leak is pre-existing and not introduced by this patch; nothing in scope of this lens."
-            ),
-        );
-        lens.insert("defects".into(), json!([]));
-        lens.insert("source_defects".into(), json!([]));
-        lens.insert("commit_message_defects".into(), json!([]));
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("lifetime".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(true)));
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(out.get("commit_message_defects"), Some(&json!([])));
-        assert_eq!(out.get("defects"), Some(&json!([])));
-    }
-
-    #[test]
-    fn structured_review_consolidate_unverified_note_stays_clean() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert(
-            "analysis".into(),
-            json!(
-                "Fixes tag is plausible. [UNVERIFIED] exact SHA, but the reviewed patch itself is clean."
-            ),
-        );
-        lens.insert("defects".into(), json!([]));
-        lens.insert("source_defects".into(), json!([]));
-        lens.insert("commit_message_defects".into(), json!([]));
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("maintainer".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(true)));
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(out.get("commit_message_defects"), Some(&json!([])));
-        assert_eq!(out.get("defects"), Some(&json!([])));
-    }
-
-    #[test]
-    fn structured_review_consolidate_negated_verification_note_stays_clean() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert(
-            "analysis".into(),
-            json!("Patch is clean. Nothing needs verification before accepting this review."),
-        );
-        lens.insert("defects".into(), json!([]));
-        lens.insert("source_defects".into(), json!([]));
-        lens.insert("commit_message_defects".into(), json!([]));
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("maintainer".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(true)));
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(out.get("commit_message_defects"), Some(&json!([])));
-        assert_eq!(out.get("defects"), Some(&json!([])));
-    }
-
-    #[test]
-    fn structured_review_consolidate_honors_split_source_defects_from_lens() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert("analysis".into(), json!("incorrectly claimed clean"));
-        lens.insert("defects".into(), json!([]));
-        lens.insert(
-            "source_defects".into(),
-            json!([{
-                "where": "mm/example.c",
-                "what": "split source defect must fail review"
-            }]),
-        );
-        lens.insert("commit_message_defects".into(), json!([]));
-        lens.insert("correction_step".into(), json!("write-commit-message"));
-
-        let out = consolidate_structured_review(&[("maintainer".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(false)));
-        assert_eq!(out.get("correction_step"), Some(&json!("write-patch")));
-        assert_eq!(
-            out.get("source_defects"),
-            Some(&json!([{
-                "lens": "maintainer",
-                "where": "mm/example.c",
-                "what": "split source defect must fail review"
-            }]))
-        );
-        assert_eq!(
-            out.get("defects"),
-            Some(&json!([{
-                "lens": "maintainer",
-                "where": "mm/example.c",
-                "what": "split source defect must fail review"
-            }]))
-        );
-    }
-
-    #[test]
-    fn structured_review_consolidate_honors_split_commit_message_defects_from_lens() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert("analysis".into(), json!("incorrectly claimed clean"));
-        lens.insert("defects".into(), json!([]));
-        lens.insert("source_defects".into(), json!([]));
-        lens.insert(
-            "commit_message_defects".into(),
-            json!([{
-                "where": "commit message",
-                "what": "split commit-message defect must fail review"
-            }]),
-        );
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("assertions".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(false)));
-        assert_eq!(
-            out.get("correction_step"),
-            Some(&json!("write-commit-message"))
-        );
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(
-            out.get("commit_message_defects"),
-            Some(&json!([{
-                "lens": "assertions",
-                "where": "commit message",
-                "what": "split commit-message defect must fail review"
-            }]))
-        );
-    }
-
-    #[test]
-    fn structured_review_consolidate_does_not_rebucket_generic_copy() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(false));
-        lens.insert("analysis".into(), json!("classified output"));
-        lens.insert(
-            "source_defects".into(),
-            json!([{
-                "where": "mm/example.c",
-                "what": "source defect"
-            }]),
-        );
-        lens.insert(
-            "commit_message_defects".into(),
-            json!([{
-                "where": "commit message",
-                "what": "message defect"
-            }]),
-        );
-        lens.insert(
-            "defects".into(),
-            json!([
-                {
-                    "summary": "This generic compatibility copy mentions a commit message but belongs to the source split only"
-                },
-                {
-                    "summary": "This generic compatibility copy mentions source but belongs to the message split only"
-                }
-            ]),
-        );
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("maintainer".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(false)));
-        assert_eq!(out.get("correction_step"), Some(&json!("write-patch")));
-        assert_eq!(
-            out.get("source_defects"),
-            Some(&json!([{
-                "lens": "maintainer",
-                "where": "mm/example.c",
-                "what": "source defect"
-            }]))
-        );
-        assert_eq!(
-            out.get("commit_message_defects"),
-            Some(&json!([{
-                "lens": "maintainer",
-                "where": "commit message",
-                "what": "message defect"
-            }]))
-        );
-        assert_eq!(
-            out.get("defects"),
-            Some(&json!([
-                {
-                    "lens": "maintainer",
-                    "where": "mm/example.c",
-                    "what": "source defect"
-                },
-                {
-                    "lens": "maintainer",
-                    "where": "commit message",
-                    "what": "message defect"
-                }
-            ]))
-        );
-    }
-
-    #[test]
-    fn structured_review_consolidate_empty_split_arrays_ignore_generic_copy() {
-        let mut lens = Map::new();
-        lens.insert("clean".into(), json!(true));
-        lens.insert("analysis".into(), json!("split arrays are authoritative"));
-        lens.insert("source_defects".into(), json!([]));
-        lens.insert("commit_message_defects".into(), json!([]));
-        lens.insert(
-            "defects".into(),
-            json!([{
-                "where": "generic compatibility copy",
-                "what": "stale generic defect must not be routed"
-            }]),
-        );
-        lens.insert("correction_step".into(), json!("write-patch"));
-
-        let out = consolidate_structured_review(&[("maintainer".into(), lens)]).unwrap();
-
-        assert_eq!(out.get("clean"), Some(&json!(true)));
-        assert_eq!(out.get("source_defects"), Some(&json!([])));
-        assert_eq!(out.get("commit_message_defects"), Some(&json!([])));
-        assert_eq!(out.get("defects"), Some(&json!([])));
-    }
-
-    #[test]
     fn derive_build_target_from_changed_source_path() {
         assert_eq!(
             derive_build_target_from_paths(&["mm/mmap.c".to_string()]),
@@ -6791,12 +6409,14 @@ mod tests {
                 name: "fs/foo.c".into(),
                 reason: "".into(),
                 path: None,
+                nice_to_have: false,
             },
             crate::followup::Followup {
                 kind: "bash".into(),
                 name: "rm -rf /".into(),
                 reason: "".into(),
                 path: None,
+                nice_to_have: false,
             },
             // 'question' always passes (it's not a fetch).
             crate::followup::Followup {
@@ -6804,6 +6424,7 @@ mod tests {
                 name: "is x defined?".into(),
                 reason: "".into(),
                 path: None,
+                nice_to_have: false,
             },
         ];
         let result = gating.fetch(&followups, None).await.unwrap();
@@ -6836,8 +6457,7 @@ mod tests {
                 "outputs": {
                     "analysis":  {"type": "string"},
                     "findings":  {"type": "array<Finding>"},
-                    "followups": {"type": "array<Followup>"},
-                    "followups_empty": {"type": "boolean"}
+                    "followups": {"type": "array<Followup>"}
                 }
             }]
         });
@@ -6872,6 +6492,7 @@ mod tests {
                 name: "foo".into(),
                 reason: "[MISSING]".into(),
                 path: None,
+                nice_to_have: false,
             }],
             fast_rounds: 2,
             strategy: crate::response::ParseStrategy::WholeBody,
@@ -6897,10 +6518,9 @@ mod tests {
                 .map(|a| a.len()),
             Some(1)
         );
-        assert_eq!(
-            out.get("followups_empty").and_then(|v| v.as_bool()),
-            Some(false)
-        );
+        // followups_empty is no longer a workflow output; the eval
+        // computes blocking-ness from the followups array directly.
+        assert!(!out.contains_key("followups_empty"));
     }
 
     #[test]
@@ -7312,5 +6932,96 @@ mod tests {
         assert_eq!(m.get("target"), Some(&json!("/tmp/x")));
         assert_eq!(m.get("n"), Some(&json!(42)));
         assert_eq!(m.get("flag"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn emitted_code_paths_drops_kres_aux_files() {
+        // Regression: in linux.wacom_queue_insert_unbounded_skip_oob the
+        // slow agent in write-patch wrote both real source edits and a
+        // `.kres-commit-msg.suggested` hand-off file. That file is
+        // gitignored, so the commit reaper's `git add` exited 1 and
+        // failed the run. emitted_code_paths must filter out anything in
+        // the kres-internal `.kres-*` namespace (commit-message file,
+        // any sibling hand-off, anywhere in the tree) so the commit
+        // reaper never sees them in changed_files.
+        let edits = vec![kres_core::CodeEdit {
+            file_path: "drivers/hid/wacom_sys.c".to_string(),
+            old_string: "x".to_string(),
+            new_string: "y".to_string(),
+            replace_all: false,
+        }];
+        let output = vec![
+            kres_core::CodeFile {
+                path: ".kres-commit-msg.tmp".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: ".kres-commit-msg.suggested".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "subdir/.kres-handoff.json".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "Documentation/foo.rst".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+        ];
+        let paths = emitted_code_paths(&output, &edits);
+        assert_eq!(
+            paths,
+            vec![
+                "drivers/hid/wacom_sys.c".to_string(),
+                "Documentation/foo.rst".to_string(),
+            ],
+            "kres-internal aux paths must not reach changed_files"
+        );
+    }
+
+    #[test]
+    fn routing_prompt_selection_is_orchestrator_only() {
+        // The dedicated routing-agent system prompt is scoped to the
+        // orchestrator workflow step. Every other fast-tagged step
+        // (research, lore-search, fixes-tag-search, compile-triage)
+        // analyzes gathered code/history and keeps the fast-gather
+        // system prompt. abe81d9 widened this incorrectly to all
+        // agent=fast steps; f5f2951 narrowed it back. This test
+        // pins the predicate so a future widening regression has to
+        // delete an assertion.
+
+        // Orchestrator routed to fast → routing prompt.
+        assert!(use_routing_prompt_for_synth("orchestrator", true));
+
+        // Orchestrator routed to slow (shouldn't happen given
+        // fix.json declares agent:fast, but the predicate is honest
+        // about the precondition) → no routing prompt because the
+        // routing prompt is paired with the fast client.
+        assert!(!use_routing_prompt_for_synth("orchestrator", false));
+
+        // Other fast-tagged workflow steps → no routing prompt.
+        for other_step in [
+            "research",
+            "lore-search",
+            "fixes-tag-search",
+            "compile-triage",
+            "write-patch",
+            "write-commit-message",
+            "review",
+            "publish",
+        ] {
+            assert!(
+                !use_routing_prompt_for_synth(other_step, true),
+                "step '{other_step}' must not get the routing prompt"
+            );
+            assert!(
+                !use_routing_prompt_for_synth(other_step, false),
+                "step '{other_step}' must not get the routing prompt"
+            );
+        }
     }
 }

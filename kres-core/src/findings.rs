@@ -113,7 +113,9 @@ pub struct Finding {
     #[serde(default)]
     pub relevant_file_sections: Vec<RelevantFileSection>,
     pub summary: String,
+    #[serde(default)]
     pub reproducer_sketch: String,
+    #[serde(default)]
     pub impact: String,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

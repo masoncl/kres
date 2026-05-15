@@ -365,44 +365,9 @@ fn last_line_start_brace(text: &str) -> Option<usize> {
 /// the order they appear. String-aware so JSON containing `{` or `}`
 /// inside quoted strings doesn't desync the brace depth.
 fn extract_brace_matches(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut start: Option<usize> = None;
-    for (i, ch) in text.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if in_string {
-            match ch {
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = Some(i);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    if let Some(s) = start.take() {
-                        out.push(text[s..=i].to_string());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
+    // Defer to the shared workflow_runner helper so the
+    // string-awareness and stray-`}` clamp live in one place.
+    kres_core::brace::extract_brace_objects(text)
 }
 
 #[cfg(test)]
@@ -550,6 +515,24 @@ that's all."#;
         let r = parse_code_response(body);
         assert_eq!(r.strategy, ParseStrategy::BraceMatch);
         assert_eq!(r.analysis, "via braces");
+    }
+
+    #[test]
+    fn brace_match_recovers_from_stray_close_in_prose() {
+        // Same shape as the workflow_runner regression: a code-fence
+        // ends with a `}` whose `{` was elided. Without depth
+        // clamping, the brace-matcher desynchronizes and misses the
+        // real JSON tail. Clamping makes the canonical analysis
+        // visible again.
+        let body = "Looking at workspace HEAD:\n\
+                    ```c\n\
+                    dev_coredumpv(...);\n\
+                    }\n\
+                    /* alias not cleared */\n\
+                    ```\n\
+                    {\"analysis\": \"verified at HEAD\"}";
+        let r = parse_code_response(body);
+        assert_eq!(r.analysis, "verified at HEAD");
     }
 
     #[test]

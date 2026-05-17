@@ -1149,7 +1149,7 @@ mod tests {
                 ][..]
             )
         );
-        assert_eq!(review.lenses.len(), 8);
+        assert_eq!(review.lenses.len(), 7);
         assert_eq!(review.aggregate, Some(Aggregate::Consolidate));
         assert!(review.consolidate.is_some());
         let review_prompt = review.prompt.as_deref().unwrap_or("");

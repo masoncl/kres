@@ -1198,11 +1198,6 @@
           "investigate": "Concurrency: lock coverage, ordering, missed wakeups, shared-state races, and protection of accessed fields."
         },
         {
-          "id": "general",
-          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
-          "investigate": "General correctness: NULL dereferences, missing error checks, semantic bugs, and concrete defects not covered by the other lenses."
-        },
-        {
           "id": "assertions",
           "run_if": "write-patch.review_dispute != '' || commit.commit_sha != ''",
           "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",

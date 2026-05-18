@@ -122,7 +122,66 @@ pub fn set_finding_status_files(finding_dir: &Path, status: &str) -> std::io::Re
         finish_lines(finding_lines, finding_body.ends_with('\n')),
     )?;
 
-    Ok(vec![metadata, finding])
+    let mut updated = vec![metadata, finding];
+    if let Some(summary) = update_summary_status(finding_dir, status)? {
+        updated.push(summary);
+    }
+    Ok(updated)
+}
+
+/// Replace the value block under summary.md's `# Status` heading with
+/// the new status (Title Case for prose), preserving the rest of the
+/// file. Returns `Ok(None)` when summary.md is absent or has no
+/// `# Status` heading — the function does not synthesize a heading
+/// it didn't find, since summary.md is human-written prose.
+fn update_summary_status(finding_dir: &Path, status: &str) -> std::io::Result<Option<PathBuf>> {
+    let summary = finding_dir.join("summary.md");
+    let body = match std::fs::read_to_string(&summary) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let pretty = match status {
+        "active" => "Active",
+        "invalidated" => "Invalidated",
+        "unconfirmed" => "Unconfirmed",
+        other => other,
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut replaced = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        out.push(line.to_string());
+        if !replaced && line.trim() == "# Status" {
+            i += 1;
+            while i < lines.len() && lines[i].trim().is_empty() {
+                out.push(lines[i].to_string());
+                i += 1;
+            }
+            let mut consumed = false;
+            while i < lines.len() && !lines[i].trim().is_empty() && !lines[i].starts_with('#') {
+                if !consumed {
+                    out.push(pretty.to_string());
+                    consumed = true;
+                    replaced = true;
+                }
+                i += 1;
+            }
+            if !consumed {
+                out.push(pretty.to_string());
+                replaced = true;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if !replaced {
+        return Ok(None);
+    }
+    std::fs::write(&summary, finish_lines(out, body.ends_with('\n')))?;
+    Ok(Some(summary))
 }
 
 pub fn write_invalidation_artifact(
@@ -893,6 +952,61 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("FINDING.md")).unwrap(),
             "# Finding\n\n**Status:** unconfirmed\n\nbody\n"
+        );
+    }
+
+    #[test]
+    fn set_finding_status_updates_summary_when_status_section_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(dir.join("FINDING.md"), "# F1\n\n**Status:** active\n").unwrap();
+        std::fs::write(
+            dir.join("summary.md"),
+            "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)\n\n\
+             # Subject: x\n\n\
+             # Status\n\n\
+             Plausible\n\n\
+             # Impact\n\n\
+             body\n",
+        )
+        .unwrap();
+
+        let files = set_finding_status_files(dir, "invalidated").unwrap();
+
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().any(|p| p.ends_with("summary.md")));
+        let summary = std::fs::read_to_string(dir.join("summary.md")).unwrap();
+        assert!(
+            summary.contains("# Status\n\nInvalidated\n"),
+            "summary status block not rewritten: {summary}"
+        );
+        assert!(
+            summary.contains("# Impact\n\nbody"),
+            "summary body must be preserved: {summary}"
+        );
+        assert!(
+            !summary.contains("Plausible"),
+            "old status value must be replaced: {summary}"
+        );
+    }
+
+    #[test]
+    fn set_finding_status_skips_summary_when_no_status_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(dir.join("FINDING.md"), "# F1\n\n**Status:** active\n").unwrap();
+        let summary_body = "# Subject: x\n\nbody without status section\n";
+        std::fs::write(dir.join("summary.md"), summary_body).unwrap();
+
+        let files = set_finding_status_files(dir, "invalidated").unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(!files.iter().any(|p| p.ends_with("summary.md")));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("summary.md")).unwrap(),
+            summary_body
         );
     }
 

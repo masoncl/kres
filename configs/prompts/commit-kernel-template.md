@@ -205,9 +205,7 @@ line. Each on its own line. Tags can run past 75 columns
   the discussion that produced the patch. Even with Link:, the
   body must remain self-contained — do not punt explanations to
   the link target (submitting-patches.rst:130-133).
-- **Cc:** `stable@vger.kernel.org` — request stable backport.
-  Lives in the trailer block, NOT as an email Cc. Read
-  Documentation/process/stable-kernel-rules.rst before adding.
+- NEVER add `Cc: stable@vger.kernel.org`.
 - **Reported-by:** `<Name> <email>` — credits the bug reporter.
   Pair with Closes:. Reporting must have been public.
 - **Tested-by:** `<Name> <email>` — someone tested the patch.

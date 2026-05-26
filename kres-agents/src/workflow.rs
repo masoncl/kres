@@ -243,6 +243,7 @@ pub enum ActionType {
     Grep,
     Callers,
     Make,
+    Meson,
     Edit,
     Bash,
     Lore,

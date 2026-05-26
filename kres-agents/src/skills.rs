@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::error::AgentError;
+use crate::workspace::WorkspaceProfile;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Skill {
@@ -65,12 +66,61 @@ impl Skills {
         Ok(Self { items })
     }
 
-    /// Return the skills that should be auto-loaded at session start.
+    /// Return the skills that should be auto-loaded at session start
+    /// for the detected workspace.
     pub fn auto_loaded(&self) -> Vec<&Skill> {
         self.items
             .values()
             .filter(|s| s.invocation_policy == InvocationPolicy::Automatic)
             .collect()
+    }
+
+    pub fn auto_loaded_for_workspace(&self, profile: &WorkspaceProfile) -> Vec<&Skill> {
+        profile
+            .knowledge_skills
+            .iter()
+            .filter_map(|name| self.items.get(*name))
+            .filter(|s| s.invocation_policy == InvocationPolicy::Automatic)
+            .collect()
+    }
+
+    /// Load only the automatic skills selected by workspace
+    /// detection. Unlike `load_dir`, this never parses unrelated
+    /// skill files, so one bad/manual skill cannot disable automatic
+    /// workspace knowledge.
+    pub fn load_auto_for_workspace(
+        dir: &Path,
+        profile: &WorkspaceProfile,
+    ) -> Result<(Self, Vec<String>), AgentError> {
+        let mut items = BTreeMap::new();
+        let mut warnings = Vec::new();
+        for name in &profile.knowledge_skills {
+            let path = dir.join(format!("{name}.md"));
+            match Skill::from_path(&path) {
+                Ok(skill)
+                    if skill.name == *name
+                        && skill.invocation_policy == InvocationPolicy::Automatic =>
+                {
+                    items.insert(skill.name.clone(), skill);
+                }
+                Ok(skill) if skill.name != *name => warnings.push(format!(
+                    "skill {} not auto-loaded: frontmatter name '{}' does not match requested skill '{}'",
+                    path.display(),
+                    skill.name,
+                    name
+                )),
+                Ok(skill) => warnings.push(format!(
+                    "skill {} not auto-loaded: invocation_policy is {:?}",
+                    path.display(),
+                    skill.invocation_policy
+                )),
+                Err(AgentError::Other(msg)) if msg.contains("No such file") => {
+                    warnings.push(format!("skill {} not loaded: {msg}", path.display()));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((Self { items }, warnings))
     }
 
     /// Produce the JSON value the code-agent prompt expects:
@@ -334,6 +384,80 @@ mod tests {
         let auto = skills.auto_loaded();
         assert_eq!(auto.len(), 1);
         assert_eq!(auto[0].name, "a");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_loaded_for_workspace_picks_detected_knowledge_only() {
+        let dir = tmpdir("workspace-auto");
+        std::fs::write(
+            dir.join("kernel.md"),
+            "---\nname: kernel\ninvocation_policy: automatic\n---\nK",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("systemd.md"),
+            "---\nname: systemd\ninvocation_policy: automatic\n---\nS",
+        )
+        .unwrap();
+        let skills = Skills::load_dir(&dir).unwrap();
+        let profile = WorkspaceProfile {
+            kind: crate::workspace::WorkspaceKind::Systemd,
+            build_system: crate::workspace::BuildSystem::Meson,
+            knowledge_skills: vec!["systemd"],
+        };
+
+        let auto = skills.auto_loaded_for_workspace(&profile);
+
+        assert_eq!(auto.len(), 1);
+        assert_eq!(auto[0].name, "systemd");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_auto_for_workspace_does_not_parse_unselected_skills() {
+        let dir = tmpdir("workspace-load-auto");
+        std::fs::write(
+            dir.join("systemd.md"),
+            "---\nname: systemd\ninvocation_policy: automatic\n---\nS",
+        )
+        .unwrap();
+        let unreadable = dir.join("kernel.md");
+        std::fs::write(&unreadable, "---\nname: kernel\n---\nK").unwrap();
+        std::fs::remove_file(&unreadable).unwrap();
+        let profile = WorkspaceProfile {
+            kind: crate::workspace::WorkspaceKind::Systemd,
+            build_system: crate::workspace::BuildSystem::Meson,
+            knowledge_skills: vec!["systemd"],
+        };
+
+        let (skills, warnings) = Skills::load_auto_for_workspace(&dir, &profile).unwrap();
+
+        assert!(warnings.is_empty());
+        assert!(skills.items.contains_key("systemd"));
+        assert!(!skills.items.contains_key("kernel"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_auto_for_workspace_rejects_frontmatter_name_mismatch() {
+        let dir = tmpdir("workspace-load-auto-name-mismatch");
+        std::fs::write(
+            dir.join("systemd.md"),
+            "---\nname: kernel\ninvocation_policy: automatic\n---\nS",
+        )
+        .unwrap();
+        let profile = WorkspaceProfile {
+            kind: crate::workspace::WorkspaceKind::Systemd,
+            build_system: crate::workspace::BuildSystem::Meson,
+            knowledge_skills: vec!["systemd"],
+        };
+
+        let (skills, warnings) = Skills::load_auto_for_workspace(&dir, &profile).unwrap();
+
+        assert!(skills.items.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("does not match requested skill 'systemd'"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

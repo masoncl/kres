@@ -221,9 +221,11 @@ Populated by `setup.sh` from the kres source tree. Contents:
 | `commands/<name>.md`      | Operator overrides / additions for non-workflow slash       |
 |                           | commands (e.g. summary templates). Workflow-owned names     |
 |                           | (`fix`, `review`, `triage`) are reserved.                   |
-| `skills/*.md`             | Domain-knowledge skill files. kres loads each `*.md` at     |
+| `skills/*.md`             | Domain-knowledge skill files. kres scans each `*.md` at     |
 |                           | startup; skills with `invocation_policy: automatic` are     |
-|                           | always loaded, others are pulled in on demand.              |
+|                           | loaded only when workspace detection selects that knowledge  |
+|                           | pack (for example kernel or systemd); others are pulled in   |
+|                           | on demand.                                                  |
 | `sessions/<timestamp>/`   | Per-run artifact directory used when the operator did not   |
 |                           | pass `--results <dir>`. Contains `findings.json`,           |
 |                           | `report.md`, optional `session.json` (resume snapshot),     |

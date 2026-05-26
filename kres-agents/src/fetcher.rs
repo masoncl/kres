@@ -17,6 +17,8 @@
 //! - `git` — name = command string.
 //! - `make` — name = make arguments; dispatched as `make` argv
 //!   without a shell, with a 300s timeout.
+//! - `meson` — name = meson arguments; dispatched as `meson` argv
+//!   without a shell, with a 300s timeout.
 //! - `bash` — name = shell command; dispatched to tools::bash_run
 //!   with default timeout and workspace-root cwd. Mainly used by the
 //!   coding flow to compile and run emitted source.
@@ -38,8 +40,8 @@ use crate::{
     followup::Followup,
     pipeline::{DataFetcher, FetchResult},
     tools::{
-        bash_run, find, git, grep, make_run, read_file_range, BashArgs, FindArgs, GitArgs,
-        GrepArgs, ReadArgs,
+        bash_run, find, git, grep, make_run, meson_run, read_file_range, BashArgs, FindArgs,
+        GitArgs, GrepArgs, ReadArgs,
     },
 };
 
@@ -179,6 +181,18 @@ impl DataFetcher for WorkspaceFetcher {
                         })),
                         Err(e) => out.context.push(json!({
                             "source": format!("make:{}", fu.name),
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
+                "meson" => {
+                    match meson_run(&self.workspace, &fu.name, Some(300)).await {
+                        Ok(content) => out.context.push(json!({
+                            "source": format!("meson:{}", fu.name),
+                            "content": content,
+                        })),
+                        Err(e) => out.context.push(json!({
+                            "source": format!("meson:{}", fu.name),
                             "error": e.to_string(),
                         })),
                     }

@@ -323,27 +323,39 @@ pub const TOOL_OUTPUT_CAP_BASH: usize = 20_000;
 pub const BASH_DEFAULT_TIMEOUT_SECS: u64 = 60;
 pub const BASH_MAX_TIMEOUT_SECS: u64 = 600;
 
-/// Run `make` directly via argv, not through a shell. `args` is
+/// Run a build tool directly via argv, not through a shell. `args` is
 /// tokenized with the same small shell-like splitter used for git so
 /// quoted values survive, but metacharacters such as `;` are never
 /// interpreted as command separators.
-pub async fn make_run(
+async fn argv_tool_run(
     workspace: &Path,
+    program: &str,
     args: &str,
     timeout_secs: Option<u64>,
 ) -> Result<String, AgentError> {
     let parts = shell_split(args)
-        .ok_or_else(|| AgentError::Other(format!("unparseable make arguments: {args}")))?;
+        .ok_or_else(|| AgentError::Other(format!("unparseable {program} arguments: {args}")))?;
+    argv_tool_run_parts(workspace, program, &parts, timeout_secs).await
+}
+
+async fn argv_tool_run_parts(
+    workspace: &Path,
+    program: &str,
+    parts: &[String],
+    timeout_secs: Option<u64>,
+) -> Result<String, AgentError> {
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(300).clamp(1, BASH_MAX_TIMEOUT_SECS));
-    let mut cmd = tokio::process::Command::new("make");
+    let mut cmd = tokio::process::Command::new(program);
     cmd.current_dir(workspace);
-    cmd.args(&parts);
+    cmd.args(parts);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     cmd.kill_on_drop(true);
     let out = tokio::time::timeout(timeout, cmd.output())
         .await
-        .map_err(|_| AgentError::Other(format!("make timed out after {}s", timeout.as_secs())))?
-        .map_err(|e| AgentError::Other(format!("make spawn: {e}")))?;
+        .map_err(|_| {
+            AgentError::Other(format!("{program} timed out after {}s", timeout.as_secs()))
+        })?
+        .map_err(|e| AgentError::Other(format!("{program} spawn: {e}")))?;
     let stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr_text = String::from_utf8_lossy(&out.stderr).to_string();
     let code_line = match out.status.code() {
@@ -365,6 +377,56 @@ pub async fn make_run(
         Ok(body)
     } else {
         Err(AgentError::Other(body))
+    }
+}
+
+pub async fn make_run(
+    workspace: &Path,
+    args: &str,
+    timeout_secs: Option<u64>,
+) -> Result<String, AgentError> {
+    argv_tool_run(workspace, "make", args, timeout_secs).await
+}
+
+pub async fn meson_run(
+    workspace: &Path,
+    args: &str,
+    timeout_secs: Option<u64>,
+) -> Result<String, AgentError> {
+    let parts = shell_split(args)
+        .ok_or_else(|| AgentError::Other(format!("unparseable meson arguments: {args}")))?;
+    let parts = normalize_meson_args(parts);
+    argv_tool_run_parts(workspace, "meson", &parts, timeout_secs).await
+}
+
+pub async fn cargo_run(
+    workspace: &Path,
+    args: &str,
+    timeout_secs: Option<u64>,
+) -> Result<String, AgentError> {
+    argv_tool_run(workspace, "cargo", args, timeout_secs).await
+}
+
+fn normalize_meson_args(mut parts: Vec<String>) -> Vec<String> {
+    match parts.first().map(String::as_str) {
+        Some("compile") => {
+            if !parts.iter().any(|part| part == "--clean") {
+                for part in &mut parts {
+                    if part == "clean" {
+                        *part = "--clean".to_string();
+                    }
+                }
+            }
+            parts
+        }
+        Some("clean") => {
+            parts[0] = "compile".to_string();
+            if !parts.iter().any(|part| part == "--clean") {
+                parts.push("--clean".to_string());
+            }
+            parts
+        }
+        _ => parts,
     }
 }
 
@@ -1415,5 +1477,33 @@ mod tests {
         assert_eq!(parts[5], r#"Fixes: 659a ("subsystem: introduce feature")"#);
         assert_eq!(parts[6], "-m");
         assert_eq!(parts[7], "Assisted-by: kres");
+    }
+
+    #[test]
+    fn normalize_meson_args_converts_compile_clean_target() {
+        let got = normalize_meson_args(vec![
+            "compile".into(),
+            "-C".into(),
+            "build".into(),
+            "clean".into(),
+        ]);
+        assert_eq!(got, vec!["compile", "-C", "build", "--clean"]);
+    }
+
+    #[test]
+    fn normalize_meson_args_converts_top_level_clean() {
+        let got = normalize_meson_args(vec!["clean".into(), "-C".into(), "build".into()]);
+        assert_eq!(got, vec!["compile", "-C", "build", "--clean"]);
+    }
+
+    #[test]
+    fn normalize_meson_args_leaves_regular_compile() {
+        let got = normalize_meson_args(vec![
+            "compile".into(),
+            "-C".into(),
+            "build".into(),
+            "systemd".into(),
+        ]);
+        assert_eq!(got, vec!["compile", "-C", "build", "systemd"]);
     }
 }

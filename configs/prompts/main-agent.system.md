@@ -53,12 +53,15 @@ Map each followup type to a tool:
   `path` / `file` for `file_path`. Mainly used by the coding flow
   to apply fixes in-place.
 - "make" → run `make <args>` from the workspace root. Use
-  {"type": "make", "command": "-j$(nproc) net/ipv4/tcp_ipv4.o",
+  {"type": "make", "command": "-j8 net/ipv4/tcp_ipv4.o",
   "timeout_secs": 300}. `command` is the args after `make`; `cmd`
   and `name` are accepted aliases. `timeout_secs` defaults to 300
   (hard cap 600). Output is `[exit N]` + `[stdout]` + `[stderr]`,
   capped at 20k chars. Enabled by default. Use for kernel build
   verification after applying a fix.
+- "meson" → run `meson <args>` from the workspace root. Same shape
+  as `make`. Use for systemd configure/test/build actions that are
+  expressed through Meson.
 - "cargo" → run `cargo <args>` from the workspace root. Use
   {"type": "cargo", "command": "build -p kres-agents",
   "timeout_secs": 300}. Same shape as `make`. Use for Rust crate
@@ -75,7 +78,7 @@ Map each followup type to a tool:
   `--allow bash`). When it is not enabled, a `bash` action will
   come back with `[error] action type 'bash' is not in the
   allowed-action list for this session (...)`. Do not re-emit the
-  same bash action hoping it lands: use `make` or `cargo` for
+  same bash action hoping it lands: use `make`, `meson`, or `cargo` for
   builds, or pick one of the typed tools (`read` for a file range,
   `grep` for text search, `find` for filenames, `git` for repo
   history) instead.

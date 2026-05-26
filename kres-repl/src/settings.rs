@@ -29,7 +29,7 @@
 //!      session regardless of what the files say);
 //!   2. project `<cwd>/.kres/settings.json` `actions.allowed` if set;
 //!   3. global `~/.kres/settings.json` `actions.allowed` if set;
-//!   4. `DEFAULT_ALLOWED_ACTIONS` (grep/find/read/git/edit — bash is
+//!   4. `DEFAULT_ALLOWED_ACTIONS` (grep/find/read/git/edit/make/meson/cargo — bash is
 //!      excluded by default because operators report it gets used as
 //!      a general escape hatch for things the typed tools already
 //!      handle).
@@ -55,8 +55,9 @@ use kres_llm::Model;
 /// (`bash sed` for range reads, `bash find` for file locates).
 /// Coding flows that genuinely need `cc && ./repro` can opt in via
 /// `--allow bash` or via settings.actions.allowed.
-pub const DEFAULT_ALLOWED_ACTIONS: &[&str] =
-    &["grep", "find", "read", "git", "edit", "make", "cargo"];
+pub const DEFAULT_ALLOWED_ACTIONS: &[&str] = &[
+    "grep", "find", "read", "git", "edit", "make", "meson", "cargo",
+];
 
 /// Every action type the main agent might emit. Used for typo
 /// detection when an operator writes `--allow bsah` or sticks
@@ -68,7 +69,7 @@ pub const DEFAULT_ALLOWED_ACTIONS: &[&str] =
 /// actions are gated by mcp.json server registration, not this
 /// list), so including it here is effectively documentation.
 pub const KNOWN_ACTION_TYPES: &[&str] = &[
-    "grep", "find", "read", "git", "edit", "bash", "make", "cargo", "mcp",
+    "grep", "find", "read", "git", "edit", "bash", "make", "meson", "cargo", "mcp",
 ];
 
 #[derive(Debug, Clone, Deserialize, Default)]

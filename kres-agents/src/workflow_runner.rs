@@ -99,6 +99,7 @@
 //!
 //! - `{type: "git", name: "<args>"}` → `git <args>` in the workspace
 //! - `{type: "make", name: "<args>"}` → `make <args>` in the workspace
+//! - `{type: "meson", name: "<args>"}` → `meson <args>` in the workspace
 //! - `{type: "publish-fix", args: {finding_dir}}` → write the patch
 //! - `{type: "commit-fix", args: {...}}` → add + commit/amend the fix
 //! - `{type: "set-finding-status", args: {...}}` → mark a finding status
@@ -106,6 +107,7 @@
 //! Failures abort the workflow (the executor records the error and
 //! moves to `WorkflowStatus::Failure`).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -258,6 +260,16 @@ pub struct LlmDriver {
     shutdown: kres_core::Shutdown,
 }
 
+fn append_skill_block(block: &mut String, label: &str, body: &str) {
+    block.push_str(&format!("\n--- SKILL: {label} ---\n"));
+    block.push_str(body.trim_end());
+    block.push('\n');
+}
+
+fn skill_key(name: &str) -> String {
+    name.strip_suffix(".md").unwrap_or(name).to_string()
+}
+
 impl LlmDriver {
     pub fn new(workspace: PathBuf, workflow: Workflow) -> Self {
         Self {
@@ -330,7 +342,9 @@ impl LlmDriver {
 
     /// Eagerly load every skill named in `workflow.skills` from
     /// `skills_dir/<name>` and prepend the concatenated bodies to
-    /// every step's prompt as a `--- SKILLS ---` block.
+    /// every step's prompt as a `--- SKILLS ---` block. The special
+    /// name `auto` expands through workspace detection, selecting the
+    /// automatic knowledge skills for the current codebase.
     ///
     /// Missing skill files are reported and the rest still load —
     /// a missing kernel.md doesn't kill the run, the operator
@@ -338,13 +352,46 @@ impl LlmDriver {
     pub fn with_skills_dir(mut self, skills_dir: &Path) -> Result<(Self, Vec<String>)> {
         let mut warnings = Vec::new();
         let mut block = String::new();
+        let mut loaded = BTreeSet::new();
+        let auto_skills = if self.workflow.skills.iter().any(|name| name == "auto") {
+            let profile = crate::detect_workspace(&self.workspace);
+            let (skills, auto_warnings) =
+                crate::Skills::load_auto_for_workspace(skills_dir, &profile)?;
+            warnings.extend(auto_warnings);
+            Some(
+                skills
+                    .auto_loaded()
+                    .into_iter()
+                    .map(|skill| {
+                        (
+                            format!("{}.md", skill.name),
+                            skill.name.clone(),
+                            skill.content.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         for name in &self.workflow.skills {
+            if name == "auto" {
+                if let Some(auto_skills) = auto_skills.as_ref() {
+                    for (label, key, body) in auto_skills {
+                        if !loaded.insert(key.clone()) {
+                            continue;
+                        }
+                        append_skill_block(&mut block, label, body);
+                    }
+                }
+                continue;
+            }
             let p = skills_dir.join(name);
             match std::fs::read_to_string(&p) {
                 Ok(body) => {
-                    block.push_str(&format!("\n--- SKILL: {name} ---\n"));
-                    block.push_str(body.trim_end());
-                    block.push('\n');
+                    if loaded.insert(skill_key(name)) {
+                        append_skill_block(&mut block, name, &body);
+                    }
                 }
                 Err(e) => {
                     warnings.push(format!("skill {} not loaded: {e}", p.display()));
@@ -1066,8 +1113,7 @@ impl LlmDriver {
                     .ok_or_else(|| format!("make step '{}' missing args.target", step.id))?;
                 let target = interpolate(target, &self.workflow, ctx, Some(&step.id))
                     .map_err(|e| format!("make target interpolation: {e}"))?;
-                let targets = expand_build_targets(&self.workspace, &target).await?;
-                run_make_step(&self.workspace, &targets).await
+                run_workspace_build_step(&self.workspace, &target).await
             }
             crate::workflow::ActionType::SetFindingStatus => {
                 let args = action
@@ -1290,6 +1336,11 @@ impl Driver for LlmDriver {
                 crate::workflow::ActionType::Make => {
                     log.push(format!("make {interpolated}"));
                     let out = spawn_in_workspace(&self.workspace, "make", &interpolated).await?;
+                    log.push(format!("  → {out}"));
+                }
+                crate::workflow::ActionType::Meson => {
+                    log.push(format!("meson {interpolated}"));
+                    let out = spawn_in_workspace(&self.workspace, "meson", &interpolated).await?;
                     log.push(format!("  → {out}"));
                 }
                 crate::workflow::ActionType::PublishFix => {
@@ -2678,6 +2729,19 @@ impl BuildTargets {
     }
 }
 
+async fn run_workspace_build_step(
+    workspace: &Path,
+    requested: &str,
+) -> Result<Map<String, Value>, String> {
+    match crate::detect_workspace(workspace).build_system {
+        crate::BuildSystem::Meson => run_meson_build_step(workspace, requested).await,
+        crate::BuildSystem::Make | crate::BuildSystem::Unknown => {
+            let targets = expand_build_targets(workspace, requested).await?;
+            run_make_step(workspace, &targets).await
+        }
+    }
+}
+
 async fn run_make_step(
     workspace: &Path,
     build: &BuildTargets,
@@ -2708,16 +2772,9 @@ async fn run_make_step(
         .map(|n| n.get())
         .unwrap_or(1)
         .to_string();
-    let mut cmd = tokio::process::Command::new("make");
-    cmd.current_dir(workspace)
-        .arg(format!("-j{jobs}"))
-        .args(&build.targets)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = tokio::time::timeout(std::time::Duration::from_secs(300), cmd.output())
-        .await
-        .map_err(|_| "make timed out".to_string())?
-        .map_err(|e| format!("make spawn: {e}"))?;
+    let mut args = vec![format!("-j{jobs}")];
+    args.extend(build.targets.clone());
+    let out = run_build_command(workspace, "make", &args).await?;
     let mut map = Map::new();
     map.insert(
         "result".into(),
@@ -2748,6 +2805,79 @@ async fn run_make_step(
         Value::Array(build.skipped.iter().cloned().map(Value::String).collect()),
     );
     Ok(map)
+}
+
+async fn run_meson_build_step(
+    workspace: &Path,
+    requested: &str,
+) -> Result<Map<String, Value>, String> {
+    let command_for_report = if requested.trim().is_empty() {
+        "meson compile -C build".to_string()
+    } else {
+        format!(
+            "meson compile -C build (ignored kernel build target: {})",
+            requested.trim()
+        )
+    };
+    if !workspace.join("build").join("build.ninja").is_file() {
+        let mut map = Map::new();
+        map.insert("result".into(), Value::String("failed".into()));
+        map.insert("build_target".into(), Value::String(command_for_report));
+        map.insert("exit_code".into(), Value::Number(1.into()));
+        map.insert("stdout".into(), Value::String(String::new()));
+        map.insert(
+            "stderr".into(),
+            Value::String(
+                "meson build directory is not configured; run `meson setup build` first"
+                    .to_string(),
+            ),
+        );
+        map.insert("skipped_targets".into(), Value::Array(Vec::new()));
+        return Ok(map);
+    }
+
+    let args = vec!["compile".to_string(), "-C".to_string(), "build".to_string()];
+    let out = run_build_command(workspace, "meson", &args).await?;
+    let mut map = Map::new();
+    map.insert(
+        "result".into(),
+        Value::String(if out.status.success() {
+            "clean".into()
+        } else {
+            "failed".into()
+        }),
+    );
+    map.insert("build_target".into(), Value::String(command_for_report));
+    map.insert(
+        "exit_code".into(),
+        Value::Number(out.status.code().unwrap_or(-1).into()),
+    );
+    map.insert(
+        "stdout".into(),
+        Value::String(tail_lossy(&out.stdout, 16 * 1024)),
+    );
+    map.insert(
+        "stderr".into(),
+        Value::String(tail_lossy(&out.stderr, 16 * 1024)),
+    );
+    map.insert("skipped_targets".into(), Value::Array(Vec::new()));
+    Ok(map)
+}
+
+async fn run_build_command(
+    workspace: &Path,
+    program: &str,
+    args: &[String],
+) -> Result<std::process::Output, String> {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.current_dir(workspace)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    tokio::time::timeout(std::time::Duration::from_secs(300), cmd.output())
+        .await
+        .map_err(|_| format!("{program} timed out"))?
+        .map_err(|e| format!("{program} spawn: {e}"))
 }
 
 async fn expand_build_targets(workspace: &Path, requested: &str) -> Result<BuildTargets, String> {
@@ -3498,7 +3628,11 @@ async fn add_side_effect_outputs(
     code_edits: &[kres_core::CodeEdit],
 ) -> Result<(), String> {
     let changed_files = emitted_code_paths(code_output, code_edits);
-    if step.outputs.contains_key("build_target") && output_string_is_empty(outputs, "build_target")
+    let is_kernel_workspace =
+        crate::detect_workspace(workspace).kind == crate::WorkspaceKind::LinuxKernel;
+    if is_kernel_workspace
+        && step.outputs.contains_key("build_target")
+        && output_string_is_empty(outputs, "build_target")
     {
         outputs.insert(
             "build_target".into(),
@@ -3888,6 +4022,7 @@ fn action_kind_to_type(kind: &str) -> Option<crate::workflow::ActionType> {
         "grep" | "search" => Some(ActionType::Grep),
         "callers" | "callees" => Some(ActionType::Callers),
         "make" => Some(ActionType::Make),
+        "meson" => Some(ActionType::Meson),
         "edit" => Some(ActionType::Edit),
         "bash" => Some(ActionType::Bash),
         "lore" => Some(ActionType::Lore),
@@ -5866,6 +6001,31 @@ mod tests {
             .contains("skipped disabled Kconfig target"));
     }
 
+    #[tokio::test]
+    async fn workspace_build_uses_meson_for_systemd_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("meson.build"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/systemd")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("units")).unwrap();
+
+        let out = run_workspace_build_step(tmp.path(), "src/core/main.o")
+            .await
+            .unwrap();
+
+        assert_eq!(out.get("result"), Some(&json!("failed")));
+        assert_eq!(
+            out.get("build_target"),
+            Some(&json!(
+                "meson compile -C build (ignored kernel build target: src/core/main.o)"
+            ))
+        );
+        assert!(out
+            .get("stderr")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("meson build directory is not configured"));
+    }
+
     #[test]
     fn mutating_git_followups_are_rejected() {
         assert!(is_mutating_git_followup("add drivers/example/example.c"));
@@ -6321,6 +6481,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn side_effect_outputs_derive_build_target_only_for_kernel_workspace() {
+        let workflow = fix_workflow();
+        let mut step = workflow
+            .steps
+            .iter()
+            .find(|s| s.id == "write-patch")
+            .unwrap()
+            .clone();
+        step.outputs = Map::from_iter([("build_target".to_string(), json!({"type": "string"}))]);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("meson.build"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/systemd")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("units")).unwrap();
+        let ctx_steps = HashMap::new();
+        let ctx_inputs = Map::new();
+        let ctx = ExecContext {
+            workflow_inputs: &ctx_inputs,
+            steps: &ctx_steps,
+        };
+        let mut outputs = Map::new();
+        outputs.insert("build_target".into(), Value::String(String::new()));
+        let edits = vec![kres_core::CodeEdit {
+            file_path: "src/core/main.c".into(),
+            old_string: "old".into(),
+            new_string: "new".into(),
+            replace_all: false,
+        }];
+
+        add_side_effect_outputs(&step, &mut outputs, tmp.path(), &ctx, &[], &edits)
+            .await
+            .unwrap();
+
+        assert_eq!(outputs.get("build_target"), Some(&json!("")));
+    }
+
+    #[tokio::test]
+    async fn side_effect_outputs_derive_build_target_for_kernel_workspace() {
+        let workflow = fix_workflow();
+        let mut step = workflow
+            .steps
+            .iter()
+            .find(|s| s.id == "write-patch")
+            .unwrap()
+            .clone();
+        step.outputs = Map::from_iter([("build_target".to_string(), json!({"type": "string"}))]);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Kconfig"), "").unwrap();
+        std::fs::write(tmp.path().join("Kbuild"), "").unwrap();
+        std::fs::write(tmp.path().join("Makefile"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("include/linux")).unwrap();
+        let ctx_steps = HashMap::new();
+        let ctx_inputs = Map::new();
+        let ctx = ExecContext {
+            workflow_inputs: &ctx_inputs,
+            steps: &ctx_steps,
+        };
+        let mut outputs = Map::new();
+        outputs.insert("build_target".into(), Value::String(String::new()));
+        let edits = vec![kres_core::CodeEdit {
+            file_path: "drivers/example/example.c".into(),
+            old_string: "old".into(),
+            new_string: "new".into(),
+            replace_all: false,
+        }];
+
+        add_side_effect_outputs(&step, &mut outputs, tmp.path(), &ctx, &[], &edits)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outputs.get("build_target"),
+            Some(&json!("drivers/example/example.o"))
+        );
+    }
+
     #[test]
     fn apply_code_edits_rejects_empty_old_string() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6372,6 +6608,38 @@ mod tests {
         assert!(driver.skills_block.contains("--- SKILL: kernel.md ---"));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("missing.md"));
+    }
+
+    #[test]
+    fn with_skills_dir_auto_loads_detected_workspace_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("meson.build"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/systemd")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("units")).unwrap();
+        std::fs::write(
+            tmp.path().join("kernel.md"),
+            "---\nname: kernel\ninvocation_policy: automatic\n---\nkernel skill body",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("systemd.md"),
+            "---\nname: systemd\ninvocation_policy: automatic\n---\nsystemd skill body",
+        )
+        .unwrap();
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "skills-auto-test",
+            "skills": ["auto"],
+            "steps": [{"id": "s", "agent": "fast", "prompt": "p"}]
+        });
+        let wf = crate::workflow::parse_workflow(&wf_json.to_string()).unwrap();
+        let driver = LlmDriver::new(tmp.path().to_path_buf(), wf);
+        let (driver, warnings) = driver.with_skills_dir(tmp.path()).unwrap();
+
+        assert!(driver.skills_block.contains("systemd skill body"));
+        assert!(driver.skills_block.contains("--- SKILL: systemd.md ---"));
+        assert!(!driver.skills_block.contains("kernel skill body"));
+        assert!(warnings.is_empty());
     }
 
     #[tokio::test]

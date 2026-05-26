@@ -31,6 +31,7 @@ pub mod user_commands;
 pub mod workflow;
 pub mod workflow_exec;
 pub mod workflow_runner;
+pub mod workspace;
 
 pub use config::{AgentConfig, AgentKind};
 pub use consolidate::{consolidate_lenses, ConsolidatedTask, LensOutput};
@@ -57,3 +58,4 @@ pub use todo_agent::{
     dedup_tokens, extract_citations, parse_todo_response, update_todo_via_agent,
     update_todo_via_agent_with_logger, TodoAgentInputs, TodoClient, TodoUpdate,
 };
+pub use workspace::{detect_workspace, BuildSystem, WorkspaceKind, WorkspaceProfile};

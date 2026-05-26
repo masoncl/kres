@@ -315,7 +315,8 @@ workflow invariants. Keep this section short and update
   reaper paths. Restarting kres or `/clear` drops the grants.
 
 ### Skills
-- Loaded from `~/.kres/skills/*.md` at startup
+- Scanned from `~/.kres/skills/*.md` at startup; automatic skills are
+  selected by workspace detection (currently kernel and systemd)
 - Skill files scanned for absolute paths in backticks — referenced files pre-loaded
 - Full skill content + pre-loaded files sent to code agent as `skills` field in JSON
 - Code agent can request additional files via `skill_reads` in response

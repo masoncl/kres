@@ -72,7 +72,7 @@
     }
   },
   "skills": [
-    "kernel.md"
+    "auto"
   ],
   "globals": {
     "review_intro": "Find every concrete correctness bug you can involving the target. Focus on bugs that can be triggered by using that target, including chains of events that pass through unchanged callers, callees, callbacks, helpers, and setup/registration code. Do not stop after the first issue. Each lens must exhaustively enumerate its own class of defects: list every distinct defect or strong suspect it can support, and keep driving followups when more source/type/history/callers/API context would materially improve confidence. Do not report style issues or vague design concerns as findings. Missing context is not itself a finding, but it is normal review frontier: emit typed followups for the exact evidence needed. A concrete unresolved suspicion is not a clean result: either prove it as a Finding, keep it as a strong-suspect Finding with open_questions and matching followups, disprove it in analysis with cited evidence, or emit a followup for the missing source/type/history needed. A clean result is valid only when the lens is confident no bugs of its class remain in scope for this target.",

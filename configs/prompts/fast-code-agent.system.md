@@ -66,17 +66,19 @@ Followup types:
 - "file" — find files. name = glob.
 - "read" — file range. name = "file.c:100+50".
 - "git" — readonly git command. name = command string.
+- "make" / "meson" / "cargo" — run that build tool from the
+  workspace root. name = args after the tool.
 - "bash" — run a shell command via `bash -c`. name = the command
   string. Optional `timeout_secs` (default 60, cap 600) and `cwd`
   (workspace-relative). Primarily used by coding tasks to compile
   and run emitted source; prefer `grep`/`read`/`git` for lookups.
 - "question" — free-form. name = question text.
 
-CODING-MODE BUILD TASKS — when the Current task is a `make` or
-`cargo` build in a coding-mode session (the accumulated preamble
-mentions a fix flow or commit), also fetch `git diff HEAD~1` before
-setting ready_for_slow, regardless of whether the build succeeded or
-failed. The slow agent needs the diff to run its review step.
+CODING-MODE BUILD TASKS — when the Current task is a `make`,
+`meson`, or `cargo` build in a coding-mode session (the accumulated
+preamble mentions a fix flow or commit), also fetch `git diff HEAD~1`
+before setting ready_for_slow, regardless of whether the build
+succeeded or failed. The slow agent needs the diff to run its review step.
 Without it, the slow agent cannot review the patch and the fix loop
 stalls.
 

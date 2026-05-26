@@ -43,8 +43,9 @@ use crate::{
         append_context, append_symbol, parse_semcode_symbol, propagate_tool_result, tool_source,
     },
     tools::{
-        bash_run, edit_file, find, git, grep, read_file_range, truncate_output, BashArgs, EditArgs,
-        FindArgs, GitArgs, GrepArgs, ReadArgs, TOOL_OUTPUT_CAP_GREP_FIND, TOOL_OUTPUT_CAP_MCP,
+        bash_run, cargo_run, edit_file, find, git, grep, make_run, meson_run, read_file_range,
+        truncate_output, BashArgs, EditArgs, FindArgs, GitArgs, GrepArgs, ReadArgs,
+        TOOL_OUTPUT_CAP_GREP_FIND, TOOL_OUTPUT_CAP_MCP,
     },
 };
 
@@ -704,14 +705,11 @@ async fn dispatch_non_mcp(
                 Err(e) => (format!("[error] {e}"), None),
             }
         }
-        "make" | "cargo" => {
-            // Both "make" and "cargo" are thin wrappers over bash_run
-            // that prepend the binary name. They exist as first-class
-            // action types so coding flows can compile without
-            // requiring `--allow bash`. Anything else (env vars, sudo,
-            // pipes, redirects) belongs in `bash` which the operator
-            // must opt into separately.
-            let tool = ty;
+        "make" | "meson" | "cargo" => {
+            // Compile-style actions are argv-dispatched typed tools,
+            // not bash snippets. Anything needing env vars, pipes, or
+            // redirects belongs in `bash`, which the operator must opt
+            // into separately.
             let command = action
                 .get("command")
                 .or_else(|| action.get("cmd"))
@@ -724,12 +722,13 @@ async fn dispatch_non_mcp(
                 .or_else(|| action.get("timeout"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(300);
-            let args = BashArgs {
-                command: format!("{tool} {command}"),
-                timeout_secs: Some(timeout_secs),
-                cwd: None,
+            let result = match ty {
+                "make" => make_run(workspace, &command, Some(timeout_secs)).await,
+                "meson" => meson_run(workspace, &command, Some(timeout_secs)).await,
+                "cargo" => cargo_run(workspace, &command, Some(timeout_secs)).await,
+                _ => unreachable!("compile action arm only matches make/meson/cargo"),
             };
-            match bash_run(workspace, &args).await {
+            match result {
                 Ok(t) => (t, None),
                 Err(e) => (format!("[error] {e}"), None),
             }

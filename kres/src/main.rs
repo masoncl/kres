@@ -1341,23 +1341,34 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             let clients: Vec<_> = spawned_mcp.values().cloned().collect();
             session.register_mcp_clients(clients).await;
         }
+        let workspace_profile = kres_agents::detect_workspace(&workspace);
+        kres_core::async_eprintln!(
+            "workspace: detected {} tree, build={}",
+            workspace_profile.kind.as_str(),
+            workspace_profile.build_system.as_str()
+        );
         let skills_value = match skills_dir.as_ref() {
-            Some(dir) => match kres_agents::Skills::load_dir(dir) {
-                Ok(s) => {
-                    let auto = s.auto_loaded();
-                    kres_core::async_eprintln!(
-                        "skills: loaded {} total, {} auto-invoked from {}",
-                        s.items.len(),
-                        auto.len(),
-                        dir.display()
-                    );
-                    Some(s.to_prompt_value(&auto))
+            Some(dir) => {
+                match kres_agents::Skills::load_auto_for_workspace(dir, &workspace_profile) {
+                    Ok((s, warnings)) => {
+                        for w in &warnings {
+                            kres_core::async_eprintln!("skills: {w}");
+                        }
+                        let auto = s.auto_loaded();
+                        kres_core::async_eprintln!(
+                            "skills: loaded {} workspace skill(s), {} auto-invoked from {}",
+                            s.items.len(),
+                            auto.len(),
+                            dir.display()
+                        );
+                        Some(s.to_prompt_value(&auto))
+                    }
+                    Err(e) => {
+                        kres_core::async_eprintln!("skills: load failed: {e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    kres_core::async_eprintln!("skills: load failed: {e}");
-                    None
-                }
-            },
+            }
             None => None,
         };
         let built = build_agent_runner(

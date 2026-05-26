@@ -121,14 +121,14 @@
     }
   },
   "skills": [
-    "kernel.md"
+    "auto"
   ],
   "globals": {
     "commit_message_style": {
       "include": "@configs/prompts/commit-kernel-template.md",
       "header": "COMMIT MESSAGE STYLE"
     },
-    "output_rules": "Never paste a unified diff or .patch as code_output content. Edits go through code_edits (or code_output rewriting the same file). Diffs are produced by `git diff HEAD~1` after the commit lands. Deterministic workflow steps own git add, git commit, git commit --amend, make, and publish; do not emit mutating git/make/publish followups from LLM steps. Keep analysis tight; the artifacts are the diff and the commit message.",
+    "output_rules": "Never paste a unified diff or .patch as code_output content. Edits go through code_edits (or code_output rewriting the same file). Diffs are produced by `git diff HEAD~1` after the commit lands. Deterministic workflow steps own git add, git commit, git commit --amend, workspace build, and publish; do not emit mutating git/build/publish followups from LLM steps. Keep analysis tight; the artifacts are the diff and the commit message.",
     "self_fix_trap": "Once code_edits or a git commit have landed, the files on disk contain YOUR work. Reading them back and seeing the fix in place is not evidence of upstream prior art. [INVALID] requires a file:line or commit ref that existed BEFORE this run started."
   },
   "defaults": {
@@ -672,18 +672,20 @@
         "their own write/build/review/publish budgets. Each code_edits item must use this shape:",
         "{\"file_path\": \"path/to/file.c\", \"old_string\": \"...\", \"new_string\": \"...\"}. Do not use",
         "source-symbol field names such as `filename` in code_edits. Do not write",
-        ".kres-commit-msg.tmp here. Do not run git commit. If you know the primary object file,",
-        "return it as build_target. Otherwise the runner derives it from the changed .c/.S paths.",
-        "For header-only, documentation-only, Kconfig-only, or other non-object changes, leave",
-        "build_target empty; the deterministic build step will skip cleanly when no enabled",
+        ".kres-commit-msg.tmp here. Do not run git commit. In kernel workspaces, if you know",
+        "the primary object file, return it as build_target; otherwise the runner derives it from",
+        "the changed .c/.S paths. In non-kernel workspaces, leave build_target empty so the",
+        "workspace build step uses that project's normal build command.",
+        "For header-only, documentation-only, Kconfig-only, or other non-object kernel changes,",
+        "leave build_target empty; the deterministic build step will skip cleanly when no enabled",
         "object target can be derived from the actual git diff.",
-        "The reaper will add all other changed .c objects from the actual git diff and skip targets",
-        "disabled by the current Kconfig."
+        "In kernel workspaces, the reaper will add all other changed .c objects from the actual",
+        "git diff and skip targets disabled by the current Kconfig."
       ],
       "outputs": {
         "build_target": {
           "type": "string",
-          "description": "Object file path for the make step, e.g. path/to/file.o. Machine-filled from changed source paths when omitted."
+          "description": "Kernel object file path for the make step, e.g. path/to/file.o. Leave empty outside kernel workspaces. Machine-filled from changed kernel source paths when omitted."
         },
         "changed_files": {
           "type": "array<string>",
@@ -1029,7 +1031,7 @@
       "prompt": [
         "Step 7: COMPILE TRIAGE ONLY.",
         "",
-        "The deterministic build step failed for `make -j$(nproc) {{build.build_target}}`.",
+        "The deterministic workspace build step failed for `{{build.build_target}}`.",
         "",
         "STDOUT:",
         "{{build.stdout}}",
@@ -1038,10 +1040,10 @@
         "{{build.stderr}}",
         "",
         "Your ONLY job is to classify the failure. Inspect git diff HEAD~1 and relevant",
-        "Kbuild/.config context before blaming the patch.",
+        "workspace build/configuration context before blaming the patch.",
         "",
         "- result=patch_error only when the compiler error is caused by the actual patch hunks in git diff HEAD~1.",
-        "- result=preexisting_error when the failure is environmental, pre-existing, unrelated Kconfig fallout, or from forcing a target that is not enabled by the current .config.",
+        "- result=preexisting_error when the failure is environmental, pre-existing, unrelated workspace configuration fallout, or from forcing a target/build variant that is not enabled by the current workspace configuration.",
         "",
         "Do not emit code_edits. Do not amend commits. Put concise evidence in analysis."
       ],

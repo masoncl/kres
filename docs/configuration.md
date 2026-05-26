@@ -300,3 +300,11 @@ When `--review-prompts` is omitted, `setup.sh` peeks at
 `~/.claude/skills/kernel/SKILL.md` and offers the first
 review-prompts path it finds there. Pass `--review-prompts PATH`
 to bypass the interactive prompt.
+
+## Workspace Skill Detection
+
+kres scans `~/.kres/skills/*.md` at startup, then selects automatic
+knowledge skills from the detected workspace type. Linux kernel trees
+load `kernel.md` and use make-oriented build assumptions; systemd trees
+load `systemd.md` and use meson-oriented build assumptions. Workflow
+JSON can request the same behavior with `"skills": ["auto"]`.

@@ -124,13 +124,15 @@ FOLLOWUPS — same schema the fast agent uses:
   args after `make`; optional `timeout_secs` (default 300, cap
   600). Enabled by default — no `--allow` needed. Use for kernel
   build verification:
-  `{"type": "make", "name": "-j$(nproc) net/ipv4/tcp_ipv4.o"}`.
+  `{"type": "make", "name": "-j8 net/ipv4/tcp_ipv4.o"}`.
+- "meson" — `meson <args>` from the workspace root. Same shape.
+  Use for systemd Meson configure/test/build actions.
 - "cargo" — `cargo <args>` from the workspace root. Same shape.
   `{"type": "cargo", "name": "build -p kres-agents"}`.
 - "bash" — `bash -c <command>` from the workspace root. `name` is
   the command; optional `timeout_secs` (default 60, cap 600) and
   `cwd` (workspace-relative). OFF by default — requires
-  `--allow bash`. Prefer `make` or `cargo` for builds. The output
+  `--allow bash`. Prefer `make`, `meson`, or `cargo` for builds. The output
   you get back looks like
   `[exit 0]\n[stdout]\n...\n[stderr]\n...\n`; use it to decide
   whether the artifact needs another revision.

@@ -400,18 +400,23 @@ fi
 echo "skills:"
 if [[ ! -d "${SKILLS_SRC}" ]]; then
   say "(no skills/ directory in source tree)"
-elif [[ -z "${REVIEW_PROMPTS_PATH}" ]]; then
-  say "kernel skill NOT installed: review-prompts directory could not be located."
-  say "  Provide it with --review-prompts PATH (e.g. /home/you/local/src/review-prompts),"
-  say "  or populate ~/.claude/skills/kernel/SKILL.md with a reference to your"
-  say "  review-prompts tree and re-run setup.sh."
 else
-  say "kernel skill: @REVIEW_PROMPTS@ = ${REVIEW_PROMPTS_PATH} (from ${REVIEW_PROMPTS_SRC})"
+  if [[ -z "${REVIEW_PROMPTS_PATH}" ]]; then
+    say "kernel skill NOT installed: review-prompts directory could not be located."
+    say "  Provide it with --review-prompts PATH (e.g. /home/you/local/src/review-prompts),"
+    say "  or populate ~/.claude/skills/kernel/SKILL.md with a reference to your"
+    say "  review-prompts tree and re-run setup.sh."
+  else
+    say "kernel skill: @REVIEW_PROMPTS@ = ${REVIEW_PROMPTS_PATH} (from ${REVIEW_PROMPTS_SRC})"
+  fi
   shopt -s nullglob
   for s in "${SKILLS_SRC}"/*.md; do
     bn="$(basename "$s")"
     dst="${DEST}/skills/${bn}"
     if [[ "${bn}" == "kernel.md" ]]; then
+      if [[ -z "${REVIEW_PROMPTS_PATH}" ]]; then
+        continue
+      fi
       if [[ -e "${dst}" ]] && [[ "${OVERWRITE}" -ne 1 ]]; then
         say "keep: ${dst}"
         continue

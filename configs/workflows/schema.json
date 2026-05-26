@@ -40,7 +40,7 @@
     "skills": {
       "type": "array",
       "items": {"type": "string"},
-      "description": "Skill files (basenames under ~/.kres/skills/) preloaded for every step's prompt context."
+      "description": "Skill files (basenames under ~/.kres/skills/) preloaded for every step's prompt context. Use \"auto\" to load the detected workspace knowledge skill."
     },
 
     "globals": {
@@ -99,7 +99,7 @@
     },
     "action_value": {
       "type": "string",
-      "enum": ["read", "source", "type", "git", "grep", "callers", "make", "edit", "bash", "lore", "publish-fix", "commit-fix", "set-finding-status", "set-finding-results", "set-finding-bugs"]
+      "enum": ["read", "source", "type", "git", "grep", "callers", "make", "meson", "edit", "bash", "lore", "publish-fix", "commit-fix", "set-finding-status", "set-finding-results", "set-finding-bugs"]
     },
     "action_list": {
       "type": "array",

@@ -44,14 +44,18 @@ Map each followup type to a tool:
   permitted (for folding review fixups into the original commit).
   `push`/`pull`/`fetch` are absent on purpose (the tool is
   workspace-local).
-- "edit" → surgical string-replacement edit to an existing file.
-  Use {"type": "edit", "file_path": "rel/path.c", "old_string": "...",
-  "new_string": "...", "replace_all": false}. Same shape and
-  semantics as Claude Code's Edit primitive: `old_string` is looked
-  up literally; it must appear exactly once unless `replace_all` is
-  true. Writes via tmp+rename for crash safety. Aliases accepted:
-  `path` / `file` for `file_path`. Mainly used by the coding flow
-  to apply fixes in-place.
+- "edit" → surgical string-replacement edit to an existing file,
+  or a new-file create when `old_string` is empty and the target
+  does not yet exist. Use {"type": "edit", "file_path": "rel/path.c",
+  "old_string": "...", "new_string": "...", "replace_all": false}.
+  Same shape and semantics as Claude Code's Edit primitive:
+  `old_string` is looked up literally; it must appear exactly once
+  unless `replace_all` is true. Empty `old_string` against a missing
+  file creates that file (and any missing parent directories) with
+  `new_string` as its body; against an existing file the empty form
+  is rejected. Writes via tmp+rename for crash safety. Aliases
+  accepted: `path` / `file` for `file_path`. Mainly used by the
+  coding flow to apply fixes in-place.
 - "make" → run `make <args>` from the workspace root. Use
   {"type": "make", "command": "-j8 net/ipv4/tcp_ipv4.o",
   "timeout_secs": 300}. `command` is the args after `make`; `cmd`

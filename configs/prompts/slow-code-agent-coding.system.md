@@ -74,6 +74,8 @@ PLAN REWRITE — optional top-level `plan` field:
 
 CodeEdit shape (same as Claude Code's Edit): `{file_path, old_string, new_string, replace_all?}`. Leave `replace_all` off (defaults to false) and `old_string` must match exactly once. `old_string` and `new_string` are VERBATIM byte sequences; include enough surrounding context to make `old_string` unique in the file.
 
+Create-new-file shape: when `file_path` does not yet exist, emit `old_string: ""` and put the full file body in `new_string`. The runner creates the file (and any missing parent directories) with that body. This form is rejected when the file already exists — anchor an in-place edit with a non-empty `old_string` instead, or rewrite the whole file via `code_output`. In one batch, only one create-edit per path is allowed; follow-up edits to the just-created file must use a non-empty `old_string` anchored on content from the create-edit's `new_string`.
+
 Multi-edit ordering contract: entries in `code_edits` apply IN ORDER,
 each against the file's state AFTER prior entries in the same batch
 have landed. If two edits touch the same file, the second one's

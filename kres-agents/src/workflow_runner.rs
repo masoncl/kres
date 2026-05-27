@@ -4304,8 +4304,16 @@ pub fn persist_code_output(
 }
 
 /// Apply a list of CodeEdit entries as string-replacement edits
-/// against existing files in the workspace. Edits are staged in memory
-/// first; if any edit fails to match, no file is written.
+/// against files in the workspace. Edits are staged in memory first;
+/// if any edit fails to match, no file is written.
+///
+/// An edit with an empty `old_string` creates a new file whose body is
+/// `new_string`. This is allowed only when the target does not yet
+/// exist and no prior staged edit has produced content for the same
+/// path — both conditions prevent silently inserting at position 0 of
+/// an existing or already-being-edited file. Use a non-empty
+/// `old_string` to anchor an in-place edit, or `code_output` to
+/// overwrite a file wholesale.
 pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Result<Vec<PathBuf>> {
     use std::collections::BTreeMap;
 
@@ -4315,13 +4323,28 @@ pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Resu
         if e.file_path.trim().is_empty() {
             return Err(anyhow!("code_edit has empty file_path"));
         }
-        if e.old_string.is_empty() {
-            return Err(anyhow!(
-                "code_edit for {} has empty old_string — refuse to apply",
-                e.file_path
-            ));
-        }
         let target = resolve_workspace_path(workspace, &e.file_path)?;
+        if e.old_string.is_empty() {
+            // Create-new-file gesture. Reject when the file already
+            // exists or when a prior edit in this batch has already
+            // staged content for the same path — otherwise the empty
+            // anchor would silently overwrite that work.
+            if staged.contains_key(&target) {
+                return Err(anyhow!(
+                    "code_edit for {} has empty old_string but a prior edit in this batch already staged content for the same path; only one create-file edit per path, anchor follow-ups with a non-empty old_string",
+                    e.file_path
+                ));
+            }
+            if target.exists() {
+                return Err(anyhow!(
+                    "code_edit for {} has empty old_string but the file already exists; supply a non-empty old_string to anchor an in-place edit, or use code_output to overwrite the whole file",
+                    e.file_path
+                ));
+            }
+            staged.insert(target.clone(), e.new_string.clone());
+            touched.push(target);
+            continue;
+        }
         let body = match staged.get(&target) {
             Some(body) => body.clone(),
             None => std::fs::read_to_string(&target)
@@ -4354,6 +4377,13 @@ pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Resu
         touched.push(target);
     }
     for (target, body) in staged {
+        // mkdir -p the parent so create-new-file edits for paths under
+        // a not-yet-existing subdir work the same way as code_output
+        // (persist_code_output, this file).
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir -p {}", parent.display()))?;
+        }
         std::fs::write(&target, body).with_context(|| format!("write {}", target.display()))?;
     }
     Ok(touched)
@@ -6558,7 +6588,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_code_edits_rejects_empty_old_string() {
+    fn apply_code_edits_rejects_empty_old_string_when_file_exists() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.c"), "anything").unwrap();
         let edits = vec![kres_core::CodeEdit {
@@ -6571,6 +6601,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty old_string"), "got: {err}");
+        assert!(err.contains("file already exists"), "got: {err}");
+        // Confirm the file body is untouched (atomic on rejection).
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.c")).unwrap(),
+            "anything"
+        );
+    }
+
+    /// Regression for the cg_kill_unbounded_retry_pid1_dos fix run:
+    /// the slow agent wrote `code_edits: [{file_path: "...", old_string:
+    /// "", new_string: "<body>"}]` to create a brand-new test file.
+    /// apply_code_edits used to reject the empty old_string outright,
+    /// which surfaced to the orchestrator as code_changes_emitted=false
+    /// across five attempts and triggered exit-failure. The empty
+    /// anchor is now the documented create-file gesture when the
+    /// target doesn't exist.
+    #[test]
+    fn apply_code_edits_creates_new_file_with_empty_old_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edits = vec![kres_core::CodeEdit {
+            file_path: "test/new-file.c".into(),
+            old_string: "".into(),
+            new_string: "int main(void) { return 0; }\n".into(),
+            replace_all: false,
+        }];
+        let touched = apply_code_edits(tmp.path(), &edits).unwrap();
+        assert_eq!(touched, vec![tmp.path().join("test/new-file.c")]);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("test/new-file.c")).unwrap(),
+            "int main(void) { return 0; }\n"
+        );
+    }
+
+    #[test]
+    fn apply_code_edits_rejects_two_create_edits_for_same_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edits = vec![
+            kres_core::CodeEdit {
+                file_path: "new.c".into(),
+                old_string: "".into(),
+                new_string: "first\n".into(),
+                replace_all: false,
+            },
+            kres_core::CodeEdit {
+                file_path: "new.c".into(),
+                old_string: "".into(),
+                new_string: "second\n".into(),
+                replace_all: false,
+            },
+        ];
+        let err = apply_code_edits(tmp.path(), &edits)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prior edit"), "got: {err}");
+        // Nothing was written (atomic on rejection).
+        assert!(!tmp.path().join("new.c").exists());
+    }
+
+    /// Create-then-anchor: a follow-up edit can refine a file the same
+    /// batch just created, as long as it uses a non-empty old_string
+    /// taken from the prior edit's body.
+    #[test]
+    fn apply_code_edits_create_then_anchor_in_same_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edits = vec![
+            kres_core::CodeEdit {
+                file_path: "new.c".into(),
+                old_string: "".into(),
+                new_string: "int x = 1;\nint y = 2;\n".into(),
+                replace_all: false,
+            },
+            kres_core::CodeEdit {
+                file_path: "new.c".into(),
+                old_string: "int x = 1;".into(),
+                new_string: "int x = 42;".into(),
+                replace_all: false,
+            },
+        ];
+        apply_code_edits(tmp.path(), &edits).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("new.c")).unwrap(),
+            "int x = 42;\nint y = 2;\n"
+        );
     }
 
     #[test]

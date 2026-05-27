@@ -531,9 +531,57 @@ pub struct EditArgs {
 const EDIT_PREVIEW_LINES: usize = 5;
 
 pub async fn edit_file(workspace: &Path, args: &EditArgs) -> Result<String, AgentError> {
+    let abs = resolve_workspace(workspace, &args.file_path)?;
     if args.old_string.is_empty() {
-        return Err(AgentError::Other(
-            "edit: old_string is empty — refusing to insert new_string at position 0; use a read+full-file-rewrite instead".into(),
+        // Create-new-file gesture: matches apply_code_edits in
+        // workflow_runner.rs. Allowed only when the target doesn't
+        // yet exist, to prevent silent insert-at-0 of a file already
+        // on disk. Empty new_string is rejected as a no-op even in
+        // the create case — `touch` isn't a valid edit intent.
+        if args.new_string.is_empty() {
+            return Err(AgentError::Other(
+                "edit: both old_string and new_string are empty — nothing to do".into(),
+            ));
+        }
+        if abs.exists() {
+            return Err(AgentError::Other(format!(
+                "edit: old_string is empty but {} already exists; supply a non-empty old_string to anchor an in-place edit, or rewrite the file wholesale via code_output",
+                abs.display()
+            )));
+        }
+        if let Some(parent) = abs.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                AgentError::Other(format!("edit: mkdir -p {}: {e}", parent.display()))
+            })?;
+        }
+        let tmp = abs.with_extension(format!(
+            "{}.kres-edit.tmp",
+            abs.extension().and_then(|e| e.to_str()).unwrap_or("")
+        ));
+        {
+            use tokio::io::AsyncWriteExt as _;
+            let mut f = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|e| AgentError::Other(format!("edit: create {}: {e}", tmp.display())))?;
+            f.write_all(args.new_string.as_bytes())
+                .await
+                .map_err(|e| AgentError::Other(format!("edit: write {}: {e}", tmp.display())))?;
+            f.sync_all()
+                .await
+                .map_err(|e| AgentError::Other(format!("edit: fsync {}: {e}", tmp.display())))?;
+        }
+        tokio::fs::rename(&tmp, &abs).await.map_err(|e| {
+            AgentError::Other(format!(
+                "edit: rename {} -> {}: {e}",
+                tmp.display(),
+                abs.display()
+            ))
+        })?;
+        let preview = build_edit_preview(&args.new_string, &args.new_string, EDIT_PREVIEW_LINES);
+        return Ok(format!(
+            "[edit {}] created ({}c)\n{preview}",
+            abs.display(),
+            args.new_string.len()
         ));
     }
     if args.old_string == args.new_string {
@@ -541,7 +589,6 @@ pub async fn edit_file(workspace: &Path, args: &EditArgs) -> Result<String, Agen
             "edit: old_string == new_string — nothing to do".into(),
         ));
     }
-    let abs = resolve_workspace(workspace, &args.file_path)?;
     let original = tokio::fs::read_to_string(&abs)
         .await
         .map_err(|e| AgentError::Other(format!("edit: read {}: {e}", abs.display())))?;
@@ -768,17 +815,23 @@ fn shell_split(s: &str) -> Option<Vec<String>> {
 /// matching how other tool errors surface in the fetcher.
 fn resolve_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, AgentError> {
     let p = Path::new(rel);
-    let joined = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        workspace.join(p)
-    };
-    // Canonicalize to dissolve `..` / symlinks. Canonicalize fails
-    // when the target doesn't exist, so fall back to a textual check
-    // against the canonical workspace.
+    // Canonicalize the workspace up-front so any relative workspace
+    // (e.g. the default `--workspace .`, or `--workspace work/foo`)
+    // resolves to an absolute base before we join `rel` onto it.
+    // Joining onto a raw `.` makes `joined = "./foo"`; when the leaf
+    // doesn't exist canonicalize fails, the lex fallback below strips
+    // the `./` to a bare relative `foo`, and starts_with(ws_canon)
+    // returns false because ws_canon is absolute — so a read or grep
+    // for a not-yet-existing leaf would falsely report a workspace
+    // escape.
     let ws_canon = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        ws_canon.join(p)
+    };
     // Outside-workspace paths are accepted when the operator
     // mentioned the containing directory in a prompt this session.
     // The ConsentStore is populated by submit_prompt via
@@ -1054,7 +1107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_rejects_empty_old_and_identity() {
+    async fn edit_rejects_empty_old_when_file_exists_and_identity_edit() {
         let dir = tmpdir("edit-empty");
         let path = dir.join("foo.c");
         std::fs::write(&path, "some body\n").unwrap();
@@ -1064,7 +1117,8 @@ mod tests {
             new_string: "x".into(),
             replace_all: false,
         };
-        assert!(edit_file(&dir, &empty_old).await.is_err());
+        let err = edit_file(&dir, &empty_old).await.unwrap_err().to_string();
+        assert!(err.contains("already exists"), "got: {err}");
         let identity = EditArgs {
             file_path: "foo.c".into(),
             old_string: "some body".into(),
@@ -1072,8 +1126,41 @@ mod tests {
             replace_all: false,
         };
         assert!(edit_file(&dir, &identity).await.is_err());
-        // File untouched.
+        // File untouched on both rejections.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "some body\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_creates_new_file_with_empty_old_string() {
+        let dir = tmpdir("edit-create");
+        let args = EditArgs {
+            file_path: "sub/new.c".into(),
+            old_string: String::new(),
+            new_string: "int main(void) { return 0; }\n".into(),
+            replace_all: false,
+        };
+        let msg = edit_file(&dir, &args).await.unwrap();
+        assert!(msg.contains("created"), "got: {msg}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/new.c")).unwrap(),
+            "int main(void) { return 0; }\n"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_both_empty_as_noop() {
+        let dir = tmpdir("edit-both-empty");
+        let args = EditArgs {
+            file_path: "would-be-empty.c".into(),
+            old_string: String::new(),
+            new_string: String::new(),
+            replace_all: false,
+        };
+        let err = edit_file(&dir, &args).await.unwrap_err().to_string();
+        assert!(err.contains("nothing to do"), "got: {err}");
+        assert!(!dir.join("would-be-empty.c").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1275,6 +1362,60 @@ mod tests {
         }
         std::fs::remove_dir_all(&workspace).ok();
         std::fs::remove_dir_all(&outside_dir).ok();
+    }
+
+    /// CWD is process-global. Serialize tests that mutate it so they
+    /// don't race with each other under cargo's default parallel test
+    /// runner. Other tests in this crate use absolute tmpdirs and
+    /// don't read CWD, so they're unaffected.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores CWD on drop so an assertion panic doesn't strand the
+    /// test process in a tmpdir that subsequent tests can't find.
+    struct CwdGuard {
+        prev: PathBuf,
+    }
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
+    /// Regression: when kres is invoked with `--workspace .` (the
+    /// default), a relative read of a not-yet-existing file under that
+    /// workspace must not be reported as "escapes workspace". The
+    /// pre-fix lex fallback joined `./test/foo.c` onto a raw "."
+    /// workspace, normalised the result to `test/foo.c`, then failed
+    /// starts_with against the canonical workspace — surfacing an
+    /// escape error for a path plainly inside the tree. This blocked
+    /// the cg_kill_unbounded_retry_pid1_dos fix run end-to-end.
+    #[test]
+    fn read_relative_workspace_reports_missing_file_not_escape() {
+        let _serial = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let workspace = tmpdir("read-rel-ws-missing");
+        let _cwd = CwdGuard {
+            prev: std::env::current_dir().unwrap(),
+        };
+        std::env::set_current_dir(&workspace).unwrap();
+        let args = ReadArgs {
+            file: "test/not-yet-created.c".into(),
+            line: None,
+            count: None,
+            end_line: None,
+        };
+        let res = read_file_range(Path::new("."), &args);
+        match res {
+            Err(AgentError::Other(m)) => {
+                assert!(
+                    !m.contains("escapes workspace"),
+                    "must not misreport missing file as escape: {m}"
+                );
+                assert!(m.starts_with("read "), "expected read error, got {m}");
+            }
+            other => panic!("expected NotFound-style read error, got {other:?}"),
+        }
+        drop(_cwd);
+        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]

@@ -584,6 +584,57 @@ fn resolved_agent_model_label(
     kres_repl::pick_model(cfg_model.as_deref(), role, settings).id
 }
 
+fn resolved_model_config_hint(
+    role: kres_repl::ModelRole,
+    settings: &kres_repl::Settings,
+) -> String {
+    match settings.model_for(role) {
+        Some(model_id) => {
+            let expected = kres_config_dirs()
+                .into_iter()
+                .map(|dir| model_config_path(&dir, model_id).display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("model {model_id:?} (expected {expected})")
+        }
+        None => "no model configured in settings.json".to_string(),
+    }
+}
+
+fn validate_prompt_agent_configs(
+    args: &ReplArgs,
+    fast_agent: Option<&PathBuf>,
+    slow_agent: Option<&PathBuf>,
+    settings: &kres_repl::Settings,
+) -> Result<()> {
+    if args.prompt.is_none() || args.resume {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    if fast_agent.is_none() {
+        missing.push(format!(
+            "fast: {}",
+            resolved_model_config_hint(kres_repl::ModelRole::Fast, settings)
+        ));
+    }
+    if slow_agent.is_none() {
+        missing.push(format!(
+            "slow: {}",
+            resolved_model_config_hint(kres_repl::ModelRole::Slow, settings)
+        ));
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow::anyhow!(
+        "--prompt requires fast and slow agent configs; missing {}. \
+         Pass --fast-agent/--slow-agent or configure matching ~/.kres/models/<model-id>.json files.",
+        missing.join("; ")
+    ))
+}
+
 fn agent_kind_for_model_role(role: kres_repl::ModelRole) -> AgentKind {
     match role {
         kres_repl::ModelRole::Fast => AgentKind::Fast,
@@ -992,6 +1043,8 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         eprintln!("--export-index: wrote  = {}", out.display());
         return Ok(());
     }
+
+    validate_prompt_agent_configs(&args, fast_agent.as_ref(), slow_agent.as_ref(), &settings)?;
 
     // --- Announce resolved paths -----------------------------------
     // Buffer these until the REPL output sink is installed. In TUI
@@ -2205,6 +2258,27 @@ mod tests {
         assert!(!bare.repl.one, "--one must default off");
         let with = Cli::try_parse_from(["kres", "--one"]).unwrap();
         assert!(with.repl.one, "--one must parse as a bare bool flag");
+    }
+
+    #[test]
+    fn prompt_requires_resolved_fast_and_slow_agent_configs() {
+        let c = Cli::try_parse_from(["kres", "--prompt", "review: security/security.c"]).unwrap();
+        let mut settings = kres_repl::Settings::default();
+        settings.set_model(
+            kres_repl::ModelRole::Fast,
+            Some("configured-fast".to_string()),
+        );
+        settings.set_model(
+            kres_repl::ModelRole::Slow,
+            Some("configured-slow".to_string()),
+        );
+
+        let fast_agent = PathBuf::from("/tmp/fast.json");
+        let err =
+            validate_prompt_agent_configs(&c.repl, Some(&fast_agent), None, &settings).unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("--prompt requires fast and slow agent configs"));
+        assert!(rendered.contains("slow: model \"configured-slow\""));
     }
 
     #[test]

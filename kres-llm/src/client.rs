@@ -28,6 +28,7 @@ const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_API_VERSION: &str = "2025-04-01-preview";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LlmCredentials {
@@ -151,6 +152,7 @@ impl Client {
             proxy: detect_proxy(),
             no_proxy: false,
             timeout: None,
+            read_timeout: Some(DEFAULT_READ_TIMEOUT),
             user_agent: format!("kres/{}", env!("CARGO_PKG_VERSION")),
             rate_limiter: None,
         }
@@ -1510,6 +1512,7 @@ pub struct ClientBuilder {
     proxy: Option<String>,
     no_proxy: bool,
     timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
     user_agent: String,
     rate_limiter: Option<Arc<RateLimiter>>,
 }
@@ -1540,6 +1543,16 @@ impl ClientBuilder {
         self
     }
 
+    pub fn read_timeout(mut self, t: Duration) -> Self {
+        self.read_timeout = Some(t);
+        self
+    }
+
+    pub fn no_read_timeout(mut self) -> Self {
+        self.read_timeout = None;
+        self
+    }
+
     pub fn rate_limiter(mut self, rl: Option<Arc<RateLimiter>>) -> Self {
         self.rate_limiter = rl;
         self
@@ -1556,6 +1569,9 @@ impl ClientBuilder {
         }
         if let Some(t) = self.timeout {
             b = b.timeout(t);
+        }
+        if let Some(t) = self.read_timeout {
+            b = b.read_timeout(t);
         }
         let http = b.build()?;
         Ok(Client {

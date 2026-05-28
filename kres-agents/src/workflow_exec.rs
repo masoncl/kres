@@ -30,10 +30,13 @@
 //! path   := ident ('.' ident)*
 //! ```
 //!
-//! A bare path (no dots) inside an `eval.expr` resolves against the
-//! current step's outputs (`commit_sha != ''` is shorthand for
-//! `<current step>.commit_sha != ''`). Dotted paths name an explicit
-//! step (`write-patch.attempt`) or `workflow.<input-or-derived-field>`.
+//! A bare path inside an `eval.expr` resolves against the current
+//! step's outputs (`commit_sha != ''` is shorthand for `<current
+//! step>.commit_sha != ''`). Dotted paths that start with a known step
+//! id name that explicit step (`write-patch.attempt`); otherwise they
+//! may walk an object emitted by the current step
+//! (`result.code == 0`). `workflow.<input-or-derived-field>` names
+//! workflow input.
 //!
 //! The two synthetic per-step fields documented in fix.json's
 //! `$format.counters` (`{step}.attempt` and `{step}.eval_failures`)
@@ -3159,10 +3162,17 @@ pub mod expr {
             return super::walk_dotted_path(start, &parts[1..])
                 .map_err(|failing| format!("workflow.{failing} not found"));
         }
-        let st = ctx
-            .steps
-            .get(&parts[0])
-            .ok_or_else(|| format!("step '{}' not in context", parts[0]))?;
+        let Some(st) = ctx.steps.get(&parts[0]) else {
+            if let Some(cur) = current {
+                if let Some(st) = ctx.steps.get(cur) {
+                    if let Some(start) = st.lookup_field(&parts[0]) {
+                        return super::walk_dotted_path(start, &parts[1..])
+                            .map_err(|failing| format!("{}.{} not found", parts[0], failing));
+                    }
+                }
+            }
+            return Err(format!("step '{}' not in context", parts[0]));
+        };
         // A reference to a step's output field returns Null when the
         // field isn't present. This is the difference between a typo
         // (step name unknown → error) and an output that the step
@@ -6522,6 +6532,27 @@ mod tests {
         };
         assert!(expr::eval("clean == true", &ctx, Some("review")).unwrap());
         assert!(!expr::eval("clean == false", &ctx, Some("review")).unwrap());
+    }
+
+    #[test]
+    fn expr_dotted_path_can_walk_current_step_object_output() {
+        let inputs = Map::new();
+        let states = ctx_with(&[(
+            "classify-summary",
+            1,
+            0,
+            json!({"triage_coding": {"schema_version": 1}}),
+        )]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(expr::eval(
+            "triage_coding.schema_version == 1",
+            &ctx,
+            Some("classify-summary")
+        )
+        .unwrap());
     }
 
     #[test]

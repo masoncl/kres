@@ -2,7 +2,7 @@
 //!
 //! The agent-role system prompts (fast-code-agent, main-agent,
 //! slow-code-agent, slow-code-agent-coding, slow-code-agent-generic,
-//! todo-agent) are included via `include_str!` at build time. A
+//! todo-agent, classifier-agent) are included via `include_str!` at build time. A
 //! freshly-rebuilt kres already knows the current prompts — no
 //! `setup.sh --overwrite` dance is needed every time the repo's
 //! prompts change.
@@ -53,6 +53,10 @@ const TABLE: &[(&str, &str)] = &[
     (
         "todo-agent.system.md",
         include_str!("../../configs/prompts/todo-agent.system.md"),
+    ),
+    (
+        "classifier-agent.system.md",
+        include_str!("../../configs/prompts/classifier-agent.system.md"),
     ),
     (
         "condense-task.system.md",
@@ -143,6 +147,7 @@ mod tests {
             "slow-code-agent-coding.system.md",
             "slow-code-agent-generic.system.md",
             "todo-agent.system.md",
+            "classifier-agent.system.md",
             "condense-task.system.md",
         ] {
             assert!(

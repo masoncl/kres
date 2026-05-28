@@ -319,8 +319,9 @@ fi
 # Per-user settings — default model ids per agent role. kres reads
 # ~/.kres/settings.json on every start. The shipped file has two
 # placeholder tokens (@SLOW_MODEL@ for the slow role, @MODEL@ for
-# fast/main/todo); we substitute them with --slow / --model values
-# (or the built-in defaults).
+# fast/main/todo); the classifier role is pinned in the shipped file
+# to the Haiku config. We substitute placeholders with --slow /
+# --model values (or the built-in defaults).
 settings_dst="${DEST}/settings.json"
 if [[ -e "${settings_dst}" ]] && [[ "${OVERWRITE}" -ne 1 ]]; then
   say "keep: ${settings_dst}"

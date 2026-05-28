@@ -1081,19 +1081,34 @@ prompt path. The workflow reads the exported finding directory, writes
 handling.
 
 The JSON workflow includes the same `configs/prompts/triage-template.md`
-body used by the golden slash-command prompt. The wrapper must preserve
-the old practical behavior:
+body used by the golden slash-command prompt. The slow triage step emits
+both the human `summary.md` artifact and a `triage_coding` JSON object for
+downstream batch tooling. Rust consumes that structured JSON directly; it
+does not infer status, priority, or routing from free-form agent prose.
+
+The wrapper must preserve the old practical behavior:
 
 - The step may gather the finding files plus readonly source/type/history
   context through `read`, `source`, `grep`, `git`, and `callers`.
-- It emits `summary.md` through `code_output`; optional
-  `metadata.yaml` and `FINDING.md` status updates are also emitted as
-  `code_output`.
+- It emits `summary.md` through `code_output`. The summary includes the
+  chosen severity and the rationale.
+- It emits synchronized `metadata.yaml` and `FINDING.md` updates through
+  `code_output` whenever status changes, and always writes the chosen
+  `severity: high|medium|low` into both files.
 - `summary_written` is machine-populated after side effects. The eval
   requires it to be true, so a bare verdict without a non-empty
   `summary.md` retries and then fails instead of reporting success.
+- `severity_written` is machine-populated after side effects. It is true
+  only when the step emitted `summary.md`, `metadata.yaml`, and
+  `FINDING.md`, and all three persisted files contain the selected
+  severity.
 - `verdict` is an enum and must be one of `Fixed`, `Plausible`,
   `Unconfirmed`, `Unknown`, or `Invalid`.
+- `severity` is an enum and must be one of `high`, `medium`, or `low`.
+- `triage_coding.schema_version` must be `1`, and
+  `triage_coding.severity` must match `severity`; missing/malformed
+  structured coding or incomplete severity file updates retry and then
+  fail the workflow.
 - `followups` are preserved when the agent needs more source/type/history
   evidence to classify the finding.
 

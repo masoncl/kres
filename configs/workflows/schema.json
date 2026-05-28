@@ -91,7 +91,7 @@
   "$defs": {
     "agent_value": {
       "type": "string",
-      "enum": ["fast", "slow", "code", "reaper"]
+      "enum": ["fast", "slow", "code", "classifier", "reaper"]
     },
     "mode_value": {
       "type": "string",
@@ -396,7 +396,7 @@
           "description": "Non-reaper steps need a prompt.",
           "if": {
             "anyOf": [
-              {"properties": {"agent": {"enum": ["fast", "slow", "code"]}}, "required": ["agent"]},
+              {"properties": {"agent": {"enum": ["fast", "slow", "code", "classifier"]}}, "required": ["agent"]},
               {"not": {"required": ["agent"]}}
             ]
           },

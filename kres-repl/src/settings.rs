@@ -9,7 +9,8 @@
 //!     "fast": "claude-sonnet-4-6",
 //!     "slow": "claude-opus-4-7",
 //!     "main": "claude-sonnet-4-6",
-//!     "todo": "claude-sonnet-4-6"
+//!     "todo": "claude-sonnet-4-6",
+//!     "classifier": "claude-haiku-4-5"
 //!   },
 //!   "actions": {
 //!     "allowed": ["grep", "find", "read", "git", "edit", "bash"]
@@ -101,6 +102,8 @@ pub struct Models {
     pub main: Option<String>,
     #[serde(default)]
     pub todo: Option<String>,
+    #[serde(default)]
+    pub classifier: Option<String>,
 }
 
 /// Which agent we're resolving a model for. Matches the per-role
@@ -111,6 +114,7 @@ pub enum ModelRole {
     Slow,
     Main,
     Todo,
+    Classifier,
 }
 
 impl Settings {
@@ -191,6 +195,9 @@ impl Settings {
         }
         if proj.models.todo.is_some() {
             self.models.todo = proj.models.todo;
+        }
+        if proj.models.classifier.is_some() {
+            self.models.classifier = proj.models.classifier;
         }
         if proj.actions.allowed.is_some() {
             self.actions.allowed = proj.actions.allowed;
@@ -293,6 +300,7 @@ impl Settings {
             ModelRole::Slow => &self.models.slow,
             ModelRole::Main => &self.models.main,
             ModelRole::Todo => &self.models.todo,
+            ModelRole::Classifier => &self.models.classifier,
         };
         slot.as_deref()
     }
@@ -307,6 +315,7 @@ impl Settings {
             ModelRole::Slow => &mut self.models.slow,
             ModelRole::Main => &mut self.models.main,
             ModelRole::Todo => &mut self.models.todo,
+            ModelRole::Classifier => &mut self.models.classifier,
         };
         *slot = Some(id);
     }

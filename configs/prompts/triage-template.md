@@ -26,15 +26,15 @@ those two files or in the actual source tree at `metadata.yaml`'s
 Write the triage to `DIR/summary.md`, replacing any existing copy.
 `metadata.yaml` and `FINDING.md` are editable only in the narrow
 ways described under "metadata.yaml updates" and "FINDING.md
-status header" below — no other edits to either file.
+status/severity header" below — no other edits to either file.
 
 Emit summary.md as a single `code_output` entry with `path` set
 to the **absolute** `DIR/summary.md` path. The operator named
 `DIR` in the prompt, so the consent gate already permits writes
-there — no bash, no cp, no relative-path hack. If you also need
-to update `metadata.yaml` or the `**Status:**` line in
-`FINDING.md`, emit those as additional `code_output` entries with
-their own absolute paths and full file contents:
+there — no bash, no cp, no relative-path hack. Also emit
+`metadata.yaml` and `FINDING.md` as additional `code_output`
+entries with their own absolute paths and full file contents so
+the chosen severity is synchronized everywhere:
 
 ```
 "code_output": [
@@ -42,6 +42,16 @@ their own absolute paths and full file contents:
     "path": "<absolute DIR>/summary.md",
     "content": "<full body>",
     "purpose": "triage summary"
+  },
+  {
+    "path": "<absolute DIR>/metadata.yaml",
+    "content": "<full metadata.yaml body with severity updated>",
+    "purpose": "triage metadata"
+  },
+  {
+    "path": "<absolute DIR>/FINDING.md",
+    "content": "<full FINDING.md body with severity/status header updated>",
+    "purpose": "triage finding header"
   }
 ]
 ```
@@ -62,6 +72,13 @@ order. Every section is required.
 # Status
 
 <Fixed | Plausible | Unconfirmed | Unknown | Invalid>
+
+# Severity
+
+<high | medium | low>
+
+<one short paragraph explaining why this severity is correct. This
+must match `metadata.yaml` and `triage_coding.severity`.>
 
 # Subsystem
 
@@ -181,7 +198,7 @@ the **finding itself** can't tell either is `Unconfirmed`, not
 
 ## metadata.yaml updates
 
-Edit `metadata.yaml` in exactly these two ways; **NO** other
+Edit `metadata.yaml` in exactly these three ways; **NO** other
 edits are permitted.
 
 1. `subsystem:` — if the field is empty and you've identified
@@ -203,15 +220,52 @@ edits are permitted.
    you picked `Invalid`, flip it to `invalidated`. The only
    case where the field is left untouched is `Unknown`, which
    means the finding itself is too thin to classify.
+3. `severity:` — always set it to the severity you chose:
+   `high`, `medium`, or `low`. If the field is missing, add it
+   near the top-level `status:` field. If it is present, replace
+   the old value. This value is the canonical replacement for any
+   earlier automated severity rating.
 
-## FINDING.md status header
+## Severity decision tree
 
-`FINDING.md` carries a `**Status:**` line near the top (around
-line 4) holding the same `active`/`fixed`/`invalidated`/
-`unconfirmed` enum as `metadata.yaml`. Whenever you change
-`metadata.yaml`'s `status:`, update that line to the same
-value so the two stay in sync. Do not touch any other part of
-`FINDING.md`.
+Decide severity from the summary you are writing and the finding's
+documented impact/reachability. Do not copy the old severity from
+`metadata.yaml` or `FINDING.md`; those values may be wrong.
+
+Pick exactly one:
+
+### `high`
+
+Use `high` when the demonstrated or fixed bug can plausibly cause
+memory corruption, use-after-free, out-of-bounds write, cross-tenant
+or remote data exposure, vm/container escape, privilege boundary
+crossing, persistent data corruption, or a reliable remote/local
+kernel crash in a commonly reachable subsystem.
+
+### `medium`
+
+Use `medium` when the bug is real and actionable but impact or
+reachability is meaningfully constrained: authenticated-only remote
+trigger without a stronger primitive, local denial of service,
+information exposure with limited sensitivity, corruption limited
+to one user/workload, niche but production-capable CONFIG, or a
+latent defect with a credible path to becoming reachable.
+
+### `low`
+
+Use `low` for invalidated findings, fixed issues that only need
+historical bookkeeping, test/debug-only paths, niche configurations
+with weak impact, protocol-correctness issues without memory or data
+integrity consequences, and latent-only defects with no current
+in-tree trigger.
+
+## FINDING.md status/severity header
+
+`FINDING.md` carries `**Severity:**` and `**Status:**` lines near
+the top. Always update `**Severity:**` to the chosen
+`high`/`medium`/`low` value. Whenever you change `metadata.yaml`'s
+`status:`, update `**Status:**` to the same value so the two stay
+in sync. Do not touch any other part of `FINDING.md`.
 
 ## Wording
 

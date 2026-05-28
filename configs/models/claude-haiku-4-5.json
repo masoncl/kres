@@ -1,0 +1,14 @@
+{
+  "api_key": "@FAST_KEY@",
+  "model": "claude-haiku-4-5",
+  "defaults": {
+    "rate_limit": 800000
+  },
+  "classifier": {
+    "max_tokens": 64000,
+    "max_input_tokens": 200000,
+    "thinking": {
+      "type": "disabled"
+    }
+  }
+}

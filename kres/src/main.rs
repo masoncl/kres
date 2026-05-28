@@ -85,6 +85,9 @@ struct RunWorkflowArgs {
     /// Mutually exclusive with --slow.
     #[arg(long, value_name = "ID", conflicts_with = "slow")]
     slow_model: Option<String>,
+    /// Override the classifier-agent model id. Beats settings.json.
+    #[arg(long, value_name = "ID")]
+    classifier_model: Option<String>,
     /// Directory of skill .md files. Defaults to <kres-dir>/skills/.
     /// Skill files named in workflow.skills are loaded eagerly and
     /// prepended to every step prompt.
@@ -160,6 +163,11 @@ struct ReplArgs {
     /// Override the todo-agent model id. Beats settings.json.
     #[arg(long, value_name = "ID")]
     todo_model: Option<String>,
+    /// Override the classifier-agent model id. Beats settings.json.
+    /// Workflow-owned prompts such as `triage:` use this when they
+    /// short-circuit into the workflow executor.
+    #[arg(long, value_name = "ID")]
+    classifier_model: Option<String>,
     /// Override the exact value used after `Assisted-by:` in
     /// fix-workflow commit messages. Defaults to
     /// `kres (<resolved-slow-model-id>)`.
@@ -582,6 +590,7 @@ fn agent_kind_for_model_role(role: kres_repl::ModelRole) -> AgentKind {
         kres_repl::ModelRole::Slow => AgentKind::Slow,
         kres_repl::ModelRole::Main => AgentKind::Main,
         kres_repl::ModelRole::Todo => AgentKind::Todo,
+        kres_repl::ModelRole::Classifier => AgentKind::Classifier,
     }
 }
 
@@ -627,6 +636,24 @@ fn resolve_agent_for_model_in_dirs(
 
 fn resolve_agent_for_model(cli: Option<&PathBuf>, model_id: Option<&str>) -> Option<PathBuf> {
     resolve_agent_for_model_in_dirs(cli, model_id, &kres_config_dirs())
+}
+
+fn resolve_classifier_agent_for_model_in_dirs(
+    classifier_model_id: Option<&str>,
+    fast_agent: Option<&PathBuf>,
+    dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    match classifier_model_id {
+        Some(model_id) => resolve_agent_for_model_in_dirs(None, Some(model_id), dirs),
+        None => fast_agent.cloned(),
+    }
+}
+
+fn resolve_classifier_agent_for_model(
+    classifier_model_id: Option<&str>,
+    fast_agent: Option<&PathBuf>,
+) -> Option<PathBuf> {
+    resolve_classifier_agent_for_model_in_dirs(classifier_model_id, fast_agent, &kres_config_dirs())
 }
 
 fn find_model_config_by_filename_selector(
@@ -732,6 +759,10 @@ fn load_settings_for_kres_dir(kres_dir: &Path, workspace: &Path) -> kres_repl::S
 fn apply_workflow_model_overrides(settings: &mut kres_repl::Settings, args: &RunWorkflowArgs) {
     settings.set_model(kres_repl::ModelRole::Fast, args.fast_model.clone());
     settings.set_model(kres_repl::ModelRole::Slow, args.slow_model.clone());
+    settings.set_model(
+        kres_repl::ModelRole::Classifier,
+        args.classifier_model.clone(),
+    );
 }
 
 async fn run_repl(args: ReplArgs) -> Result<()> {
@@ -749,6 +780,10 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     settings.set_model(kres_repl::ModelRole::Slow, args.slow_model.clone());
     settings.set_model(kres_repl::ModelRole::Main, args.main_model.clone());
     settings.set_model(kres_repl::ModelRole::Todo, args.todo_model.clone());
+    settings.set_model(
+        kres_repl::ModelRole::Classifier,
+        args.classifier_model.clone(),
+    );
 
     // --- Resolve role configs --------------------------------------
     // Explicit path wins; otherwise use ~/.kres/models/<resolved-model-id>.json.
@@ -783,6 +818,10 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     let todo_agent = resolve_agent_for_model(
         args.todo_agent.as_ref(),
         settings.model_for(kres_repl::ModelRole::Todo),
+    );
+    let classifier_agent = resolve_classifier_agent_for_model(
+        settings.model_for(kres_repl::ModelRole::Classifier),
+        fast_agent.as_ref(),
     );
     let mcp_config = resolve_default(args.mcp_config.as_ref(), "mcp.json");
     let skills_dir = resolve_default(args.skills.as_ref(), "skills");
@@ -964,6 +1003,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         ("slow-agent", slow_agent.as_ref()),
         ("main-agent", main_agent.as_ref()),
         ("todo-agent", todo_agent.as_ref()),
+        ("classifier-agent", classifier_agent.as_ref()),
         ("mcp-config", mcp_config.as_ref()),
         ("skills", skills_dir.as_ref()),
         ("findings", findings_base.as_ref()),
@@ -992,6 +1032,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         (kres_repl::ModelRole::Slow, "slow"),
         (kres_repl::ModelRole::Main, "main"),
         (kres_repl::ModelRole::Todo, "todo"),
+        (kres_repl::ModelRole::Classifier, "classifier"),
     ] {
         match settings.model_for(role) {
             Some(id) => startup_lines.push(format!("  default {label} model: {id}")),
@@ -1005,6 +1046,11 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         (kres_repl::ModelRole::Slow, "slow", slow_agent.as_ref()),
         (kres_repl::ModelRole::Main, "main", main_agent.as_ref()),
         (kres_repl::ModelRole::Todo, "todo", todo_agent.as_ref()),
+        (
+            kres_repl::ModelRole::Classifier,
+            "classifier",
+            classifier_agent.as_ref(),
+        ),
     ] {
         startup_lines.push(format!(
             "  active {label} model: {}",
@@ -1393,6 +1439,39 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             .with_agent_runner(orc)
             .with_consolidator(consolidator);
 
+        // Optional workflow classifier agent.
+        if let Some(ref classifier_path) = classifier_agent {
+            match kres_agents::AgentConfig::load_for_role(classifier_path, AgentKind::Classifier) {
+                Ok(classifier_cfg) => {
+                    let model = kres_repl::pick_model(
+                        classifier_cfg.model.as_deref(),
+                        kres_repl::ModelRole::Classifier,
+                        &settings,
+                    );
+                    let client = Arc::new(kres_llm::client::Client::new(
+                        classifier_cfg.credentials()?,
+                    )?);
+                    let max_tokens = classifier_cfg.max_tokens.unwrap_or(model.max_output_tokens);
+                    let thinking = classifier_cfg
+                        .thinking
+                        .as_ref()
+                        .map(|thinking| thinking.to_budget(max_tokens));
+                    let env = kres_agents::workflow_runner::AgentEnv::new_with_config(
+                        client,
+                        &model.id,
+                        max_tokens,
+                        classifier_cfg.system,
+                        thinking,
+                    );
+                    session = session.with_workflow_classifier(env);
+                    kres_core::async_eprintln!("classifier agent: ready");
+                }
+                Err(e) => {
+                    kres_core::async_eprintln!("classifier agent config load: {e}");
+                }
+            }
+        }
+
         // Optional todo agent.
         if let Some(ref tc_path) = todo_agent {
             match kres_agents::AgentConfig::load_for_role(tc_path, AgentKind::Todo) {
@@ -1545,6 +1624,7 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
         slow: repl.slow.first().cloned(),
         fast_model: repl.fast_model.clone(),
         slow_model: repl.slow_model.clone(),
+        classifier_model: repl.classifier_model.clone(),
         skills_dir: None,
         logs: None,
         state_dir: None,
@@ -1633,6 +1713,9 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     let fast_model_cfg = settings
         .model_for(kres_repl::ModelRole::Fast)
         .map(|model| model_config_path(&kres_dir, model));
+    let classifier_model_cfg = settings
+        .model_for(kres_repl::ModelRole::Classifier)
+        .map(|model| model_config_path(&kres_dir, model));
     let slow_model_cfg = if let Some(selector) = args.slow.as_deref() {
         let spec = resolve_slow_selector_in_dirs(selector, std::slice::from_ref(&kres_dir))?;
         apply_slow_model_override_from_spec(&mut settings, &spec);
@@ -1645,6 +1728,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     };
     let fast_path = fast_model_cfg.unwrap_or_else(|| kres_dir.join("models/__missing_fast__.json"));
     let slow_path = slow_model_cfg.unwrap_or_else(|| kres_dir.join("models/__missing_slow__.json"));
+    let classifier_path = classifier_model_cfg.unwrap_or_else(|| fast_path.clone());
 
     let mut inputs_raw = parse_input_kvs(&args.input)?;
     if workflow.inputs.contains_key("assisted_by") {
@@ -1737,6 +1821,27 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         let code_env =
             AgentEnv::new_with_config(client, &model.id, max_tokens, cfg.system, thinking);
         driver = driver.with_code(code_env);
+    }
+    if classifier_path.exists() {
+        let cfg = AgentConfig::load_for_role(&classifier_path, AgentKind::Classifier)?;
+        let client = Arc::new(Client::new(cfg.credentials()?)?);
+        let model = kres_repl::pick_model(
+            cfg.model.as_deref(),
+            kres_repl::ModelRole::Classifier,
+            &settings,
+        );
+        let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
+        let thinking = cfg
+            .thinking
+            .as_ref()
+            .map(|thinking| thinking.to_budget(max_tokens));
+        driver = driver.with_classifier(AgentEnv::new_with_config(
+            client,
+            &model.id,
+            max_tokens,
+            cfg.system.clone(),
+            thinking,
+        ));
     }
 
     if driver.fast.is_none() && driver.slow.is_none() {
@@ -2061,6 +2166,8 @@ mod tests {
             "fast-test",
             "--slow-model",
             "slow-test",
+            "--classifier-model",
+            "classifier-test",
         ])
         .unwrap();
 
@@ -2068,6 +2175,7 @@ mod tests {
             .expect("fix prompt should short-circuit");
         assert_eq!(args.fast_model.as_deref(), Some("fast-test"));
         assert_eq!(args.slow_model.as_deref(), Some("slow-test"));
+        assert_eq!(args.classifier_model.as_deref(), Some("classifier-test"));
         validate_workflow_short_circuit_model_flags(&c.repl).unwrap();
     }
 
@@ -2127,15 +2235,54 @@ mod tests {
             "fast-test",
             "--slow-model",
             "slow-test",
+            "--classifier-model",
+            "classifier-test",
         ])
         .unwrap();
         match c.cmd {
             Some(Command::RunWorkflow(args)) => {
                 assert_eq!(args.fast_model.as_deref(), Some("fast-test"));
                 assert_eq!(args.slow_model.as_deref(), Some("slow-test"));
+                assert_eq!(args.classifier_model.as_deref(), Some("classifier-test"));
             }
             other => panic!("expected run-workflow command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classifier_agent_resolution_only_falls_back_when_unconfigured() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-classifier-resolution-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let fast = models.join("fast.json");
+        let classifier = models.join("classifier.json");
+        std::fs::write(&fast, "{}").unwrap();
+        std::fs::write(&classifier, "{}").unwrap();
+        let dirs = vec![base.clone()];
+
+        assert_eq!(
+            resolve_classifier_agent_for_model_in_dirs(Some("classifier"), Some(&fast), &dirs),
+            Some(classifier)
+        );
+        assert_eq!(
+            resolve_classifier_agent_for_model_in_dirs(Some("missing"), Some(&fast), &dirs),
+            None,
+            "configured classifier model must not silently fall back to fast"
+        );
+        assert_eq!(
+            resolve_classifier_agent_for_model_in_dirs(None, Some(&fast), &dirs),
+            Some(fast),
+            "fast fallback is only for old settings without classifier"
+        );
+
+        std::fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -2350,7 +2497,7 @@ mod tests {
         std::fs::create_dir_all(workspace.join(".kres")).unwrap();
         std::fs::write(
             kres_dir.join("settings.json"),
-            r#"{"models":{"fast":"fast-global","slow":"slow-global","main":"main-global","todo":"todo-global"}}"#,
+            r#"{"models":{"fast":"fast-global","slow":"slow-global","main":"main-global","todo":"todo-global","classifier":"classifier-global"}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -2375,6 +2522,10 @@ mod tests {
         assert_eq!(
             settings.model_for(kres_repl::ModelRole::Todo),
             Some("todo-global")
+        );
+        assert_eq!(
+            settings.model_for(kres_repl::ModelRole::Classifier),
+            Some("classifier-global")
         );
 
         std::fs::remove_dir_all(base).ok();

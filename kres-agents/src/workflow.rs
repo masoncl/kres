@@ -221,6 +221,7 @@ pub enum Agent {
     Fast,
     Slow,
     Code,
+    Classifier,
     Reaper,
 }
 
@@ -792,12 +793,17 @@ mod tests {
         }
         assert!(step.include.iter().any(|i| i.contains("triage_rules")));
         assert!(step.outputs.contains_key("verdict"));
+        assert!(step.outputs.contains_key("severity"));
         assert!(step.outputs.contains_key("summary_written"));
+        assert!(step.outputs.contains_key("severity_written"));
         assert!(step.outputs.contains_key("followups"));
         assert!(step.outputs.contains_key("code_output"));
+        assert!(step.outputs.contains_key("triage_coding"));
         assert_eq!(
             step.eval.as_ref().and_then(|e| e.expr.as_deref()),
-            Some("summary_written == true")
+            Some(
+                "summary_written == true && severity_written == true && triage_coding.schema_version == 1 && triage_coding.severity == severity"
+            )
         );
     }
 

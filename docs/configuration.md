@@ -27,9 +27,10 @@ provided. The `history` file is always written to `~/.kres/history`.
 
 `~/.kres/settings.json` carries per-user default model ids per
 agent role. `setup.sh --slow MODEL` / `--model MODEL` populate
-the slow slot and the fast / main / todo slots respectively;
-defaults are `claude-opus-4-7` (slow) and `claude-sonnet-4-6`
-(the rest).
+the slow slot and the fast / main / todo slots respectively. The
+classifier slot is shipped as `claude-haiku-4-5`. Defaults are
+`claude-opus-4-7` (slow), `claude-haiku-4-5` (classifier), and
+`claude-sonnet-4-6` (the rest).
 
 Runtime precedence (`kres-repl/src/settings.rs::pick_model`):
 
@@ -39,9 +40,10 @@ Runtime precedence (`kres-repl/src/settings.rs::pick_model`):
 
 Model files set `"model"`, so settings selects which model file each
 role loads. Per-run REPL overrides (`--fast-model`, `--slow-model`,
-`--main-model`, `--todo-model`) beat `settings.json`. The one-shot
-workflow executor accepts only `--fast-model` and `--slow-model`
-because it has no main/todo agent roles. `--slow <name>` selects a
+`--main-model`, `--todo-model`, `--classifier-model`) beat
+`settings.json`. The one-shot workflow executor accepts `--fast-model`,
+`--slow-model`, and `--classifier-model`; it has no main/todo agent
+roles. `--slow <name>` selects a
 slow model config: `sonnet` and `opus` are aliases for the shipped
 model ids, while any other value must match exactly one JSON file under
 `~/.kres/models/` by filename. Exact stem matches win over substring

@@ -27,6 +27,7 @@ pub enum AgentKind {
     Slow,
     Main,
     Todo,
+    Classifier,
     Consolidator,
     Merger,
 }
@@ -287,6 +288,7 @@ impl AgentKind {
             AgentKind::Slow => Some("slow"),
             AgentKind::Main => Some("main"),
             AgentKind::Todo => Some("todo"),
+            AgentKind::Classifier => Some("classifier"),
             AgentKind::Consolidator | AgentKind::Merger => None,
         }
     }
@@ -297,6 +299,7 @@ impl AgentKind {
             AgentKind::Slow => Some("system-prompts/slow-code-agent-audit.system.md"),
             AgentKind::Main => Some("system-prompts/main-agent.system.md"),
             AgentKind::Todo => Some("system-prompts/todo-agent.system.md"),
+            AgentKind::Classifier => Some("system-prompts/classifier-agent.system.md"),
             AgentKind::Consolidator | AgentKind::Merger => None,
         }
     }
@@ -308,6 +311,7 @@ fn role_default_system_file(role: &str) -> Option<&'static str> {
         "slow" => AgentKind::Slow.default_system_file(),
         "main" => AgentKind::Main.default_system_file(),
         "todo" => AgentKind::Todo.default_system_file(),
+        "classifier" => AgentKind::Classifier.default_system_file(),
         _ => None,
     }
 }
@@ -324,13 +328,17 @@ fn expand_model_config_sections(
         && !obj.contains_key("slow")
         && !obj.contains_key("main")
         && !obj.contains_key("todo")
+        && !obj.contains_key("classifier")
     {
         return Ok(value);
     }
 
     let mut merged = serde_json::Map::new();
     for (k, v) in obj {
-        if !matches!(k.as_str(), "defaults" | "fast" | "slow" | "main" | "todo") {
+        if !matches!(
+            k.as_str(),
+            "defaults" | "fast" | "slow" | "main" | "todo" | "classifier"
+        ) {
             merged.insert(k.clone(), v.clone());
         }
     }

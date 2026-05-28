@@ -164,6 +164,7 @@ enum LensInterpolation<'a> {
 }
 
 /// Per-role agent environment: client + call config + system prompt.
+#[derive(Clone)]
 pub struct AgentEnv {
     pub client: Arc<Client>,
     pub config: CallConfig,
@@ -222,6 +223,7 @@ pub struct LlmDriver {
     pub fast: Option<AgentEnv>,
     pub slow: Option<AgentEnv>,
     pub code: Option<AgentEnv>,
+    pub classifier: Option<AgentEnv>,
     /// When set, every step's LLM call delegates to
     /// `agent_runner.run_once_with_ctx`. The AgentRunner owns the
     /// fast-rounds gather loop, fetches followups via its
@@ -276,6 +278,7 @@ impl LlmDriver {
             fast: None,
             slow: None,
             code: None,
+            classifier: None,
             agent_runner: None,
             consolidator: None,
             workspace,
@@ -337,6 +340,10 @@ impl LlmDriver {
     }
     pub fn with_code(mut self, env: AgentEnv) -> Self {
         self.code = Some(env);
+        self
+    }
+    pub fn with_classifier(mut self, env: AgentEnv) -> Self {
+        self.classifier = Some(env);
         self
     }
 
@@ -409,6 +416,7 @@ impl LlmDriver {
             AgentRole::Fast => self.fast.as_ref(),
             AgentRole::Slow => self.slow.as_ref(),
             AgentRole::Code => self.code.as_ref().or(self.slow.as_ref()),
+            AgentRole::Classifier => self.classifier.as_ref(),
             AgentRole::Reaper => return Err("reaper steps don't use an LLM".into()),
         };
         pick.ok_or_else(|| format!("no agent env wired for role {role:?}"))
@@ -582,6 +590,7 @@ impl LlmDriver {
                 runner.slow_max_input_tokens,
                 runner.slow_thinking,
             ),
+            AgentRole::Classifier => return None,
             AgentRole::Reaper => return None,
         };
         let mut cfg = CallConfig::defaults_for(model).with_max_tokens(max_tokens);
@@ -610,6 +619,7 @@ impl LlmDriver {
             AgentRole::Fast => "fast",
             AgentRole::Slow => "slow",
             AgentRole::Code => "code",
+            AgentRole::Classifier => "classifier",
             AgentRole::Reaper => "reaper",
         };
         tracker.record(
@@ -722,7 +732,11 @@ impl LlmDriver {
         // followup kinds the gather loop is allowed to dispatch.
         // We wrap the base AgentRunner's fetcher in a per-step
         // GatingFetcher rather than mutating the shared one.
-        if let Some(runner_base) = &self.agent_runner {
+        if let Some(runner_base) = self
+            .agent_runner
+            .as_ref()
+            .filter(|_| !matches!(role, AgentRole::Classifier))
+        {
             let mut last_parse_err: Option<String> = None;
             let mut last_apply_err: Option<String> = None;
             for json_retry in 0..=JSON_REPAIR_RETRIES {
@@ -785,9 +799,10 @@ impl LlmDriver {
                     })?;
 
                 // Map TaskSummary fields onto step.outputs before
-                // applying side effects. If the model failed to
-                // produce the required JSON, retrying must not leave
-                // partial edits in the workspace.
+                // applying side effects. Validation failures can
+                // still retry after code_output writes because those
+                // are full-file overwrites; anchored code_edits are
+                // not assumed idempotent.
                 let mut outputs = match map_task_summary_to_outputs(step, &summary) {
                     Ok(outputs) => outputs,
                     Err(e) if json_retry < JSON_REPAIR_RETRIES => {
@@ -826,10 +841,7 @@ impl LlmDriver {
                 )
                 .await?;
                 if let Err(e) = validate_required_outputs(step, &outputs) {
-                    if json_retry < JSON_REPAIR_RETRIES
-                        && summary.code_output.is_empty()
-                        && summary.code_edits.is_empty()
-                    {
+                    if json_retry < JSON_REPAIR_RETRIES && summary.code_edits.is_empty() {
                         last_parse_err = Some(e.to_string());
                         continue;
                     }
@@ -849,7 +861,11 @@ impl LlmDriver {
         // AgentEnv fallback — single LLM call, no gather loop. Used
         // by tests that mock a one-shot HTTP responder.
         let env = self.pick(role)?;
-        let call_cfg = self.config_for_call(env, self.mode_for(step));
+        let call_cfg = if matches!(role, AgentRole::Classifier) {
+            env.config.clone()
+        } else {
+            self.config_for_call(env, self.mode_for(step))
+        };
         let mut last_parse_err: Option<String> = None;
         let mut last_apply_err: Option<String> = None;
         for json_retry in 0..=JSON_REPAIR_RETRIES {
@@ -999,10 +1015,7 @@ impl LlmDriver {
                 &mut outputs,
             );
             if let Err(e) = validate_required_outputs(step, &outputs) {
-                if json_retry < JSON_REPAIR_RETRIES
-                    && code_response.code_output.is_empty()
-                    && code_response.code_edits.is_empty()
-                {
+                if json_retry < JSON_REPAIR_RETRIES && code_response.code_edits.is_empty() {
                     last_parse_err = Some(e.to_string());
                     continue;
                 }
@@ -2112,8 +2125,11 @@ fn resolve_one(
             .map_err(|failing| anyhow!("workflow.{failing} not found"));
     }
     // Bare ident → current step's StepState (attempt/eval_failures/
-    // prior_attempts) or its declared outputs. See
-    // StepState::lookup_field for the canonical lookup.
+    // prior_attempts) or its declared outputs. Dotted paths normally
+    // start with an explicit step id, but if no such step exists they
+    // may walk an object emitted by the current step (for example
+    // `triage_coding.schema_version`). See StepState::lookup_field for
+    // the canonical lookup.
     if parts.len() == 1 {
         if let Some(cur) = current_step {
             if let Some(st) = ctx.steps.get(cur) {
@@ -2127,10 +2143,17 @@ fn resolve_one(
         }
         return Err(anyhow!("interpolation '{}' not bound", parts[0]));
     }
-    let st = ctx
-        .steps
-        .get(parts[0])
-        .ok_or_else(|| anyhow!("step '{}' not in context", parts[0]))?;
+    let Some(st) = ctx.steps.get(parts[0]) else {
+        if let Some(cur) = current_step {
+            if let Some(st) = ctx.steps.get(cur) {
+                if let Some(start) = st.lookup_field(parts[0]) {
+                    return crate::workflow_exec::walk_dotted_path(start, &parts[1..])
+                        .map_err(|failing| anyhow!("{}.{} not found", parts[0], failing));
+                }
+            }
+        }
+        return Err(anyhow!("step '{}' not in context", parts[0]));
+    };
     let start = st
         .lookup_field(parts[1])
         .ok_or_else(|| anyhow!("{}.{} not in outputs", parts[0], parts[1]))?;
@@ -3662,7 +3685,15 @@ fn validate_output_types(step: &Step, outputs: &Map<String, Value>) -> Result<()
                     _ => errors.push(format!("{name} is not one of [{}]", allowed.join(", "))),
                 }
             }
+            "object" if !value.is_object() => {
+                errors.push(format!("{name} is not object"));
+            }
             _ => {}
+        }
+        if let Some(schema) = def.get("schema") {
+            if let Err(e) = validate_output_json_schema(name, value, schema) {
+                errors.push(e);
+            }
         }
     }
     if errors.is_empty() {
@@ -3670,6 +3701,21 @@ fn validate_output_types(step: &Step, outputs: &Map<String, Value>) -> Result<()
     } else {
         Err(anyhow!("invalid output type(s): {}", errors.join(", ")))
     }
+}
+
+fn validate_output_json_schema(name: &str, value: &Value, schema: &Value) -> Result<(), String> {
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|e| format!("{name} schema failed to compile: {e}"))?;
+    if validator.is_valid(value) {
+        return Ok(());
+    }
+    let details = validator
+        .iter_errors(value)
+        .take(3)
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!("{name} does not match schema: {details}"))
 }
 
 async fn add_side_effect_outputs(
@@ -3719,6 +3765,17 @@ async fn add_side_effect_outputs(
         outputs.insert(
             "summary_written".into(),
             Value::Bool(summary_written(code_output, code_edits, workspace)),
+        );
+    }
+    if step.outputs.contains_key("severity_written") {
+        let severity = outputs.get("severity").and_then(Value::as_str);
+        outputs.insert(
+            "severity_written".into(),
+            Value::Bool(
+                severity
+                    .map(|s| severity_written(code_output, code_edits, workspace, s))
+                    .unwrap_or(false),
+            ),
         );
     }
     if step.outputs.contains_key("affected_files_changed") {
@@ -3836,6 +3893,103 @@ fn summary_written(
                 .map(|body| !body.trim().is_empty())
                 .unwrap_or(false)
         })
+}
+
+fn severity_written(
+    code_output: &[kres_core::CodeFile],
+    code_edits: &[kres_core::CodeEdit],
+    workspace: &Path,
+    severity: &str,
+) -> bool {
+    let Some(summary_path) = emitted_path_named(code_output, code_edits, workspace, "summary.md")
+    else {
+        return false;
+    };
+    let Some(dir) = summary_path.parent() else {
+        return false;
+    };
+    let Some(metadata_path) =
+        emitted_path_named(code_output, code_edits, workspace, "metadata.yaml")
+    else {
+        return false;
+    };
+    let Some(finding_path) = emitted_path_named(code_output, code_edits, workspace, "FINDING.md")
+    else {
+        return false;
+    };
+    if metadata_path.parent() != Some(dir) || finding_path.parent() != Some(dir) {
+        return false;
+    }
+    let summary = std::fs::read_to_string(&summary_path).unwrap_or_default();
+    let metadata = std::fs::read_to_string(&metadata_path).unwrap_or_default();
+    let finding = std::fs::read_to_string(&finding_path).unwrap_or_default();
+    summary_has_severity(&summary, severity)
+        && metadata_has_severity(&metadata, severity)
+        && finding_has_severity(&finding, severity)
+}
+
+fn emitted_path_named(
+    code_output: &[kres_core::CodeFile],
+    code_edits: &[kres_core::CodeEdit],
+    workspace: &Path,
+    filename: &str,
+) -> Option<PathBuf> {
+    code_output
+        .iter()
+        .map(|f| f.path.as_str())
+        .chain(code_edits.iter().map(|e| e.file_path.as_str()))
+        .find(|p| {
+            Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n == filename)
+                .unwrap_or(false)
+        })
+        .and_then(|p| resolve_workspace_path(workspace, p).ok())
+}
+
+fn summary_has_severity(body: &str, severity: &str) -> bool {
+    let mut in_severity = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("# Severity") {
+            in_severity = true;
+            continue;
+        }
+        if in_severity && trimmed.starts_with('#') {
+            return false;
+        }
+        if in_severity && trimmed.eq_ignore_ascii_case(severity) {
+            return true;
+        }
+    }
+    false
+}
+
+fn metadata_has_severity(body: &str, severity: &str) -> bool {
+    body.lines().any(|line| {
+        line.strip_prefix("severity:")
+            .or_else(|| line.strip_prefix("\u{feff}severity:"))
+            .map(|value| yaml_scalar_matches(value, severity))
+            .unwrap_or(false)
+    })
+}
+
+fn finding_has_severity(body: &str, severity: &str) -> bool {
+    body.lines().any(|line| {
+        line.trim()
+            .strip_prefix("**Severity:**")
+            .map(|value| yaml_scalar_matches(value, severity))
+            .unwrap_or(false)
+    })
+}
+
+fn yaml_scalar_matches(value: &str, expected: &str) -> bool {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .eq_ignore_ascii_case(expected)
 }
 
 async fn git_paths_have_changes(workspace: &Path, files: &[String]) -> Result<bool, String> {
@@ -4726,6 +4880,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s, "Fixes: abc123");
+    }
+
+    #[test]
+    fn interpolate_current_step_object_field_dotted() {
+        let wf = fix_workflow();
+        let inputs = Map::new();
+        let states = make_state(&[(
+            "classify-summary",
+            1,
+            0,
+            json!({"triage_coding": {"schema_version": 1}}),
+        )]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        let s = interpolate(
+            "schema={{triage_coding.schema_version}}",
+            &wf,
+            &ctx,
+            Some("classify-summary"),
+        )
+        .unwrap();
+        assert_eq!(s, "schema=1");
     }
 
     #[test]
@@ -6628,6 +6806,40 @@ mod tests {
     }
 
     #[test]
+    fn severity_written_requires_summary_metadata_and_finding_match() {
+        let workspace = tempfile::tempdir().unwrap();
+        let finding_dir = workspace.path().join("finding");
+        std::fs::create_dir(&finding_dir).unwrap();
+        let summary = kres_core::CodeFile {
+            path: "finding/summary.md".into(),
+            content: "# Status\n\nPlausible\n\n# Severity\n\nhigh\n\nBecause.\n".into(),
+            purpose: "triage summary".into(),
+        };
+        let metadata = kres_core::CodeFile {
+            path: "finding/metadata.yaml".into(),
+            content: "id: f\nseverity: high\n".into(),
+            purpose: "triage metadata".into(),
+        };
+        let finding = kres_core::CodeFile {
+            path: "finding/FINDING.md".into(),
+            content: "# f\n\n**Severity:** high  \n".into(),
+            purpose: "triage finding".into(),
+        };
+        let files = vec![summary.clone(), metadata, finding];
+        persist_code_output(workspace.path(), &files).unwrap();
+
+        assert!(severity_written(&files, &[], workspace.path(), "high"));
+        assert!(!severity_written(&[summary], &[], workspace.path(), "high"));
+
+        std::fs::write(
+            finding_dir.join("metadata.yaml"),
+            "id: f\nseverity: medium\n",
+        )
+        .unwrap();
+        assert!(!severity_written(&files, &[], workspace.path(), "high"));
+    }
+
+    #[test]
     fn persist_code_output_rejects_unconsented_outside_dir() {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -7373,6 +7585,50 @@ mod tests {
             .to_string();
 
         assert!(err.contains("verdict is not one of"), "got: {err}");
+    }
+
+    #[test]
+    fn required_output_validation_rejects_incomplete_object_schema() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "triage-coding-contract",
+            "steps": [{
+                "id": "triage",
+                "agent": "slow",
+                "prompt": "p",
+                "outputs": {
+                    "triage_coding": {
+                        "type": "object",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["schema_version", "severity", "summary_status"],
+                            "properties": {
+                                "schema_version": {"type": "integer", "const": 1},
+                                "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                                "summary_status": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            }]
+        });
+        let wf = crate::workflow::parse_workflow(&wf_json.to_string()).unwrap();
+        let step = &wf.steps[0];
+        let outputs = Map::from_iter([(
+            "triage_coding".to_string(),
+            json!({"schema_version": 1, "severity": "low"}),
+        )]);
+
+        let err = validate_required_outputs(step, &outputs)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("triage_coding does not match schema"),
+            "got: {err}"
+        );
+        assert!(err.contains("summary_status"), "got: {err}");
     }
 
     #[test]

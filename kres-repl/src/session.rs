@@ -198,6 +198,7 @@ pub struct Session {
     cfg: ReplConfig,
     agent_runner: Option<Arc<AgentRunner>>,
     consolidator: Option<Arc<kres_agents::ConsolidatorClient>>,
+    workflow_classifier: Option<kres_agents::workflow_runner::AgentEnv>,
     todo_client: Option<Arc<kres_agents::TodoClient>>,
     goal_client: Option<Arc<kres_agents::GoalClient>>,
     findings_store: Option<Arc<FindingsStore>>,
@@ -439,6 +440,7 @@ impl Session {
                 cfg,
                 agent_runner: None,
                 consolidator: None,
+                workflow_classifier: None,
                 todo_client: None,
                 goal_client: None,
                 findings_store,
@@ -470,6 +472,7 @@ impl Session {
             cfg,
             agent_runner: None,
             consolidator: None,
+            workflow_classifier: None,
             todo_client: None,
             goal_client: None,
             findings_store,
@@ -522,6 +525,11 @@ impl Session {
 
     pub fn with_consolidator(mut self, c: Arc<kres_agents::ConsolidatorClient>) -> Self {
         self.consolidator = Some(c);
+        self
+    }
+
+    pub fn with_workflow_classifier(mut self, env: kres_agents::workflow_runner::AgentEnv) -> Self {
+        self.workflow_classifier = Some(env);
         self
     }
 
@@ -3575,6 +3583,10 @@ impl Session {
         )
         .with_agent_runner(orch)
         .with_shutdown(workflow_shutdown);
+        let driver_init = match self.workflow_classifier.as_ref() {
+            Some(env) => driver_init.with_classifier(env.clone()),
+            None => driver_init,
+        };
         let skills_dir = dirs::home_dir().map(|h| h.join(".kres").join("skills"));
         let mut driver = match skills_dir.as_ref() {
             Some(dir) => match driver_init.with_skills_dir(dir) {

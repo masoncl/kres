@@ -69,7 +69,10 @@ pub fn ensure_artifact_dir_files(dir: &Path) -> std::io::Result<()> {
 }
 
 pub fn set_finding_status_files(finding_dir: &Path, status: &str) -> std::io::Result<Vec<PathBuf>> {
-    if !matches!(status, "active" | "invalidated" | "unconfirmed") {
+    if !matches!(
+        status,
+        "active" | "invalidated" | "unconfirmed" | "confirmed_latent"
+    ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("unsupported finding status: {status}"),
@@ -145,6 +148,7 @@ fn update_summary_status(finding_dir: &Path, status: &str) -> std::io::Result<Op
         "active" => "Active",
         "invalidated" => "Invalidated",
         "unconfirmed" => "Unconfirmed",
+        "confirmed_latent" => "Confirmed Latent",
         other => other,
     };
     let lines: Vec<&str> = body.lines().collect();
@@ -989,6 +993,30 @@ mod tests {
             !summary.contains("Plausible"),
             "old status value must be replaced: {summary}"
         );
+    }
+
+    #[test]
+    fn set_finding_status_accepts_confirmed_latent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(dir.join("FINDING.md"), "# F1\n\n**Status:** active\n").unwrap();
+        std::fs::write(dir.join("summary.md"), "# Status\n\nActive\n").unwrap();
+
+        let files = set_finding_status_files(dir, "confirmed_latent").unwrap();
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("metadata.yaml")).unwrap(),
+            "id: F1\nstatus: confirmed_latent\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("FINDING.md")).unwrap(),
+            "# F1\n\n**Status:** confirmed_latent\n"
+        );
+        assert!(std::fs::read_to_string(dir.join("summary.md"))
+            .unwrap()
+            .contains("# Status\n\nConfirmed Latent\n"));
     }
 
     #[test]

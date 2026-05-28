@@ -188,6 +188,10 @@ Patch filenames are deterministic:
 The publish step also records the patch names in `metadata.yaml` under
 `auto_generated_fixes:` and updates `summary.md`. A successful valid
 publish removes stale `invalidation.md` and `partial-invalidation.md`.
+When research classified the bug with `is_latent: true` and the
+structured plan shows the finding has only one component, publish also
+sets the exported finding status to `confirmed_latent`. Latent fixes
+inside multi-component findings do not rewrite the whole finding status.
 
 ## What To Audit Afterward
 
@@ -222,4 +226,3 @@ Useful run artifacts:
 - `/tmp/kres-fix/session.json`: resumable state;
 - `.kres/logs/<session>/code.jsonl`: agent prompts and replies;
 - `.kres/logs/<session>/main.jsonl`: tool-fetch and reaper activity.
-

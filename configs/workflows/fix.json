@@ -1462,13 +1462,24 @@
         "type": "publish-fix",
         "args": {
           "finding_dir": "{{workflow.target_artifact_dir}}",
-          "fix_index": "{{workflow.fix_index || '1'}}"
+          "fix_index": "{{workflow.fix_index || '1'}}",
+          "status_when_research_is_latent": "confirmed_latent"
         }
       },
       "outputs": {
         "patch_path": {
           "type": "string",
           "description": "Absolute path to auto-generated-fix.diff"
+        },
+        "status": {
+          "type": "string",
+          "optional": true,
+          "description": "When research.is_latent is true, the status written to metadata.yaml/FINDING.md."
+        },
+        "files_updated": {
+          "type": "array<string>",
+          "optional": true,
+          "description": "Status files updated when research.is_latent is true."
         }
       }
     }

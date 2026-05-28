@@ -1064,6 +1064,24 @@ impl LlmDriver {
                 let patch_path = run_publish_fix(&self.workspace, &dir, fix_index).await?;
                 let mut out = Map::new();
                 out.insert("patch_path".into(), Value::String(patch_path));
+                if research_is_latent(ctx) && latent_status_covers_whole_finding(ctx) {
+                    if let Some(status) = action
+                        .args
+                        .as_ref()
+                        .and_then(|a| a.get("status_when_research_is_latent"))
+                        .and_then(|v| v.as_str())
+                    {
+                        let status = interpolate(status, &self.workflow, ctx, Some(&step.id))
+                            .map_err(|e| format!("publish-fix latent status interpolation: {e}"))?;
+                        validate_research_status_transition(ctx, &status)?;
+                        let files_updated = run_set_finding_status(&dir, &status, None, None)?;
+                        out.insert("status".into(), Value::String(status));
+                        out.insert(
+                            "files_updated".into(),
+                            Value::Array(files_updated.into_iter().map(Value::String).collect()),
+                        );
+                    }
+                }
                 Ok(out)
             }
             crate::workflow::ActionType::CommitFix => {
@@ -2543,6 +2561,34 @@ fn research_status_is(ctx: &ExecContext<'_>, expected: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn research_is_latent(ctx: &ExecContext<'_>) -> bool {
+    ctx.steps
+        .get("research")
+        .and_then(|st| st.outputs.get("is_latent"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn json_array_len(value: Option<&Value>) -> Option<usize> {
+    value.and_then(Value::as_array).map(Vec::len)
+}
+
+fn latent_status_covers_whole_finding(ctx: &ExecContext<'_>) -> bool {
+    if json_array_len(ctx.workflow_inputs.get("fix_series_plan")).is_some_and(|len| len > 1) {
+        return false;
+    }
+    if ctx.workflow_inputs.contains_key("current_fix_todo")
+        && json_array_len(ctx.workflow_inputs.get("fix_series_plan")).unwrap_or(0) != 1
+    {
+        return false;
+    }
+    let research_plan_len = ctx
+        .steps
+        .get("research")
+        .and_then(|st| json_array_len(st.outputs.get("fix_plan")));
+    !research_plan_len.is_some_and(|len| len > 1)
+}
+
 fn validate_research_status_transition(ctx: &ExecContext<'_>, status: &str) -> Result<(), String> {
     match status {
         "invalidated" => {
@@ -2560,6 +2606,13 @@ fn validate_research_status_transition(ctx: &ExecContext<'_>, status: &str) -> R
                     "refusing to mark finding unconfirmed: research_status is not unconfirmed"
                         .into(),
                 )
+            }
+        }
+        "confirmed_latent" => {
+            if research_status_is(ctx, "confirmed") && research_is_latent(ctx) {
+                Ok(())
+            } else {
+                Err("refusing to mark finding confirmed_latent: research_status is not confirmed with is_latent=true".into())
             }
         }
         other => Err(format!(
@@ -5494,6 +5547,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_fix_marks_latent_research_confirmed_latent() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        let out = std::process::Command::new("git")
+            .args(["add", "a.c"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "fix: update a"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "fix commit failed: {out:?}");
+
+        let artifact = tempfile::tempdir().unwrap();
+        std::fs::write(
+            artifact.path().join("metadata.yaml"),
+            "id: F1\nstatus: active\n",
+        )
+        .unwrap();
+        std::fs::write(
+            artifact.path().join("FINDING.md"),
+            "# F1\n\n**Status:** active\n",
+        )
+        .unwrap();
+        std::fs::write(
+            artifact.path().join("summary.md"),
+            "# Status\n\nActive\n\n# Impact\n\nbody\n",
+        )
+        .unwrap();
+
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "publish").unwrap().clone();
+        let mut inputs = Map::new();
+        inputs.insert(
+            "target_artifact_dir".into(),
+            Value::String(artifact.path().display().to_string()),
+        );
+        inputs.insert("fix_index".into(), Value::Number(1.into()));
+        let states = make_state(&[(
+            "research",
+            1,
+            0,
+            json!({
+                "research_status": "confirmed",
+                "valid": true,
+                "invalid_evidence": "",
+                "invalid_evidence_kind": "none",
+                "is_latent": true
+            }),
+        )]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf);
+
+        let out = driver.run_reaper(&step, &ctx).await.unwrap();
+
+        assert_eq!(out.get("status"), Some(&json!("confirmed_latent")));
+        assert!(out.get("patch_path").and_then(Value::as_str).is_some());
+        assert_eq!(
+            std::fs::read_to_string(artifact.path().join("metadata.yaml")).unwrap(),
+            "id: F1\nstatus: confirmed_latent\nauto_generated_fixes:\n- auto-generated-fix.diff\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(artifact.path().join("FINDING.md")).unwrap(),
+            "# F1\n\n**Status:** confirmed_latent\n"
+        );
+        assert!(std::fs::read_to_string(artifact.path().join("summary.md"))
+            .unwrap()
+            .contains("# Status\n\nConfirmed Latent\n\n# Impact"));
+    }
+
+    #[tokio::test]
+    async fn publish_fix_does_not_mark_multi_component_finding_latent() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        let out = std::process::Command::new("git")
+            .args(["add", "a.c"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let out = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "fix: update a"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "fix commit failed: {out:?}");
+
+        let artifact = tempfile::tempdir().unwrap();
+        std::fs::write(
+            artifact.path().join("metadata.yaml"),
+            "id: F1\nstatus: active\n",
+        )
+        .unwrap();
+        std::fs::write(
+            artifact.path().join("FINDING.md"),
+            "# F1\n\n**Status:** active\n",
+        )
+        .unwrap();
+        std::fs::write(artifact.path().join("summary.md"), "# Status\n\nActive\n").unwrap();
+
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "publish").unwrap().clone();
+        let mut inputs = Map::new();
+        inputs.insert(
+            "target_artifact_dir".into(),
+            Value::String(artifact.path().display().to_string()),
+        );
+        inputs.insert("fix_index".into(), Value::Number(1.into()));
+        inputs.insert(
+            "fix_series_plan".into(),
+            json!([
+                {"id": "latent-component"},
+                {"id": "reachable-component"}
+            ]),
+        );
+        inputs.insert("current_fix_todo".into(), json!({"id": "latent-component"}));
+        let states = make_state(&[(
+            "research",
+            1,
+            0,
+            json!({
+                "research_status": "confirmed",
+                "valid": true,
+                "invalid_evidence": "",
+                "invalid_evidence_kind": "none",
+                "is_latent": true
+            }),
+        )]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf);
+
+        let out = driver.run_reaper(&step, &ctx).await.unwrap();
+
+        assert!(out.get("status").is_none());
+        assert_eq!(
+            std::fs::read_to_string(artifact.path().join("metadata.yaml")).unwrap(),
+            "id: F1\nstatus: active\nauto_generated_fixes:\n- auto-generated-fix.diff\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(artifact.path().join("FINDING.md")).unwrap(),
+            "# F1\n\n**Status:** active\n"
+        );
+    }
+
+    #[tokio::test]
     async fn commit_fix_empty_amend_returns_current_head() {
         let tmp = init_test_git_repo();
 
@@ -5805,6 +6012,7 @@ mod tests {
         };
         assert!(validate_research_status_transition(&ctx, "unconfirmed").is_ok());
         assert!(validate_research_status_transition(&ctx, "invalidated").is_err());
+        assert!(validate_research_status_transition(&ctx, "confirmed_latent").is_err());
 
         let inputs = Map::new();
         let states = make_state(&[(
@@ -5823,6 +6031,41 @@ mod tests {
             steps: &states,
         };
         assert!(validate_research_status_transition(&ctx, "unconfirmed").is_err());
+        assert!(validate_research_status_transition(&ctx, "confirmed_latent").is_err());
+
+        let inputs = Map::new();
+        let states = make_state(&[(
+            "research",
+            1,
+            0,
+            json!({
+                "research_status": "confirmed",
+                "valid": true,
+                "invalid_evidence": "",
+                "invalid_evidence_kind": "none",
+                "is_latent": true
+            }),
+        )]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(latent_status_covers_whole_finding(&ctx));
+        assert!(validate_research_status_transition(&ctx, "confirmed_latent").is_ok());
+
+        let inputs = Map::from_iter([(
+            "fix_series_plan".to_string(),
+            json!([
+                {"id": "latent-component"},
+                {"id": "reachable-component"}
+            ]),
+        )]);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(!latent_status_covers_whole_finding(&ctx));
+        assert!(validate_research_status_transition(&ctx, "confirmed_latent").is_ok());
     }
 
     #[test]

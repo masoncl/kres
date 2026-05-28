@@ -318,6 +318,14 @@ the bug still exists at the current workspace HEAD.
    `invalid_evidence` or `analysis` prose to guess which transition is
    actionable.
 
+   `confirmed_latent` is handled later by `publish-fix`, after a valid
+   patch has landed. That transition is gated only on structured fields:
+   `research.is_latent == true` and a single-component finding/series
+   plan. A latent todo inside a multi-component finding is not enough to
+   rewrite the whole finding status; any reachable component keeps the
+   finding-level status unchanged. The runner does not inspect wording in
+   the commit message, generated patch, or research prose.
+
 3. **write-patch**
 
    The code agent receives `research.affected_files`,
@@ -744,7 +752,10 @@ the bug still exists at the current workspace HEAD.
    `auto-generated-fix-2.diff`, and so on. A successful publish also
    deletes stale `invalidation.md` and `partial-invalidation.md` files
    from the artifact directory, because the current run has proven and
-   published a valid fix.
+   published a valid fix. When `research.is_latent == true` and the
+   structured plan says the finding has only one component, publish also
+   sets `metadata.yaml`, `FINDING.md`, and the `summary.md` status section
+   (when present) to `confirmed_latent`.
 
 ### Fix Series
 

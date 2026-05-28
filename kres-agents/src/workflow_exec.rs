@@ -2535,9 +2535,11 @@ fn eval_orchestrator_dispatch(step: &Step, ctx: &ExecContext<'_>) -> (bool, Opti
     };
     match next_step {
         "publish" | "exit-failure" => (true, None),
-        "write-patch" | "write-commit-message" => (false, Some(format!("route to {next_step}"))),
+        "write-patch" | "write-commit-message" | "build" => {
+            (false, Some(format!("route to {next_step}")))
+        }
         other => eval_fail(&format!(
-            "orchestrator emitted unknown next_step '{other}'; expected one of write-patch, write-commit-message, publish, exit-failure"
+            "orchestrator emitted unknown next_step '{other}'; expected one of write-patch, write-commit-message, build, publish, exit-failure"
         )),
     }
 }
@@ -2681,7 +2683,18 @@ fn reset_dependents_preserving(
                 } else if preserve_for_skip {
                     st.preserved_outputs_on_skip = std::mem::take(&mut st.outputs);
                 } else {
-                    st.outputs.clear();
+                    // Snapshot non-empty outputs into prior_attempts
+                    // (matching reset_for_reentry's snapshot for the
+                    // branch target), so a later step that reads
+                    // `{{<id>.prior_attempts}}` can see the cycle's
+                    // values even when this step's live outputs were
+                    // cleared by the cascade. Keeping the snapshot in
+                    // prior_attempts (not in outputs) avoids retripping
+                    // downstream `run_if` expressions on the next pass.
+                    if !st.outputs.is_empty() {
+                        let snapshot = std::mem::take(&mut st.outputs);
+                        st.prior_attempts.push(snapshot);
+                    }
                     st.preserved_outputs_on_skip.clear();
                 }
             }
@@ -3368,6 +3381,115 @@ mod tests {
             after2.prior_attempts.len(),
             1,
             "empty outputs must not be snapshotted"
+        );
+    }
+
+    /// `reset_dependents_preserving` must (a) stash outputs into
+    /// `preserved_outputs_on_skip` for dependents that have the
+    /// `preserve_outputs_on_skip` flag set, and (b) snapshot outputs
+    /// into `prior_attempts` for dependents without the flag. The
+    /// snapshot path is what gives the orchestrator visibility into
+    /// the cycle's build/review/triage results even when the cascade
+    /// skip-cleared their live outputs (regression that caused the
+    /// sha256_direct_ctx_not_wiped_on_stack run to hit the 10-attempt
+    /// orchestrator cap with empty signals).
+    #[test]
+    fn reset_dependents_preserving_stashes_or_snapshots_outputs() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "preserve-test",
+            "steps": [
+                {"id": "a", "agent": "fast", "prompt": "p"},
+                {
+                    "id": "b",
+                    "agent": "fast",
+                    "prompt": "p",
+                    "depends_on": ["a"],
+                    "preserve_outputs_on_skip": true,
+                    "outputs": {"result": {"type": "string"}}
+                },
+                {
+                    "id": "c",
+                    "agent": "fast",
+                    "prompt": "p",
+                    "depends_on": ["a"],
+                    "outputs": {"result": {"type": "string"}}
+                }
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+        let mut state: HashMap<String, StepState> = HashMap::new();
+        let mut b_outputs = Map::new();
+        b_outputs.insert("result".into(), json!("cycle-1-b"));
+        state.insert(
+            "b".into(),
+            StepState {
+                status: StepStatus::Done,
+                outputs: b_outputs,
+                ..StepState::default()
+            },
+        );
+        let mut c_outputs = Map::new();
+        c_outputs.insert("result".into(), json!("cycle-1-c"));
+        state.insert(
+            "c".into(),
+            StepState {
+                status: StepStatus::Done,
+                outputs: c_outputs,
+                ..StepState::default()
+            },
+        );
+        state.insert(
+            "a".into(),
+            StepState {
+                status: StepStatus::Done,
+                ..StepState::default()
+            },
+        );
+
+        reset_dependents_preserving(&wf, &mut state, "a", None);
+
+        // b has preserve_outputs_on_skip → outputs go into the
+        // preserved_outputs_on_skip slot for restore on later skip.
+        let b = state.get("b").unwrap();
+        assert_eq!(b.status, StepStatus::Pending, "b must be marked Pending");
+        assert!(
+            b.outputs.is_empty(),
+            "b.outputs cleared while Pending so downstream doesn't observe stale data prematurely"
+        );
+        assert_eq!(
+            b.preserved_outputs_on_skip
+                .get("result")
+                .and_then(Value::as_str),
+            Some("cycle-1-b"),
+            "preserve_outputs_on_skip=true must stash outputs"
+        );
+        assert!(
+            b.prior_attempts.is_empty(),
+            "preserve path is preferred when the flag is set; prior_attempts not used"
+        );
+
+        // c has no preserve flag → outputs are snapshotted into
+        // prior_attempts so a later interpolation can read them via
+        // `{{c.prior_attempts}}` (orchestrator visibility path).
+        let c = state.get("c").unwrap();
+        assert_eq!(c.status, StepStatus::Pending);
+        assert!(
+            c.outputs.is_empty(),
+            "c.outputs cleared so downstream run_if expressions aren't tripped by stale values"
+        );
+        assert!(
+            c.preserved_outputs_on_skip.is_empty(),
+            "no preserve flag → nothing stashed in preserved_outputs_on_skip"
+        );
+        assert_eq!(
+            c.prior_attempts.len(),
+            1,
+            "outputs snapshotted to prior_attempts"
+        );
+        assert_eq!(
+            c.prior_attempts[0].get("result").and_then(Value::as_str),
+            Some("cycle-1-c")
         );
     }
 
@@ -5699,6 +5821,208 @@ mod tests {
             })
             .collect();
         assert_eq!(orchestrator_attempts, vec![1]);
+    }
+
+    /// Integration test for the prior_attempts snapshot on cascade
+    /// reset. Cycle 1 produces real build/compile-triage/review
+    /// outputs. Cycle 2's write-patch emits no edits → the cascade
+    /// skips the rest of the chain → orchestrator runs at cycle 2.
+    /// reset_dependents_preserving must have snapshotted cycle-1
+    /// outputs into prior_attempts so the orchestrator's prompt
+    /// (`{{build.prior_attempts}}` etc.) carries the prior verdict.
+    /// Before this snapshot, the cascade cleared everything and the
+    /// orchestrator saw empty signals (regression that exhausted the
+    /// orchestrator cap in the sha256_direct_ctx_not_wiped_on_stack
+    /// run).
+    #[tokio::test]
+    async fn cascade_reset_snapshots_chain_outputs_into_prior_attempts() {
+        let wf = fix_workflow();
+        let empty_write_patch = json!({
+            "build_target": "",
+            "changed_files": [],
+            "code_changes_emitted": false,
+            "affected_files_changed": false,
+            "review_dispute": ""
+        });
+        let preexisting_triage = json!({
+            "result": "preexisting_error",
+            "analysis": "Kconfig fallout, not from the patch"
+        });
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("write-patch", 2, empty_write_patch)
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, build_failed())
+            .with("compile-triage", 1, preexisting_triage)
+            .with(
+                "orchestrator",
+                1,
+                json!({"next_step": "write-patch", "rationale": "worker should verify worktree"}),
+            )
+            .with(
+                "orchestrator",
+                2,
+                json!({"next_step": "publish", "rationale": "prior_attempts confirm patch is shippable"}),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
+
+        // Each chain step ran exactly once (cycle 1) and skipped on
+        // cycle 2 — preserved cycle-1 outputs must not have leaked
+        // into live state to re-trigger the run_if expressions.
+        for step_id in [
+            "build",
+            "compile-triage",
+            "review",
+            "write-commit-message",
+            "commit",
+        ] {
+            let attempts: Vec<u32> = trace
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    TraceEvent::StepStarted { id, attempt } if id == step_id => Some(*attempt),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                attempts,
+                vec![1],
+                "{step_id} must run exactly once; the cycle-2 cascade should skip it"
+            );
+        }
+
+        // prior_attempts must carry cycle-1 outputs for the orchestrator
+        // to consult on the next cycle.
+        let build = trace.final_state.get("build").expect("build state");
+        assert_eq!(
+            build.prior_attempts.len(),
+            1,
+            "build prior_attempts must hold cycle-1 outputs after cascade reset"
+        );
+        assert_eq!(
+            build.prior_attempts[0]
+                .get("result")
+                .and_then(Value::as_str),
+            Some("failed"),
+            "build.prior_attempts[0].result must be the cycle-1 value"
+        );
+
+        let triage = trace
+            .final_state
+            .get("compile-triage")
+            .expect("compile-triage state");
+        assert_eq!(triage.prior_attempts.len(), 1);
+        assert_eq!(
+            triage.prior_attempts[0]
+                .get("result")
+                .and_then(Value::as_str),
+            Some("preexisting_error")
+        );
+
+        let review = trace.final_state.get("review").expect("review state");
+        assert_eq!(review.prior_attempts.len(), 1);
+        assert_eq!(
+            review.prior_attempts[0]
+                .get("clean")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    /// The orchestrator can route `next_step: "build"` to re-run the
+    /// build + compile-triage + review chain without re-editing source.
+    /// Use case from the sha256_direct_ctx_not_wiped_on_stack failure:
+    /// after a series of write-patch attempts, the worktree was finally
+    /// correct but the preserved build/compile-triage signals still
+    /// reflected an earlier broken attempt; the orchestrator needed
+    /// a way to refresh them before deciding publish vs exit-failure.
+    #[tokio::test]
+    async fn orchestrator_build_route_reruns_build_chain() {
+        let wf = fix_workflow();
+        let mut driver = ScriptedDriver::new()
+            .with("research", 1, ok_research())
+            .with("write-patch", 1, ok_write_patch())
+            .with("fixes-tag-search", 1, ok_fixes_tag_search())
+            .with("write-commit-message", 1, ok_commit_message())
+            .with("commit", 1, ok_commit())
+            .with("build", 1, build_failed())
+            .with("compile-triage", 1, patch_error_triage())
+            .with(
+                "orchestrator",
+                1,
+                json!({
+                    "next_step": "build",
+                    "instruction": "",
+                    "rationale": "compile-triage signal looks stale relative to the most recent worktree state; rebuild to refresh"
+                }),
+            )
+            .with("build", 2, ok_build_clean())
+            .with(
+                "orchestrator",
+                2,
+                json!({
+                    "next_step": "publish",
+                    "instruction": "",
+                    "rationale": "rebuild confirms patch is clean"
+                }),
+            )
+            .with("publish", 1, json!({"patch_path": "/tmp/p.diff"}));
+        driver = with_fix_review_attempt(driver, &wf, 1, ok_review_clean());
+        driver = with_fix_review_attempt(driver, &wf, 2, ok_review_clean());
+        let trace = run(&wf, &mut driver, finding_dir_inputs()).await;
+        eprintln!("{}", trace.pretty());
+
+        // Orchestrator's build verdict must branch back to the build step.
+        assert!(
+            trace.events.iter().any(|e| matches!(
+                e,
+                TraceEvent::BranchedTo { from, to } if from == "orchestrator" && to == "build"
+            )),
+            "next_step=build must branch to the build step"
+        );
+
+        // build must run twice (initial + rebuild).
+        let build_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "build" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(build_attempts, vec![1, 2]);
+
+        // write-patch must NOT re-run — the `build` route is supposed
+        // to skip source edits entirely.
+        let write_patch_attempts: Vec<u32> = trace
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                TraceEvent::StepStarted { id, attempt } if id == "write-patch" => Some(*attempt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            write_patch_attempts,
+            vec![1],
+            "build route must not re-trigger write-patch"
+        );
+
+        assert!(matches!(
+            trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ));
     }
 
     /// A pre-existing build break (compile-triage classifies

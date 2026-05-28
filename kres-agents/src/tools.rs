@@ -233,6 +233,7 @@ pub const GIT_ALLOWED: &[&str] = &[
     "for-each-ref",
     "add",
     "commit",
+    "rm",
 ];
 
 /// Per-tool output caps. Both are sized to roughly 500k tokens using
@@ -744,6 +745,18 @@ pub async fn git(workspace: &Path, args: &GitArgs) -> Result<String, AgentError>
 /// execute arbitrary commands (`-c core.pager=/tmp/x`, `--pager=...`),
 /// or launching external processes (`--exec=...`, `--upload-pack=...`).
 fn reject_risky_git_flag(arg: &str) -> Option<&'static str> {
+    // Bundled short flags first: `git rm -rf .` arrives as `-rf`, so an
+    // exact-match check below misses the recursive flag. Walk every
+    // single-char short flag in a non-long-form arg (starts with `-`
+    // but not `--`) and reject if any is on the gated list.
+    if arg.starts_with('-') && !arg.starts_with("--") && arg.len() > 1 {
+        for ch in arg.chars().skip(1) {
+            match ch {
+                'r' | 'R' => return Some("recursive operation; supply explicit paths instead"),
+                _ => {}
+            }
+        }
+    }
     // Strip trailing `=value` if present for name-only checks.
     let name = arg.split('=').next().unwrap_or(arg);
     match name {
@@ -759,6 +772,10 @@ fn reject_risky_git_flag(arg: &str) -> Option<&'static str> {
         // --no-verify and --no-gpg-sign stay rejected.
         "--no-verify" => Some("skips pre-commit / commit-msg hooks"),
         "--no-gpg-sign" => Some("bypasses commit signing policy"),
+        // `--recursive` long-form mirror of the `-r`/`-R` bundled-short
+        // check above. The readonly subcommands (log/show/diff/...)
+        // don't need this either, so universal rejection is safe.
+        "--recursive" => Some("recursive operation; supply explicit paths instead"),
         _ => None,
     }
 }
@@ -1317,6 +1334,14 @@ mod tests {
             "log --upload-pack=/bin/sh",
             "commit --no-verify -m x",
             "commit --no-gpg-sign -m x",
+            // `git rm -rf .` would nuke the worktree; the
+            // unstick-a-stray-file workflow only ever needs a single
+            // path. The recursive flag is gated universally because
+            // none of the allowed subcommands need it.
+            "rm -rf .",
+            "rm -r subdir",
+            "rm --recursive subdir",
+            "rm -R subdir",
         ] {
             let v = serde_json::json!({"command": cmd});
             let args: GitArgs = serde_json::from_value(v).unwrap();
@@ -1517,6 +1542,12 @@ mod tests {
             "add README.md",
             "commit -s -m \"msg\"",
             "commit --amend -s -m \"revised msg\"",
+            // `rm` is needed so the orchestrator can unstick stray
+            // files staged earlier in the run (regression from the
+            // sd_hwdb_reader_unvalidated_header_offsets failure where
+            // a stray commit-message.txt ended up tracked in HEAD and
+            // no allowed tool could remove it).
+            "rm stray-commit-msg.txt",
         ] {
             let v = serde_json::json!({"command": cmd});
             let args: GitArgs = serde_json::from_value(v).unwrap();

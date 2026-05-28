@@ -1339,7 +1339,7 @@
         "Treat the available signals as evidence, not as a verdict. The right next_step depends on what the signals collectively say, and that includes picking publish when the worker signal is non-success but the underlying patch is correct. Use the worker's prior_attempts to distinguish a recoverable protocol/context gap (re-instruct the worker with concrete missing context and tell it which step-allowed followup mechanisms to use; the worker's prompt enumerates the followup kinds its step actually allows) from a structural blocker (pick exit-failure and explain why in rationale).",
         "",
         "Your two levers:",
-        "- next_step: re-route to a worker (write-patch, write-commit-message) so it can take another pass, or finish the run (publish, exit-failure).",
+        "- next_step: re-route to a worker (write-patch, write-commit-message), force a fresh build+review pass (build), or finish the run (publish, exit-failure).",
         "- instruction: free-form guidance that the next worker reads verbatim before producing its output. Use this to break deadlocks — name the concrete defect, point at the file/function/line, and tell the worker what the prior attempt missed or got wrong.",
         "",
         "Batch every defect a single worker pass can cover. Every routing decision costs an entire downstream cycle (rebuild + multi-lens review fan-out + consolidate). When you pick a worker, scan ALL open review defects (review.defects, review.source_defects, review.commit_message_defects, review_ledger entries) and pack into one instruction every item the chosen worker can address in this pass — including doc-only or comment-only source edits adjacent to the primary fix. write-patch and write-commit-message both run in coding mode and can emit code_edits, so even when the primary motivator for a write-commit-message routing is the changelog rewrite, fold in any in-scope source-comment edits whose correction does not depend on the changelog. Do not defer items as 'follow-up if the reviewer insists' when the same worker call can handle them now; the reviewer will keep flagging them and you will pay the next review-cycle cost for the deferral.",
@@ -1347,16 +1347,22 @@
         "AVAILABLE NEXT STEPS:",
         "- write-patch: source/build/behavior still needs to change, or the prior write-patch attempt produced nothing. Use instruction to spell out what the next patch must do (which function, which contract, which path) and, when the prior attempt emitted no edits, to point at the specific source the worker needs to fetch and the followup kinds it must use to fetch it. Include any source-comment defects that should be fixed alongside the patch.",
         "- write-commit-message: the source patch is correct but the commit message is wrong, or the prior attempt produced no message file. Use instruction to specify the false/overstated/missing claim and what the rewritten message must say. A commit-message defect is real until you disprove it; don't downgrade it. write-commit-message also runs in coding mode (its actions list includes `edit`); if open source-comment defects can be fixed alongside the commit-message rewrite without changing executable code, include them in the instruction and call out that the worker must emit both code_edits (for the comments) and code_output (for the rewritten message) in one response.",
+        "- build: re-run the build + compile-triage + review chain without changing source or commit message. Use this when the build/review signals visible above look stale relative to the most recent write-patch — e.g. write-patch confirms the worktree now matches the desired final state but build.result and compile-triage.result still reflect an earlier broken attempt. The chain runs with the current worktree, giving you fresh evidence to choose between publish and exit-failure on the next orchestrator cycle. Do not pick build when the build state actually changed (a fresh write-patch already triggered the chain) — that is wasted cycles. Do not pick build before any commit has been made: build depends on write-commit-message.commit_message_written == true, so if no commit exists yet, the rebuild will skip and the orchestrator will re-run with the same empty signals.",
         "- publish: ship the fix. Pick this only when review.clean is true, OR you can cite specific evidence (file:line, commit ref, prior-attempt fact) that disproves every remaining review concern.",
         "- exit-failure: end the run unsuccessfully. Pick this only when you can name a defect that no available worker step can resolve — e.g. the fix requires changes beyond this workflow's scope, or you cannot author an instruction that would unblock the worker. Not for \"I'm tired of iterating.\"",
         "",
-        "Worker output snapshot (null/empty means the step was skipped or never ran on this cycle):",
+        "Worker output snapshot. Empty/unset values mean the step did not run on this cycle (the cascade may have skipped it because an earlier step in the chain reported no change). When this happens, the BUILD/REVIEW HISTORY block below carries the most recent prior-cycle outputs for build / compile-triage / review — use that to reason about whether the patch was previously found clean or whether the build broke for a reason that may now be moot.",
         "- write-patch.code_changes_emitted: {{write-patch.code_changes_emitted || 'unset'}}",
         "- write-patch.review_dispute: {{write-patch.review_dispute || ''}}",
         "- write-commit-message.commit_message_written: {{write-commit-message.commit_message_written || 'unset'}}",
         "- build.result: {{build.result || ''}}",
         "- review.clean: {{review.clean || 'unset'}}",
         "- compile-triage.result: {{compile-triage.result || ''}}",
+        "",
+        "BUILD/REVIEW HISTORY (prior cycles' outputs for steps that did not run on this cycle; oldest first, latest entry is most recent):",
+        "- build.prior_attempts: {{build.prior_attempts || '[]'}}",
+        "- compile-triage.prior_attempts: {{compile-triage.prior_attempts || '[]'}}",
+        "- review.prior_attempts: {{review.prior_attempts || '[]'}}",
         "",
         "REVIEW CONSOLIDATE OUTPUT:",
         "- analysis: {{review.analysis || ''}}",
@@ -1394,7 +1400,7 @@
         "",
         "If a prior verdict's instruction did not unblock the worker, refine the instruction with new evidence. Reissuing the same instruction verbatim wastes the next attempt. Capitulating to publish/exit-failure when the underlying concern is still real is worse.",
         "",
-        "Emit ONE JSON object and nothing else. No prose preamble. No Markdown fences (no ```json, no closing ```). No explanation outside the JSON. The `rationale` field IS where you put your reasoning — do not duplicate it as prose around the object. Shape: {\"next_step\": \"write-patch\" | \"write-commit-message\" | \"publish\" | \"exit-failure\", \"instruction\": \"<concrete guidance the next worker reads; empty for publish/exit-failure>\", \"rationale\": \"<why this pick advances toward correctness; cite file:line, commit ref, or prior-attempt facts>\"}."
+        "Emit ONE JSON object and nothing else. No prose preamble. No Markdown fences (no ```json, no closing ```). No explanation outside the JSON. The `rationale` field IS where you put your reasoning — do not duplicate it as prose around the object. Shape: {\"next_step\": \"write-patch\" | \"write-commit-message\" | \"build\" | \"publish\" | \"exit-failure\", \"instruction\": \"<concrete guidance the next worker reads; empty for publish/exit-failure/build>\", \"rationale\": \"<why this pick advances toward correctness; cite file:line, commit ref, or prior-attempt facts>\"}."
       ],
       "outputs": {
         "next_step": {
@@ -1402,10 +1408,11 @@
           "values": [
             "write-patch",
             "write-commit-message",
+            "build",
             "publish",
             "exit-failure"
           ],
-          "description": "Workflow-step verb the orchestrator routes to. publish continues the chain to record-results; exit-failure is caught by completion.failure_when_any; write-patch/write-commit-message branch back."
+          "description": "Workflow-step verb the orchestrator routes to. publish continues the chain to record-results; exit-failure is caught by completion.failure_when_any; write-patch/write-commit-message branch back to those workers; build branches back to the build step to refresh build/compile-triage/review signals without re-editing source."
         },
         "instruction": {
           "type": "string",

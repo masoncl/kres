@@ -3776,9 +3776,27 @@ fn emitted_code_paths(
 /// orchestrator instruction asks it to pre-author a commit-message
 /// rewrite alongside a source fix). Anything matching this predicate
 /// is excluded from `changed_files` so it never reaches `git add`.
+///
+/// Also filters the common "commit-message" stray paths the slow
+/// agent sometimes writes via `code_output` when it confuses the
+/// hand-off file with a real source artifact (observed in the
+/// sd_hwdb_reader_unvalidated_header_offsets fix run). These names
+/// have no legitimate use under any project layout we target, so
+/// silently dropping them is safer than letting `git add` track them.
 fn is_kres_aux_path(path: &str) -> bool {
     let base = path.rsplit('/').next().unwrap_or(path);
-    base.starts_with(".kres-")
+    if base.starts_with(".kres-") {
+        return true;
+    }
+    matches!(
+        base,
+        "commit-message.txt"
+            | "commit_message.txt"
+            | "commit-msg.txt"
+            | "commit_msg.txt"
+            | "COMMIT_MSG"
+            | "COMMIT_EDITMSG"
+    ) || base.starts_with(".commit-msg")
 }
 
 fn commit_message_written(code_output: &[kres_core::CodeFile], workspace: &Path) -> bool {
@@ -7605,6 +7623,46 @@ mod tests {
             ],
             "kres-internal aux paths must not reach changed_files"
         );
+    }
+
+    /// Regression for the sd_hwdb_reader_unvalidated_header_offsets fix
+    /// run: the slow agent wrote a stray `commit-message.txt` via
+    /// `code_output` (instead of `.kres-commit-msg.tmp`); the commit
+    /// reaper's `git add` swept it into HEAD and the agent had no tool
+    /// to unstick it. Drop these names at the filter so they never
+    /// reach `git add` in the first place.
+    #[test]
+    fn emitted_code_paths_drops_stray_commit_message_files() {
+        let edits = Vec::<kres_core::CodeEdit>::new();
+        let output = vec![
+            kres_core::CodeFile {
+                path: "commit-message.txt".to_string(),
+                content: "subject\n\nbody\n".to_string(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "commit_message.txt".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "commit-msg.txt".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "sub/.commit-msg".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "src/real.c".to_string(),
+                content: String::new(),
+                purpose: String::new(),
+            },
+        ];
+        let paths = emitted_code_paths(&output, &edits);
+        assert_eq!(paths, vec!["src/real.c".to_string()]);
     }
 
     #[test]

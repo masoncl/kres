@@ -92,7 +92,7 @@
     "assisted_by": {
       "type": "string",
       "required": false,
-      "description": "Exact value for the Assisted-by trailer after `Assisted-by:`. Defaults to `kres (<slow-model-id>)`; override with --assisted-by."
+      "description": "Exact value for the Assisted-by trailer after `Assisted-by:`. Defaults to `kres:<slow-model-id>`; override with --assisted-by."
     },
     "target_artifact_dir": {
       "type": "string",

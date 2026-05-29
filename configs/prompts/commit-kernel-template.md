@@ -223,10 +223,10 @@ line. Each on its own line. Tags can run past 75 columns
   produce the patch (submitting-patches.rst:637-644: "Failure to
   do so may impede the acceptance of your work"). kres-generated
   patches MUST include this trailer in the form:
-  `Assisted-by: kres (<model-id>)` — name BOTH the tool (`kres`)
+  `Assisted-by: kres:<model-id>` — name BOTH the tool (`kres`)
   AND the underlying model that wrote the patch, e.g.
-  `Assisted-by: kres (claude-sonnet-4.6)` or
-  `Assisted-by: kres (claude-opus-4.7)`. A bare
+  `Assisted-by: kres:claude-sonnet-4-6` or
+  `Assisted-by: kres:claude-opus-4-7`. A bare
   `Assisted-by: kres` without the model is INSUFFICIENT — the
   reviewer needs to know which model produced the change. Use
   the model id you are running under; do not invent one. See
@@ -291,7 +291,7 @@ folding a review fix-up into the original commit.
 ```
 "code_output": [{
   "path": ".kres-commit-msg.tmp",
-  "content": "<subject>\n\n<problem paragraph wrapped at 75>\n\n<fix paragraph wrapped at 75>\n\nFixes: <sha> (\"<original subject>\")\nAssisted-by: kres (<model-id>)"
+  "content": "<subject>\n\n<problem paragraph wrapped at 75>\n\n<fix paragraph wrapped at 75>\n\nFixes: <sha> (\"<original subject>\")\nAssisted-by: kres:<model-id>"
 }]
 
 {"type": "git",
@@ -317,7 +317,7 @@ never `git add -A` or `git add .` (sweeps in stray files).
 8. Commit citations include at least 12 hex chars plus the oneline
    summary in parens?
 9. `Fixes:` trailer present when fixing a known prior commit?
-10. `Assisted-by: kres (<model-id>)` trailer present, with BOTH
+10. `Assisted-by: kres:<model-id>` trailer present, with BOTH
     the tool name and the model id (REQUIRED per
     submitting-patches.rst:637-644)? A bare `Assisted-by: kres`
     is insufficient.

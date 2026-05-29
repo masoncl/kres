@@ -93,7 +93,7 @@ pub struct ReplConfig {
     /// turns stop, matching the existing `--turns N` exit path.
     pub exit_on_idle: bool,
     /// Exact value to use after `Assisted-by:` for fix-workflow
-    /// commit messages. Defaults to `kres (<slow-model-id>)`; the
+    /// commit messages. Defaults to `kres:<slow-model-id>`; the
     /// CLI can override it with `--assisted-by`.
     pub assisted_by: String,
 }
@@ -115,7 +115,7 @@ impl Default for ReplConfig {
             mcp_config: None,
             persist_path: None,
             exit_on_idle: false,
-            assisted_by: "kres (claude-sonnet-4-6)".to_string(),
+            assisted_by: "kres:claude-sonnet-4-6".to_string(),
         }
     }
 }

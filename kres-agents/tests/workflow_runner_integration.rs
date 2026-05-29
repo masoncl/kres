@@ -414,7 +414,7 @@ async fn fix_workflow_runs_end_to_end_against_mock_llm() {
         fake_messages_response(
             "Wrote the commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"subsystem: fix the bug\\n\\nBody explaining the fix.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"subsystem: fix the bug\\n\\nBody explaining the fix.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -427,7 +427,7 @@ async fn fix_workflow_runs_end_to_end_against_mock_llm() {
     //   - the three LLM steps plus deterministic commit/build run in sequence
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
     assert_eq!(inputs.get("target_kind"), Some(&json!("prose")));
 
@@ -582,7 +582,7 @@ async fn lore_search_findings_thread_through_write_patch_prompt() {
         fake_messages_response(
             "Wrote the commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"a: fix the bug\\n\\nBody.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"a: fix the bug\\n\\nBody.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -591,7 +591,7 @@ async fn lore_search_findings_thread_through_write_patch_prompt() {
 
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
 
     let (_guard, workspace) = fresh_git_repo();
@@ -699,7 +699,7 @@ async fn write_patch_retries_when_code_edits_apply_fails() {
         fake_messages_response(
             "Wrote the commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"a: fix the bug\\n\\nBody.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"a: fix the bug\\n\\nBody.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -708,7 +708,7 @@ async fn write_patch_retries_when_code_edits_apply_fails() {
 
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
 
     let (_guard, workspace) = fresh_git_repo();
@@ -794,7 +794,7 @@ async fn latent_research_threads_into_commit_message_prompt() {
         fake_messages_response(
             "Wrote the commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"a: fix the bug\\n\\nNote: This fixes a latent bug with no known triggers in the kernel today.\\n\\nBody.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"a: fix the bug\\n\\nNote: This fixes a latent bug with no known triggers in the kernel today.\\n\\nBody.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -803,7 +803,7 @@ async fn latent_research_threads_into_commit_message_prompt() {
 
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
 
     let (_guard, workspace) = fresh_git_repo();
@@ -893,7 +893,7 @@ async fn fix_workflow_commits_write_patch_files_when_research_file_list_is_empty
         fake_messages_response(
             "Wrote the commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"subsystem: fix empty research files\\n\\nBody explaining the fix.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"subsystem: fix empty research files\\n\\nBody explaining the fix.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -901,7 +901,7 @@ async fn fix_workflow_commits_write_patch_files_when_research_file_list_is_empty
     let port = spawn_mock(responses).await;
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
 
     let (_guard, workspace) = fresh_git_repo();
@@ -980,7 +980,7 @@ async fn fix_workflow_accepts_review_added_patch_file_outside_research_list() {
         fake_messages_response(
             "Wrote the commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"subsystem: update related contract\\n\\nBody explaining the fix.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"subsystem: update related contract\\n\\nBody explaining the fix.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -988,7 +988,7 @@ async fn fix_workflow_accepts_review_added_patch_file_outside_research_list() {
     let port = spawn_mock(responses).await;
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
 
     let (_guard, workspace) = fresh_git_repo();
@@ -1060,7 +1060,7 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
         fake_messages_response(
             "First commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"subsystem: first patch\\n\\nBody explaining the first fix.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"subsystem: first patch\\n\\nBody explaining the first fix.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -1082,7 +1082,7 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
     responses.push_back(fake_messages_response(
         "Second commit message.\n\
          {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-          \"content\": \"subsystem: corrected patch\\n\\nBody explaining the corrected fix.\\n\\nAssisted-by: kres (test)\\n\", \
+          \"content\": \"subsystem: corrected patch\\n\\nBody explaining the corrected fix.\\n\\nAssisted-by: kres:test\\n\", \
           \"purpose\": \"commit message\"}]}",
     ));
     responses.extend(clean_review_responses(&workflow));
@@ -1091,7 +1091,7 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
 
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
 
     let (_guard, workspace) = fresh_git_repo();
@@ -1158,7 +1158,7 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
         fake_messages_response(
             "First commit message.\n\
              {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-              \"content\": \"subsystem: stale claim\\n\\nBody with a stale claim.\\n\\nAssisted-by: kres (test)\\n\", \
+              \"content\": \"subsystem: stale claim\\n\\nBody with a stale claim.\\n\\nAssisted-by: kres:test\\n\", \
               \"purpose\": \"commit message\"}]}",
         ),
     ]);
@@ -1168,7 +1168,7 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
     responses.extend(vec![fake_messages_response(
         "Rewritten commit message.\n\
          {\"code_output\": [{\"path\": \".kres-commit-msg.tmp\", \
-          \"content\": \"subsystem: corrected claim\\n\\nBody with the corrected claim.\\n\\nAssisted-by: kres (test)\\n\", \
+          \"content\": \"subsystem: corrected claim\\n\\nBody with the corrected claim.\\n\\nAssisted-by: kres:test\\n\", \
           \"purpose\": \"commit message\"}]}",
     )]);
     responses.push_back(review_ledger_response("commit_message", "addressed"));
@@ -1178,7 +1178,7 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
 
     let mut inputs = Map::new();
     inputs.insert("target".into(), Value::String("freeform bug prose".into()));
-    inputs.insert("assisted_by".into(), Value::String("kres (test)".into()));
+    inputs.insert("assisted_by".into(), Value::String("kres:test".into()));
     let inputs = derive_inputs(&workflow, inputs);
 
     let (_guard, workspace) = fresh_git_repo();

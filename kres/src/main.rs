@@ -130,7 +130,7 @@ struct RunWorkflowArgs {
     mcp_config: Option<PathBuf>,
     /// Override the exact value used after `Assisted-by:` in
     /// fix-workflow commit messages. Defaults to
-    /// `kres (<resolved-slow-model-id>)`.
+    /// `kres:<resolved-slow-model-id>`.
     #[arg(long, value_name = "TEXT")]
     assisted_by: Option<String>,
 }
@@ -170,7 +170,7 @@ struct ReplArgs {
     classifier_model: Option<String>,
     /// Override the exact value used after `Assisted-by:` in
     /// fix-workflow commit messages. Defaults to
-    /// `kres (<resolved-slow-model-id>)`.
+    /// `kres:<resolved-slow-model-id>`.
     #[arg(long, value_name = "TEXT")]
     assisted_by: Option<String>,
     /// Explicit main agent config path. When omitted, kres uses
@@ -548,7 +548,7 @@ fn slow_tag_to_model_id(tag: &str) -> Option<&'static str> {
 }
 
 fn assisted_by_from_model_id(model_id: &str) -> String {
-    format!("kres ({model_id})")
+    format!("kres:{model_id}")
 }
 
 fn default_assisted_by_for_slow_agent(
@@ -2649,7 +2649,7 @@ mod tests {
         );
         assert_eq!(
             resolved_assisted_by(None, None, &settings),
-            "kres (claude-test-model)"
+            "kres:claude-test-model"
         );
         assert_eq!(
             resolved_assisted_by(Some(&"operator value".to_string()), None, &settings),

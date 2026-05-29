@@ -491,7 +491,7 @@ the bug still exists at the current workspace HEAD.
 
    The workflow passes an explicit `assisted_by` input into this step.
    By default this is derived from the resolved slow-agent model as
-   `kres (<slow-model-id>)`; `--assisted-by TEXT` overrides the exact
+   `kres:<slow-model-id>`; `--assisted-by TEXT` overrides the exact
    value. The prompt requires the commit message to contain exactly
    `Assisted-by: <assisted_by>`. The review step treats that exact
    configured trailer as allowed; it may only report an `Assisted-by`

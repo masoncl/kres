@@ -349,7 +349,7 @@ names in source.
 
 `--assisted-by TEXT` controls the exact commit-message trailer value
 used by the fix workflow after `Assisted-by:`. When omitted, kres derives
-`kres (<slow-model-id>)` from the resolved slow agent model.
+`kres:<slow-model-id>` from the resolved slow agent model.
 
 ## REPL Commands
 

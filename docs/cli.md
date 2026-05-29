@@ -20,7 +20,7 @@ descriptions.
 
 `--assisted-by TEXT` overrides the exact value used after
 `Assisted-by:` by the fix workflow's generated commit message. When
-omitted, kres derives `kres (<slow-model-id>)` from the resolved slow
+omitted, kres derives `kres:<slow-model-id>` from the resolved slow
 agent model.
 
 `--slow NAME` selects a slow model config. `sonnet` and `opus` are

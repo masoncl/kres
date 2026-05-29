@@ -5324,7 +5324,7 @@ mod tests {
         let wf = fix_workflow();
         let review = wf.steps.iter().find(|s| s.id == "review").unwrap();
         let lens = review.lenses.iter().find(|l| l.id == "assertions").unwrap();
-        let inputs = Map::from_iter([("assisted_by".to_string(), json!("kres (claude-test)"))]);
+        let inputs = Map::from_iter([("assisted_by".to_string(), json!("kres:claude-test"))]);
         let states = make_state(&[
             (
                 "write-patch",
@@ -5556,7 +5556,7 @@ mod tests {
         let inputs = Map::from_iter([
             ("target".to_string(), json!("freeform bug prose")),
             ("target_kind".to_string(), json!("prose")),
-            ("assisted_by".to_string(), json!("kres (claude-test)")),
+            ("assisted_by".to_string(), json!("kres:claude-test")),
         ]);
         let states = make_state(&[
             (
@@ -5605,7 +5605,7 @@ mod tests {
         assert!(rendered.contains("raw git commit subject (line 1) MUST be <=55 chars"));
         assert!(rendered.contains("Subject: [PATCH] <subject>"));
         assert!(rendered.contains("<=72 chars including the literal word `Subject`"));
-        assert!(rendered.contains("Assisted-by: kres (claude-test)"));
+        assert!(rendered.contains("Assisted-by: kres:claude-test"));
         assert!(rendered.contains("Add the missing cleanup call before returning."));
     }
 
@@ -5631,7 +5631,7 @@ mod tests {
             ("target".to_string(), json!("freeform bug prose")),
             ("target_kind".to_string(), json!("prose")),
             ("target_artifact_dir".to_string(), json!("")),
-            ("assisted_by".to_string(), json!("kres (claude-test)")),
+            ("assisted_by".to_string(), json!("kres:claude-test")),
         ]);
         let states = make_state(&[
             (
@@ -5666,7 +5666,7 @@ mod tests {
                 0,
                 json!({
                     "commit_sha": "abc123def4567890",
-                    "commit_message": "subsys: fix example\n\nBody.\n\nAssisted-by: kres (claude-test)\nSigned-off-by: Test <test@example.com>\n"
+                    "commit_message": "subsys: fix example\n\nBody.\n\nAssisted-by: kres:claude-test\nSigned-off-by: Test <test@example.com>\n"
                 }),
             ),
             (
@@ -5705,7 +5705,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rendered.contains("Assisted-by: kres (claude-test)"));
+        assert!(rendered.contains("Assisted-by: kres:claude-test"));
         assert!(rendered.contains("Do not report that exact trailer as a non-standard"));
         assert!(rendered.contains("missing, duplicated, or"));
         assert!(rendered.contains("does not exactly match the configured value"));

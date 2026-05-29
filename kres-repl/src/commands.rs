@@ -60,6 +60,13 @@ pub enum Command {
     /// workflow (configs/workflows/triage.json) with `target` set
     /// to the absolute path of a kres finding directory.
     Triage { target: String },
+    /// `/validate <finding-dir> [source-workspace]` — dispatch the
+    /// embedded `validate` workflow. The source workspace defaults
+    /// to the active workspace.
+    Validate {
+        finding: String,
+        workspace: Option<String>,
+    },
     /// `/extract [--dir DIR] [--report F] [--todo F] [--findings F]`
     /// — copy session artifacts to operator-chosen destinations.
     Extract {
@@ -168,6 +175,18 @@ pub fn parse_command(line: &str) -> Command {
                     )
                 } else {
                     Command::Triage { target }
+                }
+            }
+            "validate" => {
+                let mut parts = rest.split_whitespace();
+                match parts.next() {
+                    Some(finding) => Command::Validate {
+                        finding: finding.to_string(),
+                        workspace: parts.next().map(|s| s.to_string()),
+                    },
+                    None => Command::Unknown(
+                        "validate (expected: /validate <finding-dir> [source-workspace])".into(),
+                    ),
                 }
             }
             "extract" => Command::Extract {
@@ -379,6 +398,38 @@ mod tests {
         match parse_command("/triage") {
             Command::Unknown(s) => {
                 assert!(s.starts_with("triage"), "got {s}");
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_with_default_workspace() {
+        match parse_command("/validate /tmp/finding-dir") {
+            Command::Validate { finding, workspace } => {
+                assert_eq!(finding, "/tmp/finding-dir");
+                assert_eq!(workspace, None);
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_validate_with_workspace() {
+        match parse_command("/validate /tmp/finding-dir /src/linux") {
+            Command::Validate { finding, workspace } => {
+                assert_eq!(finding, "/tmp/finding-dir");
+                assert_eq!(workspace.as_deref(), Some("/src/linux"));
+            }
+            other => panic!("expected Validate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_without_target_is_unknown() {
+        match parse_command("/validate") {
+            Command::Unknown(s) => {
+                assert!(s.starts_with("validate"), "got {s}");
             }
             other => panic!("expected Unknown, got {other:?}"),
         }

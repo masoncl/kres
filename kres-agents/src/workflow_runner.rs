@@ -151,6 +151,10 @@ const LENS_GATHER_DISALLOWED_FIELDS: &[&str] = &[
 
 type StructuredLensOutputs = Vec<(String, Map<String, Value>)>;
 
+/// Symbols + context a workflow step gathered, cached per step id so a
+/// dependent step can seed its own gather and skip re-fetching (#4).
+type GatheredData = (Vec<Value>, Vec<Value>);
+
 struct StepPromptTexts {
     user_text_base: String,
     gather_user_text_base: String,
@@ -260,6 +264,14 @@ pub struct LlmDriver {
     /// cancels the in-flight workflow run instead of letting it
     /// drag on. Defaults to a fresh, never-cancelled handle.
     shutdown: kres_core::Shutdown,
+    /// Per-step cache of the symbols/context each completed LLM step
+    /// gathered, keyed by step id. A step seeds its own gather loop
+    /// from the union of its `depends_on` entries here (#4), so a
+    /// dependent step — e.g. `validate-reachability` after
+    /// `validate-claims` — starts from the source the prior step
+    /// already fetched instead of re-requesting it. Interior-mutable
+    /// so the `&self` step path can populate it.
+    gathered_cache: std::sync::Mutex<std::collections::HashMap<String, GatheredData>>,
 }
 
 fn append_skill_block(block: &mut String, label: &str, body: &str) {
@@ -287,6 +299,53 @@ impl LlmDriver {
             logger: None,
             usage: None,
             shutdown: kres_core::Shutdown::new(),
+            gathered_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Seed a step's gather loop from the symbols/context its
+    /// dependencies already gathered (#4). Returns the union over all
+    /// `depends_on` entries present in [`Self::gathered_cache`]; empty
+    /// when the step has no dependencies or none have run yet.
+    fn seed_gather_from_deps(&self, deps: &[String]) -> GatheredData {
+        let mut symbols = Vec::new();
+        let mut context = Vec::new();
+        if deps.is_empty() {
+            return (symbols, context);
+        }
+        // Dedup by symbol/context identity so a diamond dependency
+        // (the same source reachable through two dep paths) ships each
+        // item once instead of N times. Uses the same identity the
+        // previously_fetched manifest uses.
+        let mut seen_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_ctx: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Ok(cache) = self.gathered_cache.lock() {
+            for dep in deps {
+                if let Some((s, c)) = cache.get(dep) {
+                    for sym in s {
+                        if seen_syms.insert(crate::symbol::sym_identity(sym).to_string()) {
+                            symbols.push(sym.clone());
+                        }
+                    }
+                    for ctx in c {
+                        if seen_ctx.insert(crate::symbol::ctx_identity(ctx).to_string()) {
+                            context.push(ctx.clone());
+                        }
+                    }
+                }
+            }
+        }
+        (symbols, context)
+    }
+
+    /// Record the symbols/context a step gathered so dependent steps
+    /// can seed from it. No-op for an empty gather.
+    fn store_gathered(&self, step_id: &str, symbols: Vec<Value>, context: Vec<Value>) {
+        if symbols.is_empty() && context.is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.gathered_cache.lock() {
+            cache.insert(step_id.to_string(), (symbols, context));
         }
     }
 
@@ -739,13 +798,26 @@ impl LlmDriver {
         {
             let mut last_parse_err: Option<String> = None;
             let mut last_apply_err: Option<String> = None;
+            // #4: seed this step's gather from the source its
+            // dependencies already fetched, so e.g. validate-reachability
+            // does not re-pull what validate-claims gathered.
+            let (seed_symbols, seed_context) = self.seed_gather_from_deps(&step.depends_on);
+            // Raw text of the previous attempt's reply, plus the gather
+            // it produced. `prior_raw` drives the #3 JSON-reformat path;
+            // `captured_gathered` preserves the original run's gather
+            // across reformat attempts (which gather nothing of their
+            // own) so the success path can still cache it.
+            let mut prior_raw: Option<String> = None;
+            let mut captured_gathered: Option<(Vec<Value>, Vec<Value>)> = None;
+            // Most recent non-empty code_output across attempts. A
+            // reformat reply (#3) that only fixes typed JSON fields can
+            // omit the files it already wrote on an earlier attempt; the
+            // files are still on disk, but summary_written/
+            // severity_written are computed from THIS reply's
+            // code_output, so the omission would falsely report them
+            // unwritten. Carry the files forward to re-credit them.
+            let mut carried_code_output: Vec<kres_core::CodeFile> = Vec::new();
             for json_retry in 0..=JSON_REPAIR_RETRIES {
-                let user_text = build_retry_user_text(
-                    &prompt_texts.user_text_base,
-                    json_retry,
-                    &mut last_apply_err,
-                    &mut last_parse_err,
-                );
                 let allowed = effective_actions(step, &self.workflow);
                 let runner = agent_runner_with_gated_fetcher(runner_base, allowed);
                 let runner = &runner;
@@ -768,35 +840,97 @@ impl LlmDriver {
                 let synthesis_use_fast = matches!(role, AgentRole::Fast);
                 let synthesis_use_routing_prompt =
                     use_routing_prompt_for_synth(&step.id, synthesis_use_fast);
-                let task_brief = match lens {
-                    Some(l) => format!("{}|{}", step.id, l.id),
-                    None => step.id.clone(),
-                };
-                let rctx = crate::pipeline::RunContext {
-                    task_brief,
-                    mode,
-                    gather_prompt: Some(prompt_texts.gather_user_text_base.clone()),
-                    surface_over_input_limit: true,
-                    synthesis_use_fast,
-                    synthesis_use_routing_prompt,
-                    ..crate::pipeline::RunContext::default()
-                };
-                let summary = runner
-                    .run_once_with_ctx(&user_text, &rctx, &self.shutdown)
-                    .await
-                    .map_err(|e| match e {
-                        crate::AgentError::OverInputLimit { actual, limit } => {
-                            crate::workflow_exec::DriverError::OverInputLimit {
-                                step: step.id.clone(),
-                                actual,
-                                limit,
-                            }
+
+                // #3: a JSON/schema failure (not a code_edits apply
+                // failure) with a prior reply in hand is repaired by
+                // asking the model to convert that reply into the
+                // required JSON, instead of re-running the whole
+                // gather+synthesis. The reformat consumes the pending
+                // parse error; if the reformat CALL itself fails we fall
+                // through to a full retry with the error re-applied.
+                let mut summary = None;
+                if json_retry > 0 && last_apply_err.is_none() {
+                    if let Some(prior) = prior_raw.as_deref() {
+                        let validator = last_parse_err.clone().unwrap_or_default();
+                        if let Some(s) = runner
+                            .reformat_response_to_schema(
+                                &prompt_texts.user_text_base,
+                                prior,
+                                &validator,
+                                crate::pipeline::ReformatRouting {
+                                    use_fast: synthesis_use_fast,
+                                    use_routing_prompt: synthesis_use_routing_prompt,
+                                    mode,
+                                },
+                                &self.shutdown,
+                            )
+                            .await
+                        {
+                            last_parse_err = None;
+                            summary = Some(s);
                         }
-                        other => crate::workflow_exec::DriverError::Other(format!(
-                            "step '{}' AgentRunner run: {other}",
-                            step.id
-                        )),
-                    })?;
+                    }
+                }
+                let mut summary = match summary {
+                    Some(s) => s,
+                    None => {
+                        let user_text = build_retry_user_text(
+                            &prompt_texts.user_text_base,
+                            json_retry,
+                            &mut last_apply_err,
+                            &mut last_parse_err,
+                        );
+                        let task_brief = match lens {
+                            Some(l) => format!("{}|{}", step.id, l.id),
+                            None => step.id.clone(),
+                        };
+                        let rctx = crate::pipeline::RunContext {
+                            task_brief,
+                            mode,
+                            gather_prompt: Some(prompt_texts.gather_user_text_base.clone()),
+                            surface_over_input_limit: true,
+                            synthesis_use_fast,
+                            synthesis_use_routing_prompt,
+                            seed_symbols: seed_symbols.clone(),
+                            seed_context: seed_context.clone(),
+                            ..crate::pipeline::RunContext::default()
+                        };
+                        runner
+                            .run_once_with_ctx(&user_text, &rctx, &self.shutdown)
+                            .await
+                            .map_err(|e| match e {
+                                crate::AgentError::OverInputLimit { actual, limit } => {
+                                    crate::workflow_exec::DriverError::OverInputLimit {
+                                        step: step.id.clone(),
+                                        actual,
+                                        limit,
+                                    }
+                                }
+                                other => crate::workflow_exec::DriverError::Other(format!(
+                                    "step '{}' AgentRunner run: {other}",
+                                    step.id
+                                )),
+                            })?
+                    }
+                };
+                prior_raw = Some(summary.raw_response.clone());
+                if !summary.gathered_symbols.is_empty() || !summary.gathered_context.is_empty() {
+                    captured_gathered = Some((
+                        summary.gathered_symbols.clone(),
+                        summary.gathered_context.clone(),
+                    ));
+                }
+                // Carry code_output across reformat attempts (see the
+                // declaration above). Re-persisting is safe: code_output
+                // entries are full-file overwrites. code_edits are NOT
+                // carried — they are anchored to bytes that an earlier
+                // attempt already replaced, and validate/triage write via
+                // code_output, not edits.
+                if !summary.code_output.is_empty() {
+                    carried_code_output = summary.code_output.clone();
+                } else if !carried_code_output.is_empty() {
+                    summary.code_output = carried_code_output.clone();
+                }
 
                 // Map TaskSummary fields onto step.outputs before
                 // applying side effects. Validation failures can
@@ -846,6 +980,12 @@ impl LlmDriver {
                         continue;
                     }
                     return Err(format!("step '{}' output validation: {e}", step.id).into());
+                }
+                // #4: cache the gather (from the original run, preserved
+                // across any reformat attempts) so dependent steps can
+                // seed from it.
+                if let Some((symbols, context)) = captured_gathered.take() {
+                    self.store_gathered(&step.id, symbols, context);
                 }
                 return Ok(outputs);
             }
@@ -5138,6 +5278,48 @@ mod tests {
     }
 
     #[test]
+    fn gathered_cache_seeds_dependent_step_from_deps() {
+        // #4: a step's gather is cached per id; a dependent step seeds
+        // the union of its `depends_on` entries so it doesn't re-fetch.
+        let wf = crate::workflow::parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "seedtest",
+                "steps": [{"id": "a", "agent": "slow", "prompt": "p",
+                           "outputs": {"analysis": {"type": "string"}}}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let driver = LlmDriver::new(std::path::PathBuf::from("."), wf);
+
+        // No deps → empty seed.
+        let (s, c) = driver.seed_gather_from_deps(&[]);
+        assert!(s.is_empty() && c.is_empty());
+
+        driver.store_gathered(
+            "a",
+            vec![json!({"name": "sym_a"})],
+            vec![json!({"ctx": "a"})],
+        );
+        driver.store_gathered("b", vec![json!({"name": "sym_b"})], vec![]);
+
+        // Seeding from [a, b] unions both steps' gathers.
+        let (syms, ctx) = driver.seed_gather_from_deps(&["a".to_string(), "b".to_string()]);
+        assert_eq!(syms.len(), 2, "symbols union of a + b");
+        assert_eq!(ctx.len(), 1, "only a contributed context");
+
+        // Unknown dependency contributes nothing.
+        let (s2, c2) = driver.seed_gather_from_deps(&["missing".to_string()]);
+        assert!(s2.is_empty() && c2.is_empty());
+
+        // Storing an empty gather is a no-op (nothing to seed later).
+        driver.store_gathered("c", vec![], vec![]);
+        let (s3, _) = driver.seed_gather_from_deps(&["c".to_string()]);
+        assert!(s3.is_empty());
+    }
+
+    #[test]
     fn review_prompt_interpolates_when_dispute_skips_commit_and_build() {
         let wf = fix_workflow();
         let review = wf.steps.iter().find(|s| s.id == "review").unwrap();
@@ -7354,6 +7536,8 @@ mod tests {
             code_output: vec![],
             code_edits: vec![],
             plan: None,
+            gathered_symbols: vec![],
+            gathered_context: vec![],
         };
         let out = map_task_summary_to_outputs(&wf.steps[0], &summary).unwrap();
         assert_eq!(
@@ -7405,6 +7589,8 @@ mod tests {
             code_output: vec![],
             code_edits: vec![],
             plan: None,
+            gathered_symbols: vec![],
+            gathered_context: vec![],
         };
         let out = map_task_summary_to_outputs(&wf.steps[0], &summary).unwrap();
         assert_eq!(out.get("result").and_then(|v| v.as_str()), Some("clean"));
@@ -7441,6 +7627,8 @@ mod tests {
             code_output: vec![],
             code_edits: vec![],
             plan: None,
+            gathered_symbols: vec![],
+            gathered_context: vec![],
         };
         let out = map_task_summary_to_outputs(&wf.steps[0], &summary).unwrap();
         assert_eq!(out.get("valid").and_then(|v| v.as_bool()), Some(true));
@@ -7485,6 +7673,8 @@ mod tests {
             code_output: vec![],
             code_edits: vec![],
             plan: None,
+            gathered_symbols: vec![],
+            gathered_context: vec![],
         };
         let mut outputs = map_task_summary_to_outputs(step, &summary).unwrap();
 

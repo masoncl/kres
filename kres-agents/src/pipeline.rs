@@ -396,6 +396,27 @@ pub struct RunContext {
     /// at synthesis time. Default false preserves the existing
     /// fast_system / slow_system selection.
     pub synthesis_use_routing_prompt: bool,
+    /// Symbols already gathered by an earlier workflow step that this
+    /// run should start from instead of re-fetching. The gather loop
+    /// seeds its `symbols` accumulator with these so round 0 ships
+    /// them to the agent as already-available context. Empty for the
+    /// first step in a chain. See the workflow runner's per-step
+    /// gathered-context cache.
+    pub seed_symbols: Vec<Value>,
+    /// Context items already gathered by an earlier workflow step,
+    /// seeded the same way as [`Self::seed_symbols`].
+    pub seed_context: Vec<Value>,
+}
+
+/// How a [`AgentRunner::reformat_response_to_schema`] call should route
+/// its single LLM request. Mirrors the three-way synthesis routing in
+/// `run_once_with_ctx` (routing-agent prompt vs fast-gather prompt vs
+/// per-mode slow prompt) so the reformat retry speaks the same dialect
+/// the original reply did.
+pub struct ReformatRouting {
+    pub use_fast: bool,
+    pub use_routing_prompt: bool,
+    pub mode: kres_core::TaskMode,
 }
 
 fn record_usage(
@@ -595,6 +616,16 @@ pub struct TaskSummary {
     /// first slow call per top-level prompt is expected to set
     /// this (see `RunContext.allow_plan_rewrite`).
     pub plan: Option<kres_core::PlanRewrite>,
+    /// All symbols this run accumulated across its fast-gather rounds
+    /// (including any seeded from an earlier step). The workflow
+    /// runner caches these per step id so a dependent step can seed
+    /// its own gather via [`RunContext::seed_symbols`] and avoid
+    /// re-fetching the same source. Empty for runs that did no gather
+    /// (e.g. the JSON-reformat path).
+    pub gathered_symbols: Vec<Value>,
+    /// Context items this run accumulated, cached the same way as
+    /// [`Self::gathered_symbols`].
+    pub gathered_context: Vec<Value>,
 }
 
 impl AgentRunner {
@@ -634,8 +665,14 @@ impl AgentRunner {
         // responses so the fast agent can pull in extra files
         // mid-gather (§27,).
         let mut live_skills: Option<Value> = self.skills.clone();
-        let mut symbols: Vec<Value> = Vec::new();
-        let mut context: Vec<Value> = Vec::new();
+        // Seed from an earlier workflow step's gathered data (#4) so a
+        // dependent step does not re-fetch source the prior step
+        // already pulled. With prev_n_* starting at 0, round 0 ships
+        // these to the fast agent as fresh `symbols`/`context` rather
+        // than as a names-only manifest, so the agent sees the bodies
+        // and won't re-request them.
+        let mut symbols: Vec<Value> = ctx.seed_symbols.clone();
+        let mut context: Vec<Value> = ctx.seed_context.clone();
         let mut prev_n_syms: usize = 0;
         let mut prev_n_ctx: usize = 0;
         let mut fast_rounds: u8 = 0;
@@ -1173,6 +1210,13 @@ impl AgentRunner {
             code_output,
             code_edits,
             plan: slow_plan,
+            // Hand the budget-trimmed gather back (not the raw
+            // accumulator) so the workflow runner can seed a dependent
+            // step (#4) without a giant blob blowing the dependent
+            // step's round-0 fast input limit. These are the same
+            // trimmed lists already shipped to this step's slow call.
+            gathered_symbols: trimmed_symbols,
+            gathered_context: trimmed_context,
         })
     }
 
@@ -1276,6 +1320,186 @@ impl AgentRunner {
             return None;
         }
         Some(reparsed)
+    }
+
+    /// Re-emit a previous step reply as schema-correct JSON WITHOUT
+    /// re-running the gather + synthesis loop. Invoked by the workflow
+    /// runner when a step's reply was received but failed the step's
+    /// declared OUTPUT SCHEMA (prose-only, missing a required typed
+    /// field, or a malformed object). Instead of paying for a whole
+    /// fresh `run_once_with_ctx` (which re-fetches all source), the
+    /// model is shown the original task + OUTPUT SCHEMA, the exact
+    /// validator error, and its own prior reply, and is asked to
+    /// convert that content into the required JSON — not to redo the
+    /// analysis. Unlike [`Self::translate_slow_raw_text`], this targets
+    /// the step's own schema (the `base_prompt` carries the step's
+    /// OUTPUT SCHEMA tail), so workflow-specific fields such as
+    /// `claim_validation`, `verdict`, and `triage_coding` survive.
+    ///
+    /// `use_fast`/`mode` mirror the synthesis routing so the reformat
+    /// uses the same client and system prompt that produced the
+    /// original reply. Returns the reparsed `TaskSummary`, or `None`
+    /// when the reformat call itself failed or still produced no
+    /// parseable JSON (the caller then falls back to a full retry).
+    pub async fn reformat_response_to_schema(
+        &self,
+        base_prompt: &str,
+        prior_response: &str,
+        validator_err: &str,
+        routing: ReformatRouting,
+        shutdown: &Shutdown,
+    ) -> Option<TaskSummary> {
+        let ReformatRouting {
+            use_fast,
+            use_routing_prompt,
+            mode,
+        } = routing;
+        let user_content = format!(
+            "Your previous reply did not satisfy this step's required OUTPUT \
+             SCHEMA. Do NOT redo the analysis and do NOT request more data — \
+             you already gathered everything you need. Re-emit the SAME content \
+             and the SAME decisions as a single valid JSON object that matches \
+             the OUTPUT SCHEMA below, as the LAST top-level JSON object in your \
+             reply.\n\n\
+             Validator error from the previous attempt: {validator_err}\n\n\
+             Preserve every code_output file, code_edit, finding, and typed \
+             field your previous reply intended. If a required field was \
+             missing, fill it from the content you already produced; do not \
+             invent new facts or change your conclusions.\n\n\
+             --- ORIGINAL TASK AND OUTPUT SCHEMA ---\n{base_prompt}\n\n\
+             --- YOUR PREVIOUS REPLY TO REFORMAT ---\n{prior_response}"
+        );
+        let messages = vec![Message {
+            role: "user".into(),
+            content: user_content.clone(),
+            cache: false,
+            cached_prefix: None,
+        }];
+        let (client, model, max_tokens, max_in, thinking) = if use_fast {
+            (
+                &self.fast_client,
+                self.fast_model.clone(),
+                self.fast_max_tokens,
+                self.fast_max_input_tokens,
+                self.fast_thinking,
+            )
+        } else {
+            (
+                &self.slow_client,
+                self.slow_model.clone(),
+                self.slow_max_tokens,
+                self.slow_max_input_tokens,
+                self.slow_thinking,
+            )
+        };
+        let mut cfg = CallConfig::defaults_for(model.clone())
+            .with_max_tokens(max_tokens)
+            .with_stream_label("json-reformat");
+        if let Some(thinking) = thinking {
+            cfg = cfg.with_thinking(thinking);
+        }
+        // Mirror the synthesis system-prompt selection so the reformat
+        // call speaks the same dialect the original reply did. This must
+        // track all three synthesis branches in run_once_with_ctx,
+        // including the routing-agent prompt used by the orchestrator
+        // step — otherwise its reformat retry would run under the
+        // fast-gather prompt (wrong shape for a routing decision).
+        let system_for_call = if use_routing_prompt {
+            self.routing_system.as_ref().or(self.fast_system.as_ref())
+        } else if use_fast {
+            self.fast_system.as_ref()
+        } else {
+            match mode {
+                kres_core::TaskMode::Coding => self
+                    .slow_coding_system
+                    .as_ref()
+                    .or(self.slow_system.as_ref()),
+                kres_core::TaskMode::Generic => self
+                    .slow_generic_system
+                    .as_ref()
+                    .or(self.slow_system.as_ref()),
+                kres_core::TaskMode::Audit => self.slow_system.as_ref(),
+            }
+        };
+        if let Some(s) = system_for_call {
+            cfg = cfg.with_system(s.clone());
+        }
+        if let Some(n) = max_in {
+            cfg = cfg.with_max_input_tokens(n);
+        }
+        let role_for_usage = if use_fast { "fast" } else { "slow" };
+        if let Some(lg) = &self.logger {
+            lg.log_code("user", &user_content, None, None);
+        }
+        kres_core::async_eprintln!("[json-reformat] re-emitting prior reply as schema JSON");
+        let text = tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            r = client.messages_streaming(&cfg, &messages) => {
+                match r {
+                    Ok(resp) => {
+                        record_usage(&self.usage, role_for_usage, &model, &resp.usage);
+                        let t = extract_text(&resp);
+                        if let Some(lg) = &self.logger {
+                            let thinking = extract_thinking(&resp);
+                            lg.log_code(
+                                "assistant",
+                                &t,
+                                Some(log_usage(&resp.usage)),
+                                thinking.as_deref(),
+                            );
+                        }
+                        t
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "kres_agents",
+                            "json-reformat call failed: {e}"
+                        );
+                        return None;
+                    }
+                }
+            }
+        };
+        let parsed = parse_code_response(&text);
+        // A prose-only reformat reply is no better than the input it was
+        // meant to fix: parse_code_response never fails — it falls back
+        // to RawText and stuffs everything into `analysis`. Returning
+        // Some here would wrap that prose as a "successful" reformat and
+        // starve the caller's full-retry fallback (run_once_with_ctx),
+        // contradicting this method's contract. Mirror
+        // translate_slow_raw_text and surface None so the caller re-runs
+        // a full gather+synthesis instead.
+        if parsed.strategy == ParseStrategy::RawText {
+            tracing::warn!(
+                target: "kres_agents",
+                "json-reformat returned non-JSON; falling back to full retry"
+            );
+            return None;
+        }
+        // Mirror run_once_with_ctx's mode-based field routing so the
+        // returned summary maps onto the step outputs identically.
+        let (findings_out, code_output, code_edits) = match mode {
+            kres_core::TaskMode::Audit | kres_core::TaskMode::Generic => {
+                (parsed.findings, Vec::new(), Vec::new())
+            }
+            kres_core::TaskMode::Coding => (Vec::new(), parsed.code_output, parsed.code_edits),
+        };
+        Some(TaskSummary {
+            raw_response: text,
+            analysis: parsed.analysis,
+            findings: findings_out,
+            followups: parsed.followups,
+            fast_rounds: 0,
+            strategy: parsed.strategy,
+            mode,
+            code_output,
+            code_edits,
+            plan: None,
+            // No gather happened on the reformat path; the caller keeps
+            // the gathered data captured from the original run.
+            gathered_symbols: Vec::new(),
+            gathered_context: Vec::new(),
+        })
     }
 }
 
@@ -1465,6 +1689,12 @@ impl AgentRunner {
             // (lens count 0) still get plan rewrite via
             // run_once_with_ctx above.
             plan: None,
+            // Lens fan-out shares one gather across all lenses; the
+            // per-step cache is only consumed by sequential dependent
+            // steps (validate, fix), not lensed review, so an empty
+            // hand-back here is correct.
+            gathered_symbols: Vec::new(),
+            gathered_context: Vec::new(),
         })
     }
 

@@ -28,11 +28,12 @@ User prompt → Task created → Task thread starts
   actively needs them.
 - Workflow-owned commands have exactly one implementation mechanism:
   the JSON workflow under `configs/workflows/` (or the operator's
-  `~/.kres/workflows/<name>.json` override). `/fix`, `/review`, and
-  `/triage` may be started from the REPL or from CLI `--prompt`; both
-  entry points must derive behavior from the same JSON workflow.
-- `/fix` and `/triage` use the workflow executor directly. `/review`
-  uses `review.json` to define its prompt contract and lenses, then
+  `~/.kres/workflows/<name>.json` override). `/fix`, `/review`,
+  `/triage`, and `/validate` may be started from the REPL or from CLI
+  `--prompt`; both entry points must derive behavior from the same JSON
+  workflow.
+- `/fix`, `/triage`, and `/validate` use the workflow executor directly.
+  `/review` uses `review.json` to define its prompt contract and lenses, then
   runs through the REPL task/todo loop so followups become prioritized
   next-turn todos. Do not add a second review engine or a markdown
   prompt fallback.
@@ -332,8 +333,8 @@ this repo's `configs/` tree:
 | `mcp.json` | MCP server definitions (installed only when semcode-mcp is available) |
 | `settings.json` | Per-user defaults for per-role model ids. CLI flags `--fast-model`, `--slow-model`, `--main-model`, `--todo-model` override the matching role. `--slow <name>` selects one slow model JSON file: `sonnet`/`opus` are aliases for shipped model ids, and other values match filenames under `models/`. `--slow` and `--slow-model` are mutually exclusive. |
 | `system-prompts/*.system.md` | Optional operator overrides for agent system prompts. Default prompts are embedded in the kres binary (`kres-agents/src/embedded_prompts.rs`); a file at `~/.kres/system-prompts/<basename>` shadows the embedded copy. Empty by default |
-| `commands/<name>.md` | Optional operator overrides (or additions) for non-workflow slash-command templates. Summary rendering reads `summary` / `summary-markdown` templates through `kres-agents/src/user_commands.rs`; workflow-owned names (`fix`, `review`, `triage`) are reserved and cannot be resurrected as prompt templates. |
-| `workflows/<name>.json` | Optional operator overrides for shipped workflows such as `fix`, `review`, and `triage`. Disk overrides shadow embedded workflow JSON. |
+| `commands/<name>.md` | Optional operator overrides (or additions) for non-workflow slash-command templates. Summary rendering reads `summary` / `summary-markdown` templates through `kres-agents/src/user_commands.rs`; workflow-owned names (`fix`, `review`, `triage`, `validate`) are reserved and cannot be resurrected as prompt templates. |
+| `workflows/<name>.json` | Optional operator overrides for shipped workflows such as `fix`, `review`, `triage`, and `validate`. Disk overrides shadow embedded workflow JSON. |
 | `skills/*.md` | Domain knowledge files |
 
 Rate limiters are shared across agents that use the same API key string.
@@ -364,6 +365,7 @@ used by the fix workflow after `Assisted-by:`. When omitted, kres derives
 | `/summary-markdown [FILE]` | Same as `/summary` but uses the `summary-markdown` template and defaults the filename to `summary.md` |
 | `/review <target>` | Run the embedded `review` workflow for `<target>` — CLI equivalent of `--prompt 'review: <target>'`. The shipped workflow defines the review prompt contract and lenses; execution uses the REPL task/todo loop so followups become next-turn review todos. This is workflow-only; no markdown prompt fallback exists |
 | `/triage <finding-dir>` | Run the embedded `triage` workflow for a kres-exported finding directory. The workflow includes the golden triage template, preserves followups, and validates that `summary.md` was actually written. This is workflow-only; no alternate prompt path exists |
+| `/validate <finding-dir> [source-workspace]` | Run the embedded `validate` workflow for a kres-exported finding directory against source workspace (default `.`). It validates finding claims with the fast coding agent, verifies reachability/non-latency with the slow coding agent, and writes `summary.md` plus severity updates like `/triage`. This is workflow-only; no alternate prompt path exists |
 | `/fix <target>` | Run the embedded `fix` workflow for `<target>` — CLI equivalent of `--prompt 'fix: <target>'`. `fix` is workflow-only; no slash-command template or alternate prompt path is used. Drives the research → write-patch → write-commit-message → commit → build → triage/review → publish pipeline (see [docs/workflow.md](docs/workflow.md)) |
 | `/report <file>` | Write all findings to markdown file |
 | `/followup` | Show deferred items (identified but skipped when goal met) |

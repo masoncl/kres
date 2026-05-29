@@ -441,6 +441,10 @@ const EMBEDDED_WORKFLOWS: &[(&str, &str)] = &[
         "triage",
         include_str!("../../configs/workflows/triage.json"),
     ),
+    (
+        "validate",
+        include_str!("../../configs/workflows/validate.json"),
+    ),
 ];
 
 /// Iterator over every embedded workflow id. Useful for `/help` and
@@ -736,6 +740,12 @@ mod tests {
     }
 
     #[test]
+    fn lookup_workflow_finds_embedded_validate() {
+        let wf = lookup_workflow(None, "validate").unwrap();
+        assert_eq!(wf.id, "validate");
+    }
+
+    #[test]
     fn review_workflow_loads_with_parallel_lenses() {
         let body = include_str!("../../configs/workflows/review.json");
         let wf = parse_workflow(body).expect("review.json must validate against schema");
@@ -801,6 +811,95 @@ mod tests {
         assert!(step.outputs.contains_key("triage_coding"));
         assert_eq!(
             step.eval.as_ref().and_then(|e| e.expr.as_deref()),
+            Some(
+                "summary_written == true && severity_written == true && triage_coding.schema_version == 1 && triage_coding.severity == severity"
+            )
+        );
+    }
+
+    #[test]
+    fn validate_workflow_preserves_validation_contract() {
+        let body = include_str!("../../configs/workflows/validate.json");
+        let wf = parse_workflow(body).expect("validate.json must validate against schema");
+        let triage = parse_workflow(include_str!("../../configs/workflows/triage.json"))
+            .expect("triage.json must validate against schema");
+        assert_eq!(wf.id, "validate");
+        assert_eq!(wf.skills, vec!["auto"]);
+        assert_eq!(wf.steps.len(), 2);
+
+        let fast = &wf.steps[0];
+        assert_eq!(fast.id, "validate-claims");
+        assert_eq!(fast.agent, Some(Agent::Fast));
+        assert_eq!(fast.mode, Some(Mode::Coding));
+        assert!(fast.lenses.is_empty(), "validate must not use lenses");
+        assert!(fast.outputs.contains_key("claim_validation"));
+        let claim_schema = fast
+            .outputs
+            .get("claim_validation")
+            .and_then(|def| def.get("schema"))
+            .expect("claim_validation schema");
+        assert_eq!(
+            claim_schema.pointer("/properties/supported/items/type"),
+            Some(&serde_json::Value::String("object".to_string())),
+            "supported claim entries must preserve structured evidence"
+        );
+        assert_eq!(
+            claim_schema.pointer("/properties/contradicted/items/type"),
+            Some(&serde_json::Value::String("object".to_string())),
+            "contradicted claim entries must preserve structured evidence"
+        );
+        assert_eq!(
+            claim_schema.pointer("/properties/unresolved/items/type"),
+            Some(&serde_json::Value::String("object".to_string())),
+            "unresolved claim entries must preserve structured evidence"
+        );
+        assert_eq!(
+            fast.eval.as_ref().and_then(|e| e.expr.as_deref()),
+            Some("claim_validation.schema_version == 1")
+        );
+
+        let slow = &wf.steps[1];
+        assert_eq!(slow.id, "validate-reachability");
+        assert_eq!(slow.agent, Some(Agent::Slow));
+        assert_eq!(slow.mode, Some(Mode::Coding));
+        assert_eq!(slow.depends_on, vec!["validate-claims"]);
+        assert!(slow.lenses.is_empty(), "validate must not use lenses");
+        assert!(slow.include.iter().any(|i| i.contains("triage_rules")));
+        assert!(slow.outputs.contains_key("verdict"));
+        assert!(slow.outputs.contains_key("severity"));
+        assert!(slow.outputs.contains_key("summary_written"));
+        assert!(slow.outputs.contains_key("severity_written"));
+        assert!(slow.outputs.contains_key("code_output"));
+        assert!(slow.outputs.contains_key("triage_coding"));
+        assert_eq!(
+            slow.outputs
+                .get("triage_coding")
+                .and_then(|def| def.get("schema")),
+            triage.steps[0]
+                .outputs
+                .get("triage_coding")
+                .and_then(|def| def.get("schema")),
+            "validate must keep the same triage_coding schema as triage"
+        );
+        let slow_prompt = slow.prompt.as_deref().expect("validate slow prompt");
+        assert!(prompt_contains_phrase(
+            slow_prompt,
+            "if verdict is `Invalid`, summary_status must be `invalid`"
+        ));
+        assert!(prompt_contains_phrase(
+            slow_prompt,
+            "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent"
+        ));
+        assert!(prompt_contains_phrase(
+            slow_prompt,
+            "do not leave `metadata.yaml` or `FINDING.md` saying the old question remains open"
+        ));
+        assert!(prompt_contains_phrase(
+            slow_prompt,
+            "add or update this top-level marker exactly: `validation_run: true`"
+        ));
+        assert_eq!(
+            slow.eval.as_ref().and_then(|e| e.expr.as_deref()),
             Some(
                 "summary_written == true && severity_written == true && triage_coding.schema_version == 1 && triage_coding.severity == severity"
             )

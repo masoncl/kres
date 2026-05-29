@@ -1052,9 +1052,9 @@ workflow can report success.
 When `--prompt "review: ..."` is recognized on the CLI, kres builds the
 initial review prompt and session lenses from `configs/workflows/review.json`,
 then enters the normal REPL task/todo loop. `--turns N` therefore means N
-completed review tasks, matching interactive review continuation. `/fix`
-and `/triage` still use the workflow executor directly because their JSON
-steps own the full ordered pipeline.
+completed review tasks, matching interactive review continuation. `/fix`,
+`/triage`, and `/validate` still use the workflow executor directly
+because their JSON steps own the full ordered pipeline.
 
 The `--turns N` cap is a launch cap, not permission to drop active work.
 When the cap is reached, the reaper drains only Pending/Blocked todos to
@@ -1103,7 +1103,9 @@ The wrapper must preserve the old practical behavior:
   `FINDING.md`, and all three persisted files contain the selected
   severity.
 - `verdict` is an enum and must be one of `Fixed`, `Plausible`,
-  `Unconfirmed`, `Unknown`, or `Invalid`.
+  `Unconfirmed`, `Unknown`, `Invalid`, or `ConfirmedLatent` (a proven
+  dormant defect; see the Confirmed Latent branch of
+  `configs/prompts/triage-template.md`).
 - `severity` is an enum and must be one of `high`, `medium`, or `low`.
 - `triage_coding.schema_version` must be `1`, and
   `triage_coding.severity` must match `severity`; missing/malformed
@@ -1111,6 +1113,62 @@ The wrapper must preserve the old practical behavior:
   fail the workflow.
 - `followups` are preserved when the agent needs more source/type/history
   evidence to classify the finding.
+
+## Validation Flow (`/validate`)
+
+`/validate <finding-dir> [source-workspace]` and
+`--prompt "validate: <finding-dir> [source-workspace]"` dispatch
+`configs/workflows/validate.json`. There is no markdown prompt path for
+validation. The source workspace defaults to the active workspace (`.`);
+when supplied, it becomes the workflow runner workspace so local source
+tools, semcode MCP, git, and `skills: ["auto"]` all resolve against the
+codebase being validated rather than the finding export directory.
+
+Validation is intentionally sequential and does not use review lenses:
+
+- `validate-claims` runs as a fast coding step. It reads
+  `metadata.yaml` and `FINDING.md`, checks factual claims against source,
+  and emits structured `claim_validation` with object entries for
+  supported, contradicted, and unresolved claims. Each claim entry carries
+  a stable `id`, the claim text, and evidence or the exact source still
+  needed. Open-question and false-positive-risk lists remain string
+  summaries.
+- `validate-reachability` runs as a slow coding step. It uses the claim
+  validation report as a checklist, closes bug-existence questions such
+  as return-value and reachability assumptions, determines whether the
+  bug is reachable or latent, and then applies the same triage template
+  used by `/triage`.
+
+The final validation step writes `summary.md`, updates `metadata.yaml`
+and `FINDING.md` with the selected severity, adds
+`validation_run: true` to `metadata.yaml`, and emits `triage_coding`.
+The same machine-populated checks as `/triage` apply:
+`summary_written` and `severity_written` must be true, and
+`triage_coding.schema_version == 1` with
+`triage_coding.severity == severity`. Incomplete or malformed output is
+retried and then fails the workflow.
+
+The validation prompt is stricter than triage about false positives. A
+finding should not be kept `Plausible` when a load-bearing component is
+still unresolved. Status follows what the evidence proved: a
+bug-existence gate that is still genuinely open (neither proven nor
+disproven) is `Unconfirmed`, while a gate the run resolved negatively is
+not. Contradicted findings are `Invalid`.
+
+A finding proven latent-only — the defect pattern genuinely exists in
+source but 100% of it has no current in-tree trigger because every
+required precondition, hook, caller, or state is absent or cannot occur —
+is `Confirmed Latent` (verdict `ConfirmedLatent`,
+`triage_coding.summary_status: confirmed_latent`, metadata
+`status: confirmed_latent`), not `Unconfirmed` and not `Invalid`:
+nothing is left open, but the dormant structure is not a false positive
+either. This status, its decision-tree placement, and its
+`triage_coding` tagging (`latent` impact class, `latent_only` reject
+reason, trigger reachability gates resolved to `no`) are defined once in
+`configs/prompts/triage-template.md`, so `/triage` and `/validate` share
+the same definition. If any component is currently reachable and valid,
+the finding is not latent-only: validation keeps it valid and documents
+that reachable component.
 
 ## Summary Flow (`/summary`)
 

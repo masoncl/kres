@@ -83,7 +83,9 @@
         "that directory. Also update status/subsystem in those files when the template requires it.",
         "",
         "Return a `verdict` field in your structured outputs naming the chosen status (one of:",
-        "Fixed | Plausible | Unconfirmed | Unknown | Invalid).",
+        "Fixed | Plausible | Unconfirmed | Unknown | Invalid | ConfirmedLatent). The machine",
+        "`triage_coding.summary_status` is the lowercased verdict for the single-word",
+        "statuses; the one exception is `ConfirmedLatent`, which maps to `confirmed_latent`.",
         "Return a `severity` field in your structured outputs naming the chosen severity",
         "(one of: high | medium | low).",
         "",
@@ -91,7 +93,7 @@
         "content you emit. Do not put this JSON inside summary.md. Shape:",
         "- schema_version: integer, set to 1",
         "- severity: one of high, medium, low",
-        "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid",
+        "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent",
         "- summary_subject: short subject string from the summary, or empty string",
         "- impact_classes: array of lowercase strings such as local_dos, remote_dos, memory_corruption, privilege_escalation, info_leak, data_corruption, vm_escape, latent, test_only, unknown",
         "- config_commonness: one of common, niche, debug_or_test_only, unknown",
@@ -110,7 +112,8 @@
             "Plausible",
             "Unconfirmed",
             "Unknown",
-            "Invalid"
+            "Invalid",
+            "ConfirmedLatent"
           ],
           "description": "Status the agent assigned to the finding."
         },
@@ -179,7 +182,8 @@
                   "plausible",
                   "unconfirmed",
                   "unknown",
-                  "invalid"
+                  "invalid",
+                  "confirmed_latent"
                 ]
               },
               "summary_subject": {

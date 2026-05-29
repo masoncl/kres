@@ -255,7 +255,8 @@ struct ReplArgs {
     ///      `~/.kres/commands/word.md` and then in the embedded
     ///      user_commands table. If found, the extra details are
     ///      prepended to that template. Workflow-owned names such as
-    ///      `review`, `triage`, and `fix` dispatch through JSON workflows.
+    ///      `review`, `triage`, `validate`, and `fix` dispatch through
+    ///      JSON workflows.
     ///   3. `--prompt "<anything else>"` — submitted verbatim as the
     ///      opening prompt.
     #[arg(long, value_name = "PROMPT")]
@@ -420,7 +421,7 @@ fn main() -> Result<()> {
         Some(Command::RunWorkflow(args)) => rt.block_on(run_workflow(*args)),
         None => {
             // Workflow prompt invocations use their workflow-owned
-            // path. Fix/triage run through the workflow executor.
+            // path. Fix/triage/validate run through the workflow executor.
             // Review is special because its workflow-owned semantics
             // are the REPL task/todo loop: one lensed review turn
             // emits followups, the reaper sends them through the todo
@@ -467,7 +468,8 @@ fn main() -> Result<()> {
 /// Recognised forms:
 ///   1. Path to an existing file → `(path.display(), file-contents)`.
 ///   2. `"word: extra"` or `"/word extra"` naming a slash-command
-///      template that is not workflow-owned. `fix` and `triage` are
+///      template that is not workflow-owned. `fix`, `triage`, and
+///      `validate` are
 ///      handled before this function by
 ///      `workflow_short_circuit_from_repl_args`; `review` is handled
 ///      by `kres_repl::review_prompt_file_from_prompt` so it enters
@@ -506,7 +508,7 @@ fn resolve_prompt_arg(raw: &str) -> Result<(String, String)> {
         // (disk-first + embedded default + name-validation). The
         // validation inside compose covers the same character set
         // we'd enforce here, so there's no need to pre-filter.
-        if matches!(head, "fix" | "review" | "triage") {
+        if matches!(head, "fix" | "review" | "triage" | "validate") {
             return Err(anyhow::anyhow!(
                 "`{head}` is workflow-only; use `/{head} <target>` or `--prompt '{head}: <target>'`"
             ));
@@ -1149,6 +1151,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             && !args.no_tui
             && (args.tui || std::io::IsTerminal::is_terminal(&std::io::stdout())),
         workspace: args.workspace.clone(),
+        mcp_config: mcp_config.clone(),
         persist_path,
         assisted_by,
         // Piped/redirected stdout has no operator on the other end,
@@ -1334,7 +1337,8 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         .map(|l| l.session_dir().join("mcp-logs"))
                         .unwrap_or_else(|| results_dir.join("mcp-logs"));
                     for (name, cfg) in &reg.servers {
-                        match kres_mcp::McpClient::spawn(name, cfg, &log_dir).await {
+                        let cfg = cfg.with_workspace_cwd(name, &workspace);
+                        match kres_mcp::McpClient::spawn(name, &cfg, &log_dir).await {
                             Ok(client) => {
                                 kres_core::async_eprintln!(
                                     "mcp: spawned `{name}` (log: {})",
@@ -1652,8 +1656,15 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
         Ok(w) => w,
         Err(_) => return None,
     };
-    let chosen_input_key = kres_repl::target_input_key(&wf);
-    let mut input = vec![format!("{chosen_input_key}={}", rest)];
+    let (mut input, workspace) = if id == "validate" {
+        validate_prompt_inputs(rest, &repl.workspace)
+    } else {
+        let chosen_input_key = kres_repl::target_input_key(&wf);
+        (
+            vec![format!("{chosen_input_key}={rest}")],
+            repl.workspace.clone(),
+        )
+    };
     // Path to the workflow file: the lookup is by id, but
     // RunWorkflowArgs takes a path. Use a sentinel — the runner re-
     // looks up via id when the path doesn't exist (handled in
@@ -1663,7 +1674,6 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
     // workflow run so `kres --results may6 --prompt '/review HEAD'`
     // writes findings.json + report.md to may6/. Earlier the
     // short-circuit silently dropped both flags.
-    let workspace = repl.workspace.clone();
     let results = repl.results.clone();
     grant_prompt_path_mentions(&workspace, raw);
     if rest != raw {
@@ -1691,6 +1701,43 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
         mcp_config: None,
         assisted_by: repl.assisted_by.clone(),
     })
+}
+
+fn validate_prompt_inputs(rest: &str, default_workspace: &Path) -> (Vec<String>, PathBuf) {
+    let mut parts = rest.split_whitespace();
+    let finding = parts.next().unwrap_or_default();
+    let workspace = resolve_validate_source_workspace(default_workspace, parts.next());
+    (
+        vec![
+            format!("target={finding}"),
+            format!("source_workspace={}", workspace.display()),
+        ],
+        workspace,
+    )
+}
+
+fn resolve_validate_source_workspace(default_workspace: &Path, workspace: Option<&str>) -> PathBuf {
+    let raw = workspace
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".");
+    let expanded = if raw == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw))
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw))
+    } else {
+        PathBuf::from(raw)
+    };
+    let resolved = if raw == "." {
+        default_workspace.to_path_buf()
+    } else if expanded.is_absolute() {
+        expanded
+    } else {
+        default_workspace.join(expanded)
+    };
+    std::fs::canonicalize(&resolved).unwrap_or(resolved)
 }
 
 fn validate_workflow_short_circuit_model_flags(repl: &ReplArgs) -> Result<()> {
@@ -1926,7 +1973,8 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
                             .as_ref()
                             .map(|lg| lg.session_dir().to_path_buf())
                             .unwrap_or_else(|| logs_base.clone());
-                        match kres_mcp::McpClient::spawn(name, server_cfg, &mcp_log_dir).await {
+                        let server_cfg = server_cfg.with_workspace_cwd(name, &args.workspace);
+                        match kres_mcp::McpClient::spawn(name, &server_cfg, &mcp_log_dir).await {
                             Ok(mcp) => {
                                 eprintln!(
                                     "mcp: spawned '{name}' from {} ({} tool(s) advertised)",
@@ -2230,6 +2278,60 @@ mod tests {
         assert_eq!(args.slow_model.as_deref(), Some("slow-test"));
         assert_eq!(args.classifier_model.as_deref(), Some("classifier-test"));
         validate_workflow_short_circuit_model_flags(&c.repl).unwrap();
+    }
+
+    #[test]
+    fn validate_prompt_short_circuit_sets_source_workspace() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-validate-prompt-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let workspace = base.join("workspace");
+        let source = base.join("linux");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+
+        let c = Cli::try_parse_from([
+            "kres",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--prompt",
+            &format!("validate: /tmp/finding {}", source.display()),
+        ])
+        .unwrap();
+
+        let args = workflow_short_circuit_from_repl_args(&c.repl)
+            .expect("validate prompt should short-circuit");
+        assert_eq!(args.workspace, source);
+        assert!(args.input.contains(&"target=/tmp/finding".to_string()));
+        assert!(args
+            .input
+            .contains(&format!("source_workspace={}", source.display())));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn validate_prompt_defaults_source_workspace() {
+        let c = Cli::try_parse_from([
+            "kres",
+            "--workspace",
+            "/tmp/source",
+            "--prompt",
+            "validate: /tmp/finding",
+        ])
+        .unwrap();
+
+        let args = workflow_short_circuit_from_repl_args(&c.repl)
+            .expect("validate prompt should short-circuit");
+        assert_eq!(args.workspace, PathBuf::from("/tmp/source"));
+        assert!(args
+            .input
+            .contains(&"source_workspace=/tmp/source".to_string()));
     }
 
     #[test]

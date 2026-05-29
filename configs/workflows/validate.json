@@ -1,0 +1,601 @@
+{
+  "$schema_version": 1,
+  "$format": {
+    "why_this_block_exists": [
+      "$format is non-executable workflow documentation.",
+      "Validate is a sequential finding-validation workflow: one fast coding pass",
+      "checks the finding narrative for hallucinated claims, then one slow coding pass",
+      "does reachability/latency research and writes the same summary/severity artifacts",
+      "as triage. It intentionally has no lenses."
+    ]
+  },
+  "id": "validate",
+  "title": "Validate a kres finding against a source workspace",
+  "description": "Research a kres finding with false-positive elimination as the explicit goal, validate the finding's claims against source, prove reachability/non-latency where possible, write summary.md, and synchronize severity in metadata.yaml and FINDING.md.",
+  "inputs": {
+    "target": {
+      "type": "string",
+      "required": true,
+      "description": "Absolute path to a kres finding directory (must contain FINDING.md and metadata.yaml)."
+    },
+    "source_workspace": {
+      "type": "string",
+      "required": true,
+      "description": "Source workspace used for source, grep, git, semcode, and auto skill selection. The /validate command defaults this to the active workspace."
+    }
+  },
+  "skills": [
+    "auto"
+  ],
+  "globals": {
+    "triage_rules": {
+      "include": "@configs/prompts/triage-template.md"
+    }
+  },
+  "defaults": {
+    "agent": "slow",
+    "mode": "coding",
+    "actions": [
+      "read",
+      "source",
+      "type",
+      "grep",
+      "git",
+      "callers",
+      "edit"
+    ]
+  },
+  "steps": [
+    {
+      "id": "validate-claims",
+      "title": "Validate finding claims against source",
+      "agent": "fast",
+      "mode": "coding",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "grep",
+        "git",
+        "callers"
+      ],
+      "prompt": [
+        "Finding directory: {{workflow.target}}",
+        "Source workspace: {{workflow.source_workspace}}",
+        "",
+        "Read the finding's metadata.yaml and FINDING.md. Validate the factual",
+        "statements made in the finding against the source workspace. Treat false",
+        "positive elimination as the goal: verify cited files, functions, line",
+        "claims, call paths, locking/context claims, return-value assumptions,",
+        "configuration assumptions, and impact claims. Use source/grep/callers/git",
+        "followups when the supplied finding text is not enough.",
+        "",
+        "Do not update files in this step. Do not triage severity in this step.",
+        "Do not use or simulate parallel lenses. Produce structured outputs only;",
+        "do not rely on prose as a hidden control channel.",
+        "",
+        "For each material claim, classify it as supported, contradicted, or",
+        "unresolved. If the finding is only valid when a function can return NULL,",
+        "sleep, drop a reference, skip initialization, or otherwise satisfy a",
+        "precondition, explicitly check that precondition or mark it unresolved",
+        "with the exact source still needed.",
+        "",
+        "Return JSON with this exact top-level shape. Use integer 1, not string",
+        "\"1\", for schema_version. Use empty arrays when a category has no",
+        "entries:",
+        "{",
+        "  \"analysis\": \"brief narrative\",",
+        "  \"claim_validation\": {",
+        "    \"schema_version\": 1,",
+        "    \"supported\": [{\"id\":\"short_slug\",\"claim\":\"claim text\",\"evidence\":\"file:line evidence\"}],",
+        "    \"contradicted\": [{\"id\":\"short_slug\",\"claim\":\"claim text\",\"evidence\":\"file:line evidence\",\"correction\":\"what the finding should say\"}],",
+        "    \"unresolved\": [{\"id\":\"short_slug\",\"claim\":\"claim text\",\"reason\":\"why unresolved\",\"source_needed\":\"exact source/history still needed\"}],",
+        "    \"open_questions_to_close\": [\"specific remaining question\"],",
+        "    \"false_positive_risks\": [\"specific contradicted or weak assumption\"]",
+        "  },",
+        "  \"followups\": []",
+        "}"
+      ],
+      "outputs": {
+        "analysis": {
+          "type": "string",
+          "description": "Brief narrative of the claim-validation work."
+        },
+        "claim_validation": {
+          "type": "object",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema_version",
+              "supported",
+              "contradicted",
+              "unresolved",
+              "open_questions_to_close",
+              "false_positive_risks"
+            ],
+            "properties": {
+              "schema_version": {
+                "type": "integer",
+                "const": 1
+              },
+              "supported": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "id",
+                    "claim",
+                    "evidence"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "claim": {
+                      "type": "string"
+                    },
+                    "evidence": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "contradicted": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "id",
+                    "claim",
+                    "evidence"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "claim": {
+                      "type": "string"
+                    },
+                    "evidence": {
+                      "type": "string"
+                    },
+                    "correction": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "unresolved": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "id",
+                    "claim",
+                    "reason"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "claim": {
+                      "type": "string"
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "source_needed": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "open_questions_to_close": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "false_positive_risks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "description": "Structured validation of finding claims."
+        },
+        "followups": {
+          "type": "array<Followup>",
+          "description": "Typed source/history/context requests needed before the slow validation pass."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "claim_validation.schema_version == 1",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 3,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "validate-reachability",
+      "title": "Prove reachability and write validated triage",
+      "agent": "slow",
+      "mode": "coding",
+      "depends_on": [
+        "validate-claims"
+      ],
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "grep",
+        "git",
+        "callers",
+        "edit"
+      ],
+      "include": [
+        "{{globals.triage_rules}}"
+      ],
+      "prompt": [
+        "{{workflow.target}}",
+        "",
+        "Source workspace: {{workflow.source_workspace}}",
+        "",
+        "Validate the kres finding at the absolute path on the first line. Apply",
+        "the embedded triage template (see INCLUDES) for summary.md formatting,",
+        "status selection, severity selection, metadata.yaml updates, FINDING.md",
+        "header updates, and triage_coding output. This is stricter than ordinary",
+        "triage: the explicit goal is to eliminate false positives.",
+        "",
+        "The fast claim-validation pass produced this structured report:",
+        "{{validate-claims.claim_validation}}",
+        "",
+        "Use that report as a checklist, then close every material open question",
+        "that gates whether the bug exists. If the finding is only valid when",
+        "function A returns NULL, prove whether function A can return NULL on the",
+        "relevant path. If the finding depends on context, locking, lifetime,",
+        "configuration, caller reachability, privilege, or a specific return value,",
+        "trace the source until that precondition is supported or contradicted.",
+        "",
+        "A valid summary must be evidence based, and false-positive elimination is",
+        "the explicit goal. Use the status decision tree in the embedded triage",
+        "template (it defines Invalid, Confirmed Latent, Unconfirmed, Plausible,",
+        "Fixed, and Unknown), but apply it more strictly:",
+        "- Do not preserve a finding as Plausible when any load-bearing component",
+        "  remains unresolved.",
+        "- Unconfirmed is only for a bug-existence gate that is still genuinely open —",
+        "  one you could neither prove nor disprove. Do NOT use Unconfirmed for a",
+        "  gate you actually resolved negatively.",
+        "- If you proved the defect cannot exist as described, that is Invalid. If",
+        "  you proved the defect structure is real but 100% of the finding has no",
+        "  current in-tree trigger, that is Confirmed Latent (verdict",
+        "  `ConfirmedLatent`), not Unconfirmed — follow the template's Confirmed",
+        "  Latent handling for status, reachability, and triage_coding tagging.",
+        "A finding is latent-only only when every component lacks a current in-tree",
+        "trigger; if ANY component is currently reachable and valid, keep the finding",
+        "valid and explain the reachable component instead of downgrading the whole",
+        "finding.",
+        "",
+        "Do not use or simulate parallel lenses. Emit `summary.md`,",
+        "`metadata.yaml`, and `FINDING.md` as absolute-path code_output entries",
+        "under the finding directory. Rewrite stale open questions, reproducers,",
+        "and original-finding body text that your validation contradicted; do not",
+        "leave `metadata.yaml` or `FINDING.md` saying the old question remains open",
+        "after you have closed it in `summary.md`.",
+        "",
+        "When writing metadata.yaml, add or update this top-level marker exactly:",
+        "`validation_run: true`. This distinguishes validation output from ordinary",
+        "triage output for batch wrappers.",
+        "",
+        "Return a `verdict` field in your structured outputs naming the chosen",
+        "human status exactly as one of: Fixed | Plausible | Unconfirmed | Unknown |",
+        "Invalid | ConfirmedLatent. Return a `severity` field exactly as one of:",
+        "high | medium | low.",
+        "",
+        "Also return `triage_coding` as a structured object derived from the same",
+        "summary.md content you emit. Do not put this JSON inside summary.md. The",
+        "human `verdict` and machine `triage_coding.summary_status` intentionally",
+        "use different casing: if verdict is `Invalid`, summary_status must be",
+        "`invalid`; if verdict is `Unconfirmed`, summary_status must be",
+        "`unconfirmed`; if verdict is `ConfirmedLatent`, summary_status must be",
+        "`confirmed_latent`.",
+        "",
+        "Required `triage_coding` shape:",
+        "- schema_version: integer, set to 1",
+        "- severity: one of high, medium, low",
+        "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent",
+        "- summary_subject: short subject string from the summary, or empty string",
+        "- impact_classes: array of lowercase strings such as local_dos, remote_dos, memory_corruption, privilege_escalation, info_leak, data_corruption, vm_escape, latent, test_only, unknown",
+        "- config_commonness: one of common, niche, debug_or_test_only, unknown",
+        "- reject_reasons: array of lowercase strings for reasons this should not enter a fix queue, such as invalid, unconfirmed, unknown_reachability, latent_only, test_only, niche_config, fixed_already",
+        "- reachability: object with host_access, remote_access, specific_config, root_required, regular_user as yes/no/n/a/unknown strings",
+        "- touches: object with files array and subsystems array, populated only from explicit summary text",
+        "- actionability: object with fix_queue_eligible boolean and rationale string",
+        "- priority: object with tier one of critical, high, medium, low, none, unknown; score integer 0-100; reason string",
+        "- evidence: object with status, impact, reachability, and actionability strings quoting or summarizing the summary text that supports the classification",
+        "",
+        "Rust must be able to consume the JSON fields directly; do not hide routing,",
+        "status, or severity decisions in prose."
+      ],
+      "outputs": {
+        "verdict": {
+          "type": "enum",
+          "values": [
+            "Fixed",
+            "Plausible",
+            "Unconfirmed",
+            "Unknown",
+            "Invalid",
+            "ConfirmedLatent"
+          ],
+          "description": "Status assigned after validation."
+        },
+        "severity": {
+          "type": "enum",
+          "values": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "Severity assigned by validation and written to metadata.yaml, FINDING.md, and summary.md."
+        },
+        "summary_written": {
+          "type": "boolean",
+          "description": "Machine-populated. True only when this step emitted and wrote a non-empty summary.md."
+        },
+        "severity_written": {
+          "type": "boolean",
+          "description": "Machine-populated. True only when this step emitted summary.md, metadata.yaml, and FINDING.md and their persisted contents contain the chosen severity."
+        },
+        "followups": {
+          "type": "array<Followup>",
+          "description": "Typed requests for missing source/type/history/context if the finding cannot be validated from the available evidence."
+        },
+        "code_output": {
+          "type": "array<CodeFile>",
+          "optional": true,
+          "description": "Files emitted by the validation step: summary.md, metadata.yaml, and FINDING.md."
+        },
+        "triage_coding": {
+          "type": "object",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema_version",
+              "severity",
+              "summary_status",
+              "summary_subject",
+              "impact_classes",
+              "config_commonness",
+              "reject_reasons",
+              "reachability",
+              "touches",
+              "actionability",
+              "priority",
+              "evidence"
+            ],
+            "properties": {
+              "schema_version": {
+                "type": "integer",
+                "const": 1
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low"
+                ]
+              },
+              "summary_status": {
+                "type": "string",
+                "enum": [
+                  "fixed",
+                  "plausible",
+                  "unconfirmed",
+                  "unknown",
+                  "invalid",
+                  "confirmed_latent"
+                ]
+              },
+              "summary_subject": {
+                "type": "string"
+              },
+              "impact_classes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "config_commonness": {
+                "type": "string",
+                "enum": [
+                  "common",
+                  "niche",
+                  "debug_or_test_only",
+                  "unknown"
+                ]
+              },
+              "reject_reasons": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "reachability": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "host_access",
+                  "remote_access",
+                  "specific_config",
+                  "root_required",
+                  "regular_user"
+                ],
+                "properties": {
+                  "host_access": {
+                    "type": "string",
+                    "enum": [
+                      "yes",
+                      "no",
+                      "n/a",
+                      "unknown"
+                    ]
+                  },
+                  "remote_access": {
+                    "type": "string",
+                    "enum": [
+                      "yes",
+                      "no",
+                      "n/a",
+                      "unknown"
+                    ]
+                  },
+                  "specific_config": {
+                    "type": "string",
+                    "enum": [
+                      "yes",
+                      "no",
+                      "n/a",
+                      "unknown"
+                    ]
+                  },
+                  "root_required": {
+                    "type": "string",
+                    "enum": [
+                      "yes",
+                      "no",
+                      "n/a",
+                      "unknown"
+                    ]
+                  },
+                  "regular_user": {
+                    "type": "string",
+                    "enum": [
+                      "yes",
+                      "no",
+                      "n/a",
+                      "unknown"
+                    ]
+                  }
+                }
+              },
+              "touches": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "files",
+                  "subsystems"
+                ],
+                "properties": {
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "subsystems": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "actionability": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "fix_queue_eligible",
+                  "rationale"
+                ],
+                "properties": {
+                  "fix_queue_eligible": {
+                    "type": "boolean"
+                  },
+                  "rationale": {
+                    "type": "string"
+                  }
+                }
+              },
+              "priority": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tier",
+                  "score",
+                  "reason"
+                ],
+                "properties": {
+                  "tier": {
+                    "type": "string",
+                    "enum": [
+                      "critical",
+                      "high",
+                      "medium",
+                      "low",
+                      "none",
+                      "unknown"
+                    ]
+                  },
+                  "score": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100
+                  },
+                  "reason": {
+                    "type": "string"
+                  }
+                }
+              },
+              "evidence": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "status",
+                  "impact",
+                  "reachability",
+                  "actionability"
+                ],
+                "properties": {
+                  "status": {
+                    "type": "string"
+                  },
+                  "impact": {
+                    "type": "string"
+                  },
+                  "reachability": {
+                    "type": "string"
+                  },
+                  "actionability": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "description": "Structured classification derived from the generated summary.md content."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "summary_written == true && severity_written == true && triage_coding.schema_version == 1 && triage_coding.severity == severity",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 3,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    }
+  ]
+}

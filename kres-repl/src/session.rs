@@ -76,6 +76,9 @@ pub struct ReplConfig {
     /// expected "write hello-world.c" to land beside their cwd).
     /// Defaults to `.`; overridden by `--workspace` in main.rs.
     pub workspace: PathBuf,
+    /// MCP registry used to wire workflow-local source fetchers.
+    /// Defaults to `~/.kres/mcp.json` when unset.
+    pub mcp_config: Option<PathBuf>,
     /// Path to `<results>/session.json`. When set, the reaper and
     /// drain paths persist a [`kres_core::SessionState`] snapshot
     /// here on every mutation so an interrupted session can be
@@ -109,6 +112,7 @@ impl Default for ReplConfig {
             stdio: false,
             tui: false,
             workspace: PathBuf::from("."),
+            mcp_config: None,
             persist_path: None,
             exit_on_idle: false,
             assisted_by: "kres (claude-sonnet-4-6)".to_string(),
@@ -2236,6 +2240,9 @@ impl Session {
                 Command::Review { target } => self.cmd_review(target).await,
                 Command::Fix { target } => self.cmd_fix(target).await,
                 Command::Triage { target } => self.cmd_triage(target).await,
+                Command::Validate { finding, workspace } => {
+                    self.cmd_validate(finding, workspace).await
+                }
                 Command::Extract {
                     dir,
                     report,
@@ -2730,6 +2737,10 @@ impl Session {
                     surface_over_input_limit: false,
                     synthesis_use_fast: false,
                     synthesis_use_routing_prompt: false,
+                    // The REPL task path uses TaskManager's own
+                    // symbol/context cache, not the workflow per-step
+                    // gather seed.
+                    ..RunContext::default()
                 };
                 // Dispatch by mode:
                 //   Coding  → single slow call with slow_coding_system;
@@ -3516,14 +3527,36 @@ impl Session {
         self.dispatch_workflow("triage", target).await;
     }
 
-    /// Shared backend for `/fix`, `/review`, `/triage`. When a
-    /// workflow with id `<name>` exists (operator override at
-    /// `~/.kres/workflows/<name>.json` wins; otherwise the
-    /// embedded copy), build an [`LlmDriver`] with the session's
-    /// AgentRunner and run the workflow with `target=<target>`
-    /// as the input. Trace events stream to the REPL via
-    /// async_println.
-    ///
+    async fn cmd_validate(&self, finding: String, workspace: Option<String>) {
+        let finding_trimmed = finding.trim();
+        if finding_trimmed.is_empty() {
+            async_println(
+                "/validate: expected a finding directory, e.g. /validate <finding-dir> [source-workspace]"
+                    .to_string(),
+            );
+            return;
+        }
+        let workflow_workspace =
+            resolve_validate_workspace(&self.cfg.workspace, workspace.as_deref());
+        let mut inputs = serde_json::Map::new();
+        inputs.insert(
+            "target".into(),
+            serde_json::Value::String(finding_trimmed.to_string()),
+        );
+        inputs.insert(
+            "source_workspace".into(),
+            serde_json::Value::String(workflow_workspace.display().to_string()),
+        );
+        self.dispatch_workflow_inputs("validate", inputs, workflow_workspace)
+            .await;
+    }
+
+    /// Shared backend for `/fix`, `/triage`, and simple one-target
+    /// workflows. When a workflow with id `<name>` exists (operator
+    /// override at `~/.kres/workflows/<name>.json` wins; otherwise
+    /// the embedded copy), build an [`LlmDriver`] with the session's
+    /// AgentRunner and run the workflow with `target=<target>` as
+    /// the input.
     async fn dispatch_workflow(&self, name: &str, target: String) {
         let target_trimmed = target.trim();
         if target_trimmed.is_empty() {
@@ -3532,6 +3565,28 @@ impl Session {
             ));
             return;
         }
+        let mut inputs = serde_json::Map::new();
+        inputs.insert(
+            "target".into(),
+            serde_json::Value::String(target_trimmed.to_string()),
+        );
+        self.dispatch_workflow_inputs(name, inputs, self.cfg.workspace.clone())
+            .await;
+    }
+
+    /// Shared backend for `/fix`, `/triage`, `/validate`. When a
+    /// workflow with id `<name>` exists (operator override at
+    /// `~/.kres/workflows/<name>.json` wins; otherwise the
+    /// embedded copy), build an [`LlmDriver`] with the session's
+    /// AgentRunner and run the workflow with the provided inputs.
+    /// Trace events stream to the REPL via async_println.
+    ///
+    async fn dispatch_workflow_inputs(
+        &self,
+        name: &str,
+        mut inputs: serde_json::Map<String, serde_json::Value>,
+        workflow_workspace: PathBuf,
+    ) {
         // Operator override > embedded.
         let override_dir = dirs::home_dir().map(|h| h.join(".kres").join("workflows"));
         let workflow = match kres_agents::workflow::lookup_workflow(override_dir.as_deref(), name) {
@@ -3550,10 +3605,13 @@ impl Session {
             ));
             return;
         };
+        let orch = self
+            .workflow_agent_runner_for_workspace(orch, &workflow_workspace, name)
+            .await;
 
-        let mut inputs = crate::workflow::inputs_for_target_with_results(
+        crate::workflow::apply_results_artifact_dir(
             &workflow,
-            target_trimmed,
+            &mut inputs,
             self.cfg.results_dir.as_deref(),
         );
         if workflow.inputs.contains_key("assisted_by") {
@@ -3562,6 +3620,7 @@ impl Session {
                 serde_json::Value::String(self.cfg.assisted_by.clone()),
             );
         }
+        let inputs = kres_agents::workflow_runner::derive_inputs(&workflow, inputs);
 
         async_println(format!(
             "/{name}: dispatching to workflow '{}' ({} step(s))",
@@ -3578,7 +3637,7 @@ impl Session {
         // the workflow doesn't kill the rest of the REPL.
         let workflow_shutdown = self.mgr.root_shutdown().child();
         let driver_init = kres_agents::workflow_runner::LlmDriver::new(
-            self.cfg.workspace.clone(),
+            workflow_workspace.clone(),
             workflow.clone(),
         )
         .with_agent_runner(orch)
@@ -3599,7 +3658,7 @@ impl Session {
                 Err(e) => {
                     async_println(format!("/{name}: skill loading failed: {e}"));
                     kres_agents::workflow_runner::LlmDriver::new(
-                        self.cfg.workspace.clone(),
+                        workflow_workspace.clone(),
                         workflow.clone(),
                     )
                 }
@@ -3643,6 +3702,101 @@ impl Session {
                 async_println(format!("/{name}: workflow failed before execution — {e:#}"));
             }
         }
+    }
+
+    async fn workflow_agent_runner_for_workspace(
+        &self,
+        base: Arc<AgentRunner>,
+        workflow_workspace: &Path,
+        name: &str,
+    ) -> Arc<AgentRunner> {
+        if same_workspace(&self.cfg.workspace, workflow_workspace) {
+            return base;
+        }
+        let fetcher = self
+            .workflow_fetcher_for_workspace(workflow_workspace, name)
+            .await;
+        Arc::new(AgentRunner {
+            fast_client: base.fast_client.clone(),
+            fast_model: base.fast_model.clone(),
+            fast_system: base.fast_system.clone(),
+            fast_max_tokens: base.fast_max_tokens,
+            fast_max_input_tokens: base.fast_max_input_tokens,
+            fast_thinking: base.fast_thinking,
+            slow_client: base.slow_client.clone(),
+            slow_model: base.slow_model.clone(),
+            slow_system: base.slow_system.clone(),
+            slow_max_tokens: base.slow_max_tokens,
+            slow_max_input_tokens: base.slow_max_input_tokens,
+            slow_thinking: base.slow_thinking,
+            slow_variants: base.slow_variants.clone(),
+            comparison_path: base.comparison_path.clone(),
+            comparison_lock: base.comparison_lock.clone(),
+            slow_coding_system: base.slow_coding_system.clone(),
+            slow_generic_system: base.slow_generic_system.clone(),
+            routing_system: base.routing_system.clone(),
+            fetcher,
+            max_fast_rounds: base.max_fast_rounds,
+            // The base runner's skills were auto-selected for the
+            // REPL workspace. Leave this empty so LlmDriver's
+            // workflow-local `skills: ["auto"]` prelude is used for
+            // the validation source workspace instead.
+            skills: None,
+            usage: base.usage.clone(),
+            logger: base.logger.clone(),
+        })
+    }
+
+    async fn workflow_fetcher_for_workspace(
+        &self,
+        workflow_workspace: &Path,
+        name: &str,
+    ) -> Arc<dyn DataFetcher> {
+        let workspace_fetcher = kres_agents::WorkspaceFetcher::new(workflow_workspace);
+        let mcp_path = self
+            .cfg
+            .mcp_config
+            .clone()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".kres").join("mcp.json")));
+        let Some(mcp_path) = mcp_path.filter(|p| p.exists()) else {
+            return workspace_fetcher;
+        };
+        let registry = match kres_mcp::ServerRegistry::load_from_file(&mcp_path) {
+            Ok(registry) => registry,
+            Err(e) => {
+                async_println(format!(
+                    "/{name}: mcp-config load failed ({}): {e}; using workspace-only fetcher",
+                    mcp_path.display()
+                ));
+                return workspace_fetcher;
+            }
+        };
+        let Some((server_name, server_cfg)) = registry.servers.iter().next() else {
+            return workspace_fetcher;
+        };
+        let log_dir = self
+            .logger
+            .as_ref()
+            .map(|logger| logger.session_dir().join("mcp-logs"))
+            .unwrap_or_else(|| workflow_workspace.join(".kres").join("logs").join("mcp"));
+        let server_cfg = server_cfg.with_workspace_cwd(server_name, workflow_workspace);
+        let client = match kres_mcp::McpClient::spawn(server_name, &server_cfg, &log_dir).await {
+            Ok(client) => client,
+            Err(e) => {
+                async_println(format!(
+                    "/{name}: mcp spawn `{server_name}` failed: {e}; using workspace-only fetcher"
+                ));
+                return workspace_fetcher;
+            }
+        };
+        async_println(format!(
+            "/{name}: spawned mcp `{server_name}` for workspace {} (log: {})",
+            workflow_workspace.display(),
+            client.stderr_log_path().display()
+        ));
+        let shared = Arc::new(tokio::sync::Mutex::new(client));
+        self.register_mcp_clients(vec![shared.clone()]).await;
+        kres_agents::McpFetcher::from_shared(shared, workspace_fetcher)
     }
 
     /// `/extract [--dir D] [--report F] [--todo F] [--findings F]` —
@@ -4750,6 +4904,10 @@ fn print_help() {
     kres_core::async_eprintln!(
         "  /fix <target>          run the embedded `fix` workflow (finding dir or prose)"
     );
+    kres_core::async_eprintln!("  /triage <finding-dir>  run the embedded `triage` workflow");
+    kres_core::async_eprintln!(
+        "  /validate <finding-dir> [workspace]  validate a finding against source"
+    );
     kres_core::async_eprintln!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
     kres_core::async_eprintln!(
         "  /summary-markdown [FILE]  render the markdown variant (default summary.md)"
@@ -4772,6 +4930,36 @@ fn print_help() {
     kres_core::async_eprintln!(
         "override slash-command templates by dropping a file at ~/.kres/commands/<name>.md"
     );
+}
+
+fn resolve_validate_workspace(active_workspace: &Path, workspace: Option<&str>) -> PathBuf {
+    let raw = workspace
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".");
+    let expanded = if raw == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw))
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(raw))
+    } else {
+        PathBuf::from(raw)
+    };
+    let resolved = if raw == "." {
+        active_workspace.to_path_buf()
+    } else if expanded.is_absolute() {
+        expanded
+    } else {
+        active_workspace.join(expanded)
+    };
+    std::fs::canonicalize(&resolved).unwrap_or(resolved)
+}
+
+fn same_workspace(left: &Path, right: &Path) -> bool {
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
 }
 
 /// Followup types the reaper executes directly (instead of routing

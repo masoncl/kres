@@ -50,8 +50,8 @@ const TABLE: &[(&str, &str)] = &[
 /// still can't escape the directory.
 ///
 /// Workflow-owned commands are intentionally not slash templates.
-/// `/fix`, `/review`, and `/triage` dispatch through the workflow
-/// runner only.
+/// `/fix`, `/review`, `/triage`, and `/validate` dispatch through
+/// the workflow runner only.
 pub fn lookup(name: &str) -> Option<String> {
     lookup_with_root(
         dirs::home_dir().map(|h| h.join(".kres").join("commands")),
@@ -68,7 +68,7 @@ pub fn lookup_with_root(commands_dir: Option<std::path::PathBuf>, name: &str) ->
     if !is_valid_name(name) {
         return None;
     }
-    if matches!(name, "fix" | "review" | "triage") {
+    if matches!(name, "fix" | "review" | "triage" | "validate") {
         return None;
     }
     if let Some(dir) = commands_dir {
@@ -107,7 +107,7 @@ pub fn embedded_names() -> impl Iterator<Item = &'static str> {
 /// extra text.
 ///
 /// This is intentionally not used for workflow-owned commands
-/// (`fix`, `review`, `triage`) or summary rendering
+/// (`fix`, `review`, `triage`, `validate`) or summary rendering
 /// (`summary`, `summary-markdown`). Those have dedicated command
 /// paths; treating them as prompt templates would create a second
 /// execution model.
@@ -262,7 +262,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("kres-workflow-override-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["fix", "review", "triage"] {
+        for name in ["fix", "review", "triage", "validate"] {
             std::fs::write(dir.join(format!("{name}.md")), "operator override").unwrap();
             assert!(lookup(name).is_none());
             assert!(lookup_with_root(None, name).is_none());

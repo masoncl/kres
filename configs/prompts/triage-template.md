@@ -71,7 +71,7 @@ order. Every section is required.
 
 # Status
 
-<Fixed | Plausible | Unconfirmed | Unknown | Invalid>
+<Fixed | Plausible | Unconfirmed | Unknown | Invalid | Confirmed Latent>
 
 # Severity
 
@@ -124,9 +124,14 @@ these in order and pick the **first** match.
 
 ### 1. `Invalid`
 
-`metadata.yaml` says `status: invalidated`, OR FINDING.md walks
-through evidence that the originally suspected bug does not
-exist.
+FINDING.md walks through evidence that the originally suspected
+bug does not exist, OR `metadata.yaml` already says
+`status: invalidated` AND current source still supports that
+nonexistence. A stale `invalidated` status is not authoritative on
+its own: if current evidence shows the defect pattern is actually
+real, do not stop here — let the tree reach `Confirmed Latent`
+(real but no current trigger) or `Plausible` (real and
+reachable).
 
 ### 2. `Fixed`
 
@@ -180,7 +185,38 @@ Worked examples:
   `dst->anon_vma`". One unverified callee gates the whole bug.
   → `Unconfirmed`, NOT `Unknown`.
 
-### 4. `Plausible`
+### 4. `Confirmed Latent`
+
+The defect pattern **genuinely exists** in source — you verified
+the code shape is real — but 100% of the finding has no current
+in-tree trigger: every required precondition, hook, caller, or
+state is absent or cannot occur at `metadata.yaml`'s `git.sha`, so
+the defect cannot fire today. This is distinct from `Invalid` (the
+defect does not exist as described) and from `Unconfirmed` (you
+could not verify the gate either way). Use `Confirmed Latent` only
+when the dormant structure is real AND every trigger gate is
+proven closed — nothing is left open.
+
+`Confirmed Latent` (and any downgrade that rests on something
+being absent) is a negative-coverage claim, so it must be earned.
+Before concluding a trigger, caller, hook, registration, or
+precondition is absent, cite concrete evidence for that absence —
+a grep/search that came back empty, a read of the registration
+site, a callgraph, or history — not an assumption. semcode is an
+accelerator, not an authority: a failed, empty, or "not found"
+semcode result must be re-checked with local `grep`/`read` before
+you treat the symbol or path as absent. If you cannot earn the
+absence, the status is `Unconfirmed`, not `Confirmed Latent`.
+
+When you pick `Confirmed Latent`, also reflect it in
+`triage_coding`: add `latent` to `impact_classes`, add
+`latent_only` to `reject_reasons`, and answer the trigger-related
+`reachability` gates you closed with `no` rather than `unknown`.
+State in `# Impact` that the pattern exists in source but is
+unreachable in this tree, and what future change would make it
+reachable.
+
+### 5. `Plausible`
 
 The defect path is **demonstrated** by FINDING.md evidence —
 concrete code citations showing the bad path actually executes.
@@ -188,7 +224,7 @@ No crash / repro / upstream fix has been observed. Open
 questions may exist around severity or triggerability, but they
 do not gate whether the bug is real.
 
-### 5. `Unknown`
+### 6. `Unknown`
 
 Narrow fallback for when FINDING.md is too thin or contradictory
 to classify at all (empty narrative, symbols don't match the
@@ -208,11 +244,12 @@ edits are permitted.
 
    | summary verdict | metadata `status:` |
    | --------------- | ------------------ |
-   | Fixed           | fixed              |
-   | Plausible       | active             |
-   | Unconfirmed     | unconfirmed        |
-   | Invalid         | invalidated        |
-   | Unknown         | leave as-is        |
+   | Fixed            | fixed             |
+   | Plausible        | active            |
+   | Unconfirmed      | unconfirmed       |
+   | Invalid          | invalidated       |
+   | Confirmed Latent | confirmed_latent  |
+   | Unknown          | leave as-is       |
 
    Apply the mapping every time, in both directions. If the
    metadata already says `unconfirmed` and you have now picked

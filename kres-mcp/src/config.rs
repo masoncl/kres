@@ -22,6 +22,22 @@ pub struct ServerConfig {
     pub cwd: Option<PathBuf>,
 }
 
+impl ServerConfig {
+    /// Return a config suitable for source-workspace MCP lookups.
+    ///
+    /// semcode indexes and resolves symbols relative to its process
+    /// cwd, so workspace-owned callers must force semcode-like
+    /// servers into the active source tree. For other servers, fill
+    /// cwd only when the operator did not configure one explicitly.
+    pub fn with_workspace_cwd(&self, server_name: &str, workspace: &Path) -> Self {
+        let mut cfg = self.clone();
+        if cfg.cwd.is_none() || server_name == "semcode" || cfg.command.contains("semcode") {
+            cfg.cwd = Some(workspace.to_path_buf());
+        }
+        cfg
+    }
+}
+
 /// Parsed `mcp.json` — the top-level shape is `{"mcpServers": {...}}`
 /// to match and the wider MCP ecosystem.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,6 +99,32 @@ mod tests {
         assert_eq!(s.args, vec!["--foo", "bar"]);
         assert_eq!(s.env.get("X_ENV").unwrap(), "1");
         assert_eq!(s.cwd.as_deref(), Some(Path::new("/tmp")));
+    }
+
+    #[test]
+    fn workspace_cwd_forces_semcode_to_workspace() {
+        let cfg = ServerConfig {
+            command: "semcode-mcp".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: Some(PathBuf::from("/old")),
+        };
+
+        let got = cfg.with_workspace_cwd("semcode", Path::new("/src/linux"));
+        assert_eq!(got.cwd.as_deref(), Some(Path::new("/src/linux")));
+    }
+
+    #[test]
+    fn workspace_cwd_preserves_explicit_non_semcode_cwd() {
+        let cfg = ServerConfig {
+            command: "other-mcp".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: Some(PathBuf::from("/server")),
+        };
+
+        let got = cfg.with_workspace_cwd("other", Path::new("/src/linux"));
+        assert_eq!(got.cwd.as_deref(), Some(Path::new("/server")));
     }
 
     #[test]

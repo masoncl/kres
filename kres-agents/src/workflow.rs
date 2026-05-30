@@ -857,6 +857,15 @@ mod tests {
             fast.eval.as_ref().and_then(|e| e.expr.as_deref()),
             Some("claim_validation.schema_version == 1")
         );
+        let fast_prompt = fast.prompt.as_deref().expect("validate fast prompt");
+        assert!(prompt_contains_phrase(
+            fast_prompt,
+            "Use `git show -s --oneline <sha>` to check that a commit object exists"
+        ));
+        assert!(prompt_contains_phrase(
+            fast_prompt,
+            "`git merge-base --is-ancestor <sha> HEAD` to check whether that commit is present"
+        ));
 
         let slow = &wf.steps[1];
         assert_eq!(slow.id, "validate-reachability");
@@ -897,6 +906,14 @@ mod tests {
         assert!(prompt_contains_phrase(
             slow_prompt,
             "add or update this top-level marker exactly: `validation_run: true`"
+        ));
+        assert!(prompt_contains_phrase(
+            slow_prompt,
+            "Use `git show -s --oneline <sha>` to check that a commit object exists"
+        ));
+        assert!(prompt_contains_phrase(
+            slow_prompt,
+            "`git merge-base --is-ancestor <sha> HEAD` to check whether that commit is present"
         ));
         assert_eq!(
             slow.eval.as_ref().and_then(|e| e.expr.as_deref()),

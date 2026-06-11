@@ -3754,6 +3754,34 @@ mod tests {
             ),
             "research prompt must explicitly call out the failure mode"
         );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "SHAs found in metadata.yaml, summary.md, FINDING.md, auto-generated-fix*.diff"
+            ),
+            "research prompt must treat artifact SHAs as hints only"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "`git merge-base --is-ancestor <sha> HEAD` is the authoritative reachability test"
+            ),
+            "research prompt must use merge-base for reachability from HEAD"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "Do not infer ancestry from an empty `git log <sha>..HEAD`"
+            ),
+            "research prompt must reject the empty-range ancestry mistake"
+        );
+        assert!(
+            prompt_contains_phrase(
+                prompt,
+                "combination of commit reachability (when a SHA is cited), subject/message match, and semantic source evidence"
+            ),
+            "research prompt must require SHA + subject + semantic source evidence for existing patch claims"
+        );
     }
 
     #[test]

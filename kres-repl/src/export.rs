@@ -324,6 +324,7 @@ fn run_git(workspace: &Path, args: &[&str]) -> Option<String> {
 fn write_metadata_yaml(path: &Path, f: &Finding, git: &GitHead, template: &str) -> Result<()> {
     let ctx = build_context(f, git);
     let body = render(template, &ctx);
+    kres_core::validate_metadata_yaml_content(path, &body)?;
     std::fs::write(path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }

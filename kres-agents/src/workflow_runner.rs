@@ -950,8 +950,13 @@ impl LlmDriver {
 
                 // Apply code-mode side effects to the workspace.
                 if !summary.code_output.is_empty() {
-                    persist_code_output(&self.workspace, &summary.code_output)
-                        .map_err(|e| format!("step '{}' code_output persist: {e}", step.id))?;
+                    if let Err(e) = persist_code_output(&self.workspace, &summary.code_output) {
+                        if json_retry < JSON_REPAIR_RETRIES && summary.code_edits.is_empty() {
+                            last_apply_err = Some(format!("code_output persist failed: {e}"));
+                            continue;
+                        }
+                        return Err(format!("step '{}' code_output persist: {e}", step.id).into());
+                    }
                 }
                 if !summary.code_edits.is_empty() {
                     if let Err(e) = apply_code_edits(&self.workspace, &summary.code_edits) {
@@ -1098,8 +1103,13 @@ impl LlmDriver {
             // Now that the response yielded parseable workflow
             // outputs, apply any side effects it requested.
             if !code_response.code_output.is_empty() {
-                persist_code_output(&self.workspace, &code_response.code_output)
-                    .map_err(|e| format!("step '{}' code_output persist: {e}", step.id))?;
+                if let Err(e) = persist_code_output(&self.workspace, &code_response.code_output) {
+                    if json_retry < JSON_REPAIR_RETRIES && code_response.code_edits.is_empty() {
+                        last_apply_err = Some(format!("code_output persist failed: {e}"));
+                        continue;
+                    }
+                    return Err(format!("step '{}' code_output persist: {e}", step.id).into());
+                }
             }
             if !code_response.code_edits.is_empty() {
                 if let Err(e) = apply_code_edits(&self.workspace, &code_response.code_edits) {
@@ -4657,6 +4667,7 @@ pub fn persist_code_output(
             return Err(anyhow!("code_output entry has empty path"));
         }
         let target = resolve_workspace_path(workspace, &f.path)?;
+        kres_core::validate_metadata_yaml_content(&target, &f.content)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("mkdir -p {}", parent.display()))?;
@@ -4742,6 +4753,7 @@ pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Resu
         touched.push(target);
     }
     for (target, body) in staged {
+        kres_core::validate_metadata_yaml_content(&target, &body)?;
         // mkdir -p the parent so create-new-file edits for paths under
         // a not-yet-existing subdir work the same way as code_output
         // (persist_code_output, this file).
@@ -6940,6 +6952,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("escapes workspace"), "got: {err}");
+    }
+
+    #[test]
+    fn persist_code_output_rejects_invalid_metadata_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("finding/metadata.yaml");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "id: old\nseverity: low\n").unwrap();
+        let files = vec![kres_core::CodeFile {
+            path: "finding/metadata.yaml".into(),
+            content: "id: bad\nopen_questions:\n  - \"grep eee_advertise\\[ broke yaml\"\n".into(),
+            purpose: "triage metadata".into(),
+        }];
+
+        let err = persist_code_output(tmp.path(), &files)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid YAML"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(target).unwrap(),
+            "id: old\nseverity: low\n"
+        );
     }
 
     #[test]

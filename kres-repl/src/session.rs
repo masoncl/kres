@@ -4643,6 +4643,10 @@ async fn persist_code_output(workspace: &Path, task_name: &str, files: &[kres_co
                 continue;
             }
         }
+        if let Err(e) = kres_core::validate_metadata_yaml_content(&out, &f.content) {
+            kres_core::async_eprintln!("[coding] rejecting {}: {e}", out.display());
+            continue;
+        }
         // tmp + rename so a crash leaves either the old content or
         // the new content, never a truncated partial.
         let tmp = out.with_extension(format!(

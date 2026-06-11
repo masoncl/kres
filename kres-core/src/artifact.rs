@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
 /// A per-bug definition recorded in `metadata.yaml` under `bugs:`.
@@ -25,6 +26,64 @@ pub const AUTO_GENERATED_FIX_LINK: &str = "[auto-generated-fix.diff](auto-genera
 pub const INVALIDATION_NAME: &str = "invalidation.md";
 pub const PARTIAL_INVALIDATION_NAME: &str = "partial-invalidation.md";
 pub const SUMMARY_CROSS_LINK: &str = "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)";
+
+pub fn validate_metadata_yaml_content(path: &Path, content: &str) -> Result<()> {
+    if path.file_name().and_then(|n| n.to_str()) != Some("metadata.yaml") {
+        return Ok(());
+    }
+    let value = serde_yaml::from_str::<serde_yaml::Value>(content).with_context(|| {
+        format!(
+            "metadata.yaml content for {} is invalid YAML",
+            path.display()
+        )
+    })?;
+    let serde_yaml::Value::Mapping(mapping) = value else {
+        return Err(anyhow!(
+            "metadata.yaml content for {} must be a YAML mapping",
+            path.display()
+        ));
+    };
+    validate_metadata_enum(
+        &mapping,
+        "status",
+        &[
+            "active",
+            "unconfirmed",
+            "fixed",
+            "invalidated",
+            "confirmed_latent",
+            "duplicate",
+        ],
+        path,
+    )?;
+    validate_metadata_enum(&mapping, "severity", &["high", "medium", "low"], path)?;
+    Ok(())
+}
+
+fn validate_metadata_enum(
+    mapping: &serde_yaml::Mapping,
+    key: &str,
+    allowed: &[&str],
+    path: &Path,
+) -> Result<()> {
+    let Some(value) = mapping.get(serde_yaml::Value::String(key.to_string())) else {
+        return Ok(());
+    };
+    match value {
+        serde_yaml::Value::String(s) if allowed.contains(&s.as_str()) => Ok(()),
+        serde_yaml::Value::String(s) => Err(anyhow!(
+            "metadata.yaml content for {} has invalid {key}: {s:?}; expected one of {}",
+            path.display(),
+            allowed.join(", ")
+        )),
+        other => Err(anyhow!(
+            "metadata.yaml content for {} has non-string {key}: {:?}; expected one of {}",
+            path.display(),
+            other,
+            allowed.join(", ")
+        )),
+    }
+}
 
 /// Prefix applied to `auto-generated-fix*.diff` filenames when a
 /// previously-published fix is invalidated. The metadata.yaml block
@@ -913,6 +972,41 @@ fn yaml_single_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_metadata_yaml_content_rejects_bad_double_quote_escape() {
+        let path = Path::new("metadata.yaml");
+        let err = validate_metadata_yaml_content(
+            path,
+            r#"open_questions:
+  - "grep eee_advertise\[ found the sole reader"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("invalid YAML"), "got: {err}");
+        validate_metadata_yaml_content(
+            path,
+            "open_questions:\n  - 'grep eee_advertise\\[ found the sole reader'\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn validate_metadata_yaml_content_rejects_bad_status_enum() {
+        let path = Path::new("metadata.yaml");
+        let err = validate_metadata_yaml_content(
+            path,
+            "id: f\nseverity: low\nstatus: Confirmed Latent\n",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("invalid status"), "got: {err}");
+        validate_metadata_yaml_content(path, "id: f\nseverity: low\nstatus: confirmed_latent\n")
+            .unwrap();
+    }
 
     #[test]
     fn ensure_artifact_dir_files_quotes_generated_metadata_id() {

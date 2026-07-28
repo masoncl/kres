@@ -14,8 +14,7 @@ use std::io::{BufWriter, Write};
 use anyhow::{bail, Context, Result};
 use kres_agents::AgentConfig;
 use kres_llm::{
-    client::Client, config::CallConfig, request::Message, stream::StreamEventKind, Model,
-    ThinkingBudget,
+    config::CallConfig, request::Message, stream::StreamEventKind, Model, ThinkingBudget,
 };
 use serde_json::Value;
 
@@ -76,7 +75,7 @@ pub async fn run_turn(args: TurnArgs) -> Result<()> {
     }
     eprintln!("sending request (streaming)...");
 
-    let client = Client::new(agent_cfg.credentials()?)?;
+    let client = agent_cfg.client_builder()?.build()?;
     let messages = vec![Message {
         role: "user".into(),
         content: context,

@@ -33,10 +33,10 @@ Options:
   --dest DIR             Destination directory (default: \$HOME/.kres)
   --slow-key KEY         Slow-agent API key literal
   --fast-key KEY         Fast / main / todo agent API key literal
-  --slow MODEL           Model id used for the slow agent in settings.json.
-                         Default: claude-opus-4-7.
-  --model MODEL          Model id used for fast/main/todo agents in
-                         settings.json. Default: claude-sonnet-4-6.
+  --slow MODEL           Model selector used for the slow agent.
+                         Default: anthropic-slow.json:claude-opus-4-7.
+  --model MODEL          Model selector used for fast/main/todo agents.
+                         Default: anthropic-fast.json:claude-sonnet-4-6.
   --semcode PATH         Path to a semcode-mcp binary. Installs mcp.json
                          pointing at it. If omitted, mcp.json is only
                          installed when semcode-mcp is found on PATH (and
@@ -57,8 +57,8 @@ USAGE
 DEST="${HOME}/.kres"
 SLOW_KEY=""
 FAST_KEY=""
-SLOW_MODEL="claude-opus-4-7"
-MODEL="claude-sonnet-4-6"
+SLOW_MODEL="anthropic-slow.json:claude-opus-4-7"
+MODEL="anthropic-fast.json:claude-sonnet-4-6"
 # SEMCODE states: unset (auto-detect via PATH), empty-after-flag
 # (explicit skip), or a non-empty string (use as the binary path).
 SEMCODE_ARG=""
@@ -256,7 +256,7 @@ echo "system prompts and model configs:"
 
 # Model configs. kres no longer auto-loads legacy
 # ~/.kres/*-agent.json files; normal startup resolves each role to
-# ~/.kres/models/<resolved-model-id>.json.
+# a provider JSON under ~/.kres/models/ that contains the selected model.
 for src in "${CONFIGS_SRC}/models"/*.json; do
   install_model_config "$src" "${DEST}/models/$(basename "$src")"
 done

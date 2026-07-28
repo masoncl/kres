@@ -23,10 +23,9 @@ descriptions.
 omitted, kres derives `kres:<slow-model-id>` from the resolved slow
 agent model.
 
-`--slow NAME` selects a slow model config. `sonnet` and `opus` are
-aliases for the shipped model ids; any other value must match exactly
-one JSON file under `~/.kres/models/` by filename, preferring an exact
-stem match and otherwise accepting a substring match. It is repeatable
+`--slow NAME` selects a slow model. `sonnet` and `opus` are aliases for
+the shipped model ids. Other values are model ids; when multiple provider
+files offer one model, qualify it as `provider.json:model-id`. It is repeatable
 for `/review` comparison mode, for example `--slow sonnet --slow opus`.
 Review sends every slow-agent lens prompt to all configured slow models,
 tags their outputs by model, and writes the consolidator's per-turn
@@ -34,13 +33,12 @@ comparison to `<results>/comparison.json`.
 
 Examples:
 
-| Model files present | CLI | Result |
-|---------------------|-----|--------|
-| `claude-sonnet-4-6.json` | `--slow sonnet` | Selects the Sonnet alias. |
-| `gpt-5.5-xhigh.json` | `--slow gpt-5.5-xhigh` | Selects the exact filename stem. |
-| `gpt-5.5-xhigh.json` | `--slow xhigh` | Selects the unique substring match. |
-| `foo.json`, `foo-xhigh.json` | `--slow foo` | Selects `foo.json`; exact stem wins. |
-| `gpt-5.5-high.json`, `gpt-5.5-xhigh.json` | `--slow gpt-5.5` | Fails as ambiguous. |
+| Provider files present | CLI | Result |
+|------------------------|-----|--------|
+| `anthropic.json` offers Sonnet | `--slow sonnet` | Selects the Sonnet alias. |
+| `azure.json` offers `gpt-5.5` | `--slow gpt-5.5` | Selects the unique provider. |
+| `foo.json` and `bar.json` offer Opus | `--slow claude-opus-4-6` | Fails as ambiguous. |
+| `foo.json` and `bar.json` offer Opus | `--slow foo.json:claude-opus-4-6` | Selects `foo.json`. |
 
 Related docs:
 

@@ -7,6 +7,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Anthropic,
+    VertexDummy,
+    CodexCodes,
+    ClaudeCodes,
     OpenAi,
 }
 

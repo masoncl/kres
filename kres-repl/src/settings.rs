@@ -6,11 +6,11 @@
 //! ```json
 //! {
 //!   "models": {
-//!     "fast": "claude-sonnet-4-6",
-//!     "slow": "claude-opus-4-7",
-//!     "main": "claude-sonnet-4-6",
-//!     "todo": "claude-sonnet-4-6",
-//!     "classifier": "claude-haiku-4-5"
+//!     "fast": "vertex-dummy.json:claude-sonnet-4-6",
+//!     "slow": "anthropic.json:claude-opus-4-8",
+//!     "main": "vertex-dummy.json:claude-sonnet-4-6",
+//!     "todo": "vertex-dummy.json:claude-sonnet-4-6",
+//!     "classifier": "anthropic.json:claude-haiku-4-5"
 //!   },
 //!   "actions": {
 //!     "allowed": ["grep", "find", "read", "git", "edit", "bash"]
@@ -19,10 +19,8 @@
 //! ```
 //!
 //! Precedence when picking a model for an agent role:
-//!   1. the agent config's own `"model"` field (highest — per-run
-//!      override);
-//!   2. the matching `models.<role>` string in settings.json;
-//!   3. `Model::sonnet_4_6()` (lowest — hard-coded fallback).
+//! Settings and CLI flags choose a model selector. Loading the selected
+//! provider config resolves that selector to the concrete API model id.
 //!
 //! Precedence for the action allowlist:
 //!   1. CLI `--allow <action>` flags (additive on top of the list

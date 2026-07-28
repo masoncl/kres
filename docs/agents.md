@@ -1,7 +1,7 @@
 # Agents — flow of work per task
 
 Every task cycles through these roles. Normal installs configure them
-through `~/.kres/models/<model-id>.json`; explicit `--*-agent` paths
+through provider files under `~/.kres/models/`; explicit `--*-agent` paths
 remain available for one-off overrides.
 
 - **fast** — scopes the task and emits a

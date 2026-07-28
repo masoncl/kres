@@ -7,7 +7,7 @@
 //!   [`StreamEvent`]s, used by `kres turn` and later by the fast /
 //!   slow agents.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, collections::HashMap, time::Duration};
 
 use futures::StreamExt;
 use reqwest::header;
@@ -34,6 +34,25 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 pub enum LlmCredentials {
     Anthropic {
         api_key: String,
+        base_url: String,
+    },
+    VertexDummy {
+        api_key: String,
+        project_id: String,
+        region: String,
+        base_url: String,
+    },
+    CodexCodes {
+        api_key: Option<String>,
+        base_url: Option<String>,
+        codex_path: Option<std::path::PathBuf>,
+        codex_home: Option<std::path::PathBuf>,
+        codex_config: BTreeMap<String, serde_json::Value>,
+    },
+    ClaudeCodes {
+        api_key: Option<String>,
+        base_url: Option<String>,
+        claude_path: Option<std::path::PathBuf>,
     },
     OpenAi {
         api_key: String,
@@ -50,6 +69,17 @@ impl LlmCredentials {
     pub fn anthropic(api_key: impl Into<String>) -> Self {
         Self::Anthropic {
             api_key: api_key.into(),
+            base_url: DEFAULT_ANTHROPIC_BASE_URL.into(),
+        }
+    }
+
+    pub fn anthropic_with_base_url(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::Anthropic {
+            api_key: api_key.into(),
+            base_url: base_url.into(),
         }
     }
 
@@ -57,6 +87,48 @@ impl LlmCredentials {
         Self::OpenAi {
             api_key: api_key.into(),
             base_url: base_url.unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+        }
+    }
+
+    pub fn vertex_dummy(
+        api_key: impl Into<String>,
+        project_id: impl Into<String>,
+        region: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::VertexDummy {
+            api_key: api_key.into(),
+            project_id: project_id.into(),
+            region: region.into(),
+            base_url: base_url.into(),
+        }
+    }
+
+    pub fn codex_codes(
+        api_key: Option<String>,
+        base_url: Option<String>,
+        codex_path: Option<std::path::PathBuf>,
+        codex_home: Option<std::path::PathBuf>,
+        codex_config: BTreeMap<String, serde_json::Value>,
+    ) -> Self {
+        Self::CodexCodes {
+            api_key,
+            base_url,
+            codex_path,
+            codex_home,
+            codex_config,
+        }
+    }
+
+    pub fn claude_codes(
+        api_key: Option<String>,
+        base_url: Option<String>,
+        claude_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::ClaudeCodes {
+            api_key,
+            base_url,
+            claude_path,
         }
     }
 
@@ -74,7 +146,51 @@ impl LlmCredentials {
 
     pub fn cache_key(&self) -> String {
         match self {
-            LlmCredentials::Anthropic { api_key } => format!("anthropic:{api_key}"),
+            LlmCredentials::Anthropic { api_key, base_url } => {
+                format!("anthropic:{}:{api_key}", normalize_url(base_url))
+            }
+            LlmCredentials::VertexDummy {
+                api_key,
+                project_id,
+                region,
+                base_url,
+            } => format!(
+                "vertex-dummy:{}:{project_id}:{region}:{api_key}",
+                normalize_url(base_url)
+            ),
+            LlmCredentials::CodexCodes {
+                api_key,
+                base_url,
+                codex_path,
+                codex_home,
+                codex_config,
+            } => format!(
+                "codex-codes:{}:{}:{}:{}:{}",
+                base_url.as_deref().unwrap_or("default"),
+                api_key.as_deref().unwrap_or("cli-auth"),
+                codex_path
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "codex".into()),
+                codex_home
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "default-home".into()),
+                serde_json::to_string(codex_config).unwrap_or_default(),
+            ),
+            LlmCredentials::ClaudeCodes {
+                api_key,
+                base_url,
+                claude_path,
+            } => format!(
+                "claude-codes:{}:{}:{}",
+                base_url.as_deref().unwrap_or("default"),
+                api_key.as_deref().unwrap_or("cli-auth"),
+                claude_path
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "claude".into())
+            ),
             LlmCredentials::OpenAi { api_key, base_url } => {
                 format!("openai:{}:{api_key}", normalize_url(base_url))
             }
@@ -86,7 +202,10 @@ impl LlmCredentials {
 
     fn api_key(&self) -> &str {
         match self {
-            LlmCredentials::Anthropic { api_key } => api_key,
+            LlmCredentials::Anthropic { api_key, .. } => api_key,
+            LlmCredentials::VertexDummy { api_key, .. } => api_key,
+            LlmCredentials::CodexCodes { api_key, .. } => api_key.as_deref().unwrap_or(""),
+            LlmCredentials::ClaudeCodes { api_key, .. } => api_key.as_deref().unwrap_or(""),
             LlmCredentials::OpenAi { api_key, .. } => api_key,
             LlmCredentials::AzureOpenAi { api_key, .. } => api_key,
         }
@@ -94,7 +213,16 @@ impl LlmCredentials {
 
     fn default_base_url(&self) -> String {
         match self {
-            LlmCredentials::Anthropic { .. } => DEFAULT_ANTHROPIC_BASE_URL.to_string(),
+            LlmCredentials::Anthropic { base_url, .. } => normalize_url(base_url),
+            LlmCredentials::VertexDummy { base_url, .. } => normalize_url(base_url),
+            LlmCredentials::CodexCodes { base_url, .. } => base_url
+                .as_deref()
+                .map(normalize_url)
+                .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+            LlmCredentials::ClaudeCodes { base_url, .. } => base_url
+                .as_deref()
+                .map(normalize_url)
+                .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
             LlmCredentials::OpenAi { base_url, .. } => normalize_url(base_url),
             LlmCredentials::AzureOpenAi { host, .. } => normalize_url(host),
         }
@@ -102,6 +230,16 @@ impl LlmCredentials {
 
     fn is_azure_openai(&self) -> bool {
         matches!(self, LlmCredentials::AzureOpenAi { .. })
+    }
+
+    fn provider(&self) -> Provider {
+        match self {
+            Self::VertexDummy { .. } => Provider::VertexDummy,
+            Self::CodexCodes { .. } => Provider::CodexCodes,
+            Self::ClaudeCodes { .. } => Provider::ClaudeCodes,
+            Self::OpenAi { .. } | Self::AzureOpenAi { .. } => Provider::OpenAi,
+            Self::Anthropic { .. } => Provider::Anthropic,
+        }
     }
 }
 
@@ -134,6 +272,28 @@ pub struct Client {
     /// Optional shared rate limiter. Multiple clients with the same
     /// credential should share one via `Arc::clone`.
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// Submission channel for one long-lived, multiplexed Codex app-server.
+    codex_dispatcher:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CodexCommand>>>>,
+}
+
+struct CodexCommand {
+    request: CodexRequest,
+    response: tokio::sync::oneshot::Sender<Result<MessagesResponse, LlmError>>,
+}
+
+struct CodexRequest {
+    model: String,
+    system: Option<String>,
+    effort: Option<String>,
+    prompt: String,
+}
+
+struct ActiveCodexTurn {
+    model: String,
+    text: String,
+    usage: Usage,
+    response: tokio::sync::oneshot::Sender<Result<MessagesResponse, LlmError>>,
 }
 
 impl Client {
@@ -155,6 +315,9 @@ impl Client {
             read_timeout: Some(DEFAULT_READ_TIMEOUT),
             user_agent: format!("kres/{}", env!("CARGO_PKG_VERSION")),
             rate_limiter: None,
+            default_headers: header::HeaderMap::new(),
+            identity_pem: None,
+            ca_pem_bundles: Vec::new(),
         }
     }
 
@@ -171,7 +334,7 @@ impl Client {
     /// Used on a 429 to decide whether the payload needs shrinking
     /// before retrying (§10 in todo.md).
     pub async fn count_tokens_exact(&self, cfg: &CallConfig, messages: &[Message]) -> Option<u64> {
-        if cfg.model.provider() != Provider::Anthropic {
+        if self.credentials.provider() != Provider::Anthropic {
             return None;
         }
         #[derive(serde::Serialize)]
@@ -226,19 +389,24 @@ impl Client {
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
-        if cfg.model.provider() == Provider::OpenAi {
+        if self.credentials.provider() == Provider::CodexCodes {
+            return self.codex_codes_messages(cfg, messages).await;
+        }
+        if self.credentials.provider() == Provider::ClaudeCodes {
+            return self.claude_codes_messages(cfg, messages).await;
+        }
+        if self.credentials.provider() == Provider::OpenAi {
             return self.openai_messages(cfg, messages).await;
         }
         const MAX_RETRIES: u32 = 20;
         let mut working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
         for attempt in 0..=MAX_RETRIES {
-            let body = MessagesRequest::from_config(cfg, &working_messages, false);
+            let body = self.messages_body(cfg, &working_messages, false);
             let resp_result = self
                 .http
-                .post(format!("{}/v1/messages", self.base_url))
-                .header("x-api-key", self.credentials.api_key())
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .post(self.anthropic_url(cfg, false))
+                .headers(self.anthropic_headers(false))
                 .header(header::CONTENT_TYPE, "application/json")
                 .json(&body)
                 .send()
@@ -343,21 +511,23 @@ impl Client {
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<StreamHandle, LlmError> {
-        if cfg.model.provider() == Provider::OpenAi {
-            return self.openai_stream_messages(cfg, messages).await;
+        if matches!(
+            self.credentials.provider(),
+            Provider::OpenAi | Provider::CodexCodes | Provider::ClaudeCodes
+        ) {
+            return self.buffered_stream_messages(cfg, messages).await;
         }
         use eventsource_stream::Eventsource;
 
-        let body = MessagesRequest::from_config(cfg, messages, true);
+        let body = self.messages_body(cfg, messages, true);
         let max_retries = 8;
         let mut last_err: Option<LlmError> = None;
         let mut consecutive_429s: u32 = 0;
         for attempt in 0..=max_retries {
             let resp_result = self
                 .http
-                .post(format!("{}/v1/messages", self.base_url))
-                .header("x-api-key", self.credentials.api_key())
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .post(self.anthropic_url(cfg, true))
+                .headers(self.anthropic_headers(true))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "text/event-stream")
                 .json(&body)
@@ -451,7 +621,13 @@ impl Client {
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
-        if cfg.model.provider() == Provider::OpenAi {
+        if self.credentials.provider() == Provider::CodexCodes {
+            return self.codex_codes_messages(cfg, messages).await;
+        }
+        if self.credentials.provider() == Provider::ClaudeCodes {
+            return self.claude_codes_messages(cfg, messages).await;
+        }
+        if self.credentials.provider() == Provider::OpenAi {
             return self.openai_messages(cfg, messages).await;
         }
         const MAX_RETRIES: u32 = 20;
@@ -469,12 +645,11 @@ impl Client {
             .as_ref()
             .map(|l| kres_core::io::register_stream(l, &cfg.model.id));
         for attempt in 0..=MAX_RETRIES {
-            let body = MessagesRequest::from_config(cfg, &working_messages, true);
+            let body = self.messages_body(cfg, &working_messages, true);
             let resp_result = self
                 .http
-                .post(format!("{}/v1/messages", self.base_url))
-                .header("x-api-key", self.credentials.api_key())
-                .header("anthropic-version", ANTHROPIC_VERSION)
+                .post(self.anthropic_url(cfg, true))
+                .headers(self.anthropic_headers(true))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "text/event-stream")
                 .json(&body)
@@ -764,12 +939,12 @@ impl Client {
         Err(LlmError::Other("exhausted retries".into()))
     }
 
-    async fn openai_stream_messages(
+    async fn buffered_stream_messages(
         &self,
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<StreamHandle, LlmError> {
-        let resp = self.openai_messages(cfg, messages).await?;
+        let resp = self.messages(cfg, messages).await?;
         let text = response_text(&resp);
         let events = futures::stream::iter(vec![
             Ok(StreamEvent {
@@ -835,12 +1010,261 @@ impl Client {
         headers
     }
 
+    async fn claude_codes_messages(
+        &self,
+        cfg: &CallConfig,
+        messages: &[Message],
+    ) -> Result<MessagesResponse, LlmError> {
+        use claude_codes::{AsyncClient, ClaudeCliBuilder, ClaudeOutput, PermissionMode};
+        use std::process::Stdio;
+
+        let LlmCredentials::ClaudeCodes {
+            api_key,
+            base_url,
+            claude_path,
+        } = &self.credentials
+        else {
+            return Err(LlmError::Other(
+                "claude-codes credentials unavailable".into(),
+            ));
+        };
+
+        let mut prompt = String::new();
+        for message in messages {
+            prompt.push_str(&message.role.to_ascii_uppercase());
+            prompt.push('\n');
+            if let Some(prefix) = message.cached_prefix.as_deref() {
+                prompt.push_str(prefix);
+            }
+            prompt.push_str(&message.content);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("Respond only to the conversation above.");
+
+        let mut builder = ClaudeCliBuilder::new()
+            .model(&cfg.model.id)
+            .permission_mode(PermissionMode::DontAsk)
+            .settings(r#"{"permissions":{"deny":["*"]}}"#);
+        if let Some(path) = claude_path {
+            builder = builder.command(path);
+        }
+        if let Some(key) = api_key {
+            builder = builder.api_key(key);
+        }
+        if let Some(system) = cfg.system.as_deref() {
+            builder = builder.append_system_prompt(system);
+        }
+        if let crate::model::ThinkingBudget::ExplicitBudget(tokens) = cfg.thinking {
+            builder = builder.max_thinking_tokens(tokens);
+        }
+
+        let mut command = builder
+            .build_command()
+            .map_err(|e| LlmError::Other(format!("claude-codes initialization failed: {e}")))?;
+        command.stderr(Stdio::null());
+        if let Some(url) = base_url {
+            command.env("ANTHROPIC_BASE_URL", url);
+        }
+        let child = command
+            .spawn()
+            .map_err(|e| LlmError::Other(format!("claude-codes spawn failed: {e}")))?;
+        let mut client = AsyncClient::new(child)
+            .map_err(|e| LlmError::Other(format!("claude-codes initialization failed: {e}")))?;
+        let responses = client
+            .query(&prompt)
+            .await
+            .map_err(|e| LlmError::Other(format!("claude-codes query failed: {e}")))?;
+
+        let mut response_text = String::new();
+        let mut actual_model = None;
+        let mut stop_reason = Some("end_turn".to_string());
+        let mut usage = Usage::default();
+        let mut result_error = None;
+        for response in responses {
+            match response {
+                ClaudeOutput::Assistant(assistant) => {
+                    actual_model = Some(assistant.message.model);
+                    if let Some(reason) = assistant.message.stop_reason {
+                        stop_reason = Some(format!("{reason:?}").to_ascii_lowercase());
+                    }
+                    for block in assistant.message.content {
+                        if let claude_codes::ContentBlock::Text(text) = block {
+                            response_text.push_str(&text.text);
+                        }
+                    }
+                }
+                ClaudeOutput::Result(result) => {
+                    if result.is_error {
+                        result_error = Some(if result.errors.is_empty() {
+                            result.result.unwrap_or_else(|| "unknown error".into())
+                        } else {
+                            result.errors.join("; ")
+                        });
+                    } else if let Some(text) = result.result {
+                        response_text = text;
+                    }
+                    if let Some(result_usage) = result.usage {
+                        usage = Usage {
+                            input_tokens: u64::from(result_usage.input_tokens),
+                            output_tokens: u64::from(result_usage.output_tokens),
+                            cache_read_input_tokens: u64::from(
+                                result_usage.cache_read_input_tokens,
+                            ),
+                            cache_creation_input_tokens: u64::from(
+                                result_usage.cache_creation_input_tokens,
+                            ),
+                        };
+                    }
+                    if let Some(reason) = result.stop_reason {
+                        stop_reason = Some(reason);
+                    }
+                }
+                _ => {}
+            }
+        }
+        client
+            .shutdown()
+            .await
+            .map_err(|e| LlmError::Other(format!("claude-codes shutdown failed: {e}")))?;
+        if let Some(error) = result_error {
+            return Err(LlmError::Other(format!(
+                "claude-codes query failed: {error}"
+            )));
+        }
+
+        Ok(MessagesResponse {
+            model: actual_model.or_else(|| Some(cfg.model.id.clone())),
+            stop_reason,
+            usage,
+            content: vec![ContentBlock::Text {
+                text: response_text,
+            }],
+        })
+    }
+
     fn openai_base_url(&self) -> String {
         if self.base_url == DEFAULT_ANTHROPIC_BASE_URL {
             DEFAULT_OPENAI_BASE_URL.to_string()
         } else {
             self.base_url.clone()
         }
+    }
+
+    async fn codex_codes_messages(
+        &self,
+        cfg: &CallConfig,
+        messages: &[Message],
+    ) -> Result<MessagesResponse, LlmError> {
+        let mut prompt = String::new();
+        for message in messages {
+            prompt.push_str(&message.role.to_ascii_uppercase());
+            prompt.push('\n');
+            if let Some(prefix) = message.cached_prefix.as_deref() {
+                prompt.push_str(prefix);
+            }
+            prompt.push_str(&message.content);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("Respond only to the conversation above.");
+
+        if !matches!(self.credentials, LlmCredentials::CodexCodes { .. }) {
+            return Err(LlmError::Other(
+                "codex-codes credentials unavailable".into(),
+            ));
+        }
+        let request = CodexRequest {
+            model: cfg.model.id.clone(),
+            system: cfg.system.clone(),
+            effort: openai_reasoning_effort(cfg.thinking).map(str::to_string),
+            prompt,
+        };
+        self.submit_codex_request(request).await
+    }
+
+    async fn submit_codex_request(
+        &self,
+        request: CodexRequest,
+    ) -> Result<MessagesResponse, LlmError> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let mut command = CodexCommand {
+            request,
+            response: response_tx,
+        };
+        for _ in 0..2 {
+            let mut slot = self.codex_dispatcher.lock().await;
+            if slot.is_none() {
+                *slot = Some(start_codex_dispatcher(&self.credentials).await?);
+            }
+            let sender = slot.as_ref().expect("dispatcher initialized above");
+            match sender.send(command) {
+                Ok(()) => {
+                    drop(slot);
+                    return response_rx.await.map_err(|_| {
+                        LlmError::Other("codex-codes dispatcher stopped during turn".into())
+                    })?;
+                }
+                Err(error) => {
+                    command = error.0;
+                    *slot = None;
+                }
+            }
+        }
+        Err(LlmError::Other(
+            "codex-codes dispatcher could not be started".into(),
+        ))
+    }
+
+    fn messages_body(
+        &self,
+        cfg: &CallConfig,
+        messages: &[Message],
+        stream: bool,
+    ) -> serde_json::Value {
+        let request = MessagesRequest::from_config(cfg, messages, stream);
+        if self.credentials.provider() == Provider::VertexDummy {
+            request.into_vertex_value()
+        } else {
+            serde_json::to_value(request).expect("MessagesRequest is serializable")
+        }
+    }
+
+    fn anthropic_url(&self, cfg: &CallConfig, stream: bool) -> String {
+        match &self.credentials {
+            LlmCredentials::VertexDummy {
+                project_id, region, ..
+            } => {
+                let method = if stream {
+                    "streamRawPredict"
+                } else {
+                    "rawPredict"
+                };
+                format!(
+                    "{}/projects/{project_id}/locations/{region}/publishers/anthropic/models/{}:{method}",
+                    self.base_url, cfg.model.id
+                )
+            }
+            _ => format!("{}/v1/messages", self.base_url),
+        }
+    }
+
+    fn anthropic_headers(&self, stream: bool) -> header::HeaderMap {
+        let mut headers = header::HeaderMap::new();
+        if self.credentials.provider() == Provider::Anthropic {
+            if let Ok(key) = header::HeaderValue::from_str(self.credentials.api_key()) {
+                headers.insert("x-api-key", key);
+            }
+            headers.insert(
+                "anthropic-version",
+                header::HeaderValue::from_static(ANTHROPIC_VERSION),
+            );
+        }
+        if stream {
+            headers.insert(
+                header::ACCEPT,
+                header::HeaderValue::from_static("text/event-stream"),
+            );
+        }
+        headers
     }
 }
 
@@ -1366,26 +1790,38 @@ fn transport_error_kind(e: &reqwest::Error) -> &'static str {
 /// User-visible notice that we hit a transport error and are retrying.
 /// Without this, an offline / DNS-broken host looks like kres just hanging.
 fn log_transport_retry(label: &str, attempt: u32, max: u32, e: &reqwest::Error, wait: Duration) {
+    let detail = error_chain(e);
     kres_core::async_eprintln!(
         "[network] {} attempt={}/{} kind={} error={} — retrying in {:?} (check connectivity to the configured API endpoint)",
         label,
         attempt + 1,
         max + 1,
         transport_error_kind(e),
-        e,
+        detail,
         wait,
     );
 }
 
 /// User-visible notice that we exhausted retries on transport errors.
 fn log_transport_giveup(label: &str, max: u32, e: &reqwest::Error) {
+    let detail = error_chain(e);
     kres_core::async_eprintln!(
         "[network] {} giving up after {} attempts: kind={} error={} — API unreachable, check network / proxy / DNS",
         label,
         max + 1,
         transport_error_kind(e),
-        e,
+        detail,
     );
+}
+
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        messages.push(cause.to_string());
+        source = cause.source();
+    }
+    messages.join(": ")
 }
 
 /// Parse the `retry-after` header. Returns `None` when absent or
@@ -1515,6 +1951,9 @@ pub struct ClientBuilder {
     read_timeout: Option<Duration>,
     user_agent: String,
     rate_limiter: Option<Arc<RateLimiter>>,
+    default_headers: header::HeaderMap,
+    identity_pem: Option<Vec<u8>>,
+    ca_pem_bundles: Vec<Vec<u8>>,
 }
 
 impl ClientBuilder {
@@ -1558,8 +1997,34 @@ impl ClientBuilder {
         self
     }
 
+    pub fn default_headers(mut self, headers: header::HeaderMap) -> Self {
+        self.default_headers = headers;
+        self
+    }
+
+    pub fn identity_pem(mut self, pem: Vec<u8>) -> Self {
+        self.identity_pem = Some(pem);
+        self
+    }
+
+    pub fn ca_pem_bundle(mut self, pem: Vec<u8>) -> Self {
+        self.ca_pem_bundles.push(pem);
+        self
+    }
+
     pub fn build(self) -> Result<Client, LlmError> {
         let mut b = reqwest::Client::builder().user_agent(self.user_agent);
+        if !self.default_headers.is_empty() {
+            b = b.default_headers(self.default_headers);
+        }
+        if let Some(pem) = self.identity_pem {
+            b = b.identity(reqwest::Identity::from_pem(&pem)?);
+        }
+        for pem in self.ca_pem_bundles {
+            for certificate in reqwest::Certificate::from_pem_bundle(&pem)? {
+                b = b.add_root_certificate(certificate);
+            }
+        }
         if self.no_proxy {
             b = b.no_proxy();
         } else if let Some(proxy_url) = self.proxy.as_deref() {
@@ -1579,7 +2044,267 @@ impl ClientBuilder {
             base_url: self.base_url,
             http,
             rate_limiter: self.rate_limiter,
+            codex_dispatcher: Arc::new(tokio::sync::Mutex::new(None)),
         })
+    }
+}
+
+async fn start_codex_dispatcher(
+    credentials: &LlmCredentials,
+) -> Result<tokio::sync::mpsc::UnboundedSender<CodexCommand>, LlmError> {
+    use codex_codes::AsyncClient;
+
+    let builder = codex_app_server_builder(credentials)?;
+    let client = AsyncClient::start_with(builder)
+        .await
+        .map_err(|error| LlmError::Other(format!("codex-codes initialization failed: {error}")))?;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run_codex_dispatcher(client, receiver));
+    Ok(sender)
+}
+
+fn codex_app_server_builder(
+    credentials: &LlmCredentials,
+) -> Result<codex_codes::AppServerBuilder, LlmError> {
+    use codex_codes::AppServerBuilder;
+
+    let LlmCredentials::CodexCodes {
+        api_key,
+        base_url,
+        codex_path,
+        codex_home,
+        codex_config,
+    } = credentials
+    else {
+        return Err(LlmError::Other(
+            "codex-codes credentials unavailable".into(),
+        ));
+    };
+    let mut builder = AppServerBuilder::new().env("RUST_LOG", "off");
+    if let Some(path) = codex_path {
+        builder = builder.command(path);
+    }
+    if let Some(url) = base_url {
+        builder = builder.env("OPENAI_BASE_URL", url);
+    }
+    if let Some(key) = api_key {
+        builder = builder.env("CODEX_API_KEY", key);
+    }
+    if let Some(home) = codex_home {
+        std::fs::create_dir_all(home).map_err(|error| {
+            LlmError::Other(format!("creating codex_home {}: {error}", home.display()))
+        })?;
+        builder = builder.env("CODEX_HOME", home);
+    }
+    for (key, value) in codex_config {
+        builder = builder.config_override(key, codex_config_toml(value)?);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        builder = builder.working_directory(cwd);
+    }
+    Ok(builder)
+}
+
+fn codex_config_toml(value: &serde_json::Value) -> Result<String, LlmError> {
+    match value {
+        serde_json::Value::Null => Err(LlmError::Other(
+            "codex_config values must not be null".into(),
+        )),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        serde_json::Value::String(value) => serde_json::to_string(value)
+            .map_err(|error| LlmError::Other(format!("encoding codex_config string: {error}"))),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(codex_config_toml)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| format!("[{}]", values.join(", "))),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| {
+                let key = serde_json::to_string(key).map_err(|error| {
+                    LlmError::Other(format!("encoding codex_config key: {error}"))
+                })?;
+                Ok(format!("{key} = {}", codex_config_toml(value)?))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|values| format!("{{ {} }}", values.join(", "))),
+    }
+}
+
+async fn run_codex_dispatcher(
+    mut client: codex_codes::AsyncClient,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<CodexCommand>,
+) {
+    use codex_codes::{Notification, ServerMessage};
+
+    let mut active = HashMap::<String, ActiveCodexTurn>::new();
+    loop {
+        if active.is_empty() {
+            let Some(command) = commands.recv().await else {
+                return;
+            };
+            start_codex_turn(&mut client, command, &mut active).await;
+        }
+        while let Ok(command) = commands.try_recv() {
+            start_codex_turn(&mut client, command, &mut active).await;
+        }
+
+        let message = match client.next_message().await {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                fail_codex_turns(
+                    &mut active,
+                    "codex-codes app-server closed before completing active turns",
+                );
+                return;
+            }
+            Err(error) => {
+                fail_codex_turns(&mut active, &format!("codex-codes receive failed: {error}"));
+                return;
+            }
+        };
+        match message {
+            ServerMessage::Notification(Notification::AgentMessageDelta(delta)) => {
+                if let Some(turn) = active.get_mut(&delta.thread_id) {
+                    turn.text.push_str(&delta.delta);
+                }
+            }
+            ServerMessage::Notification(Notification::ThreadTokenUsageUpdated(update)) => {
+                if let Some(turn) = active.get_mut(&update.thread_id) {
+                    turn.usage.input_tokens = update.token_usage.last.input_tokens.max(0) as u64;
+                    turn.usage.output_tokens = update.token_usage.last.output_tokens.max(0) as u64;
+                    turn.usage.cache_read_input_tokens =
+                        update.token_usage.last.cached_input_tokens.max(0) as u64;
+                    turn.usage.cache_creation_input_tokens = update
+                        .token_usage
+                        .last
+                        .cache_write_input_tokens
+                        .unwrap_or_default()
+                        .max(0) as u64;
+                }
+            }
+            ServerMessage::Notification(Notification::TurnCompleted(done)) => {
+                if let Some(turn) = active.remove(&done.thread_id) {
+                    let result = if let Some(error) = done.turn.error {
+                        Err(LlmError::Other(format!(
+                            "codex-codes turn failed: {error:?}"
+                        )))
+                    } else {
+                        Ok(MessagesResponse {
+                            model: Some(turn.model),
+                            stop_reason: Some("end_turn".into()),
+                            usage: turn.usage,
+                            content: vec![ContentBlock::Text { text: turn.text }],
+                        })
+                    };
+                    let _ = turn.response.send(result);
+                }
+            }
+            ServerMessage::Notification(Notification::Error(error)) if !error.will_retry => {
+                if let Some(turn) = active.remove(&error.thread_id) {
+                    let _ = turn.response.send(Err(LlmError::Other(format!(
+                        "codex-codes turn failed: {:?}",
+                        error.error
+                    ))));
+                }
+            }
+            ServerMessage::Request { id, request } => {
+                let _ = client
+                    .respond_error(
+                        id,
+                        -32601,
+                        &format!("kres does not handle {}", request.method()),
+                    )
+                    .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn start_codex_turn(
+    client: &mut codex_codes::AsyncClient,
+    command: CodexCommand,
+    active: &mut HashMap<String, ActiveCodexTurn>,
+) {
+    use codex_codes::{
+        AskForApproval, SandboxMode, SandboxPolicy, ThreadStartParams, TurnStartParams, UserInput,
+    };
+
+    let CodexCommand { request, response } = command;
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string());
+    let thread_params = ThreadStartParams {
+        approval_policy: Some(AskForApproval::Never),
+        approvals_reviewer: None,
+        base_instructions: request.system,
+        config: None,
+        cwd: cwd.clone(),
+        developer_instructions: None,
+        ephemeral: Some(true),
+        model: Some(request.model.clone()),
+        model_provider: None,
+        personality: None,
+        sandbox: Some(SandboxMode::Read_only),
+        service_name: None,
+        service_tier: None,
+        session_start_source: None,
+        thread_source: None,
+    };
+    let thread = match client.thread_start(&thread_params).await {
+        Ok(thread) => thread,
+        Err(error) => {
+            let _ = response.send(Err(LlmError::Other(format!(
+                "codex-codes thread start failed: {error}"
+            ))));
+            return;
+        }
+    };
+    let thread_id = thread.thread.id;
+    let turn_params = TurnStartParams {
+        approval_policy: Some(AskForApproval::Never),
+        approvals_reviewer: None,
+        client_user_message_id: None,
+        cwd,
+        effort: request.effort.map(codex_codes::ReasoningEffort),
+        input: vec![UserInput::Text {
+            text: request.prompt,
+            text_elements: None,
+        }],
+        model: Some(request.model.clone()),
+        output_schema: None,
+        personality: None,
+        sandbox_policy: Some(SandboxPolicy::ReadOnly {
+            network_access: Some(false),
+        }),
+        service_tier: None,
+        summary: None,
+        thread_id: thread_id.clone(),
+    };
+    if let Err(error) = client.turn_start(&turn_params).await {
+        let _ = response.send(Err(LlmError::Other(format!(
+            "codex-codes turn start failed: {error}"
+        ))));
+        return;
+    }
+    active.insert(
+        thread_id,
+        ActiveCodexTurn {
+            model: request.model,
+            text: String::new(),
+            usage: Usage::default(),
+            response,
+        },
+    );
+}
+
+fn fail_codex_turns(active: &mut HashMap<String, ActiveCodexTurn>, message: &str) {
+    for (_, turn) in active.drain() {
+        let _ = turn
+            .response
+            .send(Err(LlmError::Other(message.to_string())));
     }
 }
 
@@ -1595,6 +2320,144 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(c.base_url, "http://localhost:1");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an authenticated Codex CLI"]
+    async fn codex_codes_multiplexes_fresh_threads() {
+        let client = Client::new(LlmCredentials::codex_codes(
+            None,
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+        ))
+        .unwrap();
+        let cfg = CallConfig::defaults_for(Model::from_id("gpt-5.6-sol"));
+        let first = [Message::plain("user", "Reply with exactly FIRST")];
+        let second = [Message::plain("user", "Reply with exactly SECOND")];
+
+        let (first_result, second_result) = tokio::join!(
+            client.messages(&cfg, &first),
+            client.messages(&cfg, &second)
+        );
+
+        assert_eq!(response_text(&first_result.unwrap()).trim(), "FIRST");
+        assert_eq!(response_text(&second_result.unwrap()).trim(), "SECOND");
+    }
+
+    #[test]
+    fn codex_codes_builds_isolated_app_server_command() {
+        let codex_home =
+            std::env::temp_dir().join(format!("kres-codex-home-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&codex_home).ok();
+        let config = BTreeMap::from([
+            (
+                "mcp_servers.meta_core.enabled".to_string(),
+                serde_json::Value::Bool(false),
+            ),
+            (
+                "project_skill_configurable_directories".to_string(),
+                serde_json::json!([]),
+            ),
+            (
+                "features.plugins".to_string(),
+                serde_json::Value::Bool(false),
+            ),
+        ]);
+        let credentials = LlmCredentials::codex_codes(
+            None,
+            None,
+            Some("/opt/bin/codex".into()),
+            Some(codex_home.clone()),
+            config,
+        );
+        let command = codex_app_server_builder(&credentials)
+            .unwrap()
+            .build_command_sync()
+            .unwrap();
+        assert_eq!(command.get_program(), "/opt/bin/codex");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "features.plugins=false",
+                "-c",
+                "mcp_servers.meta_core.enabled=false",
+                "-c",
+                "project_skill_configurable_directories=[]",
+                "app-server",
+                "--listen",
+                "stdio://",
+            ]
+        );
+        let env: BTreeMap<_, _> = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("CODEX_HOME")),
+            Some(&codex_home.as_os_str())
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("RUST_LOG")),
+            Some(&std::ffi::OsStr::new("off"))
+        );
+        assert!(codex_home.is_dir());
+        std::fs::remove_dir_all(codex_home).unwrap();
+    }
+
+    #[test]
+    fn codex_config_values_use_toml_syntax() {
+        assert_eq!(
+            codex_config_toml(&serde_json::json!(false)).unwrap(),
+            "false"
+        );
+        assert_eq!(codex_config_toml(&serde_json::json!(0)).unwrap(), "0");
+        assert_eq!(
+            codex_config_toml(&serde_json::json!(["one", "two"])).unwrap(),
+            r#"["one", "two"]"#
+        );
+        assert_eq!(
+            codex_config_toml(&serde_json::json!({"enabled": false})).unwrap(),
+            r#"{ "enabled" = false }"#
+        );
+        assert!(codex_config_toml(&serde_json::Value::Null).is_err());
+    }
+
+    #[test]
+    fn vertex_builds_protocol_url_and_body() {
+        let credentials = LlmCredentials::vertex_dummy(
+            "dummy",
+            "project-a",
+            "global",
+            "https://gateway.example/v1/",
+        );
+        let client = Client::builder(credentials).build().unwrap();
+        let cfg = CallConfig::defaults_for(Model::sonnet_4_6());
+        let messages = vec![Message {
+            role: "user".into(),
+            content: "hello".into(),
+            cache: false,
+            cached_prefix: None,
+        }];
+
+        assert_eq!(
+            client.anthropic_url(&cfg, true),
+            "https://gateway.example/v1/projects/project-a/locations/global/publishers/anthropic/models/claude-sonnet-4-6:streamRawPredict"
+        );
+        let body = client.messages_body(&cfg, &messages, true);
+        assert!(body.get("model").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        assert!(!client.anthropic_headers(true).contains_key("x-api-key"));
+
+        let non_streaming = client.messages_body(&cfg, &messages, false);
+        assert!(non_streaming.get("stream").is_none());
     }
 
     #[tokio::test]

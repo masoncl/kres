@@ -1,16 +1,18 @@
 //! Agent config files.
 //!
-//! Shape of each per-agent JSON file: credentials (`api_key` for all
-//! providers, plus `host` + optional `api_version` for Azure GPT),
-//! `model`, `max_tokens`, `max_input_tokens`, `rate_limit`, `thinking`,
-//! and `system` (or `system_file`).
+//! A provider JSON file contains shared credentials and transport fields plus
+//! a `models` object. Each model entry owns its token limits and thinking
+//! defaults; agent roles only select a model and supply their embedded prompt.
 //!
 //! The `api_key` field carries the literal API key string. Shipped
 //! configs in the repo carry `@FAST_KEY@` / `@SLOW_KEY@` placeholders
 //! that setup.sh rewrites at install time from literal
 //! `--fast-key` / `--slow-key` values.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +50,35 @@ pub struct AgentConfig {
     pub host: Option<String>,
     #[serde(default)]
     pub api_version: Option<String>,
+    /// Optional path to the `codex` executable for the codex-codes provider.
+    #[serde(default)]
+    pub codex_path: Option<PathBuf>,
+    /// Optional isolated Codex state/config directory, exported as CODEX_HOME.
+    #[serde(default)]
+    pub codex_home: Option<PathBuf>,
+    /// Codex CLI `-c key=value` overrides applied to the app-server process.
+    #[serde(default)]
+    pub codex_config: BTreeMap<String, serde_json::Value>,
+    /// Optional path to the `claude` executable for the claude-codes provider.
+    #[serde(default)]
+    pub claude_path: Option<PathBuf>,
+    /// Vertex project and region for the Anthropic Vertex protocol.
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Static HTTP headers applied to every request.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Header whose value is generated once per client as a UUID.
+    #[serde(default)]
+    pub session_header: Option<String>,
+    /// Optional client certificate candidates for mTLS, tried in order.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    /// Explicit proxy URL. An empty string disables proxy auto-detection.
+    #[serde(default)]
+    pub proxy: Option<String>,
     /// Model id override. Required in practice — when omitted, kres
     /// falls back to Model::sonnet_4_6(). All shipped configs set this.
     #[serde(default)]
@@ -89,6 +120,23 @@ pub struct AgentConfig {
     /// rather than as escaped JSON strings.
     #[serde(default)]
     pub system_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    pub identity_candidates: Vec<TlsIdentityCandidate>,
+    /// Additional PEM CA bundles used to verify the server certificate.
+    #[serde(default)]
+    pub ca_certificates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsIdentityCandidate {
+    pub cert: String,
+    #[serde(default)]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,24 +199,42 @@ impl AgentConfig {
         Self::load_with_role(path, Some(role))
     }
 
+    pub fn load_for_role_model(
+        path: impl AsRef<Path>,
+        role: AgentKind,
+        model_id: &str,
+    ) -> Result<Self, AgentError> {
+        Self::load_with_role_name(
+            path,
+            role.model_section(),
+            role.default_system_file(),
+            Some(model_id),
+        )
+    }
+
     fn load_with_role(path: impl AsRef<Path>, role: Option<AgentKind>) -> Result<Self, AgentError> {
         let role_name = role.and_then(AgentKind::model_section);
         let default_system_file = role.and_then(AgentKind::default_system_file);
-        Self::load_with_role_name(path, role_name, default_system_file)
+        Self::load_with_role_name(path, role_name, default_system_file, None)
     }
 
     fn load_with_role_name(
         path: impl AsRef<Path>,
-        role_name: Option<&str>,
+        _role_name: Option<&str>,
         default_system_file: Option<&str>,
+        model_id: Option<&str>,
     ) -> Result<Self, AgentError> {
-        let cfg_path = path.as_ref();
+        let (cfg_path_buf, path_model) = split_config_selector(path.as_ref());
+        let cfg_path = cfg_path_buf.as_path();
         let raw = std::fs::read_to_string(cfg_path)?;
-        let cfg: AgentConfig = serde_json::from_value(expand_model_config_sections(
+        let cfg: AgentConfig = serde_json::from_value(select_model_config(
             serde_json::from_str(&raw)?,
-            role_name,
+            model_id.or(path_model.as_deref()),
         )?)?;
         let mut cfg = cfg;
+        if let Some(home) = cfg.codex_home.take() {
+            cfg.codex_home = Some(expand_tilde(&home));
+        }
         if cfg.system.is_none() && cfg.system_file.is_none() {
             if let Some(default) = default_system_file {
                 cfg.system_file = Some(PathBuf::from(default));
@@ -234,11 +300,39 @@ impl AgentConfig {
         Ok(cfg)
     }
 
+    /// Return the real JSON path for a possibly-qualified
+    /// `/path/provider.json:model-id` selector.
+    pub fn backing_path(path: &Path) -> PathBuf {
+        split_config_selector(path).0
+    }
+
     pub fn credentials(&self) -> Result<LlmCredentials, AgentError> {
         let provider = self.provider.as_deref().map(normalize_provider);
-        let api_key = self.api_key.as_deref().ok_or_else(|| {
-            AgentError::Other("agent config missing credentials: set `api_key`".into())
-        })?;
+        let api_key = self.api_key.as_deref().unwrap_or("dummy");
+        if matches!(provider.as_deref(), Some("codex_codes")) {
+            return Ok(LlmCredentials::codex_codes(
+                self.api_key.clone(),
+                self.base_url.clone(),
+                self.codex_path.clone(),
+                self.codex_home.clone(),
+                self.codex_config.clone(),
+            ));
+        }
+        if matches!(provider.as_deref(), Some("claude_codes")) {
+            return Ok(LlmCredentials::claude_codes(
+                self.api_key.clone(),
+                self.base_url.clone(),
+                self.claude_path.clone(),
+            ));
+        }
+        if matches!(provider.as_deref(), Some("vertex_dummy")) {
+            let project_id = required_field(self.project_id.as_deref(), "project_id")?;
+            let region = required_field(self.region.as_deref(), "region")?;
+            let base_url = required_field(self.base_url.as_deref(), "base_url")?;
+            return Ok(LlmCredentials::vertex_dummy(
+                api_key, project_id, region, base_url,
+            ));
+        }
         if let Some(host) = self.host.as_deref() {
             return Ok(LlmCredentials::azure_openai(
                 host,
@@ -249,7 +343,53 @@ impl AgentConfig {
         if matches!(provider.as_deref(), Some("openai" | "open_ai")) || self.model_is_openai() {
             return Ok(LlmCredentials::openai(api_key, self.base_url.clone()));
         }
-        Ok(LlmCredentials::anthropic(api_key))
+        match self.base_url.as_deref() {
+            Some(base_url) => Ok(LlmCredentials::anthropic_with_base_url(api_key, base_url)),
+            None => Ok(LlmCredentials::anthropic(api_key)),
+        }
+    }
+
+    pub fn client_builder(&self) -> Result<kres_llm::client::ClientBuilder, AgentError> {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        for (name, value) in &self.headers {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                AgentError::Other(format!("invalid HTTP header name {name:?}: {e}"))
+            })?;
+            let value = HeaderValue::from_str(&expand_env(value)).map_err(|e| {
+                AgentError::Other(format!("invalid value for HTTP header {name}: {e}"))
+            })?;
+            headers.insert(name, value);
+        }
+        if let Some(name) = self.session_header.as_deref() {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                AgentError::Other(format!("invalid session header name {name:?}: {e}"))
+            })?;
+            let value = HeaderValue::from_str(&uuid::Uuid::new_v4().to_string())
+                .expect("UUID is a valid header value");
+            headers.insert(name, value);
+        }
+
+        let mut builder =
+            kres_llm::client::Client::builder(self.credentials()?).default_headers(headers);
+        if let Some(proxy) = self.proxy.as_deref() {
+            builder = if proxy.is_empty() {
+                builder.no_proxy()
+            } else {
+                builder.proxy(Some(expand_env(proxy)))
+            };
+        }
+        if let Some(tls) = &self.tls {
+            builder = builder.identity_pem(resolve_identity(tls)?);
+            for path in &tls.ca_certificates {
+                let path = expand_env(path);
+                let pem = std::fs::read(&path)
+                    .map_err(|e| AgentError::Other(format!("reading TLS CA bundle {path}: {e}")))?;
+                builder = builder.ca_pem_bundle(pem);
+            }
+        }
+        Ok(builder)
     }
 
     pub fn credential_cache_key(&self) -> Result<String, AgentError> {
@@ -257,6 +397,29 @@ impl AgentConfig {
     }
 
     fn validate_credentials(&self, cfg_path: &Path) -> Result<(), AgentError> {
+        let provider = self.provider.as_deref().map(normalize_provider);
+        if matches!(provider.as_deref(), Some("codex_codes")) {
+            return Ok(());
+        }
+        if matches!(provider.as_deref(), Some("claude_codes")) {
+            return Ok(());
+        }
+        if matches!(provider.as_deref(), Some("vertex_dummy")) {
+            return match self.api_key.as_deref() {
+                Some(k) if k.starts_with('@') && k.ends_with('@') => {
+                    Err(AgentError::Other(format!(
+                        "agent config {} still contains the placeholder key {:?}",
+                        cfg_path.display(),
+                        k
+                    )))
+                }
+                Some(k) if !valid_secret(k) => Err(AgentError::Other(format!(
+                    "agent config {} has an invalid `api_key`",
+                    cfg_path.display()
+                ))),
+                _ => Ok(()),
+            };
+        }
         match self.api_key.as_deref() {
             Some(k) if valid_secret(k) => Ok(()),
             Some(k) if k.starts_with('@') && k.ends_with('@') => {
@@ -278,6 +441,17 @@ impl AgentConfig {
             .as_deref()
             .map(|id| Model::from_id(id).provider() == Provider::OpenAi)
             .unwrap_or(false)
+    }
+}
+
+fn split_config_selector(path: &Path) -> (PathBuf, Option<String>) {
+    let rendered = path.to_string_lossy();
+    match rendered.rsplit_once(".json:") {
+        Some((base, model)) if !model.is_empty() => (
+            PathBuf::from(format!("{base}.json")),
+            Some(model.to_string()),
+        ),
+        _ => (path.to_path_buf(), None),
     }
 }
 
@@ -305,88 +479,150 @@ impl AgentKind {
     }
 }
 
-fn role_default_system_file(role: &str) -> Option<&'static str> {
-    match role {
-        "fast" => AgentKind::Fast.default_system_file(),
-        "slow" => AgentKind::Slow.default_system_file(),
-        "main" => AgentKind::Main.default_system_file(),
-        "todo" => AgentKind::Todo.default_system_file(),
-        "classifier" => AgentKind::Classifier.default_system_file(),
-        _ => None,
-    }
-}
-
-fn expand_model_config_sections(
+fn select_model_config(
     value: serde_json::Value,
-    role: Option<&str>,
+    requested_model: Option<&str>,
 ) -> Result<serde_json::Value, AgentError> {
-    let Some(obj) = value.as_object() else {
-        return Ok(value);
-    };
-    if !obj.contains_key("defaults")
-        && !obj.contains_key("fast")
-        && !obj.contains_key("slow")
-        && !obj.contains_key("main")
-        && !obj.contains_key("todo")
-        && !obj.contains_key("classifier")
-    {
-        return Ok(value);
-    }
-
-    let mut merged = serde_json::Map::new();
-    for (k, v) in obj {
-        if !matches!(
-            k.as_str(),
-            "defaults" | "fast" | "slow" | "main" | "todo" | "classifier"
-        ) {
-            merged.insert(k.clone(), v.clone());
-        }
-    }
-    if let Some(defaults) = obj.get("defaults") {
-        merge_object_section(&mut merged, defaults, "defaults")?;
-    }
-    if let Some(role) = role {
-        if let Some(section) = obj.get(role) {
-            merge_object_section(&mut merged, section, role)?;
-        }
-        if !merged.contains_key("system") && !merged.contains_key("system_file") {
-            if let Some(default) = role_default_system_file(role) {
-                merged.insert(
-                    "system_file".to_string(),
-                    serde_json::Value::String(default.to_string()),
-                );
-            }
-        }
-    }
-    Ok(serde_json::Value::Object(merged))
-}
-
-fn merge_object_section(
-    dst: &mut serde_json::Map<String, serde_json::Value>,
-    section: &serde_json::Value,
-    name: &str,
-) -> Result<(), AgentError> {
-    let Some(obj) = section.as_object() else {
-        return Err(AgentError::Other(format!(
-            "agent config section `{name}` must be a JSON object"
-        )));
-    };
-    for (k, v) in obj {
-        if is_credential_key(k) {
+    let mut provider = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| AgentError::Other("provider config must be a JSON object".into()))?;
+    for forbidden in [
+        "model",
+        "max_tokens",
+        "max_input_tokens",
+        "rate_limit",
+        "thinking",
+        "defaults",
+        "fast",
+        "slow",
+        "main",
+        "todo",
+        "classifier",
+    ] {
+        if provider.contains_key(forbidden) {
             return Err(AgentError::Other(format!(
-                "agent config section `{name}` must not set credential field `{k}`; set credentials once at the model-file top level"
+                "provider config must put `{forbidden}` inside a `models.<model-id>` entry"
             )));
         }
-        dst.insert(k.clone(), v.clone());
     }
-    Ok(())
+    let models = provider.remove("models").ok_or_else(|| {
+        AgentError::Other("provider config missing required `models` object".into())
+    })?;
+    let models = models.as_object().ok_or_else(|| {
+        AgentError::Other("provider config `models` must be a JSON object".into())
+    })?;
+    let model_id = match requested_model {
+        Some(id) => id,
+        None if models.len() == 1 => models.keys().next().expect("one model"),
+        None => {
+            return Err(AgentError::Other(format!(
+                "provider config contains {} models; select one explicitly",
+                models.len()
+            )))
+        }
+    };
+    let model = models.get(model_id).ok_or_else(|| {
+        AgentError::Other(format!(
+            "provider config does not provide model `{model_id}`"
+        ))
+    })?;
+    let model = model.as_object().ok_or_else(|| {
+        AgentError::Other(format!("model `{model_id}` config must be a JSON object"))
+    })?;
+    for (key, value) in model {
+        if is_credential_key(key) || matches!(key.as_str(), "model" | "system" | "system_file") {
+            return Err(AgentError::Other(format!(
+                "model `{model_id}` must not set shared field `{key}`"
+            )));
+        }
+        provider.insert(key.clone(), value.clone());
+    }
+    provider.insert("model".into(), serde_json::Value::String(model_id.into()));
+    Ok(serde_json::Value::Object(provider))
 }
 
 fn is_credential_key(key: &str) -> bool {
     matches!(
         key,
-        "api_key" | "provider" | "base_url" | "host" | "api_version"
+        "api_key"
+            | "provider"
+            | "base_url"
+            | "host"
+            | "api_version"
+            | "codex_path"
+            | "codex_home"
+            | "codex_config"
+            | "claude_path"
+            | "project_id"
+            | "region"
+            | "headers"
+            | "session_header"
+            | "tls"
+            | "proxy"
     )
+}
+
+fn required_field<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str, AgentError> {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| AgentError::Other(format!("agent config missing `{name}`")))
+}
+
+fn expand_env(value: &str) -> String {
+    let mut out = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let name = &after[..end];
+        out.push_str(&std::env::var(name).unwrap_or_default());
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn resolve_identity(tls: &TlsConfig) -> Result<Vec<u8>, AgentError> {
+    let mut failures = Vec::new();
+    for candidate in &tls.identity_candidates {
+        let cert_path = expand_env(&candidate.cert);
+        if cert_path.is_empty() {
+            failures.push("certificate path expanded to empty".to_string());
+            continue;
+        }
+        let mut pem = match std::fs::read(&cert_path) {
+            Ok(pem) => pem,
+            Err(e) => {
+                failures.push(format!("{cert_path}: {e}"));
+                continue;
+            }
+        };
+        if let Some(key) = candidate.key.as_deref() {
+            let key_path = expand_env(key);
+            if !key_path.is_empty() && key_path != cert_path {
+                match std::fs::read(&key_path) {
+                    Ok(key) => {
+                        pem.push(b'\n');
+                        pem.extend(key);
+                    }
+                    Err(e) => {
+                        failures.push(format!("{key_path}: {e}"));
+                        continue;
+                    }
+                }
+            }
+        }
+        return Ok(pem);
+    }
+    Err(AgentError::Other(format!(
+        "no usable mTLS identity: {}",
+        failures.join("; ")
+    )))
 }
 
 fn system_file_candidates(cfg_path: &Path, system_file: &Path) -> Vec<PathBuf> {
@@ -444,8 +680,30 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        let mut value: serde_json::Value = serde_json::from_str(contents).unwrap();
+        if value.get("models").is_none() {
+            let object = value.as_object_mut().unwrap();
+            let model_id = object
+                .remove("model")
+                .and_then(|v| v.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "test-model".into());
+            let mut model = object
+                .remove("defaults")
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            for key in ["max_tokens", "max_input_tokens", "rate_limit", "thinking"] {
+                if let Some(value) = object.remove(key) {
+                    model.insert(key.into(), value);
+                }
+            }
+            object.insert(
+                "models".into(),
+                serde_json::json!({model_id: serde_json::Value::Object(model)}),
+            );
+        }
         let mut f = std::fs::File::create(&p).unwrap();
-        f.write_all(contents.as_bytes()).unwrap();
+        f.write_all(serde_json::to_string_pretty(&value).unwrap().as_bytes())
+            .unwrap();
         p
     }
 
@@ -499,7 +757,7 @@ mod tests {
             c.credentials().unwrap(),
             LlmCredentials::Anthropic { .. }
         ));
-        assert_eq!(c.model, None);
+        assert_eq!(c.model.as_deref(), Some("test-model"));
         assert_eq!(c.max_tokens, None);
         assert_eq!(c.thinking, None);
         assert_eq!(c.system, None);
@@ -571,38 +829,30 @@ mod tests {
     }
 
     #[test]
-    fn model_file_defaults_and_role_sections_are_merged() {
+    fn model_limits_are_independent_of_agent_role() {
         let p = write_tmp(
             r#"{
                 "provider": "openai",
                 "api_key": "sk-openai",
-                "model": "gpt-5.5",
-                "defaults": {
+                "models": {"gpt-5.5": {
                     "max_tokens": 64000,
                     "rate_limit": 900000,
                     "thinking": {"type": "adaptive", "effort": "medium"}
-                },
-                "fast": {
-                    "max_tokens": 16000,
-                    "thinking": {"type": "adaptive", "effort": "low"}
-                },
-                "slow": {
-                    "thinking": {"type": "adaptive", "effort": "high"}
-                }
+                }}
             }"#,
         );
         let fast = AgentConfig::load_for_role(&p, AgentKind::Fast).unwrap();
         let slow = AgentConfig::load_for_role(&p, AgentKind::Slow).unwrap();
-        assert_eq!(fast.max_tokens, Some(16000));
+        assert_eq!(fast.max_tokens, Some(64000));
         assert_eq!(fast.rate_limit, Some(900000));
         assert_eq!(
-            fast.thinking.as_ref().map(|t| t.to_budget(16000)),
-            Some(ThinkingBudget::Adaptive(Effort::Low))
+            fast.thinking.as_ref().map(|t| t.to_budget(64000)),
+            Some(ThinkingBudget::Adaptive(Effort::Medium))
         );
         assert_eq!(slow.max_tokens, Some(64000));
         assert_eq!(
             slow.thinking.as_ref().map(|t| t.to_budget(64000)),
-            Some(ThinkingBudget::Adaptive(Effort::High))
+            Some(ThinkingBudget::Adaptive(Effort::Medium))
         );
         assert!(matches!(
             slow.credentials().unwrap(),
@@ -612,15 +862,14 @@ mod tests {
     }
 
     #[test]
-    fn model_role_sections_reject_credentials() {
+    fn model_entries_reject_shared_connection_fields() {
         let p = write_tmp(
             r#"{
                 "api_key": "sk-top-level",
-                "model": "claude-sonnet-4-6",
-                "slow": {
+                "models": {"claude-sonnet-4-6": {
                     "api_key": "sk-role-level",
                     "max_tokens": 64000
-                }
+                }}
             }"#,
         );
         let msg = format!(
@@ -628,7 +877,7 @@ mod tests {
             AgentConfig::load_for_role(&p, AgentKind::Slow).unwrap_err()
         );
         assert!(
-            msg.contains("must not set credential field `api_key`"),
+            msg.contains("must not set shared field `api_key`"),
             "got: {msg}"
         );
         std::fs::remove_file(&p).ok();
@@ -683,7 +932,7 @@ mod tests {
         let cfg_path = dir.join("agent.json");
         std::fs::write(
             &cfg_path,
-            r#"{"api_key": "sk-x", "system_file": "prompt.md"}"#,
+            r#"{"api_key":"sk-x","system_file":"prompt.md","models":{"test-model":{}}}"#,
         )
         .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
@@ -699,7 +948,7 @@ mod tests {
         std::fs::write(&md_path, "absolute-path body").unwrap();
         let cfg_path = dir.join("agent.json");
         let cfg_body = format!(
-            r#"{{"api_key": "sk-x", "system_file": "{}"}}"#,
+            r#"{{"api_key":"sk-x","system_file":"{}","models":{{"test-model":{{}}}}}}"#,
             md_path.display()
         );
         std::fs::write(&cfg_path, cfg_body).unwrap();
@@ -717,7 +966,7 @@ mod tests {
         let cfg_path = dir.join("agent.json");
         std::fs::write(
             &cfg_path,
-            r#"{"api_key": "sk-x", "system": "inline-should-lose", "system_file": "prompt.md"}"#,
+            r#"{"api_key":"sk-x","system":"inline-should-lose","system_file":"prompt.md","models":{"test-model":{}}}"#,
         )
         .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
@@ -759,7 +1008,7 @@ mod tests {
         let cfg_path = dir.join("agent.json");
         std::fs::write(
             &cfg_path,
-            r#"{"api_key": "sk-x", "system_file": "system-prompts/main-agent.system.md"}"#,
+            r#"{"api_key":"sk-x","system_file":"system-prompts/main-agent.system.md","models":{"test-model":{}}}"#,
         )
         .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
@@ -795,7 +1044,7 @@ mod tests {
         let cfg_path = dir.join("agent.json");
         std::fs::write(
             &cfg_path,
-            r#"{"api_key": "sk-x", "system_file": "system-prompts/main-agent.system.md"}"#,
+            r#"{"api_key":"sk-x","system_file":"system-prompts/main-agent.system.md","models":{"test-model":{}}}"#,
         )
         .unwrap();
         let c = AgentConfig::load(&cfg_path).unwrap();
@@ -819,12 +1068,115 @@ mod tests {
         let cfg_path = models.join("claude-sonnet-4-6.json");
         std::fs::write(
             &cfg_path,
-            r#"{"api_key": "sk-x", "model": "claude-sonnet-4-6"}"#,
+            r#"{"api_key":"sk-x","models":{"claude-sonnet-4-6":{}}}"#,
         )
         .unwrap();
 
         let c = AgentConfig::load_for_role(&cfg_path, AgentKind::Fast).unwrap();
         assert_eq!(c.system.as_deref(), Some("MODEL ROOT OVERRIDE"));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn vertex_config_does_not_require_api_key() {
+        let p = write_tmp(
+            r#"{
+                "provider": "vertex-dummy",
+                "model": "claude-sonnet-4-6",
+                "base_url": "https://gateway.example/v1",
+                "project_id": "project-a",
+                "region": "global",
+                "session_header": "X-Session"
+            }"#,
+        );
+        let cfg = AgentConfig::load(&p).unwrap();
+        assert!(matches!(
+            cfg.credentials().unwrap(),
+            LlmCredentials::VertexDummy { .. }
+        ));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn codex_codes_config_does_not_require_api_key() {
+        let p = write_tmp(
+            r#"{
+                "provider": "codex-codes",
+                "codex_path": "/opt/bin/codex",
+                "codex_home": "/tmp/kres-codex-home",
+                "codex_config": {
+                    "mcp_servers.meta_core.enabled": false,
+                    "project_skill_configurable_directories": [],
+                    "project_doc_max_bytes": 0
+                },
+                "models": {"gpt-5.6-sol": {
+                    "max_tokens": 128000,
+                    "thinking": {"type": "adaptive", "effort": "high"}
+                }}
+            }"#,
+        );
+        let cfg = AgentConfig::load(&p).unwrap();
+        let credentials = cfg.credentials().unwrap();
+        let LlmCredentials::CodexCodes {
+            codex_home,
+            codex_config,
+            ..
+        } = credentials
+        else {
+            panic!("expected codex-codes credentials");
+        };
+        assert_eq!(codex_home, Some(PathBuf::from("/tmp/kres-codex-home")));
+        assert_eq!(
+            codex_config.get("mcp_servers.meta_core.enabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            codex_config.get("project_skill_configurable_directories"),
+            Some(&serde_json::json!([]))
+        );
+        assert_eq!(cfg.max_tokens, Some(128000));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn claude_codes_config_does_not_require_api_key() {
+        let p = write_tmp(
+            r#"{
+                "provider": "claude-codes",
+                "claude_path": "/opt/bin/claude",
+                "models": {"claude-sonnet-4-6": {
+                    "max_tokens": 64000,
+                    "thinking": {"type": "adaptive", "effort": "high"}
+                }}
+            }"#,
+        );
+        let cfg = AgentConfig::load(&p).unwrap();
+        assert!(matches!(
+            cfg.credentials().unwrap(),
+            LlmCredentials::ClaudeCodes { .. }
+        ));
+        assert_eq!(cfg.max_tokens, Some(64000));
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn mtls_identity_uses_first_readable_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("identity.pem");
+        std::fs::write(&good, b"certificate-and-key").unwrap();
+        let tls = TlsConfig {
+            identity_candidates: vec![
+                TlsIdentityCandidate {
+                    cert: dir.path().join("missing.pem").display().to_string(),
+                    key: None,
+                },
+                TlsIdentityCandidate {
+                    cert: good.display().to_string(),
+                    key: None,
+                },
+            ],
+            ca_certificates: Vec::new(),
+        };
+        assert_eq!(resolve_identity(&tls).unwrap(), b"certificate-and-key");
     }
 }

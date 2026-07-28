@@ -19,6 +19,9 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 kres-core = { workspace = true }
+uuid = { workspace = true }
+codex-codes = { workspace = true }
+claude-codes = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

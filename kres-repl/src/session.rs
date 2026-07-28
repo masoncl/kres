@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use kres_agents::{AgentConfig, AgentKind, AgentRunner, DataFetcher, RunContext};
 use kres_core::log::TurnLogger;
 use kres_core::{format_usage_summary, FindingsStore, TaskManager, TaskState, UsageTracker};
-use kres_llm::{client::Client, RateLimiter};
+use kres_llm::RateLimiter;
 
 use crate::commands::{parse_command, Command};
 
@@ -4359,12 +4359,14 @@ pub async fn build_agent_runner(
             })
     };
     let fast_client = Arc::new(
-        Client::builder(fast_credentials)
+        fast_cfg
+            .client_builder()?
             .rate_limiter(fast_limiter.clone())
             .build()?,
     );
     let slow_client = Arc::new(
-        Client::builder(slow_credentials)
+        slow_cfg
+            .client_builder()?
             .rate_limiter(slow_limiter.clone())
             .build()?,
     );
@@ -4403,7 +4405,7 @@ pub async fn build_agent_runner(
             }
             limiter
         };
-        let client = Arc::new(Client::builder(credentials).rate_limiter(limiter).build()?);
+        let client = Arc::new(cfg.client_builder()?.rate_limiter(limiter).build()?);
         let max_tokens = cfg.max_tokens.unwrap_or(model.max_output_tokens);
         let thinking = cfg
             .thinking

@@ -1,0 +1,19 @@
+{
+  "provider": "vertex-dummy",
+  "base_url": "https://vertex.example.invalid/v1",
+  "project_id": "dummy-project",
+  "region": "global",
+  "api_key": "dummy",
+  "models": {
+    "claude-sonnet-4-6": {
+      "max_tokens": 64000,
+      "max_input_tokens": 900000,
+      "rate_limit": 800000
+    },
+    "claude-opus-4-7": {
+      "max_tokens": 128000,
+      "max_input_tokens": 900000,
+      "rate_limit": 800000
+    }
+  }
+}

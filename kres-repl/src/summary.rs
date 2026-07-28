@@ -128,7 +128,7 @@ pub fn load_fast_for_summary(
         crate::settings::ModelRole::Fast,
         settings,
     );
-    let client = Arc::new(Client::new(fast_cfg.credentials()?)?);
+    let client = Arc::new(fast_cfg.client_builder()?.build()?);
     let max_tokens = fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens);
     Ok((client, fast_model, max_tokens, fast_cfg.max_input_tokens))
 }

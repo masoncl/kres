@@ -1,0 +1,20 @@
+{
+  "provider": "codex-codes",
+  "codex_path": "codex",
+  "codex_home": "~/.kres/codex-home",
+  "codex_config": {
+    "mcp_servers.meta_core.enabled": false,
+    "project_skill_configurable_directories": [],
+    "features.skill_search": false,
+    "features.plugins": false,
+    "features.hooks": false,
+    "project_doc_max_bytes": 0
+  },
+  "models": {
+    "gpt-5.6-sol": {
+      "max_tokens": 128000,
+      "max_input_tokens": 900000,
+      "thinking": {"type": "adaptive", "effort": "high"}
+    }
+  }
+}

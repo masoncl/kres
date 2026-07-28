@@ -4,6 +4,9 @@ This document is the source of truth for the shipped kres workflows.
 Keep `AGENTS.md` short and point back here instead of duplicating the
 flow details.
 
+For a cross-workflow inventory of goal ownership, planning, plan mutation,
+and completion decisions, see [Planning and Goal-Setting Audit](planning-and-goals-audit.md).
+
 ## Shared Workflow Runner Behavior
 
 The configured workspace is implicitly readable and writable by kres
@@ -14,14 +17,14 @@ itself. The same grant is used by `read`, `edit`, `code_output`, and
 workflow reaper paths; `/clear` or process restart drops the grants.
 
 The workflow runner wires the normal orchestrator into every LLM step.
-That means LLM steps still use the fast-gather -> main-fetch ->
-slow-synthesise loop:
+That means LLM steps use the fast-gather -> main-fetch -> synthesis loop:
 
 1. Fast agent requests typed followups such as `read`, `source`,
    `type`, `grep`, `git`, `callers`, or `make`.
 2. The main/service path fetches data and adds it to symbols/context.
-3. The slow agent receives the gathered context and emits the final
-   step response.
+3. The step's declared agent receives the gathered context and emits the final
+   response. `agent: fast` uses the fast model for synthesis; `agent: slow` and
+   `agent: code` use the slow model.
 
 Deterministic workflow steps run in the reaper without an LLM. Reaper
 steps are used for git commits, builds, finding invalidation, and patch
@@ -877,8 +880,8 @@ The parallel slow calls are the important part of `/review`; keep them
 unless the operator explicitly chooses a cheaper custom workflow.
 
 When multiple `--slow` selectors are passed, review runs in comparison
-mode. Each selector resolves to one slow model JSON file (`sonnet` and
-`opus` are aliases; other values match filenames under `~/.kres/models/`).
+mode. Each selector resolves to one model (`sonnet` and `opus` are aliases;
+use `provider.json:model-id` when more than one provider offers the model).
 Each active lens prompt is sent to every configured slow model, so a
 commit review with six active lenses and `--slow sonnet --slow opus`
 performs twelve slow calls after the shared gather. Every per-lens

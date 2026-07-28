@@ -5,7 +5,7 @@
 `kres repl` resolves agent config paths in this order:
 
 1. explicit CLI flag (e.g. `--fast-agent /path/to/fast.json`)
-2. model file under `~/.kres/models/<resolved-model-id>.json`
+2. provider file under `~/.kres/models/` containing the selected model
 
 Non-agent paths such as `mcp.json` and `skills/` only use explicit
 CLI flags and the same filename under `~/.kres/`.
@@ -25,94 +25,63 @@ provided. The `history` file is always written to `~/.kres/history`.
 
 ## Model selection
 
-`~/.kres/settings.json` carries per-user default model ids per
-agent role. `setup.sh --slow MODEL` / `--model MODEL` populate
-the slow slot and the fast / main / todo slots respectively. The
-classifier slot is shipped as `claude-haiku-4-5`. Defaults are
-`claude-opus-4-7` (slow), `claude-haiku-4-5` (classifier), and
-`claude-sonnet-4-6` (the rest).
+`~/.kres/settings.json` carries a model selector for each agent role.
+A selector is either a model id, when exactly one provider file offers it,
+or `<provider>.json:<model-id>` when disambiguation is required:
 
-Runtime precedence (`kres-repl/src/settings.rs::pick_model`):
-
-1. The agent config's explicit `"model"` field.
-2. `settings.models.<role>` in `~/.kres/settings.json`.
-3. `Model::sonnet_4_6()` — built-in fallback.
-
-Model files set `"model"`, so settings selects which model file each
-role loads. Per-run REPL overrides (`--fast-model`, `--slow-model`,
-`--main-model`, `--todo-model`, `--classifier-model`) beat
-`settings.json`. The one-shot workflow executor accepts `--fast-model`,
-`--slow-model`, and `--classifier-model`; it has no main/todo agent
-roles. `--slow <name>` selects a
-slow model config: `sonnet` and `opus` are aliases for the shipped
-model ids, while any other value must match exactly one JSON file under
-`~/.kres/models/` by filename. Exact stem matches win over substring
-matches. `--slow` and `--slow-model` are mutually exclusive.
-
-For example, with these files:
-
-```text
-~/.kres/models/claude-sonnet-4-6.json
-~/.kres/models/gpt-5.5-high.json
-~/.kres/models/gpt-5.5-xhigh.json
-~/.kres/models/local-coder.json
+```json
+{
+  "models": {
+    "fast": "vertex-dummy.json:claude-sonnet-4-6",
+    "slow": "anthropic.json:claude-opus-4-8",
+    "main": "vertex-dummy.json:claude-sonnet-4-6",
+    "todo": "vertex-dummy.json:claude-sonnet-4-6",
+    "classifier": "anthropic.json:claude-haiku-4-5"
+  }
+}
 ```
 
-`--slow sonnet` selects the Sonnet alias, `--slow gpt-5.5-xhigh`
-selects the exact filename stem, `--slow local` selects
-`local-coder.json` if it is the only filename containing `local`, and
-`--slow gpt-5.5` fails because both GPT files match.
+Each JSON file under `~/.kres/models/` describes one connection. Credentials,
+provider, endpoint, proxy, headers, and TLS settings are top-level and shared.
+The required `models` object contains per-model limits and thinking defaults:
+
+```json
+{
+  "api_key": "...",
+  "models": {
+    "claude-sonnet-4-6": {
+      "max_tokens": 64000,
+      "max_input_tokens": 900000,
+      "rate_limit": 800000
+    },
+    "claude-opus-4-8": {
+      "max_tokens": 128000,
+      "max_input_tokens": 900000,
+      "rate_limit": 800000,
+      "thinking": {"type": "adaptive", "effort": "xhigh"}
+    }
+  }
+}
+```
+
+Role-specific model settings do not exist. Fast, main, todo, classifier, and
+slow receive the same limits whenever they select the same model; their
+behavior differs through role-specific embedded system prompts. A provider
+file with multiple models must be qualified when passed directly, for example
+`kres test ~/.kres/models/anthropic.json:claude-opus-4-8`.
+
+If multiple provider files contain the same model, an unqualified selector is
+an error listing the candidates. Select it as
+`foo.json:claude-opus-4-6`. Per-run `--fast-model`, `--slow-model`,
+`--main-model`, `--todo-model`, and `--classifier-model` accept the same
+selector syntax. `--slow sonnet` and `--slow opus` remain short spellings for
+their shipped model ids, but ambiguity still requires qualification.
 
 Pointing fast and slow at the same model is fine: the fast/slow
 distinction is driven by per-agent system prompts and the
 context each agent receives, not by model choice. Two different
 models is a cost/latency optimisation, not a correctness
 requirement.
-
-GPT model ids such as `gpt-5.5` use the OpenAI adapter in `kres-llm`.
-The normal layout is one file per model:
-
-```text
-~/.kres/models/gpt-5.5.json
-```
-
-That file carries model credentials plus default request parameters.
-Role sections are optional; add them only when a role needs different
-tuning. The top-level `api_key` is used for every role that loads that
-model file:
-
-```json
-{
-  "api_key": "...",
-  "model": "claude-sonnet-4-6",
-  "defaults": {
-    "rate_limit": 800000
-  },
-  "fast": {
-    "max_tokens": 64000,
-    "max_input_tokens": 800000
-  },
-  "main": {
-    "max_tokens": 16384
-  },
-  "todo": {
-    "max_tokens": 32000
-  },
-  "slow": {
-    "max_tokens": 64000,
-    "max_input_tokens": 900000
-  }
-}
-```
-
-For a role-specific load, kres merges model-file fields in this order:
-
-1. Top-level fields.
-2. `defaults`.
-3. The selected role section: `fast`, `slow`, `main`, or `todo`.
-
-Later entries replace earlier entries for the same key. Config files
-are strict: unknown fields are rejected instead of ignored.
 
 For OpenAI API access, set `provider: "openai"`. `base_url` is
 optional and defaults to `https://api.openai.com/v1`; set it only for a
@@ -122,16 +91,12 @@ compatible proxy:
 {
   "provider": "openai",
   "api_key": "...",
-  "model": "gpt-5.5",
-  "defaults": {
+  "models": {"gpt-5.5": {
     "max_tokens": 128000,
     "max_input_tokens": 900000,
     "rate_limit": 900000,
     "thinking": {"type": "adaptive", "effort": "medium"}
-  },
-  "slow": {
-    "thinking": {"type": "adaptive", "effort": "high"}
-  }
+  }}
 }
 ```
 
@@ -143,13 +108,9 @@ field plus `host`:
   "host": "example.azure-api.net",
   "api_key": "...",
   "api_version": "2025-04-01-preview",
-  "model": "gpt-5.5",
-  "defaults": {
+  "models": {"gpt-5.5": {
     "thinking": {"type": "adaptive", "effort": "medium"}
-  },
-  "slow": {
-    "thinking": {"type": "adaptive", "effort": "high"}
-  }
+  }}
 }
 ```
 
@@ -158,12 +119,87 @@ OpenAI `reasoning.effort`, and kres sends text verbosity `medium` by
 default. Explicit thinking budgets are mapped onto OpenAI effort
 tiers; adaptive `low` / `medium` / `high` are sent directly.
 
-All provider credentials use the same JSON field name: `api_key`.
+## Codex Codes
+
+Use `provider: "codex-codes"` to run a model through the `codex-codes` Rust
+crate. This backend maintains a Codex app-server connection; it does not use
+kres's HTTP client. `codex_path` optionally selects a Codex
+executable and defaults to `codex` on `PATH`. `base_url` and `api_key` are
+optional and are forwarded to the SDK when present; otherwise the CLI's own
+authentication and configuration apply.
+
+`codex_home` sets an isolated `CODEX_HOME` for the child process; kres creates
+the directory before starting Codex. Values in
+`codex_config` are serialized as TOML and passed as repeated Codex CLI
+`-c key=value` overrides before `app-server`. The shipped configuration uses
+both to prevent kres's API-style calls from loading the operator's Codex
+plugins, skills, hooks, project instructions, and managed `meta_core` MCP
+server:
+
+```json
+{
+  "provider": "codex-codes",
+  "codex_home": "~/.kres/codex-home",
+  "codex_config": {
+    "mcp_servers.meta_core.enabled": false,
+    "project_skill_configurable_directories": [],
+    "features.skill_search": false,
+    "features.plugins": false,
+    "features.hooks": false,
+    "project_doc_max_bytes": 0
+  }
+}
+```
+
+System-managed Codex requirements still apply. Other managed MCP servers must
+be disabled by their own `mcp_servers.<name>.enabled=false` entry if present.
+
+Kres creates a fresh ephemeral thread for every call, while reusing one
+app-server process. A dispatcher routes interleaved notifications by thread ID,
+so independent agent calls run concurrently without sharing conversation
+context. Threads are read-only with approvals disabled. Select the shipped
+example as `codex-codes.json:gpt-5.6-sol`.
+
+## Claude Codes
+
+Use `provider: "claude-codes"` to run models through the `claude-codes` Rust
+crate and a locally installed Claude CLI. `claude_path` optionally selects the
+executable and defaults to `claude` on `PATH`. `api_key` and `base_url` are
+optional; without them, the CLI's normal authentication and configuration
+apply.
+
+Each kres call uses a fresh, non-persistent Claude process and therefore starts
+with an empty conversation context. The process runs with tool access denied.
+The shipped example contains both Sonnet and Opus; select one with, for example,
+`claude-codes.json:claude-sonnet-4-6`.
+
+## Anthropic Vertex and custom transports
+
+Use `provider: "vertex-dummy"` for an Anthropic Messages API exposed
+through Vertex `rawPredict` / `streamRawPredict`. This protocol requires
+`base_url`, `project_id`, and `region`; the model is routed in the URL and
+kres emits the Vertex Anthropic API version in the request body. Exact token
+counting is unavailable on this protocol, so kres uses its local estimate.
+
+Model configs can also define `headers`, a UUID-valued `session_header`, an
+explicit `proxy`, additional `tls.ca_certificates` PEM bundles, and ordered
+`tls.identity_candidates`. A candidate's `cert`
+may hold a combined certificate/key PEM, or `key` may name a separate key.
+`${NAME}` references in these transport fields expand from the environment.
+Missing certificate candidates are skipped and certificate contents are never
+included in logs or rate-limiter keys.
+
+The shipped `vertex-dummy.json` shows the minimal multi-model Vertex shape
+using intentionally non-functional connection values. Supply a real endpoint
+and authentication transport in the operator-owned configuration.
+
+Provider API credentials use the same JSON field name: `api_key`; transport-
+authenticated providers may omit it.
 Legacy `key`, `primary_key`, and `secondary_key` fields are rejected.
 
-Model files use each role's default embedded system prompt unless a
-role section overrides `system` or `system_file`. The default prompt is
-injected by role when the loaded config has neither field.
+Provider files use each role's default embedded system prompt. An optional
+top-level `system` or `system_file` overrides it for every model using that
+connection.
 
 Legacy role-specific filenames such as `fast-code-agent.json`,
 `main-agent.json`, `todo-agent.json`, and

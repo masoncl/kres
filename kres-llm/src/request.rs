@@ -344,6 +344,26 @@ impl<'a> MessagesRequest<'a> {
             stream,
         }
     }
+
+    /// Vertex's Anthropic publisher accepts the Messages payload, but
+    /// routes the model in the URL and uses a Vertex-specific API version.
+    pub fn into_vertex_value(self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("MessagesRequest is serializable");
+        if let Some(object) = value.as_object_mut() {
+            object.remove("model");
+            // Vertex still requires `stream: true` in the body even though
+            // streaming is also selected by the :streamRawPredict endpoint.
+            // Omit only the false value used with :rawPredict.
+            if object.get("stream") != Some(&serde_json::Value::Bool(true)) {
+                object.remove("stream");
+            }
+            object.insert(
+                "anthropic_version".into(),
+                serde_json::Value::String("vertex-2023-10-16".into()),
+            );
+        }
+        value
+    }
 }
 
 /// Non-streaming response envelope — only the fields we use.

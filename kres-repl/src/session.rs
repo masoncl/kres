@@ -20,7 +20,7 @@ pub struct ReplConfig {
     pub stop_grace: Duration,
     /// Lines emitted after the REPL output sink is installed. Startup
     /// context must go through this path because TUI mode owns an
-    /// alternate-screen scrollback.
+    /// ratatui scrollback.
     pub startup_lines: Vec<String>,
     /// Path to the canonical `findings.json` (jsondb-backed). When
     /// None, nothing is written to disk and findings stay in memory.
@@ -723,7 +723,7 @@ impl Session {
         *self.input_ack_tx.lock().await = Some(ack_tx);
         // --stdio always wins, even if --tui was also passed — so a
         // redirected-to-file run stays line-buffered and doesn't
-        // enter the alt screen / raw mode.
+        // enter ratatui's inline viewport / raw mode.
         let use_tui = self.cfg.tui && !self.cfg.stdio;
         if use_tui {
             let scrollback = crate::tui::Scrollback::new();

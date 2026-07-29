@@ -2,7 +2,7 @@
 //!
 //! This module is a drop-in replacement for [`session::read_stdin`]
 //! when the session is started with `--tui`. It owns the terminal
-//! (raw mode + alternate screen) for the lifetime of the loop, runs
+//! (raw mode + an inline full-height viewport) for the lifetime of the loop, runs
 //! a crossterm event poll, and feeds submitted lines into the same
 //! `mpsc::UnboundedSender<String>` the rustyline path uses — so the
 //! rest of `Session::run` doesn't care which input driver produced
@@ -29,7 +29,7 @@
 //! - Mouse scrollback, search, panes, findings sidebar.
 //!
 //! Teardown: [`run_tui`] always restores the terminal (leave raw
-//! mode, leave alt screen, show cursor) before returning, even on
+//! mode, disable input modes, show cursor) before returning, even on
 //! panic, via [`TuiGuard`]. If kres is killed uncleanly the user may
 //! need `reset` — same caveat as the existing DECSTBM path.
 //!
@@ -46,7 +46,7 @@ use crossterm::{
         Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -54,7 +54,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Terminal,
+    Terminal, TerminalOptions, Viewport,
 };
 use tokio::sync::mpsc;
 
@@ -182,7 +182,7 @@ impl Scrollback {
 pub fn install_tui_printer(scrollback: Scrollback) {
     // Replace unconditionally: the session may have installed a
     // stdout-bootstrap printer earlier to serve `print_banner` and
-    // other pre-TUI messages; once alt screen is about to take over
+    // other pre-TUI messages; once ratatui is about to take over
     // those stdout writes would blow up the frame, so the TUI
     // scrollback takes ownership here.
     let sb_print = scrollback.clone();
@@ -836,7 +836,7 @@ pub fn save_history(path: &std::path::Path, history: &[String]) {
     let _ = std::fs::write(path, body);
 }
 
-/// RAII guard: leaves raw mode and the alternate screen on drop.
+/// RAII guard: leaves raw mode and terminal input modes on drop.
 /// Constructed *before* the event loop so a panic unwinding through
 /// the loop restores the user's terminal instead of leaving it in
 /// raw mode.
@@ -852,12 +852,7 @@ impl TuiGuard {
         // would otherwise submit at the first Enter. Capture is
         // best-effort; terminals without support leave it off and
         // the old one-key-per-char behaviour keeps working.
-        if let Err(e) = execute!(
-            out,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste
-        ) {
+        if let Err(e) = execute!(out, EnableMouseCapture, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(e);
         }
@@ -868,12 +863,7 @@ impl TuiGuard {
 impl Drop for TuiGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        let _ = execute!(
-            out,
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
+        let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = out.flush();
     }
@@ -890,17 +880,12 @@ impl Drop for TuiGuard {
 /// TUI mode was never entered.
 pub fn emergency_restore_terminal() {
     let mut out = io::stdout();
-    let _ = execute!(
-        out,
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
+    let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = out.flush();
 }
 
-/// Suspend the TUI (leave alt screen + raw mode), run `$EDITOR` on
+/// Suspend the TUI input modes, run `$EDITOR` on
 /// a tempfile, then restore the TUI so the event loop can resume
 /// drawing. Mirrors [`Session::cmd_edit`] at session.rs:2515 but
 /// lives on the TUI thread because that's the thread that owns the
@@ -915,12 +900,11 @@ pub fn emergency_restore_terminal() {
 /// the caller is expected to bail — at that point the terminal is
 /// wedged and the session has to tear down.
 fn run_editor_handoff() -> Option<String> {
-    // Leave the TUI before the child runs so the editor paints on a
-    // normal-screen terminal with raw mode off. The subsequent
-    // re-entry rebuilds the TUI frame from scratch via
-    // `terminal.clear()` in the caller.
+    // Suspend input modes before the child runs. Most full-screen editors
+    // enter their own alternate screen; after they exit, the caller clears
+    // and redraws the inline viewport.
     let mut out = io::stdout();
-    let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = out.flush();
 
@@ -947,15 +931,14 @@ fn run_editor_handoff() -> Option<String> {
     };
     let _ = std::fs::remove_file(&tmp);
 
-    // Re-enter the TUI. Raw mode + alt screen are restored so the
-    // next draw() fires into a clean frame.
+    // Re-enter the TUI input modes so the next draw can resume.
     if enable_raw_mode().is_err() {
         kres_core::async_eprintln!("/edit: re-entering raw mode failed");
         return None;
     }
-    if execute!(out, EnterAlternateScreen, EnableMouseCapture).is_err() {
+    if execute!(out, EnableMouseCapture, EnableBracketedPaste).is_err() {
         let _ = disable_raw_mode();
-        kres_core::async_eprintln!("/edit: re-entering alt screen failed");
+        kres_core::async_eprintln!("/edit: restoring terminal input modes failed");
         return None;
     }
     let trimmed = content
@@ -974,6 +957,12 @@ fn run_editor_handoff() -> Option<String> {
 /// tokio background task) and passes a capturing closure that reads
 /// it synchronously. No `block_on` from the crossterm thread.
 pub type StatusFn = Box<dyn Fn(usize) -> String + Send>;
+
+fn tui_terminal_options(height: u16) -> TerminalOptions {
+    TerminalOptions {
+        viewport: Viewport::Inline(height.max(1)),
+    }
+}
 
 /// Width of the "> " prompt prefix painted on the very first visual
 /// row of the input widget. Subsequent visual rows (either from
@@ -1061,7 +1050,11 @@ pub fn run_tui(
     history_path: Option<std::path::PathBuf>,
 ) -> io::Result<()> {
     let _guard = TuiGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let viewport_height = crossterm::terminal::size()?.1.max(1);
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        tui_terminal_options(viewport_height),
+    )?;
     let mut input = Input::default();
     if let Some(ref p) = history_path {
         input.history = load_history(p);
@@ -1564,6 +1557,12 @@ pub fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tui_uses_inline_viewport_to_preserve_terminal_scrollback() {
+        assert_eq!(tui_terminal_options(40).viewport, Viewport::Inline(40));
+        assert_eq!(tui_terminal_options(0).viewport, Viewport::Inline(1));
+    }
 
     fn line_plain_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()

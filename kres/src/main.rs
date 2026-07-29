@@ -1049,8 +1049,8 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
 
     // --- Announce resolved paths -----------------------------------
     // Buffer these until the REPL output sink is installed. In TUI
-    // mode, printing before Session::run() enters the alternate
-    // screen leaves the lines outside the visible scrollback.
+    // mode, printing before Session::run() installs the ratatui
+    // scrollback sink leaves the lines outside the visible buffer.
     let mut startup_lines = Vec::new();
     for (label, p) in [
         ("fast-agent", fast_agent.as_ref()),

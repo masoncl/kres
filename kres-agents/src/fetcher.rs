@@ -5,6 +5,8 @@
 //! followups to kres-mcp and non-MCP ones to this type.
 //!
 //! Followup types routed locally:
+//! - `survey` — fallback file-scoped definition matches when semcode's
+//!   Tree-sitter `file_survey` is unavailable.
 //! - `read` — name = "file.c:100+50" or "file.c"; delegates to tools::read_file_range.
 //! - `search` / `grep` — name = regex; `path` = search root.
 //! - `source` — fallback grep for a symbol, plus bounded source reads
@@ -40,8 +42,8 @@ use crate::{
     followup::Followup,
     pipeline::{DataFetcher, FetchResult},
     tools::{
-        bash_run, find, git, grep, make_run, meson_run, read_file_range, BashArgs, FindArgs,
-        GitArgs, GrepArgs, ReadArgs,
+        bash_run, cargo_run, find, git, grep, make_run, meson_run, read_file_range, BashArgs,
+        FindArgs, GitArgs, GrepArgs, ReadArgs,
     },
 };
 
@@ -72,6 +74,25 @@ impl DataFetcher for WorkspaceFetcher {
         let mut out = FetchResult::default();
         for fu in followups {
             match fu.kind.as_str() {
+                "survey" => {
+                    let args = GrepArgs {
+                        pattern: r"^[[:space:]]*(struct|union|enum|typedef)[[:space:]]|^[A-Za-z_][A-Za-z0-9_[:space:]_*]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(".into(),
+                        path: Some(fu.name.clone()),
+                        limit: None,
+                        glob: None,
+                    };
+                    match grep(&self.workspace, &args).await {
+                        Ok(content) => out.context.push(json!({
+                            "source": format!("fallback:survey:{}", fu.name),
+                            "content": content,
+                            "note": "semcode file_survey was unavailable; this is a file-scoped local definition-match inventory, not a complete Tree-sitter survey",
+                        })),
+                        Err(e) => out.context.push(json!({
+                            "source": format!("fallback:survey:{}", fu.name),
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
                 "read" => match parse_read_spec(&fu.name) {
                     Ok(args) => match read_file_range(&self.workspace, &args) {
                         Ok(content) => out.context.push(json!({
@@ -139,7 +160,7 @@ impl DataFetcher for WorkspaceFetcher {
                         })),
                     }
                 }
-                "find" => {
+                "file" | "find" => {
                     // `find` accepts a single `name` value for
                     // `-name` and an optional `path`.
                     let args = FindArgs {
@@ -193,6 +214,18 @@ impl DataFetcher for WorkspaceFetcher {
                         })),
                         Err(e) => out.context.push(json!({
                             "source": format!("meson:{}", fu.name),
+                            "error": e.to_string(),
+                        })),
+                    }
+                }
+                "cargo" => {
+                    match cargo_run(&self.workspace, &fu.name, Some(300)).await {
+                        Ok(content) => out.context.push(json!({
+                            "source": format!("cargo:{}", fu.name),
+                            "content": content,
+                        })),
+                        Err(e) => out.context.push(json!({
+                            "source": format!("cargo:{}", fu.name),
                             "error": e.to_string(),
                         })),
                     }
@@ -457,6 +490,49 @@ mod tests {
         assert_eq!(r.context.len(), 1);
         let content = r.context[0].get("content").unwrap().as_str().unwrap();
         assert_eq!(content, "2\n3\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn survey_fallback_returns_scoped_definition_matches() {
+        let dir = tmpdir("survey-fallback");
+        let mut f = std::fs::File::create(dir.join("large.c")).unwrap();
+        f.write_all(
+            b"struct demo { int value; };\n\
+              static int helper(struct demo *demo)\n\
+              {\n\
+                  return demo->value;\n\
+              }\n",
+        )
+        .unwrap();
+        let f = WorkspaceFetcher::new(&dir);
+        let r = f
+            .fetch(
+                &[Followup {
+                    kind: "survey".into(),
+                    name: "large.c".into(),
+                    reason: "build inventory".into(),
+                    path: None,
+                    nice_to_have: false,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        let item = &r.context[0];
+        assert_eq!(
+            item.get("source").and_then(|v| v.as_str()),
+            Some("fallback:survey:large.c")
+        );
+        let content = item.get("content").and_then(|v| v.as_str()).unwrap();
+        assert!(content.contains("struct demo"));
+        assert!(content.contains("static int helper"));
+        assert!(!content.contains("return demo->value"));
+        assert!(item
+            .get("note")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .contains("not a complete Tree-sitter survey"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

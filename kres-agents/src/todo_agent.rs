@@ -80,6 +80,10 @@ pub struct TodoUpdate {
 /// caller-side context so the public function signatures stay narrow.
 pub struct TodoAgentInputs<'a> {
     pub completed_query: &'a str,
+    /// Stable id/name carried by the task that just completed. The
+    /// model sees human-readable `completed_query`, but Rust uses
+    /// this identity to make completion deterministic.
+    pub completed_todo_id: Option<&'a str>,
     pub analysis_summary: &'a str,
     pub new_followups: &'a [Value],
     pub current_todo: &'a [TodoItem],
@@ -105,6 +109,7 @@ pub async fn update_todo_via_agent_with_logger(
 ) -> Result<TodoUpdate, AgentError> {
     let TodoAgentInputs {
         completed_query,
+        completed_todo_id,
         analysis_summary,
         new_followups,
         current_todo,
@@ -114,6 +119,7 @@ pub async fn update_todo_via_agent_with_logger(
     // --- Prepare inputs ------------------------------------------------
     let mut todo_list = current_todo.to_vec();
     assign_ids(&mut todo_list);
+    mark_completed_todo(&mut todo_list, completed_todo_id);
     let current_payload: Vec<Value> = todo_list.iter().map(todo_to_payload).collect();
 
     let lens_payload: Vec<Value> = lenses
@@ -210,7 +216,7 @@ pub async fn update_todo_via_agent_with_logger(
     // Try the combined (todo + plan) envelope first so the agent's
     // optional plan rewrite survives; fall back to the todo-only
     // parser for responses that only carry the todo array.
-    let (parsed, returned_plan) = match parse_todo_update_full(&text) {
+    let (mut parsed, returned_plan) = match parse_todo_update_full(&text) {
         Some((todo, plan)) => (todo, plan),
         None => match parse_todo_response(&text) {
             Some(v) => (v, None),
@@ -226,6 +232,8 @@ pub async fn update_todo_via_agent_with_logger(
             }
         },
     };
+
+    reconcile_agent_identities(&mut parsed, &todo_list, completed_todo_id);
 
     // --- Reconcile with existing done items ---------------------------
     let (done_from_agent, mut pending_from_agent): (Vec<TodoItem>, Vec<TodoItem>) = parsed
@@ -308,7 +316,11 @@ pub async fn update_todo_via_agent_with_logger(
             // stays visible; the agent gets another chance next
             // round to mark it done or genuinely retire it.
             let mut item = orig.clone();
-            item.status = TodoStatus::Pending;
+            item.status = if orig.status == TodoStatus::InProgress {
+                TodoStatus::InProgress
+            } else {
+                TodoStatus::Pending
+            };
             restored.push(item.id.clone());
             pending_from_agent.push(item);
         }
@@ -411,6 +423,90 @@ pub async fn update_todo_via_agent_with_logger(
         todo: result,
         plan: returned_plan,
     })
+}
+
+/// Preserve scheduler-owned identity and execution state across an
+/// LLM todo rewrite. The model may reprioritize prose, but it cannot
+/// rename existing IDs, detach plan/dependency links, reopen the
+/// completed item, or make another currently-running task dispatchable.
+fn reconcile_agent_identities(
+    parsed: &mut Vec<TodoItem>,
+    originals: &[TodoItem],
+    completed_todo_id: Option<&str>,
+) {
+    let by_id: HashMap<&str, &TodoItem> = originals
+        .iter()
+        .filter(|item| !item.id.is_empty())
+        .map(|item| (item.id.as_str(), item))
+        .collect();
+    let by_name: HashMap<String, &TodoItem> = originals
+        .iter()
+        .filter(|item| !item.name.is_empty())
+        .map(|item| (item.name.to_ascii_lowercase(), item))
+        .collect();
+
+    for item in parsed.iter_mut() {
+        let original = by_id
+            .get(item.id.as_str())
+            .copied()
+            .or_else(|| by_name.get(&item.name.to_ascii_lowercase()).copied());
+        let Some(original) = original else {
+            continue;
+        };
+        item.id.clone_from(&original.id);
+        item.step_id.clone_from(&original.step_id);
+        item.depends_on.clone_from(&original.depends_on);
+        if item.kind.is_empty() {
+            item.kind.clone_from(&original.kind);
+        }
+        let is_completed = completed_todo_id
+            .is_some_and(|id| original.id == id || (original.id.is_empty() && original.name == id));
+        if is_completed {
+            item.status = TodoStatus::Done;
+            if item.coverage.is_empty() {
+                item.coverage = "completed by the reaped task".to_string();
+            }
+        } else if original.status == TodoStatus::InProgress {
+            item.status = TodoStatus::InProgress;
+        }
+    }
+
+    // Exact-name duplicates commonly appear once with the stable
+    // original id and once with a title-derived id. After identity
+    // restoration retain one row, preferring terminal state.
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut deduped: Vec<TodoItem> = Vec::with_capacity(parsed.len());
+    for item in parsed.drain(..) {
+        let key = if !item.id.is_empty() {
+            format!("id:{}", item.id)
+        } else {
+            format!("name:{}", item.name.to_ascii_lowercase())
+        };
+        if let Some(index) = positions.get(&key).copied() {
+            if item.status.is_terminal() && !deduped[index].status.is_terminal() {
+                deduped[index] = item;
+            }
+            continue;
+        }
+        positions.insert(key, deduped.len());
+        deduped.push(item);
+    }
+    *parsed = deduped;
+}
+
+fn mark_completed_todo(items: &mut [TodoItem], completed_todo_id: Option<&str>) {
+    let Some(completed_id) = completed_todo_id else {
+        return;
+    };
+    if let Some(item) = items
+        .iter_mut()
+        .find(|item| item.id == completed_id || (item.id.is_empty() && item.name == completed_id))
+    {
+        item.status = TodoStatus::Done;
+        if item.coverage.is_empty() {
+            item.coverage = "completed by the reaped task".to_string();
+        }
+    }
 }
 
 fn pending_matches_completed_exact(
@@ -1021,6 +1117,62 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_preserves_completed_id_and_running_siblings() {
+        let mut originals = Vec::new();
+        for (id, name, step) in [
+            ("review-write", "Trace write path", "write"),
+            ("review-read", "Trace read path", "read"),
+            ("review-final", "Verify shared contracts", "final"),
+        ] {
+            let mut item = TodoItem::new(name, "review");
+            item.id = id.to_string();
+            item.step_id = step.to_string();
+            item.status = TodoStatus::InProgress;
+            originals.push(item);
+        }
+        mark_completed_todo(&mut originals, Some("review-write"));
+
+        // Mirrors sol4: the model rewrote stable IDs from titles,
+        // reopened every item as pending, and emitted a duplicate of
+        // the completed task.
+        let mut parsed = vec![
+            TodoItem {
+                id: "Trace write path".into(),
+                status: TodoStatus::Pending,
+                ..TodoItem::new("Trace write path", "review")
+            },
+            TodoItem {
+                id: "review-write".into(),
+                status: TodoStatus::Pending,
+                ..TodoItem::new("Trace write path", "review")
+            },
+            TodoItem {
+                id: "Trace read path".into(),
+                status: TodoStatus::Pending,
+                ..TodoItem::new("Trace read path", "review")
+            },
+            TodoItem {
+                id: "Verify shared contracts".into(),
+                status: TodoStatus::Pending,
+                ..TodoItem::new("Verify shared contracts", "review")
+            },
+        ];
+
+        reconcile_agent_identities(&mut parsed, &originals, Some("review-write"));
+        assert_eq!(parsed.len(), 3);
+        let write = parsed
+            .iter()
+            .find(|item| item.id == "review-write")
+            .unwrap();
+        assert_eq!(write.status, TodoStatus::Done);
+        assert_eq!(write.step_id, "write");
+        for id in ["review-read", "review-final"] {
+            let item = parsed.iter().find(|item| item.id == id).unwrap();
+            assert_eq!(item.status, TodoStatus::InProgress);
+        }
+    }
 
     #[test]
     fn extract_citations_finds_c_h_rs() {

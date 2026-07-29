@@ -22,12 +22,19 @@
 //! fields are checked with `isinstance(list)` semantics — non-list
 //! values collapse to empty.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{error::AgentError, followup::Followup};
 
 use kres_core::findings::Finding;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InvalidFinding {
+    pub index: usize,
+    pub raw: Value,
+    pub error: String,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CodeResponse {
@@ -35,6 +42,9 @@ pub struct CodeResponse {
     pub followups: Vec<Followup>,
     pub skill_reads: Vec<String>,
     pub findings: Vec<Finding>,
+    /// Raw finding entries rejected by serde, retained so callers can
+    /// request one schema-only repair instead of silently losing them.
+    pub invalid_findings: Vec<InvalidFinding>,
     pub ready_for_slow: bool,
     /// Source files emitted by a Coding-mode slow-agent turn. Empty
     /// for Audit-mode responses. The coding-mode system prompt
@@ -62,6 +72,11 @@ pub struct CodeResponse {
     pub plan: Option<kres_core::PlanRewrite>,
     /// Which parse strategy won — used for diagnostics.
     pub strategy: ParseStrategy,
+    /// Structural problems that the forgiving parser would
+    /// otherwise hide (for example a non-array `followups` field or
+    /// an invalid item inside that array). Gather callers reject and
+    /// retry these before dispatching tools.
+    pub validation_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -151,11 +166,13 @@ pub fn parse_code_response(text: &str) -> CodeResponse {
         followups: vec![],
         skill_reads: vec![],
         findings: vec![],
+        invalid_findings: vec![],
         ready_for_slow: false,
         code_output: vec![],
         code_edits: vec![],
         plan: None,
         strategy: ParseStrategy::RawText,
+        validation_errors: vec!["response did not contain a JSON object".to_string()],
     }
 }
 
@@ -192,16 +209,20 @@ fn try_parse(s: &str) -> Option<RawResponse> {
 }
 
 fn into_code_response(r: RawResponse, _original: &str, strategy: ParseStrategy) -> CodeResponse {
+    let (followups, validation_errors) = value_to_followups(r.followups);
+    let (findings, invalid_findings) = value_to_findings(r.findings);
     CodeResponse {
         analysis: value_to_string(r.analysis),
-        followups: value_to_followups(r.followups),
+        followups,
         skill_reads: value_to_string_list(r.skill_reads),
-        findings: value_to_findings(r.findings),
+        findings,
+        invalid_findings,
         ready_for_slow: matches!(r.ready_for_slow, Value::Bool(true)),
         code_output: value_to_code_output(r.code_output),
         code_edits: value_to_code_edits(r.code_edits),
         plan: value_to_plan(r.plan),
         strategy,
+        validation_errors,
     }
 }
 
@@ -263,24 +284,41 @@ fn value_to_string_list(v: Value) -> Vec<String> {
         .collect()
 }
 
-fn value_to_followups(v: Value) -> Vec<Followup> {
+fn value_to_followups(v: Value) -> (Vec<Followup>, Vec<String>) {
+    if v.is_null() {
+        return (vec![], vec![]);
+    }
     let Value::Array(items) = v else {
-        return vec![];
+        return (vec![], vec!["`followups` must be an array".to_string()]);
     };
-    items
-        .into_iter()
-        .filter_map(|item| serde_json::from_value(item).ok())
-        .collect()
+    let mut parsed = Vec::with_capacity(items.len());
+    let mut errors = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
+        match serde_json::from_value(item) {
+            Ok(followup) => parsed.push(followup),
+            Err(error) => errors.push(format!("followups[{index}] is invalid: {error}")),
+        }
+    }
+    (parsed, errors)
 }
 
-fn value_to_findings(v: Value) -> Vec<Finding> {
+fn value_to_findings(v: Value) -> (Vec<Finding>, Vec<InvalidFinding>) {
     let Value::Array(items) = v else {
-        return vec![];
+        return (vec![], vec![]);
     };
-    items
-        .into_iter()
-        .filter_map(|item| serde_json::from_value(item).ok())
-        .collect()
+    let mut findings = Vec::new();
+    let mut invalid = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
+        match serde_json::from_value(item.clone()) {
+            Ok(finding) => findings.push(finding),
+            Err(error) => invalid.push(InvalidFinding {
+                index,
+                raw: item,
+                error: error.to_string(),
+            }),
+        }
+    }
+    (findings, invalid)
 }
 
 /// Pull the text out of a fenced block. Prefers fences opened with
@@ -589,7 +627,7 @@ that's all."#;
     }
 
     #[test]
-    fn invalid_finding_entries_are_dropped_not_panicked() {
+    fn invalid_finding_entries_are_retained_for_repair() {
         let r = parse_code_response(
             r#"{
                 "analysis": "",
@@ -602,6 +640,13 @@ that's all."#;
         );
         assert_eq!(r.findings.len(), 1);
         assert_eq!(r.findings[0].id, "good");
+        assert_eq!(r.invalid_findings.len(), 1);
+        assert_eq!(r.invalid_findings[0].index, 0);
+        assert_eq!(
+            r.invalid_findings[0].raw,
+            Value::String("not an object".into())
+        );
+        assert!(!r.invalid_findings[0].error.is_empty());
     }
 
     #[test]

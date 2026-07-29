@@ -47,7 +47,7 @@ STRICT RULES:
     backed by evidence in the analysis.
 
 Per-Finding schema (same as the main pipeline):
-  {id, title, severity (low|medium|high|critical),
+  {id, title, severity (low|medium|high),
    status ('active'|'invalidated'),
    relevant_symbols: [{name, filename, line, definition}],
    relevant_file_sections: [{filename, line_start, line_end, content}],

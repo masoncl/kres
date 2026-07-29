@@ -775,6 +775,11 @@ mod tests {
         assert!(step.consolidate.is_some());
         assert!(step.outputs.contains_key("analysis"));
         assert!(step.outputs.contains_key("findings"));
+        assert!(wf
+            .globals
+            .get("finding_schema")
+            .and_then(|v| v.as_str())
+            .is_some_and(|schema| schema.contains("survey|read|source")));
     }
 
     #[test]

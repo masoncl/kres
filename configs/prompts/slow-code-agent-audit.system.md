@@ -63,6 +63,10 @@ ANALYSIS — prose narrative:
 - A later fast-agent pass consolidates your analysis with sibling-lens analyses into a unified task narrative — don't worry about duplication across lenses.
 
 Followup types (same schema the fast agent uses):
+- "survey" — compact Tree-sitter function/call/type-name inventory for one
+  workspace-relative source file. It has aggregate counts but no line numbers
+  or bodies; use it to plan targeted source and reads. Spelling-based
+  caller/referencer counts are not symbol resolution.
 - "source" — function/macro definition. name = symbol name.
 - "type" — struct/union/typedef definition. name = type name,
   preferably without a `struct` or `union` prefix. Use this instead

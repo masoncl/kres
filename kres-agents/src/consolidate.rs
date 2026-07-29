@@ -108,7 +108,7 @@ pub async fn consolidate_lenses_with_logger(
     };
     let request_text = serde_json::to_string(&request)?;
 
-    let mut cfg = CallConfig::defaults_for(model)
+    let mut cfg = CallConfig::defaults_for(model.clone())
         .with_max_tokens(max_tokens)
         .with_stream_label("consolidator");
     if let Some(s) = system {
@@ -162,7 +162,36 @@ pub async fn consolidate_lenses_with_logger(
             },
         );
     }
-    let parsed = parse_code_response(&text);
+    let mut parsed = parse_code_response(&text);
+    if !parsed.invalid_findings.is_empty() {
+        let outcome = crate::finding_repair::repair_invalid_findings(
+            client.clone(),
+            model.clone(),
+            max_tokens,
+            max_input_tokens,
+            std::mem::take(&mut parsed.invalid_findings),
+            logger.clone(),
+            None,
+        )
+        .await?;
+        parsed.findings.extend(outcome.findings);
+        if !outcome.unrepaired.is_empty() {
+            let note = crate::finding_repair::format_unrepaired_findings(&outcome.unrepaired);
+            if !parsed.analysis.is_empty() {
+                parsed.analysis.push_str("\n\n");
+            }
+            parsed.analysis.push_str(&note);
+            parsed.followups.push(Followup {
+                kind: "question".into(),
+                name: "Repair the malformed Finding records preserved in the preceding analysis"
+                    .into(),
+                reason: "[MISSING] Rust rejected Finding fields after one schema-repair attempt; re-emit the same claims with valid typed fields before completion"
+                    .into(),
+                path: None,
+                nice_to_have: false,
+            });
+        }
+    }
     let comparison = extract_comparison(&text);
     // §20g: when findings parsed OK but analysis is empty, fall back
     // to the naive-concat narrative while keeping the parsed

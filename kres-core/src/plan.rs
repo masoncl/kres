@@ -66,6 +66,11 @@ pub struct PlanStep {
     /// todo is terminal.
     #[serde(default)]
     pub todo_ids: Vec<String>,
+    /// Plan-step IDs that must complete before this step may run.
+    /// Review bootstrap maps these to the corresponding linked todo
+    /// IDs, preserving the slow planner's staged execution graph.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     /// Additional context injected into the prompt for todos
     /// linked to this step. When non-empty, the dispatch path
     /// prepends it to the derived task's prompt so the slow agent
@@ -89,6 +94,7 @@ impl PlanStep {
             description: String::new(),
             status: PlanStepStatus::Pending,
             todo_ids: Vec::new(),
+            depends_on: Vec::new(),
             context: String::new(),
         }
     }
@@ -144,6 +150,13 @@ impl PlanRewrite {
                     if let Some(prior_step) = p.steps.iter().find(|s| s.id == step.id) {
                         if !prior_step.context.is_empty() {
                             step.context.clone_from(&prior_step.context);
+                        }
+                    }
+                }
+                if step.depends_on.is_empty() {
+                    if let Some(prior_step) = p.steps.iter().find(|s| s.id == step.id) {
+                        if !prior_step.depends_on.is_empty() {
+                            step.depends_on.clone_from(&prior_step.depends_on);
                         }
                     }
                 }
@@ -623,10 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_to_carries_forward_context_from_matching_prior_steps() {
+    fn apply_to_carries_forward_context_and_dependencies() {
         let mut prior = Plan::new("fix", "fix bug", TaskMode::Coding);
         let mut review = PlanStep::new("review-patch", "Review");
         review.context = "REVIEW PROTOCOL\nlens checklist here".into();
+        review.depends_on = vec!["write-fix".into()];
         prior.steps.push(PlanStep::new("write-fix", "Write"));
         prior.steps.push(review);
         // Rewrite keeps the same step ids but omits context (as an
@@ -644,6 +658,7 @@ mod tests {
             built.steps[1].context,
             "REVIEW PROTOCOL\nlens checklist here"
         );
+        assert_eq!(built.steps[1].depends_on, vec!["write-fix"]);
     }
 
     #[test]

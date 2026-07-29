@@ -158,13 +158,31 @@ pub fn review_prompt_file_from_target(
     prompt.push_str("Run the JSON-defined review workflow through the task/todo loop.\n\n");
     prompt.push_str("TARGET: ");
     prompt.push_str(target);
-    prompt.push_str("\n\n");
+    let target_is_commit = inputs
+        .get("target_is_commit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if target_is_commit {
+        prompt.push_str(
+            "\nTARGET KIND: git commit or range\n\n\
+Review the changes introduced by exactly this ref/range. Start by fetching \
+`git show --stat` and `git show`/`git diff` for TARGET, then gather the changed \
+files, symbols, and unchanged contract consumers.\n\n",
+        );
+    } else {
+        prompt.push_str(
+            "\nTARGET KIND: current-workspace source scope (not a git ref)\n\n\
+Review the current source named by TARGET. There is no implied commit, range, \
+base revision, or target diff. Do not invent one and do not request `git show` \
+or `git diff` merely to establish scope. Use a file survey as an intermediate \
+inventory, then gather targeted function bodies, types, callers, and line \
+ranges before slow review. Request git history only for a specific semantic \
+question that source alone cannot answer.\n\n",
+        );
+    }
     prompt.push_str(
-        "Target semantics: if TARGET is a git ref such as HEAD, a commit SHA, \
-or a range, review the changes introduced by that ref/range. Start by \
-fetching `git show --stat` and `git show`/`git diff` for the target, then \
-gather the changed files and symbols. Do not survey or audit the whole \
-repository unless the operator explicitly asks for a whole-tree audit.\n\n",
+        "Do not survey or audit the whole repository unless the operator \
+explicitly asks for a whole-tree audit.\n\n",
     );
     for include in &step.include {
         if let Some(key) = include
@@ -951,10 +969,14 @@ mod tests {
     #[test]
     fn review_prompt_file_uses_embedded_json_lenses() {
         let cfg = review_prompt_file_from_target("HEAD", None).expect("embedded review workflow");
-        assert_eq!(cfg.prompt_file.lenses.len(), 6);
-        assert_eq!(cfg.prompt_file.lenses[0].id, "lifetime");
+        assert_eq!(cfg.prompt_file.lenses.len(), 5);
+        assert_eq!(cfg.prompt_file.lenses[0].id, "memory-lifetime");
         assert!(cfg.prompt_file.lenses.iter().any(|l| l.id == "assertions"));
         assert!(cfg.prompt_file.prompt.contains("TARGET: HEAD"));
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("TARGET KIND: git commit or range"));
         assert!(cfg.prompt_file.prompt.contains("full Finding records"));
         assert!(cfg.prompt_file.prompt.contains("target diff/stat"));
         assert!(cfg.prompt_file.prompt.contains("Do not enumerate"));
@@ -972,8 +994,16 @@ mod tests {
     fn review_prompt_file_omits_commit_assertions_for_file_targets() {
         let cfg =
             review_prompt_file_from_target("drivers/example/example.c", None).expect("workflow");
-        assert_eq!(cfg.prompt_file.lenses.len(), 5);
+        assert_eq!(cfg.prompt_file.lenses.len(), 4);
         assert!(!cfg.prompt_file.lenses.iter().any(|l| l.id == "assertions"));
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("TARGET KIND: current-workspace source scope"));
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("There is no implied commit"));
     }
 
     #[test]

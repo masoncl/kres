@@ -205,6 +205,8 @@ pub struct Session {
     workflow_classifier: Option<kres_agents::workflow_runner::AgentEnv>,
     todo_client: Option<Arc<kres_agents::TodoClient>>,
     goal_client: Option<Arc<kres_agents::GoalClient>>,
+    review_todo_client: Option<Arc<kres_agents::TodoClient>>,
+    review_goal_client: Option<Arc<kres_agents::GoalClient>>,
     findings_store: Option<Arc<FindingsStore>>,
     usage: Arc<UsageTracker>,
     lenses: Arc<tokio::sync::RwLock<Vec<kres_core::LensSpec>>>,
@@ -447,6 +449,8 @@ impl Session {
                 workflow_classifier: None,
                 todo_client: None,
                 goal_client: None,
+                review_todo_client: None,
+                review_goal_client: None,
                 findings_store,
                 usage: Arc::new(UsageTracker::new()),
                 lenses: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -479,6 +483,8 @@ impl Session {
             workflow_classifier: None,
             todo_client: None,
             goal_client: None,
+            review_todo_client: None,
+            review_goal_client: None,
             findings_store,
             usage: Arc::new(UsageTracker::new()),
             lenses: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -547,6 +553,19 @@ impl Session {
     /// pre-goal behaviour).
     pub fn with_goal_client(mut self, c: Arc<kres_agents::GoalClient>) -> Self {
         self.goal_client = Some(c);
+        self
+    }
+
+    /// Attach the authoritative review planner. These structured
+    /// goal and todo clients share the primary slow model, while
+    /// non-review workflows keep their existing clients.
+    pub fn with_review_planner(
+        mut self,
+        goal: Arc<kres_agents::GoalClient>,
+        todo: Arc<kres_agents::TodoClient>,
+    ) -> Self {
+        self.review_goal_client = Some(goal);
+        self.review_todo_client = Some(todo);
         self
     }
 
@@ -944,9 +963,11 @@ impl Session {
         let reaper_shutdown = self.mgr.root_shutdown().clone();
         let last_analysis = self.last_analysis.clone();
         let todo_client = self.todo_client.clone();
+        let review_todo_client = self.review_todo_client.clone();
         let lenses_for_reaper = self.lenses.clone();
         let logger_for_reaper = self.logger.clone();
         let goal_client_for_reaper = self.goal_client.clone();
+        let review_goal_client_for_reaper = self.review_goal_client.clone();
         let task_goals_for_reaper = self.task_goals.clone();
         let task_prompts_for_reaper = self.task_prompts.clone();
         let accumulated_for_reaper = self.accumulated.clone();
@@ -1241,6 +1262,7 @@ impl Session {
                     // human reader of the narrative can find the
                     // new Findings by id.
                     let mut promoted_ids: Vec<String> = Vec::new();
+                    let mut unrepaired_promotion_note: Option<String> = None;
                     if r.mode.produces_findings() && !effective_analysis.is_empty() {
                         if let Some(ref promoter) = promoter_for_reaper {
                             // Assemble the full universe of known
@@ -1307,15 +1329,24 @@ impl Session {
                             )
                             .await
                             {
-                                Ok(extras) if !extras.is_empty() => {
-                                    kres_core::async_eprintln!(
-                                        "[promote] {} prose-only bug(s) promoted to findings",
-                                        extras.len()
-                                    );
-                                    promoted_ids.extend(extras.iter().map(|f| f.id.clone()));
-                                    working_delta.extend(extras);
+                                Ok(outcome) => {
+                                    if !outcome.findings.is_empty() {
+                                        kres_core::async_eprintln!(
+                                            "[promote] {} prose-only bug(s) promoted to findings",
+                                            outcome.findings.len()
+                                        );
+                                        promoted_ids
+                                            .extend(outcome.findings.iter().map(|f| f.id.clone()));
+                                        working_delta.extend(outcome.findings);
+                                    }
+                                    if !outcome.unrepaired.is_empty() {
+                                        unrepaired_promotion_note = Some(
+                                            kres_agents::finding_repair::format_unrepaired_findings(
+                                                &outcome.unrepaired,
+                                            ),
+                                        );
+                                    }
                                 }
-                                Ok(_) => {}
                                 Err(e) => {
                                     tracing::warn!(
                                         target: "kres_repl",
@@ -1338,6 +1369,22 @@ impl Session {
                         Some(tag) => format!("{}/{}", r.uuid.as_simple(), tag),
                         None => r.uuid.as_simple().to_string(),
                     };
+                    if let Some(note) = unrepaired_promotion_note.as_deref() {
+                        if let Some(ref s) = store_for_reaper {
+                            if let Err(e) = s.append_task_prose(&stamp, note).await {
+                                kres_core::async_eprintln!("finding repair task_prose append: {e}");
+                            }
+                        }
+                        if let Some(ref rp) = report_path_for_reaper {
+                            if let Err(e) = crate::report::append_task_section(rp, &r.name, note) {
+                                tracing::warn!(
+                                    target: "kres_repl",
+                                    "report finding-repair append to {}: {e}",
+                                    rp.display()
+                                );
+                            }
+                        }
+                    }
                     // Persist the task's effective_analysis at the
                     // file level for `/summary`'s benefit, regardless
                     // of whether a finding delta landed. Captures the
@@ -1505,7 +1552,7 @@ impl Session {
                             quiescent,
                         );
                     }
-                    let followups_for_todo: Vec<_> =
+                    let mut followups_for_todo: Vec<_> =
                         if matches!(r.mode, kres_core::TaskMode::Coding) {
                             r.followups
                                 .iter()
@@ -1515,6 +1562,25 @@ impl Session {
                         } else {
                             r.followups.clone()
                         };
+                    if unrepaired_promotion_note.is_some() {
+                        followups_for_todo.push(serde_json::json!({
+                            "type": "question",
+                            "name": "Repair malformed Finding records from the completed task",
+                            "reason": "[MISSING] Rust preserved Finding objects that remained schema-invalid after one repair attempt; re-emit the same claims with valid typed fields"
+                        }));
+                    }
+                    let lensed_review = matches!(r.mode, kres_core::TaskMode::Audit)
+                        && !lenses_for_reaper.read().await.is_empty();
+                    let task_todo_client = if lensed_review {
+                        review_todo_client.as_ref()
+                    } else {
+                        todo_client.as_ref()
+                    };
+                    let task_goal_client = if lensed_review {
+                        review_goal_client_for_reaper.clone()
+                    } else {
+                        goal_client_for_reaper.clone()
+                    };
                     // If this task pushed us to/past --turns N, stop
                     // before continuation LLMs. Findings/report/state
                     // above are already published for the completed
@@ -1539,9 +1605,14 @@ impl Session {
                     // Update todo list via todo-agent when one is
                     // configured. Non-fatal on any failure — the todo
                     // list is maintained best-effort.
-                    if let Some(ref tc) = todo_client {
+                    if let Some(tc) = task_todo_client {
                         let current = mgr_for_reaper.todo_snapshot().await;
                         let completed_query = r.name.clone();
+                        let completed_todo_id = if matches!(r.state, TaskState::Done) {
+                            r.todo_name.as_deref()
+                        } else {
+                            None
+                        };
                         // Errored tasks reach this path with
                         // analysis="". Without surfacing the error
                         // here the todo agent reads "no analysis" as
@@ -1580,6 +1651,7 @@ impl Session {
                             tc,
                             kres_agents::TodoAgentInputs {
                                 completed_query: &completed_query,
+                                completed_todo_id,
                                 analysis_summary: &analysis,
                                 new_followups: &followups_for_todo,
                                 current_todo: &current,
@@ -1680,9 +1752,7 @@ impl Session {
                             .await
                             .remove(&r.id)
                             .unwrap_or_default();
-                        if let (Some(gc), Some(goal)) =
-                            (goal_client_for_reaper.clone(), per_task_goal)
-                        {
+                        if let (Some(gc), Some(goal)) = (task_goal_client, per_task_goal) {
                             let entries = accumulated_for_reaper.lock().await.clone();
                             kres_core::async_eprintln!(
                             "[goal check] checking against {} accumulated analysis/es ({}k chars)",
@@ -1817,7 +1887,7 @@ impl Session {
                                 // deduped against existing items and
                                 // appended as new todos.
                                 if !check.missing.is_empty() {
-                                    if let Some(ref tc) = todo_client {
+                                    if let Some(tc) = task_todo_client {
                                         let reason_prefix = format!(
                                             "goal not met: {}",
                                             check.reason.chars().take(100).collect::<String>()
@@ -1846,6 +1916,7 @@ impl Session {
                                             tc,
                                             kres_agents::TodoAgentInputs {
                                                 completed_query: &completed_query,
+                                                completed_todo_id: None,
                                                 analysis_summary: "",
                                                 new_followups: &missing_fus,
                                                 current_todo: &current,
@@ -2369,11 +2440,12 @@ impl Session {
     /// unavailable or the agent declines to produce one.
     async fn derive_goal(
         &self,
+        client: Option<&Arc<kres_agents::GoalClient>>,
         text: &str,
         plan: Option<&kres_core::Plan>,
         label: &str,
     ) -> (Option<String>, kres_agents::TaskMode) {
-        let Some(gc) = &self.goal_client else {
+        let Some(gc) = client else {
             return (None, kres_agents::TaskMode::default());
         };
         match kres_agents::define_goal(gc, text, plan).await {
@@ -2557,12 +2629,19 @@ impl Session {
         // before any operator submission), fall back to the live
         // define_goal call so we get something rather than nothing.
         let existing_plan = self.mgr.plan_snapshot().await;
+        let review_submission = forced_mode == Some(kres_agents::TaskMode::Audit)
+            && !self.lenses.read().await.is_empty();
+        let planning_goal_client = if review_submission {
+            self.review_goal_client.as_ref()
+        } else {
+            self.goal_client.as_ref()
+        };
         let (defined_goal, task_mode): (Option<String>, kres_agents::TaskMode) =
             if include_recent_context {
                 // Operator-typed submission: derive a fresh goal and
                 // cache it for downstream pipeline follow-ups.
                 let r = self
-                    .derive_goal(&text, existing_plan.as_ref(), "fresh")
+                    .derive_goal(planning_goal_client, &text, existing_plan.as_ref(), "fresh")
                     .await;
                 let r = if let Some(mode) = forced_mode {
                     kres_core::async_eprintln!(
@@ -2597,7 +2676,12 @@ impl Session {
                     // any operator submission). Fall back to a
                     // fresh derivation and cache it.
                     let r = self
-                        .derive_goal(&text, existing_plan.as_ref(), "fallback")
+                        .derive_goal(
+                            planning_goal_client,
+                            &text,
+                            existing_plan.as_ref(),
+                            "fallback",
+                        )
                         .await;
                     if let Some(g) = r.0.as_ref() {
                         *self.session_goal.lock().await = Some((g.clone(), r.1));
@@ -2639,7 +2723,7 @@ impl Session {
         // topic (emit a new plan); set_plan reconciles orphan
         // step_ids on todos when ids change.
         if include_recent_context {
-            if let (Some(gc), Some(goal)) = (&self.goal_client, defined_goal.as_ref()) {
+            if let (Some(gc), Some(goal)) = (planning_goal_client, defined_goal.as_ref()) {
                 let existing = self.mgr.plan_snapshot().await;
                 let plan = if let Some(steps) = embedded_steps {
                     let steps = kres_core::plan::normalize_steps(steps);
@@ -2660,7 +2744,19 @@ impl Session {
                 };
                 if let Some(plan) = plan {
                     log_plan_change("define_plan", existing.as_ref(), &plan);
-                    self.mgr.set_plan(Some(plan)).await;
+                    self.mgr.set_plan(Some(plan.clone())).await;
+                    if review_submission && self.mgr.todo_snapshot().await.is_empty() {
+                        let todos = review_todos_from_plan(&plan);
+                        if !todos.is_empty() {
+                            kres_core::async_eprintln!(
+                                "review planner: seeded {} linked todo(s)",
+                                todos.len()
+                            );
+                            self.mgr.replace_todo(todos).await;
+                            self.interrupted_prompt.lock().await.take();
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -3452,13 +3548,9 @@ impl Session {
             Some(s) if !s.trim().is_empty() => Some(s),
             _ => self.cfg.results_dir.as_ref().and_then(|d| {
                 let p = d.join("prompt.md");
-                std::fs::read_to_string(&p).ok().and_then(|s| {
-                    if s.trim().is_empty() {
-                        None
-                    } else {
-                        Some(s)
-                    }
-                })
+                std::fs::read_to_string(&p)
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
             }),
         };
         let inputs = crate::summary::SummaryInputs {
@@ -4177,6 +4269,24 @@ impl Session {
     }
 }
 
+fn review_todos_from_plan(plan: &kres_core::Plan) -> Vec<kres_core::TodoItem> {
+    plan.steps
+        .iter()
+        .map(|step| {
+            let mut todo = kres_core::TodoItem::new(step.title.clone(), "review");
+            todo.id = format!("review-{}", step.id);
+            todo.step_id = step.id.clone();
+            todo.reason = step.description.clone();
+            todo.depends_on = step
+                .depends_on
+                .iter()
+                .map(|id| format!("review-{id}"))
+                .collect();
+            todo
+        })
+        .collect()
+}
+
 /// Max total size of the "recent context" preamble
 /// `submit_prompt` injects ahead of a new operator prompt. The
 /// accumulated ledger can grow without bound across a long session;
@@ -4272,6 +4382,11 @@ fn load_routing_system() -> Option<String> {
 pub struct BuiltAgents {
     pub agent_runner: Arc<AgentRunner>,
     pub consolidator: Arc<kres_agents::ConsolidatorClient>,
+    /// Review planning uses the primary slow model.  These clients
+    /// deliberately share its transport/rate limiter while using the
+    /// structured goal and todo contracts.
+    pub review_goal_client: Arc<kres_agents::GoalClient>,
+    pub review_todo_client: Arc<kres_agents::TodoClient>,
 }
 
 /// Optional knobs threaded into `build_agent_runner`. Splitting them
@@ -4435,6 +4550,28 @@ pub async fn build_agent_runner(
         max_input_tokens: fast_cfg.max_input_tokens,
     });
 
+    let review_goal_client = Arc::new(kres_agents::GoalClient {
+        client: slow_client.clone(),
+        model: slow_model.clone(),
+        system: Some(format!(
+            "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Turn a vague target into a staged graph: (1) exactly one initial orientation/context step with no dependencies, describing the source inventory, callers, history, types, and contract evidence the fast gather agent must obtain; for a named source-file target, explicitly require a `survey` followup for that path followed in the SAME task by targeted source/type/caller/read requests selected from the survey. A survey is an intermediate inventory, never sufficient context for slow review and never a complete orientation step by itself; (2) a bounded middle wave of 3 or 4 independent semantic path/contract groups, each depending on the orientation step; and (3) exactly one final cross-contract completeness step depending on every middle-wave step. Never partition by generic review lenses. Do not create more than 6 total steps. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
+            kres_agents::GOAL_INSTRUCTIONS
+        )),
+        max_tokens: slow_max_tokens.min(8_000),
+        max_input_tokens: slow_cfg.max_input_tokens,
+        logger: logger.clone(),
+    });
+    let review_todo_client = Arc::new(kres_agents::TodoClient {
+        client: slow_client.clone(),
+        model: slow_model.clone(),
+        system: Some(format!(
+            "{}\n\nREVIEW PLANNING POLICY:\nThe todo list implements a staged review plan. Preserve existing depends_on edges and stable IDs unless concrete completed evidence makes a dependency obsolete. Orientation/context work must finish before semantic path groups become runnable. Keep the middle wave bounded to 3 or 4 independent groups. Keep the final cross-contract completeness todo dependent on every surviving middle-wave group. Do not flatten all pending review work into one parallel batch. When orientation evidence changes the decomposition, revise the middle groups and final dependencies explicitly while preserving completed history.",
+            kres_agents::TODO_INSTRUCTIONS
+        )),
+        max_tokens: slow_max_tokens.min(32_000),
+        max_input_tokens: slow_cfg.max_input_tokens,
+    });
+
     let slow_coding_system = load_slow_coding_system();
     let slow_generic_system = load_slow_generic_system();
     let routing_system = load_routing_system();
@@ -4467,6 +4604,8 @@ pub async fn build_agent_runner(
     Ok(BuiltAgents {
         agent_runner,
         consolidator,
+        review_goal_client,
+        review_todo_client,
     })
 }
 
@@ -5709,6 +5848,30 @@ mod tests {
 
         assert_eq!(s.initial_prompt.as_deref(), Some("review this"));
         assert_eq!(s.initial_prompt_mode, Some(kres_agents::TaskMode::Audit));
+    }
+
+    #[test]
+    fn review_plan_steps_seed_linked_pending_todos() {
+        let mut plan = kres_core::Plan::new(
+            "review: mm/example.c",
+            "cover the target",
+            kres_core::TaskMode::Audit,
+        );
+        let mut step = kres_core::PlanStep::new("orient-target", "Map target contracts");
+        step.description = "Gather definitions, callers, and history".to_string();
+        plan.steps.push(step);
+        let mut dependent = kres_core::PlanStep::new("trace-reads", "Trace read contracts");
+        dependent.depends_on = vec!["orient-target".to_string()];
+        plan.steps.push(dependent);
+
+        let todos = review_todos_from_plan(&plan);
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].id, "review-orient-target");
+        assert_eq!(todos[0].step_id, "orient-target");
+        assert_eq!(todos[0].kind, "review");
+        assert_eq!(todos[0].status, kres_core::TodoStatus::Pending);
+        assert_eq!(todos[0].reason, "Gather definitions, callers, and history");
+        assert_eq!(todos[1].depends_on, vec!["review-orient-target"]);
     }
 
     #[test]

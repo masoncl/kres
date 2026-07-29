@@ -862,7 +862,11 @@ separate hardcoded review lens list. `/review <target>` and
 workflow-defined task loop. It uses the optimized lens path:
 
 1. One shared gather phase collects source, type definitions, callers, grep results, and
-   git context for the target.
+   git context for the target. For a named source-file review, its orientation task first
+   requests semcode's compact Tree-sitter `file_survey`, then selects targeted symbol and
+   line-range reads from that inventory instead of loading the entire file. The survey is
+   only an intermediate planning artifact: the task must gather reviewable bodies and
+   contract evidence before handing the shared context to slow lenses.
 2. The active slow-agent review lenses run in parallel.
 3. A fast consolidator merges and ranks the results.
 4. The lensed step completes with `findings` and typed `followups` in
@@ -879,12 +883,17 @@ workflow-defined task loop. It uses the optimized lens path:
 The parallel slow calls are the important part of `/review`; keep them
 unless the operator explicitly chooses a cheaper custom workflow.
 
+Review prompts carry a resolved target kind. A source file or directory means the current
+workspace contents and does not imply a revision, base, or diff. Only a target classified
+as a git commit/range starts from `git show` or `git diff`; source reviews may request
+targeted history later when a concrete semantic question requires it.
+
 When multiple `--slow` selectors are passed, review runs in comparison
 mode. Each selector resolves to one model (`sonnet` and `opus` are aliases;
 use `provider.json:model-id` when more than one provider offers the model).
 Each active lens prompt is sent to every configured slow model, so a
-commit review with six active lenses and `--slow sonnet --slow opus`
-performs twelve slow calls after the shared gather. Every per-lens
+commit review with five active lenses and `--slow sonnet --slow opus`
+performs ten slow calls after the shared gather. Every per-lens
 output sent to the consolidator is
 tagged with `slow_model`; the consolidator compares sibling model
 outputs for quality and depth, keeps the best evidence and Findings
@@ -893,10 +902,11 @@ completed review turn in `<results>/comparison.json`.
 
 ### Review Lenses
 
-- `lifetime`: pointer ownership, refcounts, RCU grace periods, free
-  ordering, copied pointers, and shared object lifetime.
-- `memory`: leaks, use-after-free, double-free, memory corruption, and
-  allocator API misuse.
+- `memory-lifetime`: allocation and initialization, publication, pointer
+  ownership, refcounts, RCU grace periods, asynchronous use, cleanup paths,
+  callback ownership, object layout, free ordering, leaks, use-after-free,
+  double-free, uninitialized memory, and allocator API misuse. Pure index,
+  range, and arithmetic errors remain owned by `bounds`.
 - `bounds`: array/index correctness, trusted versus untrusted indexes,
   integer overflow, truncation, and size calculation mistakes.
 - `races`: lock coverage, ordering, missed wakeups, shared-state races,
@@ -917,8 +927,17 @@ source, type definitions, callers, history, or API semantics would materially im
 confidence. `analysis` is the audit narrative, while `findings` contains
 the concrete bugs. Findings must be full kres `Finding` records, not
 simplified review notes. The parser drops partial objects that do not
-deserialize as `kres_core::findings::Finding`, so `{file, what,
-severity}` is not a valid review finding shape.
+deserialize as `kres_core::findings::Finding` from the accepted findings list,
+so `{file, what, severity}` is not a valid review finding shape. It retains the
+raw rejected object separately for the repair path described below.
+
+Malformed full-Finding attempts are retained with their raw JSON and exact
+serde error rather than silently discarded. After lens consolidation, and
+again after the prose-promotion pass, kres gives the fast formatting agent one
+schema-only repair attempt. Rust accepts only repaired records with an original
+id and validates them normally. A record that remains invalid is preserved in
+`report.md` and `findings.json.task_prose`, and a blocking typed retry followup
+is added; no missing line number or other evidence is fabricated.
 
 For commit/range reviews, the target is the semantic change, not only
 the edited lines. The gather pass and each lens must identify changed

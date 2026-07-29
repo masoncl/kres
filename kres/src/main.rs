@@ -1362,20 +1362,14 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             }
         }
 
-        // Fetcher selection:
-        //
-        //   * `--main-agent` set → build a MainAgent, which consults
-        //     the LLM to decide which tool to call and routes MCP
-        //     across every spawned server (§1, §13, §29).
-        //   * otherwise → fall back to the rule-based path:
-        //     McpFetcher(first server) wrapping WorkspaceFetcher, or
-        //     plain WorkspaceFetcher when no MCP is configured.
-        // `goal_client_from_main` is populated alongside the main-
-        // agent-backed fetcher so the Session can run §4's
-        // define_goal / check_goal loop on the same model.
+        // The fast agent is the only model that reasons about data
+        // gathering. Its typed followups are executed directly by
+        // MCP/WorkspaceFetcher; a second LLM must not reinterpret or
+        // silently repair them. The configured main model remains
+        // available to the legacy non-review goal loop.
         let mut goal_client_from_main: Option<Arc<kres_agents::GoalClient>> = None;
-        let fetcher: Arc<dyn kres_agents::pipeline::DataFetcher> = match main_agent.as_ref() {
-            Some(p) => match kres_agents::AgentConfig::load_for_role(p, AgentKind::Main) {
+        if let Some(p) = main_agent.as_ref() {
+            match kres_agents::AgentConfig::load_for_role(p, AgentKind::Main) {
                 Ok(mc) => {
                     let model = kres_repl::pick_model(
                         mc.model.as_deref(),
@@ -1401,38 +1395,22 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         max_input_tokens: mc.max_input_tokens,
                         logger: logger.clone(),
                     }));
-                    let ma = kres_agents::main_agent::MainAgent {
-                        client,
-                        model: model.clone(),
-                        system: mc.system,
-                        max_tokens: ma_max_tokens,
-                        max_input_tokens: mc.max_input_tokens,
-                        max_main_turns: kres_agents::DEFAULT_MAX_MAIN_TURNS,
-                        user_query: String::new(),
-                        task_brief: String::new(),
-                        workspace: workspace.clone(),
-                        mcp_servers: spawned_mcp.clone(),
-                        logger: logger.clone(),
-                        usage: usage.clone(),
-                        allowed_actions: allowed_actions.clone(),
-                    };
-                    kres_core::async_eprintln!(
-                        "main-agent: LLM-driven ({}), {} MCP server(s) routed",
-                        p.display(),
-                        spawned_mcp.len()
-                    );
-                    Arc::new(ma)
+                    kres_core::async_eprintln!("goal agent: configured from {}", p.display());
                 }
                 Err(e) => {
                     kres_core::async_eprintln!(
-                        "main-agent: config load failed ({}): {e}; falling back",
+                        "goal agent: config load failed ({}): {e}",
                         p.display()
                     );
-                    rule_based_fetcher(&spawned_mcp, &primary_name, workspace_fetcher.clone())
                 }
-            },
-            None => rule_based_fetcher(&spawned_mcp, &primary_name, workspace_fetcher.clone()),
-        };
+            }
+        }
+        let fetcher: Arc<dyn kres_agents::pipeline::DataFetcher> =
+            rule_based_fetcher(&spawned_mcp, &primary_name, workspace_fetcher.clone());
+        kres_core::async_eprintln!(
+            "gather service: deterministic, {} MCP server(s)",
+            spawned_mcp.len()
+        );
         if let Some(gc) = goal_client_from_main {
             session = session.with_goal_client(gc);
             kres_core::async_eprintln!("goal agent: ready");
@@ -1493,7 +1471,9 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         let consolidator = built.consolidator;
         session = session
             .with_agent_runner(orc)
-            .with_consolidator(consolidator);
+            .with_consolidator(consolidator)
+            .with_review_planner(built.review_goal_client, built.review_todo_client);
+        kres_core::async_eprintln!("review planner: primary slow model");
 
         // Optional workflow classifier agent.
         if let Some(ref classifier_path) = classifier_agent {

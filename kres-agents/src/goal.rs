@@ -90,6 +90,8 @@ struct PlanStepRaw {
     title: String,
     #[serde(default)]
     description: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,6 +524,7 @@ fn build_plan_from_raw(
         .map(|r| {
             let mut s = kres_core::PlanStep::new(r.id, r.title);
             s.description = r.description;
+            s.depends_on = r.depends_on;
             s
         })
         .collect();
@@ -741,6 +744,7 @@ mod tests {
             id: id.into(),
             title: title.into(),
             description: String::new(),
+            depends_on: Vec::new(),
         }
     }
 

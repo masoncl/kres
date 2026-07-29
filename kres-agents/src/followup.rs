@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Followup {
-    /// "source", "type", "callers", "callees", "search", "file",
+    /// "survey", "source", "type", "callers", "callees", "search", "file",
     /// "read", "git", "question".
     #[serde(rename = "type")]
     pub kind: String,

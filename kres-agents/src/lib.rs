@@ -14,6 +14,7 @@ pub mod consolidate;
 pub mod embedded_prompts;
 pub mod error;
 pub mod fetcher;
+pub mod finding_repair;
 pub mod followup;
 pub mod goal;
 pub mod main_agent;
@@ -56,6 +57,6 @@ pub use symbol::{
 };
 pub use todo_agent::{
     dedup_tokens, extract_citations, parse_todo_response, update_todo_via_agent,
-    update_todo_via_agent_with_logger, TodoAgentInputs, TodoClient, TodoUpdate,
+    update_todo_via_agent_with_logger, TodoAgentInputs, TodoClient, TodoUpdate, TODO_INSTRUCTIONS,
 };
 pub use workspace::{detect_workspace, BuildSystem, WorkspaceKind, WorkspaceProfile};

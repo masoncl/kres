@@ -38,6 +38,53 @@ use crate::{
 };
 
 const GENERIC_LENS_REPAIR_RETRIES: usize = 1;
+const FAST_GATHER_KINDS: &[&str] = &[
+    "survey", "source", "type", "callers", "callees", "search", "grep", "read", "file", "find",
+    "git", "make", "meson", "cargo", "bash", "lore", "question",
+];
+
+fn validate_fast_gather_response(response: &CodeResponse) -> Result<(), Vec<String>> {
+    let mut errors = response.validation_errors.clone();
+    if response.strategy == ParseStrategy::RawText {
+        errors.push("return one JSON object, not prose".to_string());
+    }
+    for (index, followup) in response.followups.iter().enumerate() {
+        let kind = followup.kind.trim();
+        if !FAST_GATHER_KINDS.contains(&kind) {
+            errors.push(format!(
+                "followups[{index}].type `{kind}` is unsupported; allowed: {}",
+                FAST_GATHER_KINDS.join(", ")
+            ));
+        }
+        if followup.name.trim().is_empty() {
+            errors.push(format!("followups[{index}].name must not be empty"));
+        }
+        if followup.reason.trim().is_empty() {
+            errors.push(format!("followups[{index}].reason must not be empty"));
+        }
+        if followup
+            .path
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            errors.push(format!(
+                "followups[{index}].path must not be empty when present"
+            ));
+        }
+    }
+    for (index, path) in response.skill_reads.iter().enumerate() {
+        if path.trim().is_empty() {
+            errors.push(format!("skill_reads[{index}] must not be empty"));
+        }
+    }
+    errors.sort();
+    errors.dedup();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 /// CodePrompt fields that go into the cached-prefix block.
 ///
@@ -629,6 +676,65 @@ pub struct TaskSummary {
 }
 
 impl AgentRunner {
+    async fn repair_fast_gather_response(
+        &self,
+        invalid: &str,
+        errors: &[String],
+        label: &str,
+        shutdown: &Shutdown,
+    ) -> Result<CodeResponse, AgentError> {
+        let content = format!(
+            "Your previous fast-gather response was rejected before any tools ran.\n\nValidation errors:\n- {}\n\nReturn a corrected JSON object only. Preserve the intended analysis and requests. Shape: {{\"analysis\":\"...\",\"followups\":[{{\"type\":\"survey|source|type|callers|callees|search|grep|read|file|find|git|make|meson|cargo|bash|lore|question\",\"name\":\"non-empty target\",\"reason\":\"non-empty justification\"}}],\"skill_reads\":[],\"ready_for_slow\":false}}. Do not use unknown request types.\n\nRejected response:\n{invalid}",
+            errors.join("\n- ")
+        );
+        let messages = vec![Message {
+            role: "user".into(),
+            content: content.clone(),
+            cache: false,
+            cached_prefix: None,
+        }];
+        let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
+            .with_max_tokens(self.fast_max_tokens)
+            .with_stream_label(label);
+        if let Some(thinking) = self.fast_thinking {
+            cfg = cfg.with_thinking(thinking);
+        }
+        if let Some(system) = &self.fast_system {
+            cfg = cfg.with_system(system.clone());
+        }
+        if let Some(limit) = self.fast_max_input_tokens {
+            cfg = cfg.with_max_input_tokens(limit);
+        }
+        if let Some(logger) = &self.logger {
+            logger.log_code_labeled("user", Some(label), &content, None, None);
+        }
+        let response = tokio::select! {
+            _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fast gather repair".into())),
+            result = self.fast_client.messages_streaming(&cfg, &messages) => {
+                result.map_err(|error| AgentError::Other(error.to_string()))?
+            }
+        };
+        record_usage(&self.usage, "fast", &self.fast_model, &response.usage);
+        let text = extract_text(&response);
+        if let Some(logger) = &self.logger {
+            logger.log_code_labeled(
+                "assistant",
+                Some(label),
+                &text,
+                Some(log_usage(&response.usage)),
+                extract_thinking(&response).as_deref(),
+            );
+        }
+        let parsed = parse_code_response(&text);
+        if let Err(errors) = validate_fast_gather_response(&parsed) {
+            return Err(AgentError::Other(format!(
+                "fast gather response remained invalid after repair: {}",
+                errors.join("; ")
+            )));
+        }
+        Ok(parsed)
+    }
+
     /// Convenience wrapper with an empty RunContext.
     pub async fn run_once(
         &self,
@@ -787,7 +893,21 @@ impl AgentRunner {
                     t
                 }
             };
-            let parsed = parse_code_response(&text);
+            let mut parsed = parse_code_response(&text);
+            if let Err(errors) = validate_fast_gather_response(&parsed) {
+                kres_core::async_eprintln!(
+                    "[fast round {fast_rounds}] invalid gather response; retrying once: {}",
+                    errors.join("; ")
+                );
+                parsed = self
+                    .repair_fast_gather_response(
+                        &text,
+                        &errors,
+                        "fast gather schema repair",
+                        shutdown,
+                    )
+                    .await?;
+            }
 
             // §27: honour skill_reads. Read each requested file and
             // graft it into the first skill's `files` map so the next
@@ -891,7 +1011,8 @@ impl AgentRunner {
                 fetched_keys.insert(fu.cache_key());
             }
 
-            // Fetch via main agent (data layer).
+            // Execute validated typed requests directly through the
+            // deterministic data layer.
             let fetched = tokio::select! {
                 _ = shutdown.cancelled() => {
                     return Err(AgentError::Other("cancelled during fetch".into()));
@@ -2154,7 +2275,21 @@ impl AgentRunner {
                     t
                 }
             };
-            let parsed = parse_code_response(&text);
+            let mut parsed = parse_code_response(&text);
+            if let Err(errors) = validate_fast_gather_response(&parsed) {
+                kres_core::async_eprintln!(
+                    "[fast gather round {fast_rounds}] invalid response; retrying once: {}",
+                    errors.join("; ")
+                );
+                parsed = self
+                    .repair_fast_gather_response(
+                        &text,
+                        &errors,
+                        "fast lens gather schema repair",
+                        shutdown,
+                    )
+                    .await?;
+            }
             if !parsed.skill_reads.is_empty() {
                 apply_skill_reads(&mut live_skills, &parsed.skill_reads);
             }
@@ -2464,6 +2599,60 @@ mod tests {
             .unwrap();
         assert!(r.symbols.is_empty());
         assert!(r.context.is_empty());
+    }
+
+    #[test]
+    fn fast_gather_validation_rejects_raw_text() {
+        let response = parse_code_response("please read foo.c");
+        let errors = validate_fast_gather_response(&response).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("JSON object")));
+    }
+
+    #[test]
+    fn fast_gather_validation_rejects_non_array_and_bad_items() {
+        let non_array = parse_code_response(r#"{"analysis":"x","followups":"read foo"}"#);
+        assert!(validate_fast_gather_response(&non_array)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("must be an array")));
+
+        let bad_item =
+            parse_code_response(r#"{"analysis":"x","followups":[{"type":"read","reason":"why"}]}"#);
+        assert!(validate_fast_gather_response(&bad_item)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("followups[0] is invalid")));
+    }
+
+    #[test]
+    fn fast_gather_validation_rejects_bad_semantics() {
+        let response = parse_code_response(
+            r#"{"analysis":"x","followups":[{"type":"invented","name":" ","reason":""}]}"#,
+        );
+        let errors = validate_fast_gather_response(&response).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("unsupported")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("name must not be empty")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("reason must not be empty")));
+    }
+
+    #[test]
+    fn fast_gather_validation_accepts_typed_request() {
+        let response = parse_code_response(
+            r#"{"analysis":"need source","followups":[{"type":"read","name":"mm/filemap.c:1+80","reason":"map entry points"}]}"#,
+        );
+        assert!(validate_fast_gather_response(&response).is_ok());
+    }
+
+    #[test]
+    fn fast_gather_validation_accepts_file_survey_request() {
+        let response = parse_code_response(
+            r#"{"analysis":"need an outline","followups":[{"type":"survey","name":"mm/filemap.c","reason":"build a targeted review inventory"}]}"#,
+        );
+        assert!(validate_fast_gather_response(&response).is_ok());
     }
 
     /// Unit-test the loop-back decision table. We can't easily run

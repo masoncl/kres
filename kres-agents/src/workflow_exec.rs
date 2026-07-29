@@ -3569,7 +3569,7 @@ mod tests {
         let wf = review_workflow();
         assert_eq!(wf.steps.len(), 1);
         assert_eq!(wf.steps[0].id, "investigate");
-        assert_eq!(wf.steps[0].lenses.len(), 6);
+        assert_eq!(wf.steps[0].lenses.len(), 5);
         assert!(wf.steps[0].consolidate.is_some());
         assert!(wf.steps[0].outputs.contains_key("analysis"));
         assert_eq!(
@@ -3578,14 +3578,9 @@ mod tests {
         );
         let mut driver = ScriptedDriver::new()
             .with(
-                "investigate|lifetime",
+                "investigate|memory-lifetime",
                 1,
-                json!({"analysis": "checked lifetime", "findings": []}),
-            )
-            .with(
-                "investigate|memory",
-                1,
-                json!({"analysis": "checked memory", "findings": []}),
+                json!({"analysis": "checked memory and lifetime", "findings": []}),
             )
             .with(
                 "investigate|bounds",
@@ -3615,11 +3610,11 @@ mod tests {
         assert_eq!(trace.status, WorkflowStatus::Success);
         assert!(trace.events.iter().any(|e| matches!(
             e,
-            TraceEvent::FanOut { id, lens_ids, .. } if id == "investigate" && lens_ids.len() == 5
+            TraceEvent::FanOut { id, lens_ids, .. } if id == "investigate" && lens_ids.len() == 4
         )));
         assert!(trace.events.iter().any(|e| matches!(
             e,
-            TraceEvent::Consolidating { id, lens_count, .. } if id == "investigate" && *lens_count == 5
+            TraceEvent::Consolidating { id, lens_count, .. } if id == "investigate" && *lens_count == 4
         )));
     }
 

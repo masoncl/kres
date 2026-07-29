@@ -2,6 +2,8 @@
 //! tool kinds an MCP server doesn't handle.
 //!
 //! Routes followups based on `kind`:
+//! - `survey` → MCP `file_survey`, falling back to a file-scoped local
+//!   definition search if the server is unavailable.
 //! - `source` → MCP `find_function`, falling back to local grep if the
 //!   server returns empty, indexing/unavailable text, or errors.
 //! - `type` → MCP `find_type`, falling back to grep+read if the server
@@ -37,6 +39,7 @@ use crate::{
 /// followup kind. The defaults match the semcode server used in the
 #[derive(Debug, Clone)]
 pub struct McpMethodMap {
+    pub file_survey: &'static str,
     pub find_function: &'static str,
     pub find_type: &'static str,
     pub find_callers: &'static str,
@@ -47,6 +50,7 @@ pub struct McpMethodMap {
 impl Default for McpMethodMap {
     fn default() -> Self {
         Self {
+            file_survey: "file_survey",
             find_function: "find_function",
             find_type: "find_type",
             find_callers: "find_callers",
@@ -68,6 +72,14 @@ const LORE_SINCE_DAYS: i64 = 30;
 /// result, so this helper is unit-tested.
 fn lore_call_args(query: &str, since: &str) -> Value {
     json!({"body_patterns": [query], "since_date": since})
+}
+
+/// Keep semcode's compact survey object structured in the gathered context.
+/// If a future result exceeds the shared MCP output cap, preserve the visible
+/// truncation marker as text rather than pretending the partial JSON is valid.
+fn structured_survey_result(text: &str) -> Value {
+    let capped = truncate_output(text, TOOL_OUTPUT_CAP_MCP);
+    serde_json::from_str(&capped).unwrap_or(Value::String(capped))
 }
 
 pub struct McpFetcher {
@@ -110,6 +122,22 @@ impl DataFetcher for McpFetcher {
 
         for fu in followups {
             match fu.kind.as_str() {
+                "survey" => {
+                    match self
+                        .try_call_mcp_file_survey(self.methods.file_survey, &fu.name)
+                        .await
+                    {
+                        Ok(v) if !mcp_result_unavailable(&v) => out.context.push(v),
+                        Ok(v) => {
+                            out.context.push(v);
+                            passthrough.push(fu.clone());
+                        }
+                        Err(err_ctx) => {
+                            out.context.push(err_ctx);
+                            passthrough.push(fu.clone());
+                        }
+                    }
+                }
                 "source" => {
                     match self
                         .try_call_mcp_text("source", self.methods.find_function, &fu.name)
@@ -263,6 +291,35 @@ impl DataFetcher for McpFetcher {
 }
 
 impl McpFetcher {
+    async fn try_call_mcp_file_survey(&self, tool: &str, path: &str) -> Result<Value, Value> {
+        let args = json!({"path": path});
+        let mut guard = self.client.lock().await;
+        let server = guard.server_name().to_string();
+        match guard.call_tool(tool, &args).await {
+            Ok(text) => Ok(json!({
+                "source": format!("mcp:survey:{path}"),
+                "result": structured_survey_result(&text),
+                "note": "Tree-sitter file survey; caller/referencer counts are spelling-based, not symbol resolution",
+            })),
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!(
+                    target: "kres_agents",
+                    server = %server,
+                    tool,
+                    path,
+                    "mcp call failed: {msg}"
+                );
+                Err(json!({
+                    "source": format!("mcp:survey:{path}"),
+                    "error": msg,
+                    "server": server,
+                    "tool": tool,
+                }))
+            }
+        }
+    }
+
     /// Call an MCP tool and return the raw (already-capped) text —
     /// used by the `source` path so the caller can parse it into a
     /// semcode symbol. Returns Err(error_text) on failure so the
@@ -412,6 +469,7 @@ mod tests {
     #[test]
     fn method_map_defaults_match_semcode() {
         let m = McpMethodMap::default();
+        assert_eq!(m.file_survey, "file_survey");
         assert_eq!(m.find_function, "find_function");
         assert_eq!(m.find_type, "find_type");
         assert_eq!(m.find_callers, "find_callers");
@@ -440,6 +498,25 @@ mod tests {
                 "since_date": "2026-04-14",
             })
         );
+    }
+
+    #[test]
+    fn compact_file_survey_json_is_kept_structured() {
+        let survey = serde_json::to_string(&json!({
+            "file": "mm/filemap.c",
+            "functions_defined": [["filemap_fault", 6]],
+            "calls": [["folio_put", 31]],
+            "types_defined": [],
+            "types_mentioned": [["struct folio", 143]],
+            "parse_errors": 0,
+            "truncated": false
+        }))
+        .unwrap();
+        let result = structured_survey_result(&survey);
+        assert!(result.is_object());
+        assert_eq!(result["file"], "mm/filemap.c");
+        assert_eq!(result["functions_defined"][0][0], "filemap_fault");
+        assert_eq!(result["functions_defined"][0][1], 6);
     }
 
     #[test]

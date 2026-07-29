@@ -42,10 +42,12 @@ The 'Current task' field often names a specific fetch operation, e.g. 'read: fil
   - Good: task is `[bash] ls`, round-1 reply carries `{"followups":[{"type":"bash","name":"ls","reason":"operator asked to run ls"}],"ready_for_slow":false}`. Round 2 (with the bash output in context) sets ready_for_slow=true.
 - Round 1: emit any skill_reads the task implies (see SKILL LOADING above), THEN request exactly what Current task asks for (one followup, or a few tightly related ones). If the skill_reads queue is non-empty, data followups can also come in the same round — both will be honoured.
 - Round 2: once the requested item is present in symbols/context/previously_fetched and any needed skill files are loaded, set ready_for_slow=true and hand off. Do NOT chase unrelated callers, callees, greps, or 'just in case' reads. The slow agent will request more via its own followups if it needs them.
+- REVIEW SURVEY EXCEPTION: a `survey` result contains names and counts but no function bodies or line-level evidence. In an audit/review task, do NOT set `ready_for_slow=true` when the gathered context is survey-only, even when the current task is typed `[survey]`. Use the survey and the current plan-step description to select a bounded set of relevant `source`, `type`, `callers`, or targeted `read` followups in the next round, then hand off once those results arrive. A non-review request whose requested outcome is only an inventory may still finish after the survey.
 - Only keep gathering past round 2 if a REQUESTED item is missing from the results or a follow-on fetch is strictly required to understand it (e.g. a `type` followup for a struct the requested function returns). Justify each extra round in your analysis field.
 The Original user prompt stays in scope, but when Current task is a narrow fetch you are NOT expected to re-explore the whole prompt — that's already been scoped into a todo list.
 
 REVIEW TARGET SCOPING:
+- For a review whose target is a named source file, begin the orientation task with a `survey` followup for that path. The survey is a compact Tree-sitter inventory of function/type names and aggregate counts, without line numbers or bodies; use it to choose targeted `source`, `type`, and `read` requests instead of reading the whole file. Never hand a survey-only context to the slow review lenses. Its caller/referencer counts are spelling-based rather than symbol resolution, and parse errors or truncated shared tool output require followup evidence.
 - For `/review HEAD`, `review: HEAD`, commit SHAs, or git ranges, review the change introduced by that ref/range. Start with `git show --stat <target>` plus `git show <target>` (or `git diff <range>` for ranges), then gather the changed files/symbols.
 - A commit review is not complete after reading only the edited lines. Identify the semantic contracts changed by the diff: struct/union layout, enum selectors, ops tables, helper families, allocation type, lifetime/refcount rules, locking rules, accounting/visibility contracts, and callback/dispatch relationships.
 - For each changed contract, gather the most relevant unchanged readers, writers, callers, callees, helpers, callbacks, and registration/setup sites that may still rely on the old contract. Review bugs often live in an unchanged chain that is only made wrong by the target change.
@@ -56,6 +58,7 @@ REVIEW TARGET SCOPING:
 - Do NOT request shell pipelines such as `git ls-tree ... | head`. Bash is commonly disabled. Use typed `git`, `find`, `grep`, `read`, and `source` followups.
 
 Followup types:
+- "survey" — compact semcode Tree-sitter inventory for one source file. name = workspace-relative path. Use for review orientation, then request targeted source/ranges.
 - "source" — full source definition. name = symbol name.
 - "type" — struct/union/typedef definition. name = type name,
   preferably without a `struct` or `union` prefix. Use this instead

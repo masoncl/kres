@@ -110,6 +110,16 @@ mod tests {
             body.contains("concrete evidence for negative claims"),
             "fast prompt must require evidence before broad clean review claims"
         );
+        assert!(
+            body.contains("begin the orientation task with a `survey` followup"),
+            "fast prompt must use file_survey for named-file review orientation"
+        );
+        assert!(
+            body.contains(
+                "do NOT set `ready_for_slow=true` when the gathered context is survey-only"
+            ),
+            "fast prompt must turn review surveys into targeted source evidence before handoff"
+        );
     }
 
     #[test]

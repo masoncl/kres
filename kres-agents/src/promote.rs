@@ -52,7 +52,7 @@ use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 use crate::{
     error::AgentError,
-    response::{parse_code_response, ParseStrategy},
+    response::{parse_code_response, InvalidFinding, ParseStrategy},
 };
 
 pub const PROMOTE_INSTRUCTIONS: &str = include_str!("prompts/promote.txt");
@@ -85,6 +85,12 @@ pub struct PromoteInputs<'a> {
     pub prose_relevant_existing: &'a [Finding],
     pub dedup_against: &'a [Finding],
     pub cancel: Option<Arc<Notify>>,
+}
+
+#[derive(Debug, Default)]
+pub struct PromoteOutcome {
+    pub findings: Vec<Finding>,
+    pub unrepaired: Vec<InvalidFinding>,
 }
 
 /// Run the promotion pass against a configured fast-agent client.
@@ -120,7 +126,7 @@ pub async fn promote_prose_bugs_with_logger(
     max_input_tokens: Option<u32>,
     inputs: PromoteInputs<'_>,
     logger: Option<Arc<TurnLogger>>,
-) -> Result<Vec<Finding>, AgentError> {
+) -> Result<PromoteOutcome, AgentError> {
     let PromoteInputs {
         task_brief,
         analysis,
@@ -130,7 +136,7 @@ pub async fn promote_prose_bugs_with_logger(
     } = inputs;
     // Prose nothing to audit.
     if analysis.trim().is_empty() {
-        return Ok(vec![]);
+        return Ok(PromoteOutcome::default());
     }
 
     // Cap task_brief like the consolidator does so a long operator
@@ -145,7 +151,7 @@ pub async fn promote_prose_bugs_with_logger(
     };
     let request_text = serde_json::to_string(&request)?;
 
-    let mut cfg = CallConfig::defaults_for(model)
+    let mut cfg = CallConfig::defaults_for(model.clone())
         .with_max_tokens(max_tokens)
         .with_stream_label("promote prose");
     if let Some(s) = system {
@@ -173,7 +179,7 @@ pub async fn promote_prose_bugs_with_logger(
                     target: "kres_agents",
                     "promote pass cancelled mid-call"
                 );
-                return Ok(vec![]);
+                return Ok(PromoteOutcome::default());
             }
             r = client.messages_streaming(&cfg, &messages) => r,
         },
@@ -195,7 +201,7 @@ pub async fn promote_prose_bugs_with_logger(
             None,
         );
     }
-    let parsed = parse_code_response(&text);
+    let mut parsed = parse_code_response(&text);
     // A RawText strategy on the promoter's OWN reply means the
     // dedicated PROMOTE_SYSTEM judge-mode prompt didn't hold — the
     // model emitted free-form prose instead of the required
@@ -211,7 +217,25 @@ pub async fn promote_prose_bugs_with_logger(
             "promoter reply had no parseable JSON; PROMOTE_SYSTEM drift suspected, returning empty"
         );
     }
-    Ok(filter_promoted_delta(parsed.findings, dedup_against))
+    let mut unrepaired = Vec::new();
+    if !parsed.invalid_findings.is_empty() {
+        let outcome = crate::finding_repair::repair_invalid_findings(
+            client,
+            model,
+            max_tokens,
+            max_input_tokens,
+            std::mem::take(&mut parsed.invalid_findings),
+            logger,
+            cancel,
+        )
+        .await?;
+        parsed.findings.extend(outcome.findings);
+        unrepaired = outcome.unrepaired;
+    }
+    Ok(PromoteOutcome {
+        findings: filter_promoted_delta(parsed.findings, dedup_against),
+        unrepaired,
+    })
 }
 
 /// Filter and normalize promoted finding deltas.
@@ -392,7 +416,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(out.is_empty());
+        assert!(out.findings.is_empty());
+        assert!(out.unrepaired.is_empty());
     }
 
     #[tokio::test]
@@ -431,7 +456,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            out.is_empty(),
+            out.findings.is_empty() && out.unrepaired.is_empty(),
             "cancel path must return an empty extras list"
         );
     }

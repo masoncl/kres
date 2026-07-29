@@ -458,8 +458,10 @@ uuid5 so parallel kres processes don't collide.
 ## Reading JSONL Log Files
 
 Both `code.jsonl` and `main.jsonl` are newline-delimited JSON. Each
-line is a `LogEntry` with fields: `role`, `content`, and optionally
-`usage` (token counts) and `thinking` (slow agent reasoning).
+line is a `LogEntry` with an RFC 3339 UTC `timestamp`, `role`, `content`,
+and optionally `usage` (token counts) and `thinking` (slow agent reasoning).
+Subtract matching user and assistant timestamps to measure a model call;
+overlapping intervals show concurrent calls.
 
 ### code.jsonl
 

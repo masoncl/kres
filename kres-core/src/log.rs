@@ -37,6 +37,9 @@ const NAMESPACE_OID: Uuid = Uuid::from_bytes([
 /// so log readers can confirm what was actually asked of the model.
 #[derive(Debug, Serialize)]
 struct LogEntry<'a> {
+    /// UTC wall-clock time at which this record was appended. User and
+    /// assistant records for the same label delimit one model call.
+    timestamp: String,
     role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<&'a str>,
@@ -168,6 +171,7 @@ impl TurnLogger {
         request: Option<&RequestMeta>,
     ) {
         let entry = LogEntry {
+            timestamp: log_timestamp(),
             role,
             label,
             content,
@@ -189,6 +193,7 @@ impl TurnLogger {
         thinking: Option<&str>,
     ) {
         let entry = LogEntry {
+            timestamp: log_timestamp(),
             role,
             label: None,
             content,
@@ -213,6 +218,10 @@ impl TurnLogger {
         f.write_all(b"\n")?;
         f.flush()
     }
+}
+
+fn log_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
 #[cfg(test)]
@@ -262,6 +271,11 @@ mod tests {
             .read_to_string(&mut code)
             .unwrap();
         assert_eq!(code.lines().count(), 2);
+        for line in code.lines() {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            let timestamp = entry["timestamp"].as_str().unwrap();
+            chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+        }
         assert!(code.contains("\"role\":\"user\""));
         assert!(code.contains("\"thinking\":\"thought\""));
 
@@ -271,6 +285,7 @@ mod tests {
             .read_to_string(&mut main)
             .unwrap();
         assert_eq!(main.lines().count(), 1);
+        assert!(main.contains("\"timestamp\":"));
         assert!(main.contains("\"role\":\"user\""));
         assert!(!main.contains("\"usage\""));
     }

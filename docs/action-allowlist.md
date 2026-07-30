@@ -1,7 +1,8 @@
 # Action allowlist
 
-The main agent's non-MCP tools are gated by a session-wide
-allowlist. Defaults: `grep`, `find`, `read`, `git`, `edit`.
+The deterministic tool service's non-MCP actions are gated by a session-wide
+allowlist. Defaults: `grep`, `find`, `read`, `git`, `edit`, `make`,
+`meson`, and `cargo`.
 `bash` is OFF by default — operators reach for it as a generic
 escape hatch for things the typed tools already cover
 (`bash sed` for range reads, `bash find` for filename locates).
@@ -24,7 +25,7 @@ naming the allowed set.
 Enable bash permanently:
 
 ```json
-{ "actions": { "allowed": ["grep", "find", "read", "git", "edit", "bash"] } }
+{ "actions": { "allowed": ["grep", "find", "read", "git", "edit", "make", "meson", "cargo", "bash"] } }
 ```
 
 Lock down to MCP-only:

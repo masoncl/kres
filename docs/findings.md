@@ -114,4 +114,5 @@ The reaper logs per apply:
 ```
 
 `tasks_since_change` resets only on a structural change (not on
-details-only updates) and drives the `--turns 0` quiescence stop.
+details-only updates) and is persisted for observability. The REPL's
+`--turns 0 --follow` stop uses its separate three-run no-new-findings streak.

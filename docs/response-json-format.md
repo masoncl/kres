@@ -18,9 +18,18 @@ requests for additional data.
   ],
   "skill_reads": [
     "string — absolute file path referenced in a skill that needs loading"
-  ]
+  ],
+  "findings": ["full Finding records or deltas"],
+  "ready_for_slow": true,
+  "code_output": [{"path": "relative/path", "content": "...", "purpose": "..."}],
+  "code_edits": [{"file_path": "path", "old_string": "...", "new_string": "...", "replace_all": false}],
+  "plan": {"steps": []}
 }
 ```
+
+The complete response must be one JSON object. Unknown top-level and nested
+fields are rejected. Consumers may impose stricter required fields or allow
+workflow-declared extension fields.
 
 ## Followup types
 
@@ -34,8 +43,21 @@ requests for additional data.
 | `file`     | filename glob                    | Find files matching the pattern                |
 | `read`     | `file.c:100+50`                  | Read specific file range (start line + count)  |
 | `question` | question text                    | Free-form question for the orchestrator        |
+| `survey`   | source filename                  | Compact semcode file inventory                 |
+| `grep`     | regex pattern                    | Local grep fallback/search                     |
+| `find`     | filename pattern                 | Local file discovery                           |
+| `git`      | readonly git command             | Repository history or diff context             |
+| `make` / `meson` / `cargo` | command          | Typed build or test command                    |
+| `bash`     | shell command                    | Allowlist-gated workspace command              |
+| `lore`     | query                            | Semcode lore/history search                    |
 
-The optional `path` field scopes `search` and `file` to a subdirectory.
+The optional `path` field scopes searches and file discovery. Optional
+`nice_to_have: true` marks a non-blocking followup; omitted or false is
+blocking.
+
+`findings` is a delta, not the complete store. `code_output` and `code_edits`
+are used in coding mode. `plan` is accepted only when the request set
+`plan_rewrite_allowed`; review lenses cannot rewrite the global plan.
 
 ## Example
 

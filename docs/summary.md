@@ -6,24 +6,24 @@ jsondb-backed `<results>/findings.json`. The canonical file is
 rewritten atomically in place (tmp + fsync + rename); there are no
 per-turn history snapshots.
 
-A plain-text summary is produced by `/summary` (or automatically
-on `--turns` exit, or standalone via
-`kres --summary --results <dir>`). The markdown variant is
+A plain-text summary is produced explicitly by `/summary` or standalone via
+`kres --summary --results <dir>`. Turn-cap and idle exits do not render one
+automatically. The markdown variant is
 `/summary-markdown` / `kres --summary-markdown --results <dir>`,
 which writes `summary.md`. That run:
 
-- reads `<results>/prompt.md` (saved on first submit so later
-  summaries know the original question), `<results>/report.md`,
-  and `<results>/findings.json`;
-- calls the fast agent with the embedded `summary` slash-command
-  template as its system prompt (override at
+- reads `<results>/prompt.md` (saved on first submit so later summaries know
+  the original question) and `<results>/findings.json`; it does not parse
+  `report.md`. Per-task narrative comes from `findings[].details` and the
+  top-level `task_prose` ledger;
+- uses the fast agent for task condensation, then renders with the embedded
+  `summary` slash-command template as its system prompt (override at
   `~/.kres/commands/summary.md`; `--summary-markdown` picks the
   `summary-markdown` variant at
   `~/.kres/commands/summary-markdown.md`);
-- if the assembled prompt exceeds the fast agent's
-  `max_input_tokens`, splits the findings into chunks that each
-  fit, renders one partial summary per chunk, and then runs a
-  final combine call that merges the partials into one report;
+- filters invalidated findings, sorts stored severities high to low, groups
+  findings and narrative by task, condenses task batches that fit the fast
+  model's input limit, and runs a final render/combine pass;
 - orders sections by `bug-severity` (`high` → `medium` → `low` →
   `latent` → `unknown`), one section per bug headed by
   `Subject:`, `bug-severity:`, `bug-impact:` lines;

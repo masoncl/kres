@@ -68,7 +68,8 @@ review differences are documented in the review section.
 
 1. `Session::submit_prompt_inner` receives an operator prompt.
 2. `define_goal` runs on `GoalClient`, which reuses the configured **main**
-   model and client with the dedicated `prompts/goal.txt` system prompt.
+   model and client with the dedicated `kres-agents/src/prompts/goal.txt`
+   system prompt.
 3. The same response both defines a completion criterion and classifies the
    task as `audit`, `generic`, or `coding`.
 4. `define_plan` runs as a second independent call on that same main model.

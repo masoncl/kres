@@ -1,10 +1,8 @@
 # findings.json format
 
-`kres --findings FILE` establishes the base path for bug snapshots.
-`FILE` itself is the canonical current state, rewritten after every
-merge pass; `FILE-N` snapshots capture the pre-overwrite state for
-each turn so an operator can walk the history. See
-kres-core/src/findings.rs for the atomic write path.
+`kres --findings FILE` selects the canonical findings store. The jsondb-backed
+file is rewritten atomically after every apply; kres does not create per-turn
+`FILE-N` snapshots. See `kres-core/src/findings.rs` for the write path.
 
 Rationale:
 - A machine-readable `findings` list lets every slow agent skip
@@ -21,17 +19,25 @@ Rationale:
 
 ```json
 {
+  "version": 0,
   "findings": [ <Finding>, ... ],
   "updated_at": "2026-04-18T03:42:10Z",
-  "tasks_since_change": 0
+  "tasks_since_change": 0,
+  "turn_n": 12,
+  "task_prose": [
+    {"task": "...", "created_at": "...", "prose": "..."}
+  ]
 }
 ```
 
 - `findings`: array of Finding records (may be empty).
 - `updated_at`: ISO-8601 UTC timestamp of the most recent write.
-- `tasks_since_change`: how many consecutive tasks have completed
-  without adding or modifying a finding. When this reaches 5, kres
-  considers the analysis complete and prints a message.
+- `version`: jsondb schema version.
+- `tasks_since_change`: consecutive store applies without a structural finding
+  change. This is persisted observability; session stopping uses its own
+  three-run no-new-findings streak when `--follow` is active.
+- `turn_n`: monotonic count of store applies.
+- `task_prose`: broader per-task narratives retained for summary generation.
 
 ## Finding record
 
@@ -72,27 +78,33 @@ Rationale:
 }
 ```
 
-### Required fields
+### Core fields
+
+Rust requires `id`, `title`, `severity`, and `summary`; the other fields below
+have serde defaults. Review workflow prompts impose the stronger evidence and
+reproducer requirements described in their contracts.
 
 | field | type | purpose |
 |---|---|---|
 | `id` | string | Short snake_case slug, ≤40 chars. Stable across updates. |
 | `title` | string | One-line human title. |
 | `severity` | enum | `low` / `medium` / `high`. Scored by exploit potential, not textbook CVSS. |
-| `status` | enum | `active` or `invalidated`. Default `active`. |
-| `relevant_symbols` | array[object] | **Embedded** symbol records that the reader needs to understand the bug. Each: `{name, filename, line, definition}`. Pull only what's actually referenced in summary/reproducer_sketch — NOT the entire session's symbol list. At least one required. |
-| `relevant_file_sections` | array[object] | **Embedded** source slices that aren't whole symbols (headers, tables, assembly, macros). Each: `{filename, line_start, line_end, content}`. Optional if every cited region is captured via `relevant_symbols`. |
+| `status` | enum | `active`, `unconfirmed`, `fixed`, or `invalidated`. Default `active`. |
+| `relevant_symbols` | array[object] | Embedded `{name, filename, line, definition}` records. Defaults empty; review prompts require sufficient embedded evidence for actionable findings. |
+| `relevant_file_sections` | array[object] | Embedded `{filename, line_start, line_end, content}` slices. Defaults empty. |
 | `summary` | string | 2-5 sentences. Must be sufficient for a reader to understand *what* is wrong and *why*. Reference code by `filename:line` — the reader can look it up in `relevant_symbols` / `relevant_file_sections`. |
-| `reproducer_sketch` | string | The code path, inputs, and state required to trigger the bug. Even partial reproducers are recorded — do not leave blank. |
-| `impact` | string | What goes wrong when triggered (crash, corruption, escape, firewall bypass, info leak, etc.). |
+| `reproducer_sketch` | string | The code path, inputs, and state required to trigger the bug. Defaults empty at the storage boundary; review contracts require it. |
+| `impact` | string | What goes wrong when triggered. Defaults empty at the storage boundary; review contracts require it. |
 
 ### Optional fields
 
 | field | type | purpose |
 |---|---|---|
-| `first_seen_task` | string | `todo_item.name` of the task that produced this finding. |
-| `last_updated_task` | string | `todo_item.name` of the most recent task that extended the finding. |
+| `first_seen_task` | string | Store-owned task provenance stamp (`uuid/todo-id` when dispatched from a todo). |
+| `last_updated_task` | string | Provenance stamp of the most recent task that extended the finding. |
 | `related_finding_ids` | array[string] | IDs of findings whose impact combines with, depends on, or amplifies this one. Used by the slow agent to build chains. |
+| `first_seen_at` | RFC3339 timestamp | Store-owned discovery time, stamped once on insertion. |
+| `introduced_by` | object | Proven introducing commit: `{sha, subject}`. |
 | `mechanism_detail` | string | Specifics that pin down HOW the bug becomes exploitable: which struct-field type/offset gets clobbered, which invariant-establishing ordering contract in adjacent code is violated, or what the actual kernel object behind an OOB target is. These are the facts a reproducer or patch author would otherwise re-derive. |
 | `fix_sketch` | string | 1-3 sentences describing a concrete patch the analysis identified, with the file:line anchor for the change. Omit entirely if no fix was analyzed — never fabricate. |
 | `open_questions` | array[string] | Unresolved items that would settle or refine the finding: `[UNVERIFIED]` claims, call sites not yet confirmed, type-query followups, locking-order assumptions, etc. One sentence each. These accumulate across turns; the merger unions them. |
@@ -139,7 +151,7 @@ The four are complementary and independent — writing
 
 ## Agent interaction
 
-Three points where findings flow:
+Four points where findings flow:
 
 1. **Each slow-agent call emits `findings` natively**, inline with its
    `analysis` + `followups`, pulling relevant symbols/file-sections

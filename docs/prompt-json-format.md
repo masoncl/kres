@@ -24,7 +24,14 @@ provides kernel source context and a question for the agent to analyze.
       "source": "string — where this data came from (e.g. 'semcode/find_callers')",
       "content": "string — raw content"
     }
-  ]
+  ],
+  "previously_fetched": {},
+  "previous_findings": [],
+  "parallel_lenses": [],
+  "lens_instruction": "string",
+  "skills": {},
+  "plan": {},
+  "plan_rewrite_allowed": true
 }
 ```
 
@@ -43,6 +50,12 @@ provides kernel source context and a question for the agent to analyze.
 | `symbols` | array  | Array of symbol objects providing source code context. |
 | `context` | array  | Array of general context objects from tool results.    |
 | `skills`  | object | Dict of skill name → {content, files} for domain knowledge. |
+| `previously_fetched` | object | Manifest of evidence already gathered for this task. |
+| `previous_findings` | array | Current findings, redacted to remove store-owned narrative/provenance fields. |
+| `parallel_lenses` | value | Workflow-defined lens metadata for lensed slow calls. |
+| `lens_instruction` | string | Instruction for the current lens. |
+| `plan` | object | Current session plan, forwarded to fast and slow turns. |
+| `plan_rewrite_allowed` | boolean | Permits the first eligible non-review slow turn to return a replacement step list. |
 
 ## Symbol object
 
@@ -61,7 +74,9 @@ Each entry in `symbols` describes a kernel code symbol.
 ## Context object
 
 General-purpose context from tool results that don't map to a specific
-symbol (e.g. call chains, grep results, lore search hits).
+symbol (e.g. call chains, grep results, lore search hits). Tool-specific
+objects may carry additional structured fields; `source` and `content` are the
+common form, not a closed serde schema.
 
 | Field     | Type   | Description                                          |
 |-----------|--------|------------------------------------------------------|

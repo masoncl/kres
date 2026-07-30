@@ -223,6 +223,8 @@ Check:
 Useful run artifacts:
 
 - `/tmp/kres-fix/report.md`: high-level workflow report;
-- `/tmp/kres-fix/session.json`: resumable state;
+- `/tmp/kres-fix/workflow-state/`: persisted planning and per-todo execution
+  snapshots for audit/debugging. Outer fix-series `--resume` is not currently
+  supported;
 - `.kres/logs/<session>/code.jsonl`: agent prompts and replies;
 - `.kres/logs/<session>/main.jsonl`: tool-fetch and reaper activity.

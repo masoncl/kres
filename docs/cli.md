@@ -23,8 +23,9 @@ descriptions.
 omitted, kres derives `kres:<slow-model-id>` from the resolved slow
 agent model.
 
-`--slow NAME` selects a slow model. `sonnet` and `opus` are aliases for
-the shipped model ids. Other values are model ids; when multiple provider
+`--slow NAME` selects a slow model. `sonnet` and `opus` first resolve through
+`settings.json:model_aliases`, then fall back to the shipped model ids. Other
+values are model ids; when multiple provider
 files offer one model, qualify it as `provider.json:model-id`. It is repeatable
 for `/review` comparison mode, for example `--slow sonnet --slow opus`.
 Review sends every slow-agent lens prompt to all configured slow models,
@@ -50,7 +51,8 @@ Related docs:
   `--summary-markdown`, `--template`.
 - [configuration.md](configuration.md) — model-id overrides
   (`--fast-model`, `--slow-model`, `--main-model`,
-  `--todo-model`) and workflow-executor limits.
+  `--todo-model`, `--classifier-model`), configurable model aliases, and
+  workflow-executor limits.
 
 ## REPL commands
 
@@ -67,7 +69,7 @@ Related docs:
 | `/plan`                        | Show the current plan + per-step status |
 | `/resume [PATH]`               | Load a persisted `session.json` |
 | `/followup`                    | List items deferred by goal-met or `--turns` cap |
-| `/summary [FILE]`              | Render `report.md` + `findings.json` to a plain-text summary (default `summary.txt`) |
+| `/summary [FILE]`              | Render `findings.json` (including stored task prose) to a plain-text summary (default `summary.txt`) |
 | `/summary-markdown [FILE]`     | Same as `/summary`, markdown output (default `summary.md`) |
 | `/review <target>`             | Compose the review template + target, submit |
 | `/extract …`                   | Copy artifacts out (`--dir`, `--report`, `--todo`, `--findings`) |

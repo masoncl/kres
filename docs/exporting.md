@@ -14,7 +14,7 @@ kres --results <run-dir> --export <out-dir> [--workspace <repo>]
   `findings.json` lives). `--findings <file>` also works.
 - `--export <out-dir>` is the target. It is created if missing; it
   is not emptied first, so a re-export on top of an old one stacks
-  new `<tag>/` directories alongside any stale ones.
+  new `findings/<tag>/` directories alongside any stale ones.
 - `--workspace <repo>` is the source tree the findings refer to.
   kres probes `git -C <workspace>` for the HEAD sha and subject and
   records them on every exported finding. Defaults to the current
@@ -25,16 +25,21 @@ file, writes the tree, and exits.
 
 ## Per-finding layout
 
-Each finding lands at `<out-dir>/<tag>/` with two files:
+Each finding lands at `<out-dir>/findings/<tag>/` with two files. The export
+also installs `README.md` and `findings-index.py` at the top level without
+overwriting operator-edited copies:
 
 ```
 <out-dir>/
-  <tag>/
-    metadata.yaml
-    FINDING.md
-  <tag>/
-    metadata.yaml
-    FINDING.md
+  README.md
+  findings-index.py
+  findings/
+    <tag>/
+      metadata.yaml
+      FINDING.md
+    <tag>/
+      metadata.yaml
+      FINDING.md
   ...
 ```
 
@@ -54,13 +59,16 @@ Fields:
 
 - `id`, `title` — finding identity.
 - `severity` — `low` / `medium` / `high`.
-- `status` — `active` or `invalidated`.
-- `date` — RFC3339 timestamp of the first task that inserted this
+- `status` — `active`, `unconfirmed`, `fixed`, or `invalidated`.
+- `filename` — first relevant-symbol filename, then first relevant file
+  section, or an empty string.
+- `subsystem` — currently emitted as an empty placeholder.
+- `date` — calendar date (`YYYY-MM-DD`) of the first task that inserted this
   finding (`Finding.first_seen_at`). Stamped once on insert, never
   shifted by later merges. When the source findings.json predates
   the field and a record has no stamp, the export falls back to
   wall-clock now so the row still carries a date — note that a
-  re-export of that unstamped record will show a different timestamp
+  re-export of that unstamped record can show a different date
   each time, while freshly-discovered findings keep a stable one.
 - `git:` — workspace HEAD `sha` and commit `subject` at export
   time.
@@ -92,7 +100,7 @@ Human-readable body rendered directly from the stored Finding:
 
 - Header block with severity, status, `Introduced by`, first/last
   seen task, and a Related line that renders each cross-reference
-  as `[`id`](../tag/FINDING.md)` so you can click through.
+  as a relative `../<tag>/FINDING.md` link so you can click through.
 - `## Summary`, `## Mechanism` (when `mechanism_detail` is set),
   `## Reproducer`, `## Impact`, `## Fix sketch` (when
   `fix_sketch` is set), `## Open questions` (when any).
@@ -113,9 +121,10 @@ Nothing in the export consults report.md — every field comes from
 kres --export-index <out-dir>
 ```
 
-Walks every `<tag>/metadata.yaml` under `<out-dir>` and writes
-`<out-dir>/INDEX.md` — a single markdown table of every finding,
-sorted by severity (`high` → `medium` → `low`) and, within each
+Runs the installed `findings-index.py --generate`, which walks every
+`findings/<tag>/metadata.yaml` and writes `<out-dir>/INDEX.md` plus
+`<out-dir>/index.html`. Rows are sorted by severity (`high` → `medium` →
+`low`) and, within each
 tier, by `date` ascending so long-standing bugs sit at the top.
 Entries with no `date` field sink to the bottom of their tier.
 Each row links to that finding's `FINDING.md`. No `findings.json`
@@ -129,7 +138,7 @@ next run.
 kres --results run1 --prompt 'review: path/to/file.c' --turns 5
 kres --results run1 --export kres-bugs --workspace .
 less kres-bugs/INDEX.md
-less kres-bugs/<tag>/FINDING.md
+less kres-bugs/findings/<tag>/FINDING.md
 
 # if you update severities or status, reindex
 kres --export-index kres-bugs

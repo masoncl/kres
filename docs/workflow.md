@@ -931,7 +931,8 @@ as a git commit/range starts from `git show` or `git diff`; source reviews may r
 targeted history later when a concrete semantic question requires it.
 
 When multiple `--slow` selectors are passed, review runs in comparison
-mode. Each selector resolves to one model (`sonnet` and `opus` are aliases;
+mode. Each selector resolves to one model (`sonnet` and `opus` consult
+`settings.json:model_aliases` before their built-in fallbacks;
 use `provider.json:model-id` when more than one provider offers the model).
 Each active lens prompt is sent to every configured slow model, so a
 commit review with five active lenses and `--slow sonnet --slow opus`

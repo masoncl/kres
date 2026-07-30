@@ -4,32 +4,37 @@ Every task cycles through these roles. Normal installs configure them
 through provider files under `~/.kres/models/`; explicit `--*-agent` paths
 remain available for one-off overrides.
 
-- **fast** — scopes the task and emits a
-  list of `followups`: grep / read / semcode / git fetches the
-  main agent should run.
-- **main** — the data fetcher. Dispatches
-  followups to local tools and MCP servers (semcode via
-  `mcp.json`). Output is fed back into fast for another round.
-  The fast↔main loop ends when fast emits `ready_for_slow` or
+- **fast** — scopes the task and emits a validated list of typed
+  `followups`: grep / read / semcode / git fetches the deterministic
+  tool service should run.
+- **tool service** (not an LLM role) — dispatches validated followups to
+  local tools and MCP servers (semcode via `mcp.json`). Output is fed back into
+  fast for another round.
+  The fast↔tool loop ends when fast emits `ready_for_slow` or
   `--gather-turns` is hit.
-- **slow** (default tag `sonnet`) — the
+- **main** — authors the initial goal/mode/plan and checks completion for
+  generic sessions. It is not interposed between fast followups and tools.
+- **slow** (selected by `settings.models.slow` or CLI override) — the
   deep analyser. Gets the gathered symbols, the cumulative
   findings, and the task brief; returns analysis prose plus
   structured findings.
-- **todo** — dedups the slow agent's
+- **todo** — for generic sessions, dedups the slow agent's
   followups against the current todo list, reprioritises, and
   may reshape the plan.
-- **merger** — non-agent fast-client call that folds new
-  findings into the cumulative list; supersedes become
-  `invalidated`.
+- **consolidator/promoter** — fast-client calls that merge sibling lens
+  outputs and recover concrete prose-only bugs. Rust then applies the findings
+  delta deterministically; invalidated records remain as negative evidence.
 
 Every round-trip is logged to `.kres/logs/<session-uuid>/`.
 
 ## Building up a larger review
 
-One `--prompt 'review: path/to/file.c'` seeds one task. Its
-slow-agent response usually emits followup suggestions the todo
-agent converts into todo items. To work through them:
+A named-file `--prompt 'review: path/to/file.c'` first runs one file survey
+and one non-lensed slow ranking call. The primary slow model then authors a
+bounded semantic plan whose linked todos enter the normal task loop. Review
+followups are reconciled by dedicated goal/todo clients backed by that primary
+slow model; generic sessions continue to use the configured main/todo roles.
+To work through pending items interactively:
 
 - `/next` runs the first pending item.
 - `/continue` dispatches every unblocked pending item.
@@ -37,9 +42,10 @@ agent converts into todo items. To work through them:
   pending todos and no active tasks. Typing (including `/stop`)
   cancels the idle.
 
-The goal agent (a judge-mode call on the main-agent client)
-checks after every task whether the original prompt is
-satisfied; goal-met stops work even with pending followups.
+The goal agent checks after every task whether the original prompt is
+satisfied. Generic sessions use the main model; reviews use the primary slow
+model. Concrete review followups prevent an early goal-met result from
+discarding required work.
 
 A thorough review of a real source file runs 5–50 tasks
 depending on branchiness and how aggressive the slow agent is

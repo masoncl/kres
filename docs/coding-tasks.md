@@ -8,7 +8,7 @@ consolidator with a single slow-agent call producing source
 code on two channels:
 
 - **`code_output`** — `{path, content, purpose}` records. The
-  reaper writes each entry to `<workspace>/code/<path>` via
+  reaper writes each relative path directly under `<workspace>/<path>` via
   tmp + rename. Use for fresh artifacts (reproducers, test
   harnesses, trigger programs, whole-file fixes).
 
@@ -44,6 +44,6 @@ kres --prompt 'write a reproducer for the stack OOB in x_tables' \
      --results repro-run
 ```
 
-Artifacts land in `<results>/code/<path>` (code_output) and
-in-place under `<workspace>` (code_edits). Coding tasks skip the
-findings merger — their output is source, not bug records.
+Both `code_output` and `code_edits` mutate paths under `<workspace>` (absolute
+paths additionally require the session's explicit path consent). Coding tasks
+skip the findings merger — their output is source, not bug records.

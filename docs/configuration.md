@@ -2,7 +2,7 @@
 
 ## Config directory: `~/.kres/`
 
-`kres repl` resolves agent config paths in this order:
+The `kres` REPL resolves agent config paths in this order:
 
 1. explicit CLI flag (e.g. `--fast-agent /path/to/fast.json`)
 2. provider file under `~/.kres/models/` containing the selected model
@@ -10,18 +10,19 @@
 Non-agent paths such as `mcp.json` and `skills/` only use explicit
 CLI flags and the same filename under `~/.kres/`.
 
-Default non-agent filenames looked up in `~/.kres/`:
+Default non-agent paths:
 
-| Flag              | Default under `~/.kres/`         |
+| Flag              | Default                          |
 |-------------------|----------------------------------|
-| `--mcp-config`    | `mcp.json`                       |
-| `--skills`        | `skills/`                        |
-| `--findings`      | `findings.json`                  |
+| `--mcp-config`    | `~/.kres/mcp.json`               |
+| `--skills`        | `~/.kres/skills/`                |
+| `--findings`      | `<results>/findings.json`        |
 
-A missing model file in `~/.kres/models/` is not an error by
-itself, but any role whose model file cannot be resolved is treated
-as not configured unless the matching explicit `--*-agent` flag was
-provided. The `history` file is always written to `~/.kres/history`.
+A missing model file in `~/.kres/models/` is not an error by itself, but any
+role whose model file cannot be resolved is treated as not configured unless
+the matching explicit `--*-agent` flag was provided. Results default to a
+unique directory under `~/.kres/sessions/`; the command history is written to
+`~/.kres/history`.
 
 ## Model selection
 

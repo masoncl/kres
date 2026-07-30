@@ -7,21 +7,24 @@ kres/
 ├── Cargo.toml                     Rust workspace manifest
 ├── kres/                          binary crate (`kres` command)
 ├── kres-core/                     Task, TaskManager, Plan, shutdown, findings
-├── kres-llm/                      Anthropic streaming client + rate limiter
+├── kres-llm/                      model transports, streaming clients, rate limiting
 ├── kres-mcp/                      stdio JSON-RPC client for MCP servers
-├── kres-agents/                   fast / slow / main / todo / consolidator / merger
-├── kres-repl/                     readline UI, commands, signal handling
+├── kres-agents/                   fast / slow / main / todo / consolidator pipelines
+├── kres-repl/                     TUI/REPL, commands, sessions, workflow integration
 ├── configs/                       shipped runtime defaults
 │   ├── models/
-│   │   ├── claude-opus-4-7.json
-│   │   └── claude-sonnet-4-6.json
+│   │   ├── anthropic-fast.json
+│   │   ├── anthropic-slow.json
+│   │   ├── claude-codes.json
+│   │   ├── codex-codes.json
+│   │   └── vertex-dummy.json
 │   ├── settings.json
 │   ├── mcp.json
-│   └── prompts/                   system prompts + review templates
-├── skills/                        domain-knowledge markdown fed to agents
-│   └── kernel.md
+│   ├── prompts/                   system prompts + report/artifact templates
+│   └── workflows/                 shipped JSON workflow contracts + schema
 ├── docs/                          JSON-schema docs + feature guides
-├── CLAUDE.md                      project instructions for Claude Code
+├── AGENTS.md                      project architecture and implementation rules
+├── CLAUDE.md                      pointer to AGENTS.md for Claude Code
 ├── setup.sh                       bootstrap ~/.kres/ from configs/
 ├── .githooks/pre-commit           runs cargo fmt + clippy on every commit
 └── README.md

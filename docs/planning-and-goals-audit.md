@@ -6,7 +6,7 @@ begun the migration to slow-model planning; the other workflows retain their
 existing ownership. The final review section distinguishes implemented state
 from remaining work.
 
-Current as of 2026-07-29, including the review-planning, staged-dependency, and
+Current as of 2026-07-30, including the review-planning, staged-dependency, and
 todo-reconciliation implementation.
 
 ## Workflow inventory
@@ -40,8 +40,8 @@ There are currently two planning systems. They are not interchangeable.
 prompt, derived goal, classified mode, creation time, and 3–12 `PlanStep`
 records. Steps are linked to todo items through `step_id` and `todo_ids` and
 may carry `depends_on` step IDs. Plans and linked todos are persisted in
-`session.json`. Review policy currently caps its staged plan at six steps;
-generic plan prompting retains the broader historical range.
+`session.json`. Review's primary-slow prompt policy currently asks for at most
+six staged steps; generic plan prompting retains the broader historical range.
 
 The session plan is visible to the deterministic fetcher, fast agent, slow
 agent, todo agent, and goal judge. It is created only for an
@@ -169,18 +169,23 @@ dedicated clients backed by the primary selected slow model. Comparison slow
 models remain analysis variants and do not author competing plans. There is no
 fallback from these review clients to the configured generic main/todo models.
 
-The initial slow plan is converted into stable linked todos before review work
-starts. `PlanStep.depends_on` becomes scheduler-enforced todo dependencies. The
-planner policy requires one orientation/context step, three or four semantic
-path/contract groups depending on orientation, and one final cross-contract
-completeness step depending on the middle wave, with at most six steps total.
+For named source files, bootstrap performs one file survey and one non-lensed
+slow ranking call before `define_goal` or `define_plan`. Both planning calls see
+the ranked function inventory. The initial slow plan is then converted into
+stable linked todos before review work starts. `PlanStep.depends_on` becomes
+scheduler-enforced todo dependencies. The planner prompt requires three or four
+source-informed semantic path/contract groups and one final cross-contract
+completeness step depending on those groups, with at most five steps total.
+Rust preserves and schedules the returned dependency graph, but does not yet
+strictly validate this review-specific shape.
 This replaces the nine-way cold-cache fanout observed in `kres-sol4`: the
 orientation task populates shared caches before bounded parallel work starts.
 
-Each task performs fast gathering, deterministic MCP/local tool execution,
-parallel slow lenses, and consolidation. The slow lenses receive the plan but
-cannot rewrite it. Typed followups go through the primary-slow todo client and
-become future review tasks. The primary-slow goal client then checks completion;
+After the initial scan, each semantic task performs fast gathering,
+deterministic MCP/local tool execution, parallel slow lenses, and consolidation.
+The slow lenses receive the plan but cannot rewrite it. Typed followups go
+through the primary-slow todo client and become future review tasks. The
+primary-slow goal client then checks completion;
 concrete review followups still override an early met judgment.
 
 Todo identity and execution state are deterministic rather than model-owned.
@@ -202,8 +207,16 @@ back to local search/read evidence rather than establishing absence.
 
 Review persistence still uses the normal `SessionState`: plan, linked todo
 state, deferred work, completed count, and last prompt. In-progress work resets
-to pending on resume. Planning calls are not yet separately labeled or charged
-to a distinct planning role.
+to pending on resume. Calls have the generic `define_goal`, `define_plan`,
+`todo_update`, and `check_goal` stream labels, but are not identified or charged
+as a distinct review-planning role.
+
+The current review planning policy is not JSON-owned. `build_session` appends
+review-specific policy text to the embedded goal and todo system prompts in
+`kres-repl/src/session.rs`; `review.json` owns the review task prompt, lenses,
+and consolidation contract but does not define the goal/plan/todo policy. This
+is an implementation gap relative to the JSON-ownership rule and the target
+architecture below, not a second review execution engine.
 
 `kres run-workflow workflow-id:review` can execute the JSON step directly, but
 that is not the supported `/review` or `--prompt 'review: ...'` behavior. The
@@ -221,8 +234,7 @@ Implemented pieces:
 
 - primary selected slow model owns review goal/plan/todo/goal-check calls;
 - initial plan steps seed linked `review-<step-id>` todos;
-- plan and todo dependencies enforce orientation → bounded middle wave →
-  final pass;
+- named-file bootstrap scans inform the initial goal and bounded semantic plan;
 - fast followups execute directly through MCP/local fetchers;
 - malformed gather envelopes and bad requests are rejected and retried once;
 - semcode failures fall back to local grep/read evidence;
@@ -232,10 +244,12 @@ Implemented pieces:
 
 Still outstanding:
 
-- separate slow discovery and source-informed initialization calls;
+- generalized slow-directed discovery for non-file or ambiguous targets;
 - one atomic revisioned planning update replacing todo-then-goal calls;
 - typed dispositions for every incoming followup;
 - a dedicated planning selector, usage role, log labels, and evidence manifest;
+- moving the review goal/plan/todo policy and schemas out of `session.rs` and
+  into `review.json` (or a shared workflow schema referenced by it);
 - strict Rust validation/retry of the staged plan shape; and
 - stale-revision protection for concurrent planner updates.
 
@@ -370,9 +384,10 @@ manifest. It returns one validated initialization envelope:
 
 The initial plan must be a coverage partition derived from gathered source,
 not a restatement of memory-lifetime/bounds/races/general lenses. Every initial
-todo is linked to a valid plan step before any review task starts. This removes
-the current state where plan steps have no todo linkage and cannot accurately
-roll up.
+todo is linked to a valid plan step before any review task starts. The current
+implementation already provides that linkage from its source-blind initial
+plan; this phase retains it while replacing initialization with an
+evidence-backed atomic envelope.
 
 The planner may reuse planning-gather evidence as task cache seeds, but a todo
 still requests targeted source when the evidence is insufficient. Planning
@@ -632,7 +647,7 @@ exists.
 | --- | --- | --- | --- | --- | --- |
 | Define outcome goal | main | primary slow | static JSON completion/prompt | static JSON prompt/eval | static JSON prompt/eval |
 | Build initial plan | main | primary slow, staged dependencies | static DAG; fast creates `fix_plan` | static DAG | static one-step DAG |
-| Source-informed plan revision | first slow call, then todo | primary-slow todo reconciliation after orientation/tasks | fast per-todo research | none | none |
+| Source-informed plan revision | first slow call, then todo | named-file scan before initial goal/plan; primary-slow reconciliation after tasks | fast per-todo research | none | none |
 | Decide followup priority | todo | primary slow with deterministic identity/state guards | static DAG + fast orchestrator | static dependency | n/a |
 | Decide completion | main goal judge | primary-slow goal judge plus followup guard | Rust expressions/evals | Rust step/eval state | Rust step/eval state |
 | Deep analysis | slow | parallel slow lenses | mixed by step | slow final pass | slow |
@@ -644,9 +659,9 @@ exists.
 2. Generic mode still combines main-model goal definition with mode
    classification. Review forces audit mode and uses the primary slow client,
    but a general planner role still needs an explicit routing contract.
-3. Review's initial slow plan still runs before source gathering. The staged
-   orientation task makes later reconciliation source-informed, but the target
-   two-call discovery/initialization protocol is not implemented.
+3. Named-file review now scans before goal and plan creation. Ambiguous,
+   directory, and non-file targets still lack the target architecture's general
+   slow-directed discovery call and evidence manifest.
 4. Review correctly suppresses competing lens rewrites. The primary-slow todo
    client is authoritative after tasks, but todo update and goal check are still
    separate calls rather than one atomic revisioned update.

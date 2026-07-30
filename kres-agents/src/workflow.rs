@@ -235,6 +235,7 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ActionType {
+    Survey,
     Read,
     Source,
     Type,

@@ -810,6 +810,10 @@ fn apply_workflow_model_overrides(settings: &mut kres_repl::Settings, args: &Run
     );
 }
 
+fn review_comparison_path(results_dir: &Path, slow_model_count: usize) -> Option<PathBuf> {
+    (slow_model_count > 1).then(|| results_dir.join("comparison.json"))
+}
+
 async fn run_repl(args: ReplArgs) -> Result<()> {
     use kres_agents::WorkspaceFetcher;
     use kres_core::TaskManager;
@@ -1467,7 +1471,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 usage: usage.clone(),
                 gather_turns: args.gather_turns,
                 logger: logger.clone(),
-                comparison_path: Some(results_dir.join("comparison.json")),
+                comparison_path: review_comparison_path(&results_dir, slow_agent_specs.len()),
             },
         )
         .await?;
@@ -2007,7 +2011,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
                 usage: Some(usage.clone()),
                 gather_turns: 5,
                 logger: logger.clone(),
-                comparison_path: args.results.as_ref().map(|d| d.join("comparison.json")),
+                comparison_path: None,
                 ..Default::default()
             },
         )
@@ -2507,6 +2511,17 @@ mod tests {
     fn slow_tag_can_repeat_for_comparison() {
         let c = Cli::try_parse_from(["kres", "--slow", "sonnet", "--slow", "opus"]).unwrap();
         assert_eq!(c.repl.slow, vec!["sonnet", "opus"]);
+    }
+
+    #[test]
+    fn comparison_artifact_requires_multiple_slow_models() {
+        let results = Path::new("results");
+        assert_eq!(review_comparison_path(results, 0), None);
+        assert_eq!(review_comparison_path(results, 1), None);
+        assert_eq!(
+            review_comparison_path(results, 2),
+            Some(results.join("comparison.json"))
+        );
     }
 
     #[test]

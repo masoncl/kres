@@ -99,7 +99,7 @@
     },
     "action_value": {
       "type": "string",
-      "enum": ["read", "source", "type", "git", "grep", "callers", "make", "meson", "edit", "bash", "lore", "publish-fix", "commit-fix", "set-finding-status", "set-finding-results", "set-finding-bugs"]
+      "enum": ["survey", "read", "source", "type", "git", "grep", "callers", "make", "meson", "edit", "bash", "lore", "publish-fix", "commit-fix", "set-finding-status", "set-finding-results", "set-finding-bugs"]
     },
     "action_list": {
       "type": "array",

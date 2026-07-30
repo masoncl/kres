@@ -213,6 +213,7 @@ pub struct Session {
     lens_consolidate_rules: Arc<tokio::sync::RwLock<Option<String>>>,
     initial_prompt: Option<String>,
     initial_prompt_mode: Option<kres_agents::TaskMode>,
+    review_file_scan_target: Arc<tokio::sync::RwLock<Option<String>>>,
     /// Last reaped task's analysis — consumed by /reply.
     last_analysis: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Findings loaded from disk at Session::new time. Applied to
@@ -447,6 +448,7 @@ impl Session {
                 lens_consolidate_rules: Arc::new(tokio::sync::RwLock::new(None)),
                 initial_prompt: None,
                 initial_prompt_mode: None,
+                review_file_scan_target: Arc::new(tokio::sync::RwLock::new(None)),
                 last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
                 pending_bootstrap: findings,
                 logger: None,
@@ -480,6 +482,7 @@ impl Session {
             lens_consolidate_rules: Arc::new(tokio::sync::RwLock::new(None)),
             initial_prompt: None,
             initial_prompt_mode: None,
+            review_file_scan_target: Arc::new(tokio::sync::RwLock::new(None)),
             last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
             pending_bootstrap: Vec::new(),
             logger: None,
@@ -649,6 +652,7 @@ impl Session {
     pub fn with_review_prompt_config(mut self, cfg: crate::workflow::ReviewPromptConfig) -> Self {
         self.lenses = Arc::new(tokio::sync::RwLock::new(cfg.prompt_file.lenses));
         self.lens_consolidate_rules = Arc::new(tokio::sync::RwLock::new(cfg.consolidate_rules));
+        self.review_file_scan_target = Arc::new(tokio::sync::RwLock::new(cfg.file_scan_target));
         if !cfg.prompt_file.prompt.is_empty() {
             self.initial_prompt = Some(cfg.prompt_file.prompt);
             self.initial_prompt_mode = Some(kres_agents::TaskMode::Audit);
@@ -659,6 +663,7 @@ impl Session {
     async fn install_review_config_and_submit(&self, cfg: crate::workflow::ReviewPromptConfig) {
         *self.lenses.write().await = cfg.prompt_file.lenses;
         *self.lens_consolidate_rules.write().await = cfg.consolidate_rules;
+        *self.review_file_scan_target.write().await = cfg.file_scan_target;
         if !cfg.prompt_file.prompt.trim().is_empty() {
             self.submit_prompt_inner(
                 cfg.prompt_file.prompt,
@@ -1994,20 +1999,40 @@ impl Session {
                                 "[{carry} pending item(s) deferred — see /followup]"
                             );
                         }
-                        let active = mgr_for_reaper.active_count().await;
-                        match turns_cap_action(done, turns_limit, active) {
+                        // `active_count` excludes terminal tasks, but a
+                        // sibling can become Done while this tick is busy
+                        // publishing an earlier result. Require the entire
+                        // manager task list to be empty so terminal results
+                        // receive a subsequent reap/publication pass before
+                        // exit.
+                        let outstanding = mgr_for_reaper.snapshot().await.len();
+                        match turns_cap_action(done, turns_limit, outstanding) {
                             TurnsCapAction::Continue => {}
                             TurnsCapAction::DrainAndWait => {
-                                if turns_limit_waiting_active != Some(active) {
+                                if turns_limit_waiting_active != Some(outstanding) {
                                     kres_core::async_eprintln!(
-                                        "[--turns cap reached; waiting for {active} active task(s) to finish and publish results]"
+                                        "[--turns cap reached; waiting for {outstanding} active or terminal task(s) to finish and publish results]"
                                     );
-                                    turns_limit_waiting_active = Some(active);
+                                    turns_limit_waiting_active = Some(outstanding);
                                 }
                                 persist_reaper_tick!();
                                 continue;
                             }
                             TurnsCapAction::DrainAndExit => {
+                                // No executor remains, so an InProgress todo
+                                // cannot legitimately survive this snapshot.
+                                // Successful reaped tasks were marked Done
+                                // before the cap check above; leftovers are
+                                // interrupted/orphaned work that must be
+                                // resumable rather than permanently owned by
+                                // a vanished task.
+                                let (reset, carry) =
+                                    reconcile_turn_cap_todos(&mgr_for_reaper).await;
+                                if reset > 0 || carry > 0 {
+                                    kres_core::async_eprintln!(
+                                        "[--turns cap final reconciliation: reset {reset} orphaned in-progress item(s), deferred {carry} resumable item(s)]"
+                                    );
+                                }
                                 kres_core::async_eprintln!("exiting REPL.");
                                 persist_reaper_tick!();
                                 mgr_for_reaper.root_shutdown().cancel();
@@ -2588,6 +2613,43 @@ impl Session {
         let existing_plan = self.mgr.plan_snapshot().await;
         let review_submission = forced_mode == Some(kres_agents::TaskMode::Audit)
             && !self.lenses.read().await.is_empty();
+        let text = if include_recent_context && review_submission {
+            let target = self.review_file_scan_target.read().await.clone();
+            if let Some(target) = target {
+                let scan = match review_file_scan_context(&self.mgr).await {
+                    Some(scan) => Some(scan),
+                    None => {
+                        match run_review_file_scan(&orc, &target, self.mgr.root_shutdown()).await {
+                            Ok(scan) => {
+                                self.mgr
+                                    .cache_context(
+                                        REVIEW_FILE_SCAN_CACHE_KEY,
+                                        serde_json::Value::String(scan.clone()),
+                                    )
+                                    .await;
+                                Some(scan)
+                            }
+                            Err(error) => {
+                                kres_core::async_eprintln!(
+                                    "review bootstrap scan failed for {target}: {error}"
+                                );
+                                None
+                            }
+                        }
+                    }
+                };
+                match scan {
+                    Some(scan) => format!(
+                        "{text}\n\n--- WHOLE-FILE RISK SCAN ---\n{scan}\n--- END WHOLE-FILE RISK SCAN ---\nUse this source-derived ranking when defining the completion goal and semantic coverage plan. Do not add a survey/scan step to the plan."
+                    ),
+                    None => text,
+                }
+            } else {
+                text
+            }
+        } else {
+            text
+        };
         let planning_goal_client = if review_submission {
             self.review_goal_client.as_ref()
         } else {
@@ -2783,6 +2845,18 @@ impl Session {
         // the cloned snapshot keeps each task pinned to its own
         // plan for the duration.
         let plan_for_ctx = self.mgr.plan_snapshot().await;
+        let review_scan = if matches!(task_mode, kres_agents::TaskMode::Audit) {
+            review_file_scan_context(&self.mgr).await
+        } else {
+            None
+        };
+        let has_review_scan = review_scan.is_some();
+        let text = match review_scan {
+                Some(scan) => format!(
+                    "WHOLE-FILE RISK SCAN (already completed; do not request another survey):\n{scan}\n\n---\n\n{text}"
+                ),
+                None => text,
+        };
         // Only the initial task spawned from an operator-typed
         // prompt gets to rewrite the plan via the slow agent. A
         // pipeline follow-up (/next, /continue, auto-continue) has
@@ -2799,6 +2873,20 @@ impl Session {
                     task_brief: task_brief_clone,
                     original_prompt,
                     gather_prompt: None,
+                    disable_skill_reads: false,
+                    allowed_gather_kinds: if has_review_scan {
+                        Some(
+                            [
+                                "source", "type", "callers", "callees", "search", "grep", "read",
+                                "file", "find", "git", "question",
+                            ]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                        )
+                    } else {
+                        None
+                    },
                     mode: task_mode,
                     plan: plan_for_ctx,
                     allow_plan_rewrite,
@@ -4209,6 +4297,7 @@ fn review_todos_from_plan(plan: &kres_core::Plan) -> Vec<kres_core::TodoItem> {
 /// /compact to trim the ledger itself; this cap only limits what
 /// leaks into each new task's prompt.
 const RECENT_CONTEXT_CAP_CHARS: usize = 8_000;
+const REVIEW_FILE_SCAN_CACHE_KEY: &str = "review:file-risk-scan";
 
 /// Render the most recent accumulated-analysis entries into a
 /// short preamble, newest-first, capped at `cap` characters.
@@ -4468,7 +4557,7 @@ pub async fn build_agent_runner(
         client: slow_client.clone(),
         model: slow_model.clone(),
         system: Some(format!(
-            "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Turn a vague target into a staged graph: (1) exactly one initial orientation/context step with no dependencies, describing the source inventory, callers, history, types, and contract evidence the fast gather agent must obtain; for a named source-file target, explicitly require a `survey` followup for that path followed in the SAME task by targeted source/type/caller/read requests selected from the survey. A survey is an intermediate inventory, never sufficient context for slow review and never a complete orientation step by itself; (2) a bounded middle wave of 3 or 4 independent semantic path/contract groups, each depending on the orientation step; and (3) exactly one final cross-contract completeness step depending on every middle-wave step. Never partition by generic review lenses. Do not create more than 6 total steps. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
+            "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For a named source-file target, the prompt contains a WHOLE-FILE RISK SCAN gathered before goal selection. Use that ranked inventory to define an evidence-backed completion goal and a staged plan; never add another survey or scan step. Return 3 or 4 independent semantic path/contract groups with no dependencies, partitioned by real code paths and prioritized by the ranked functions, plus exactly one final cross-contract completeness step depending on every group. For other targets, create one orientation/context step, a bounded middle wave, and a final completeness step. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Never partition by generic review lenses. Do not create more than 5 total steps for a scanned file. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
             kres_agents::GOAL_INSTRUCTIONS
         )),
         max_tokens: slow_max_tokens,
@@ -5088,14 +5177,59 @@ enum TurnsCapAction {
     DrainAndExit,
 }
 
-fn turns_cap_action(done: u32, limit: u32, active: usize) -> TurnsCapAction {
+fn turns_cap_action(done: u32, limit: u32, outstanding: usize) -> TurnsCapAction {
     if limit == 0 || done < limit {
         TurnsCapAction::Continue
-    } else if active > 0 {
+    } else if outstanding > 0 {
         TurnsCapAction::DrainAndWait
     } else {
         TurnsCapAction::DrainAndExit
     }
+}
+
+async fn reconcile_turn_cap_todos(mgr: &Arc<TaskManager>) -> (usize, usize) {
+    let reset = mgr.reset_in_progress_to_pending().await;
+    let deferred = mgr.defer_pending().await;
+    (reset, deferred)
+}
+
+async fn review_file_scan_context(mgr: &Arc<TaskManager>) -> Option<String> {
+    if let Some(serde_json::Value::String(scan)) =
+        mgr.get_cached_context(REVIEW_FILE_SCAN_CACHE_KEY).await
+    {
+        return Some(scan);
+    }
+    let plan = mgr.plan_snapshot().await?;
+    let (_, tail) = plan.prompt.split_once("--- WHOLE-FILE RISK SCAN ---\n")?;
+    let (scan, _) = tail.split_once("\n--- END WHOLE-FILE RISK SCAN ---")?;
+    (!scan.trim().is_empty()).then(|| scan.trim().to_string())
+}
+
+async fn run_review_file_scan(
+    runner: &Arc<AgentRunner>,
+    target: &str,
+    shutdown: &kres_core::Shutdown,
+) -> Result<String> {
+    let prompt = format!(
+        "Whole-file review bootstrap scan for {target}. In the first gather round request exactly one `survey` followup for {target}. Do not request skills or any other followup. After receiving the file_survey inventory, set ready_for_slow=true. The slow response must set `analysis` to a compact JSON array with exactly one object per defined function: {{\"name\":string,\"uses\":nonnegative integer,\"bug_likelihood\":integer 0-100}}. Guess without reasoning from use/reference counts and internal metrics. Do not score referenced-only functions. Return empty findings and followups."
+    );
+    let ctx = RunContext {
+        task_brief: format!("review bootstrap scan: {target}"),
+        mode: kres_core::TaskMode::Audit,
+        disable_skill_reads: true,
+        allowed_gather_kinds: Some(std::iter::once("survey".to_string()).collect()),
+        ..RunContext::default()
+    };
+    let summary = runner
+        .run_once_with_ctx(&prompt, &ctx, shutdown)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(&summary.analysis)
+        .context("slow scan analysis is not a JSON array")?;
+    if !value.is_array() {
+        anyhow::bail!("slow scan analysis is not a JSON array");
+    }
+    serde_json::to_string(&value).context("serializing review scan")
 }
 
 async fn ensure_review_followups_remain_pending(
@@ -5757,6 +5891,7 @@ mod tests {
                 }],
             },
             consolidate_rules: Some("merge carefully".to_string()),
+            file_scan_target: Some("mm/filemap.c".to_string()),
         };
         let s = Session::new(mgr, ReplConfig::default())
             .await
@@ -5830,6 +5965,96 @@ mod tests {
         assert_eq!(turns_cap_action(10, 10, 2), TurnsCapAction::DrainAndWait);
         assert_eq!(turns_cap_action(11, 10, 1), TurnsCapAction::DrainAndWait);
         assert_eq!(turns_cap_action(10, 10, 0), TurnsCapAction::DrainAndExit);
+    }
+
+    #[tokio::test]
+    async fn turns_cap_waits_for_terminal_tasks_until_they_are_reaped() {
+        let mgr = TaskManager::new();
+        mgr.spawn("finished", None, |_handle| async {
+            Ok(kres_core::task::TaskOutcome {
+                analysis: "published only after reap".into(),
+                ..Default::default()
+            })
+        })
+        .await;
+        loop {
+            let snapshot = mgr.snapshot().await;
+            if snapshot.iter().all(|task| task.state.is_terminal()) {
+                assert_eq!(mgr.active_count().await, 0);
+                assert_eq!(
+                    turns_cap_action(20, 20, snapshot.len()),
+                    TurnsCapAction::DrainAndWait
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(mgr.reap().await.len(), 1);
+        assert_eq!(
+            turns_cap_action(20, 20, mgr.snapshot().await.len()),
+            TurnsCapAction::DrainAndExit
+        );
+    }
+
+    #[tokio::test]
+    async fn turns_cap_final_reconciliation_leaves_no_in_progress_todos() {
+        let mgr = TaskManager::new();
+        let mut completed = kres_core::TodoItem::new("completed", "review");
+        completed.id = "completed".into();
+        completed.status = kres_core::TodoStatus::Done;
+        let mut orphaned = kres_core::TodoItem::new("orphaned", "review");
+        orphaned.id = "orphaned".into();
+        orphaned.status = kres_core::TodoStatus::InProgress;
+        mgr.load_runtime_state(vec![completed, orphaned], Vec::new(), None, 20)
+            .await;
+
+        let (reset, deferred) = reconcile_turn_cap_todos(&mgr).await;
+
+        assert_eq!((reset, deferred), (1, 1));
+        let live = mgr.todo_snapshot().await;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "completed");
+        assert_eq!(live[0].status, kres_core::TodoStatus::Done);
+        let deferred = mgr.deferred_snapshot().await;
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].id, "orphaned");
+        assert_eq!(deferred[0].status, kres_core::TodoStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn review_scan_context_survives_resume_via_plan_prompt() {
+        let mgr = TaskManager::new();
+        let scan = r#"[{"name":"filemap_fault","uses":6,"bug_likelihood":72}]"#;
+        let plan = kres_core::Plan::new(
+            format!(
+                "review\n--- WHOLE-FILE RISK SCAN ---\n{scan}\n--- END WHOLE-FILE RISK SCAN ---"
+            ),
+            "goal",
+            kres_core::TaskMode::Audit,
+        );
+        mgr.load_runtime_state(Vec::new(), Vec::new(), Some(plan), 1)
+            .await;
+
+        assert_eq!(
+            review_file_scan_context(&mgr).await.as_deref(),
+            Some(r#"[{"name":"filemap_fault","uses":6,"bug_likelihood":72}]"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn review_scan_context_prefers_live_cache() {
+        let mgr = TaskManager::new();
+        mgr.cache_context(
+            REVIEW_FILE_SCAN_CACHE_KEY,
+            serde_json::Value::String("live scan".into()),
+        )
+        .await;
+
+        assert_eq!(
+            review_file_scan_context(&mgr).await.as_deref(),
+            Some("live scan")
+        );
     }
 
     #[tokio::test]

@@ -676,6 +676,11 @@ impl TaskManager {
         g.context_cache.put(key.into(), value);
     }
 
+    pub async fn get_cached_context(&self, key: &str) -> Option<serde_json::Value> {
+        let mut g = self.caches.lock().await;
+        g.context_cache.get(&key.to_string()).cloned()
+    }
+
     pub async fn cached_symbol_names(&self) -> Vec<String> {
         let g = self.caches.lock().await;
         g.symbol_cache.keys()

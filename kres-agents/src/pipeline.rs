@@ -82,6 +82,46 @@ fn validate_fast_gather_text(text: &str) -> Result<CodeResponse, Vec<String>> {
     CodeResponseContract::default().validate_with(text, fast_gather_semantic_errors)
 }
 
+fn validate_fast_gather_text_for_run(
+    text: &str,
+    disable_skill_reads: bool,
+    allowed_gather_kinds: Option<&BTreeSet<String>>,
+) -> Result<CodeResponse, Vec<String>> {
+    let response = validate_fast_gather_text(text)?;
+    let errors =
+        fast_gather_run_policy_errors(&response, disable_skill_reads, allowed_gather_kinds);
+    if errors.is_empty() {
+        Ok(response)
+    } else {
+        Err(errors)
+    }
+}
+
+fn fast_gather_run_policy_errors(
+    response: &CodeResponse,
+    disable_skill_reads: bool,
+    allowed_gather_kinds: Option<&BTreeSet<String>>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if disable_skill_reads && !response.skill_reads.is_empty() {
+        errors.push(
+            "skill_reads are disabled for this run; return an empty skill_reads array".into(),
+        );
+    }
+    if let Some(allowed) = allowed_gather_kinds {
+        for (index, followup) in response.followups.iter().enumerate() {
+            if !allowed.contains(&followup.kind) {
+                errors.push(format!(
+                    "followups[{index}].type `{}` is disabled for this run; allowed: {}",
+                    followup.kind,
+                    allowed.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+    }
+    errors
+}
+
 #[cfg(test)]
 fn validate_fast_gather_response(response: &CodeResponse) -> Result<(), Vec<String>> {
     let mut errors = response.validation_errors.clone();
@@ -421,6 +461,13 @@ pub struct RunContext {
     /// preserving the exact final prompt for the slow/coding agent.
     /// When unset, gather and final synthesis both use `prompt`.
     pub gather_prompt: Option<String>,
+    /// Reject and repair fast-gather responses that request skill files.
+    /// Workflow steps set this when their workflow declares `skills: []`.
+    /// Generic tasks retain on-demand skill reads through the default `false`.
+    pub disable_skill_reads: bool,
+    /// Optional per-run allowlist for fast-gather followup kinds.
+    /// The whole-file review scan uses this to permit only `survey`.
+    pub allowed_gather_kinds: Option<BTreeSet<String>>,
     /// Which pipeline this task should run. `Analysis` (default)
     /// feeds the findings merger; `Coding` swaps in
     /// `slow_coding_system`, skips the lens fan-out, and returns a
@@ -761,7 +808,11 @@ impl AgentRunner {
         // Per-run skills clone — mutated mid-loop by `skill_reads`
         // responses so the fast agent can pull in extra files
         // mid-gather (§27,).
-        let mut live_skills: Option<Value> = self.skills.clone();
+        let mut live_skills: Option<Value> = if ctx.disable_skill_reads {
+            None
+        } else {
+            self.skills.clone()
+        };
         // Seed from an earlier workflow step's gathered data (#4) so a
         // dependent step does not re-fetch source the prior step
         // already pulled. With prev_n_* starting at 0, round 0 ships
@@ -884,20 +935,37 @@ impl AgentRunner {
                     t
                 }
             };
-            let parsed = match validate_fast_gather_text(&text) {
+            let parsed = match validate_fast_gather_text_for_run(
+                &text,
+                ctx.disable_skill_reads,
+                ctx.allowed_gather_kinds.as_ref(),
+            ) {
                 Ok(parsed) => parsed,
                 Err(errors) => {
                     kres_core::async_eprintln!(
                         "[fast round {fast_rounds}] invalid gather response; retrying once: {}",
                         errors.join("; ")
                     );
-                    self.repair_fast_gather_response(
-                        &text,
-                        &errors,
-                        "fast gather schema repair",
-                        shutdown,
-                    )
-                    .await?
+                    let repaired = self
+                        .repair_fast_gather_response(
+                            &text,
+                            &errors,
+                            "fast gather schema repair",
+                            shutdown,
+                        )
+                        .await?;
+                    let policy_errors = fast_gather_run_policy_errors(
+                        &repaired,
+                        ctx.disable_skill_reads,
+                        ctx.allowed_gather_kinds.as_ref(),
+                    );
+                    if !policy_errors.is_empty() {
+                        return Err(AgentError::Other(format!(
+                            "fast gather response still violated run policy after repair: {}",
+                            policy_errors.join("; ")
+                        )));
+                    }
+                    repaired
                 }
             };
 
@@ -1834,7 +1902,12 @@ impl AgentRunner {
         // Gather once via fast+main (same loop as run_once, up to the
         // point where we'd call the slow agent).
         let (symbols, context, fast_rounds, live_skills) = self
-            .gather(gather_prompt, ctx.plan.as_ref(), shutdown)
+            .gather(
+                gather_prompt,
+                ctx.plan.as_ref(),
+                ctx.disable_skill_reads,
+                shutdown,
+            )
             .await?;
 
         // All review lenses share the same gathered source/context.
@@ -2085,6 +2158,7 @@ impl AgentRunner {
         &self,
         prompt: &str,
         plan: Option<&kres_core::Plan>,
+        disable_skill_reads: bool,
         shutdown: &Shutdown,
     ) -> Result<(Vec<Value>, Vec<Value>, u8, Option<Value>), AgentError> {
         let mut symbols: Vec<Value> = Vec::new();
@@ -2097,7 +2171,11 @@ impl AgentRunner {
         // gather path just like `run_once_with_ctx` does. Without
         // this, a skill file the fast agent requests mid-gather
         // never lands in the lens slow-agent payload.
-        let mut live_skills: Option<Value> = self.skills.clone();
+        let mut live_skills: Option<Value> = if disable_skill_reads {
+            None
+        } else {
+            self.skills.clone()
+        };
         for round in 0..self.max_fast_rounds {
             if shutdown.is_cancelled() {
                 return Err(AgentError::Other(format!(
@@ -2185,20 +2263,27 @@ impl AgentRunner {
                     t
                 }
             };
-            let parsed = match validate_fast_gather_text(&text) {
+            let parsed = match validate_fast_gather_text_for_run(&text, disable_skill_reads, None) {
                 Ok(parsed) => parsed,
                 Err(errors) => {
                     kres_core::async_eprintln!(
                         "[fast gather round {fast_rounds}] invalid response; retrying once: {}",
                         errors.join("; ")
                     );
-                    self.repair_fast_gather_response(
-                        &text,
-                        &errors,
-                        "fast lens gather schema repair",
-                        shutdown,
-                    )
-                    .await?
+                    let repaired = self
+                        .repair_fast_gather_response(
+                            &text,
+                            &errors,
+                            "fast lens gather schema repair",
+                            shutdown,
+                        )
+                        .await?;
+                    if disable_skill_reads && !repaired.skill_reads.is_empty() {
+                        return Err(AgentError::Other(
+                            "fast lens gather response still requested skill_reads after repair, but skill reads are disabled for this run".into(),
+                        ));
+                    }
+                    repaired
                 }
             };
             if !parsed.skill_reads.is_empty() {
@@ -2677,6 +2762,15 @@ mod tests {
             r#"{"analysis":"need an outline","followups":[{"type":"survey","name":"mm/filemap.c","reason":"build a targeted review inventory"}]}"#,
         );
         assert!(validate_fast_gather_response(&response).is_ok());
+    }
+
+    #[test]
+    fn fast_gather_validation_rejects_skill_reads_when_disabled() {
+        let text = r#"{"analysis":"load more policy","followups":[],"skill_reads":["technical-patterns.md"],"ready_for_slow":false}"#;
+
+        assert!(validate_fast_gather_text_for_run(text, false, None).is_ok());
+        let errors = validate_fast_gather_text_for_run(text, true, None).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("disabled")));
     }
 
     /// Unit-test the loop-back decision table. We can't easily run

@@ -20,6 +20,7 @@ pub struct ReviewPromptConfig {
     pub source: String,
     pub prompt_file: PromptFile,
     pub consolidate_rules: Option<String>,
+    pub file_scan_target: Option<String>,
 }
 
 /// Resolve a workflow either from a path or from the `workflow-id:<id>`
@@ -163,6 +164,7 @@ pub fn review_prompt_file_from_target(
         .get("target_is_commit")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let target_is_file = !target_is_commit && looks_like_source_file(target);
     if target_is_commit {
         prompt.push_str(
             "\nTARGET KIND: git commit or range\n\n\
@@ -170,15 +172,25 @@ Review the changes introduced by exactly this ref/range. Start by fetching \
 `git show --stat` and `git show`/`git diff` for TARGET, then gather the changed \
 files, symbols, and unchanged contract consumers.\n\n",
         );
-    } else {
+    } else if target_is_file {
         prompt.push_str(
             "\nTARGET KIND: current-workspace source scope (not a git ref)\n\n\
 Review the current source named by TARGET. There is no implied commit, range, \
 base revision, or target diff. Do not invent one and do not request `git show` \
-or `git diff` merely to establish scope. Use a file survey as an intermediate \
-inventory, then gather targeted function bodies, types, callers, and line \
-ranges before slow review. Request git history only for a specific semantic \
+or `git diff` merely to establish scope. Before goal and plan creation, survey \
+the file exactly once, perform no other fetches, and have one non-lensed slow \
+call rank every defined function. Use that ranking to build the initial semantic \
+coverage plan. Later review tasks \
+gather targeted function bodies, types, callers, and line ranges. Request git history only for a specific semantic \
 question that source alone cannot answer.\n\n",
+        );
+    } else {
+        prompt.push_str(
+            "\nTARGET KIND: current-workspace source scope (not a git ref)\n\n\
+Review the current source scope named by TARGET. There is no implied commit, range, \
+base revision, or target diff. Do not invent one. Gather a bounded source inventory \
+appropriate to the target, then obtain targeted bodies, types, callers, and line ranges. \
+Request git history only for a specific semantic question source cannot answer.\n\n",
         );
     }
     prompt.push_str(
@@ -224,7 +236,15 @@ explicitly asks for a whole-tree audit.\n\n",
         source: "workflow-id:review task loop".to_string(),
         prompt_file: PromptFile { prompt, lenses },
         consolidate_rules: step.consolidate.as_ref().map(|c| c.prompt.clone()),
+        file_scan_target: target_is_file.then(|| target.to_string()),
     })
+}
+
+fn looks_like_source_file(target: &str) -> bool {
+    let path = Path::new(target);
+    !target.chars().any(char::is_whitespace)
+        && path.file_name().is_some()
+        && path.extension().is_some()
 }
 
 pub struct WorkflowRunOptions {
@@ -1031,6 +1051,14 @@ mod tests {
             .prompt_file
             .prompt
             .contains("There is no implied commit"));
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("Before goal and plan creation"));
+        assert_eq!(
+            cfg.file_scan_target.as_deref(),
+            Some("drivers/example/example.c")
+        );
     }
 
     #[test]

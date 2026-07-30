@@ -901,12 +901,14 @@ separate hardcoded review lens list. `/review <target>` and
 `--prompt "review: <target>"` are only two entry points into that same
 workflow-defined task loop. It uses the optimized lens path:
 
-1. One shared gather phase collects source, type definitions, callers, grep results, and
-   git context for the target. For a named source-file review, its orientation task first
-   requests semcode's compact Tree-sitter `file_survey`, then selects targeted symbol and
-   line-range reads from that inventory instead of loading the entire file. The survey is
-   only an intermediate planning artifact: the task must gather reviewable bodies and
-   contract evidence before handing the shared context to slow lenses.
+1. For a named source-file review, bootstrap requests semcode's compact Tree-sitter
+   `file_survey` exactly once, performs no other fetches, and sends that inventory to one
+   non-lensed slow call. The slow call emits a no-reasoning 0-100 bug-likelihood guess
+   for every defined function. That ranking is supplied to `define_goal` and
+   `define_plan`, so the initial semantic groups are source-informed. It is also cached
+   and embedded in the persisted plan prompt for later tasks and resume. Scheduled tasks
+   cannot request another survey; they gather targeted source, types, callers, grep
+   results, and history before parallel slow review lenses run.
 2. The active slow-agent review lenses run in parallel.
 3. A fast consolidator merges and ranks the results.
 4. The lensed step completes with `findings` and typed `followups` in

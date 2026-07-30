@@ -111,14 +111,14 @@ mod tests {
             "fast prompt must require evidence before broad clean review claims"
         );
         assert!(
-            body.contains("begin the orientation task with a `survey` followup"),
-            "fast prompt must use file_survey for named-file review orientation"
+            body.contains("bootstrap supplies a ranked file_survey inventory"),
+            "fast prompt must consume the bootstrap scan for named-file review"
         );
         assert!(
             body.contains(
-                "do NOT set `ready_for_slow=true` when the gathered context is survey-only"
+                "Scheduled review tasks receive that ranking and must not request another survey"
             ),
-            "fast prompt must turn review surveys into targeted source evidence before handoff"
+            "fast prompt must not repeat the bootstrap survey"
         );
     }
 

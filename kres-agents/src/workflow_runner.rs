@@ -137,6 +137,7 @@ struct JudgeResponse {
 }
 const CODE_EDIT_REPAIR_PREFIX: &str = "IMPORTANT: The previous reply's code_edits failed to apply. Re-read the file you intend to edit using a `read` followup before re-emitting code_edits. Every `old_string` MUST be copied verbatim from the current file contents byte-for-byte — match tabs vs spaces and column alignment exactly. If you are uncertain about indentation, widen the snippet so the surrounding lines anchor the exact byte sequence.\nApply error from the previous attempt:";
 const FAST_GATHER_ALLOWED_FIELDS: &str = "analysis, followups, skill_reads, ready_for_slow";
+const FAST_GATHER_ALLOWED_FIELDS_WITHOUT_SKILLS: &str = "analysis, followups, ready_for_slow";
 const DEFAULT_GATHER_DISALLOWED_FIELDS: &[&str] = &[
     "clean",
     "defects",
@@ -784,7 +785,8 @@ impl LlmDriver {
             sid = step.id,
             SCHEMA_HEADER = "OUTPUT SCHEMA"
         );
-        let gather_contract = fast_gather_contract(gather_disallowed_fields);
+        let gather_contract =
+            fast_gather_contract(gather_disallowed_fields, !self.workflow.skills.is_empty());
         let gather_user_text_base = format!(
             "{skills_prelude}{includes_prelude}{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n{gather_contract}",
             sid = step.id,
@@ -872,16 +874,38 @@ impl LlmDriver {
                         Some(l) => format!("{}|{}", step.id, l.id),
                         None => step.id.clone(),
                     };
+                    let (run_seed_symbols, run_seed_context, gather_prompt) = if let Some((
+                        symbols,
+                        context,
+                    )) =
+                        captured_gathered.as_ref()
+                    {
+                        (
+                                symbols.clone(),
+                                context.clone(),
+                                format!(
+                                    "{}\n\nRESPONSE RETRY: The required context was already gathered by the previous attempt and is attached to this request. Do not emit followups or skill_reads. Set ready_for_slow=true immediately so only final synthesis is retried.",
+                                    prompt_texts.gather_user_text_base
+                                ),
+                            )
+                    } else {
+                        (
+                            seed_symbols.clone(),
+                            seed_context.clone(),
+                            prompt_texts.gather_user_text_base.clone(),
+                        )
+                    };
                     let rctx = crate::pipeline::RunContext {
                         task_brief,
                         mode,
                         allowed_response_extensions: step.outputs.keys().cloned().collect(),
-                        gather_prompt: Some(prompt_texts.gather_user_text_base.clone()),
+                        gather_prompt: Some(gather_prompt),
+                        disable_skill_reads: self.workflow.skills.is_empty(),
                         surface_over_input_limit: true,
                         synthesis_use_fast,
                         synthesis_use_routing_prompt,
-                        seed_symbols: seed_symbols.clone(),
-                        seed_context: seed_context.clone(),
+                        seed_symbols: run_seed_symbols,
+                        seed_context: run_seed_context,
                         ..crate::pipeline::RunContext::default()
                     };
                     runner
@@ -1887,6 +1911,7 @@ impl Driver for LlmDriver {
             mode,
             allowed_response_extensions: step.outputs.keys().cloned().collect(),
             gather_prompt: Some(prompt_texts.gather_user_text_base),
+            disable_skill_reads: self.workflow.skills.is_empty(),
             ..crate::pipeline::RunContext::default()
         };
         if uses_structured_review_outputs(step) {
@@ -2478,11 +2503,16 @@ fn response_text(resp: &kres_llm::request::MessagesResponse) -> String {
     out
 }
 
-fn fast_gather_contract(disallowed_fields: &[&str]) -> String {
+fn fast_gather_contract(disallowed_fields: &[&str], allow_skill_reads: bool) -> String {
+    let allowed_fields = if allow_skill_reads {
+        FAST_GATHER_ALLOWED_FIELDS
+    } else {
+        FAST_GATHER_ALLOWED_FIELDS_WITHOUT_SKILLS
+    };
     format!(
         "--- FAST GATHER CONTRACT ---\n\
 This is the fast gather phase, not the final workflow step response. Gather only the source, history, build, or context needed by the final agent.\n\
-Reply only with the standard fast-agent JSON fields: {FAST_GATHER_ALLOWED_FIELDS}.\n\
+Reply only with the standard fast-agent JSON fields: {allowed_fields}.\n\
 Do not emit final workflow output fields such as {}. Those fields are accepted only from the final step response.",
         disallowed_fields.join(", ")
     )
@@ -4887,6 +4917,7 @@ fn render_readonly_payload(label: &str, command: &str, body: &str) -> String {
 fn action_kind_to_type(kind: &str) -> Option<crate::workflow::ActionType> {
     use crate::workflow::ActionType;
     match kind {
+        "survey" => Some(ActionType::Survey),
         "read" => Some(ActionType::Read),
         "source" => Some(ActionType::Source),
         "type" => Some(ActionType::Type),
@@ -7364,12 +7395,20 @@ mod tests {
 
     #[test]
     fn fast_gather_contract_is_not_a_workflow_output_schema() {
-        let contract = fast_gather_contract(&["clean", "defects", "source_defects"]);
+        let contract = fast_gather_contract(&["clean", "defects", "source_defects"], true);
 
         assert!(contract.contains("FAST GATHER CONTRACT"));
         assert!(contract.contains("analysis, followups, skill_reads, ready_for_slow"));
         assert!(contract.contains("clean, defects, source_defects"));
         assert!(!contract.contains("OUTPUT SCHEMA"));
+    }
+
+    #[test]
+    fn fast_gather_contract_omits_skill_reads_when_disabled() {
+        let contract = fast_gather_contract(&["clean"], false);
+
+        assert!(contract.contains("analysis, followups, ready_for_slow"));
+        assert!(!contract.contains("analysis, followups, skill_reads"));
     }
 
     #[test]

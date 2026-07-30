@@ -233,6 +233,7 @@ pub async fn promote_prose_bugs_with_logger(
                     model: model.clone(),
                     max_tokens,
                     max_input_tokens,
+                    thinking,
                     contract: crate::json_repair::JsonContract {
                         name: "promoter",
                         schema: &schema,
@@ -294,6 +295,7 @@ pub async fn promote_prose_bugs_with_logger(
             std::mem::take(&mut parsed.invalid_findings),
             crate::finding_repair::FindingRepairRuntime {
                 logger,
+                thinking,
                 cancel: cancel.map(crate::finding_repair::FindingRepairCancel::Notify),
                 usage,
                 role: "promote",

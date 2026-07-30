@@ -701,6 +701,7 @@ impl AgentRunner {
             model: self.fast_model.clone(),
             max_tokens: self.fast_max_tokens,
             max_input_tokens: self.fast_max_input_tokens,
+            thinking: self.fast_thinking,
             contract: JsonContract {
                 name: label,
                 schema: &schema,
@@ -1232,6 +1233,7 @@ impl AgentRunner {
                 model: synth_model.clone(),
                 max_tokens: synth_max_tokens,
                 max_input_tokens: synth_max_in,
+                thinking: synth_thinking,
                 contract: JsonContract {
                     name: "slow-synthesis",
                     schema: &response_schema,
@@ -1263,6 +1265,7 @@ impl AgentRunner {
                 std::mem::take(&mut slow_parsed.invalid_findings),
                 crate::finding_repair::FindingRepairRuntime {
                     logger: self.logger.clone(),
+                    thinking: synth_thinking,
                     cancel: Some(crate::finding_repair::FindingRepairCancel::Shutdown(
                         shutdown.clone(),
                     )),
@@ -1745,6 +1748,7 @@ impl AgentRunner {
                     std::mem::take(&mut parsed.invalid_findings),
                     crate::finding_repair::FindingRepairRuntime {
                         logger: self.logger.clone(),
+                        thinking: variant.thinking,
                         cancel: Some(crate::finding_repair::FindingRepairCancel::Shutdown(
                             shutdown.clone(),
                         )),
@@ -1776,6 +1780,7 @@ impl AgentRunner {
             model: variant.model.clone(),
             max_tokens: variant.max_tokens,
             max_input_tokens: variant.max_input_tokens,
+            thinking: variant.thinking,
             contract: JsonContract {
                 name: policy.contract_name,
                 schema: policy.schema,

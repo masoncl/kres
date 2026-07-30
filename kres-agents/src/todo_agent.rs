@@ -257,6 +257,7 @@ pub async fn update_todo_via_agent_with_logger(
             model: tc.model.clone(),
             max_tokens: tc.max_tokens,
             max_input_tokens: tc.max_input_tokens,
+            thinking: tc.thinking,
             contract: crate::json_repair::JsonContract {
                 name: "todo-update",
                 schema: &schema,

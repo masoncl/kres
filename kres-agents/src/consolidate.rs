@@ -182,6 +182,7 @@ pub async fn consolidate_lenses_with_logger(
             model: model.clone(),
             max_tokens,
             max_input_tokens,
+            thinking: consolidator.thinking,
             contract: crate::json_repair::JsonContract {
                 name: "lens-consolidator",
                 schema: &response_schema,
@@ -231,6 +232,7 @@ pub async fn consolidate_lenses_with_logger(
             std::mem::take(&mut parsed.invalid_findings),
             crate::finding_repair::FindingRepairRuntime {
                 logger: logger.clone(),
+                thinking: consolidator.thinking,
                 cancel: shutdown.map(crate::finding_repair::FindingRepairCancel::Shutdown),
                 usage: consolidator.usage.clone(),
                 role: "consolidator",

@@ -137,6 +137,160 @@ struct Inner {
     /// the session persistence layer saves it alongside the todo
     /// list so a resumed session sees the same decomposition.
     plan: Option<crate::plan::Plan>,
+    /// Work intentionally removed from active scheduling by goal,
+    /// turn-cap, stop, or error handling.
+    deferred: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanChange {
+    pub prior: Option<crate::plan::Plan>,
+    pub current: crate::plan::Plan,
+}
+
+pub struct InferredTodoUpdate {
+    pub items: Vec<TodoItem>,
+    pub completed_todo_id: Option<String>,
+    pub inference_snapshot: Vec<TodoItem>,
+    pub plan_rewrite: Option<crate::plan::PlanRewrite>,
+}
+
+#[derive(Debug, Default)]
+pub struct TodoClaims {
+    pub items: Vec<TodoItem>,
+    pub blocked: usize,
+    pub remaining: usize,
+}
+
+fn same_todo_item(a: &TodoItem, b: &TodoItem) -> bool {
+    if !a.id.is_empty() && !b.id.is_empty() {
+        a.id == b.id
+    } else {
+        a.kind == b.kind && a.name.eq_ignore_ascii_case(&b.name)
+    }
+}
+
+fn normalize_todo_dependencies(items: &mut [TodoItem], live_items: &[TodoItem]) {
+    let mut identities = std::collections::BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
+        if !item.id.is_empty() {
+            identities.insert(item.id.clone(), index);
+        }
+        identities.insert(item.name.clone(), index);
+    }
+
+    fn reaches(graph: &[Vec<usize>], start: usize, target: usize) -> bool {
+        let mut stack = vec![start];
+        let mut seen = vec![false; graph.len()];
+        while let Some(node) = stack.pop() {
+            if node == target {
+                return true;
+            }
+            if seen[node] {
+                continue;
+            }
+            seen[node] = true;
+            stack.extend(graph[node].iter().copied());
+        }
+        false
+    }
+
+    // Install scheduler-established edges first, using live-list order rather
+    // than model-provided order. Proposed reverse edges can therefore never
+    // win a cycle tie and displace an existing prerequisite.
+    let mut graph = vec![Vec::new(); items.len()];
+    let mut protected = vec![Vec::new(); items.len()];
+    for live in live_items {
+        let Some(index) = items.iter().position(|item| same_todo_item(item, live)) else {
+            continue;
+        };
+        for dependency in &live.depends_on {
+            let Some(&dependency_index) = identities.get(dependency) else {
+                continue;
+            };
+            if dependency_index == index || protected[index].contains(dependency) {
+                continue;
+            }
+            graph[index].push(dependency_index);
+            protected[index].push(dependency.clone());
+        }
+    }
+
+    for (index, item) in items.iter_mut().enumerate() {
+        let mut accepted = protected[index].clone();
+        let mut seen: std::collections::BTreeSet<String> = accepted.iter().cloned().collect();
+        for dependency in std::mem::take(&mut item.depends_on) {
+            let Some(&dependency_index) = identities.get(&dependency) else {
+                continue;
+            };
+            if dependency_index == index || !seen.insert(dependency.clone()) {
+                continue;
+            }
+            if reaches(&graph, dependency_index, index) {
+                continue;
+            }
+            graph[index].push(dependency_index);
+            accepted.push(dependency);
+        }
+        item.depends_on = accepted;
+    }
+}
+
+fn todo_id_base(item: &TodoItem) -> String {
+    let raw = format!("{}-{}", item.kind, item.name);
+    let mut out = String::new();
+    let mut separator = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            separator = false;
+        } else if !separator && !out.is_empty() {
+            out.push('-');
+            separator = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "todo".to_string()
+    } else {
+        out
+    }
+}
+
+fn install_plan_locked(inner: &mut Inner, plan: Option<crate::plan::Plan>) {
+    let step_ids: std::collections::BTreeSet<&str> = plan
+        .as_ref()
+        .map(|plan| plan.steps.iter().map(|step| step.id.as_str()).collect())
+        .unwrap_or_default();
+    for todo in &mut inner.todo {
+        if !todo.step_id.is_empty() && !step_ids.contains(todo.step_id.as_str()) {
+            todo.step_id.clear();
+        }
+    }
+    inner.plan = plan;
+}
+
+fn sync_plan_locked(inner: &mut Inner) {
+    let todo = inner.todo.clone();
+    if let Some(plan) = inner.plan.as_mut() {
+        plan.sync_from_todo(&todo);
+    }
+}
+
+fn apply_plan_rewrite_locked(inner: &mut Inner, rewrite: crate::plan::PlanRewrite) -> PlanChange {
+    let prior = inner.plan.clone();
+    let mut new_plan = rewrite.apply_to(prior.as_ref());
+    // Step execution state is scheduler-owned. A planning model may
+    // reshape steps, but cannot declare work complete or skipped.
+    for step in &mut new_plan.steps {
+        step.status = crate::plan::PlanStepStatus::Pending;
+    }
+    install_plan_locked(inner, Some(new_plan));
+    sync_plan_locked(inner);
+    let current = inner.plan.clone().expect("plan was just installed");
+    PlanChange { prior, current }
 }
 
 struct Caches {
@@ -160,6 +314,7 @@ impl TaskManager {
                 findings: Vec::new(),
                 completed_run_count: 0,
                 plan: None,
+                deferred: Vec::new(),
             }),
             caches: Mutex::new(Caches {
                 symbol_cache: LruCache::new(symbol_cap),
@@ -197,6 +352,7 @@ impl TaskManager {
                     findings: Vec::new(),
                     completed_run_count: 0,
                     plan: None,
+                    deferred: Vec::new(),
                 }),
                 caches: Mutex::new(Caches {
                     symbol_cache: LruCache::new(2000),
@@ -425,16 +581,19 @@ impl TaskManager {
         let deadline = tokio::time::Instant::now() + grace;
         let mut stopped = 0u32;
         let mut expired = 0u32;
-        for (_, h) in handles {
+        for (_, mut h) in handles {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 h.abort();
                 expired += 1;
                 continue;
             }
-            match tokio::time::timeout(remaining, h).await {
+            match tokio::time::timeout(remaining, &mut h).await {
                 Ok(_) => stopped += 1,
-                Err(_) => expired += 1,
+                Err(_) => {
+                    h.abort();
+                    expired += 1;
+                }
             }
         }
         StopAllOutcome {
@@ -524,19 +683,361 @@ impl TaskManager {
 
     // -- todo ----------------------------------------------------------
 
-    pub async fn replace_todo(&self, items: Vec<TodoItem>) {
+    #[cfg(test)]
+    async fn replace_todo(&self, items: Vec<TodoItem>) {
         let mut g = self.inner.write().await;
         g.todo = items;
+    }
+
+    /// Apply an inferred todo rewrite without allowing a stale model
+    /// round-trip to overwrite scheduler-owned execution state.
+    ///
+    /// Todo inference starts from a snapshot and may take long enough
+    /// for pending work to be dispatched or running work to finish.
+    /// Merge against the live list under the write lock so those
+    /// transitions win over the stale snapshot. The just-reaped task
+    /// is authoritative even though its live row is still InProgress.
+    pub async fn merge_inferred_state(&self, update: InferredTodoUpdate) -> Option<PlanChange> {
+        fn matches_completed(item: &TodoItem, completed_todo_id: Option<&str>) -> bool {
+            completed_todo_id.is_some_and(|completed| {
+                (!item.id.is_empty() && item.id == completed) || item.name == completed
+            })
+        }
+
+        let InferredTodoUpdate {
+            mut items,
+            completed_todo_id,
+            inference_snapshot,
+            plan_rewrite,
+        } = update;
+        let completed_todo_id = completed_todo_id.as_deref();
+        let mut g = self.inner.write().await;
+        // A row that existed in the inference snapshot but no longer
+        // exists live was removed deliberately (`/done`, `/clear`, a
+        // drain, or a concurrent reconciliation). Do not resurrect it
+        // from the stale model response. Rows absent from the snapshot
+        // are genuinely new model proposals and remain eligible.
+        items.retain(|item| {
+            let existed_at_start = inference_snapshot
+                .iter()
+                .any(|snapshot_item| same_todo_item(snapshot_item, item));
+            let exists_live = g.todo.iter().any(|live| same_todo_item(live, item));
+            !existed_at_start || exists_live || matches_completed(item, completed_todo_id)
+        });
+        for item in &mut items {
+            let live = g.todo.iter().find(|live| same_todo_item(item, live));
+            if matches_completed(item, completed_todo_id) {
+                item.status = TodoStatus::Done;
+                if item.coverage.is_empty() {
+                    item.coverage = "completed by the reaped task".to_string();
+                }
+            } else if let Some(live) = live {
+                // Dependencies admitted into the live scheduler are
+                // monotonic across model-authored full-list rewrites. A
+                // later inference may add prerequisites, but it must not
+                // silently remove prerequisites established by an earlier
+                // completed task. Explicit todo deletion scrubs dependency
+                // edges separately in remove_todo().
+                let mut dependencies = live.depends_on.clone();
+                for dependency in &item.depends_on {
+                    if !dependencies.contains(dependency) {
+                        dependencies.push(dependency.clone());
+                    }
+                }
+                item.depends_on = dependencies;
+                // Once linked, keep plan attribution scheduler-owned. A
+                // model may attach an unlinked row, but cannot move existing
+                // work between plan steps during a stale round trip.
+                if !live.step_id.is_empty() {
+                    item.step_id.clone_from(&live.step_id);
+                }
+                if live.status == TodoStatus::InProgress || live.status.is_terminal() {
+                    item.status = live.status;
+                    if item.coverage.is_empty() && !live.coverage.is_empty() {
+                        item.coverage.clone_from(&live.coverage);
+                    }
+                }
+            }
+        }
+
+        // Omission is how the todo agent reports deduplication. Honor it only
+        // for an unchanged pending row that no live todo depends on. Rows
+        // added or mutated after the inference snapshot, executor-owned rows,
+        // completed history, and dependency targets remain authoritative.
+        for live in &g.todo {
+            if items.iter().any(|item| same_todo_item(item, live)) {
+                continue;
+            }
+            let snapshot = inference_snapshot
+                .iter()
+                .find(|snapshot| same_todo_item(snapshot, live));
+            let unchanged_since_snapshot = snapshot.is_some_and(|snapshot| {
+                snapshot.name == live.name
+                    && snapshot.kind == live.kind
+                    && snapshot.status == live.status
+                    && snapshot.reason == live.reason
+                    && snapshot.depends_on == live.depends_on
+                    && snapshot.coverage == live.coverage
+                    && snapshot.id == live.id
+                    && snapshot.step_id == live.step_id
+            });
+            let is_dependency_target = g.todo.iter().any(|item| {
+                item.depends_on.iter().any(|dependency| {
+                    (!live.id.is_empty() && dependency == &live.id) || dependency == &live.name
+                })
+            });
+            if unchanged_since_snapshot
+                && live.status == TodoStatus::Pending
+                && !is_dependency_target
+                && !matches_completed(live, completed_todo_id)
+            {
+                continue;
+            }
+            let mut retained = live.clone();
+            if matches_completed(&retained, completed_todo_id) {
+                retained.status = TodoStatus::Done;
+                if retained.coverage.is_empty() {
+                    retained.coverage = "completed by the reaped task".to_string();
+                }
+            }
+            items.push(retained);
+        }
+        normalize_todo_dependencies(&mut items, &g.todo);
+        g.todo = items;
+        plan_rewrite.map(|rewrite| apply_plan_rewrite_locked(&mut g, rewrite))
+    }
+
+    /// Append todos without cloning and replacing the live list.
+    /// Stable ids win; rows without ids deduplicate by `(kind, name)`
+    /// and receive an id before becoming dispatchable.
+    pub async fn append_todo_unique(&self, candidates: Vec<TodoItem>) -> usize {
+        let mut g = self.inner.write().await;
+        let mut added = 0;
+        for mut candidate in candidates {
+            if g.todo.iter().any(|item| same_todo_item(item, &candidate)) {
+                continue;
+            }
+            if candidate.id.is_empty() {
+                let base = todo_id_base(&candidate);
+                let mut id = base.clone();
+                let mut suffix = 2;
+                while g.todo.iter().any(|item| item.id == id) {
+                    id = format!("{base}-{suffix}");
+                    suffix += 1;
+                }
+                candidate.id = id;
+            }
+            g.todo.push(candidate);
+            added += 1;
+        }
+        added
+    }
+
+    async fn defer_matching(&self, include_running: bool) -> usize {
+        let mut g = self.inner.write().await;
+        let mut kept = Vec::with_capacity(g.todo.len());
+        let mut count = 0;
+        for mut item in std::mem::take(&mut g.todo) {
+            let should_move = matches!(item.status, TodoStatus::Pending | TodoStatus::Blocked)
+                || (include_running && item.status == TodoStatus::InProgress);
+            if should_move {
+                count += 1;
+                item.status = TodoStatus::Pending;
+                if !g
+                    .deferred
+                    .iter()
+                    .any(|deferred| same_todo_item(deferred, &item))
+                {
+                    g.deferred.push(item);
+                }
+            } else {
+                kept.push(item);
+            }
+        }
+        g.todo = kept;
+        count
+    }
+
+    /// Defer work that has not been dispatched. Running rows remain
+    /// active because an executor still owns them.
+    pub async fn defer_pending(&self) -> usize {
+        self.defer_matching(false).await
+    }
+
+    /// Defer all non-terminal work after every executor has been
+    /// cancelled and joined (or aborted after its grace period).
+    pub async fn defer_all_after_stop(&self) -> usize {
+        self.defer_matching(true).await
+    }
+
+    /// Atomically restore deferred work to active scheduling.
+    /// Returns `(deferred_rows_consumed, active_rows_added)`.
+    pub async fn restore_deferred(&self) -> (usize, usize) {
+        let mut g = self.inner.write().await;
+        let deferred = std::mem::take(&mut g.deferred);
+        let consumed = deferred.len();
+        let mut added = 0;
+        for mut item in deferred {
+            item.status = TodoStatus::Pending;
+            if g.todo.iter().any(|live| same_todo_item(live, &item)) {
+                continue;
+            }
+            g.todo.push(item);
+            added += 1;
+        }
+        (consumed, added)
+    }
+
+    pub async fn deferred_snapshot(&self) -> Vec<TodoItem> {
+        self.inner.read().await.deferred.clone()
+    }
+
+    pub async fn clear_session_work(&self) {
+        let mut g = self.inner.write().await;
+        g.todo.clear();
+        g.deferred.clear();
+        g.plan = None;
+    }
+
+    /// Remove one todo without replacing unrelated rows whose state
+    /// may have changed since an operator snapshot was rendered.
+    pub async fn remove_todo(&self, identity: &str) -> bool {
+        let mut g = self.inner.write().await;
+        let removed_ids: std::collections::BTreeSet<String> = g
+            .todo
+            .iter()
+            .filter(|item| {
+                if item.id.is_empty() {
+                    item.name == identity
+                } else {
+                    item.id == identity
+                }
+            })
+            .flat_map(|item| [item.id.clone(), item.name.clone()])
+            .filter(|value| !value.is_empty())
+            .collect();
+        let before = g.todo.len();
+        g.todo.retain(|item| {
+            if item.id.is_empty() {
+                item.name != identity
+            } else {
+                item.id != identity
+            }
+        });
+        let removed = g.todo.len() != before;
+        if removed {
+            for item in &mut g.todo {
+                item.depends_on
+                    .retain(|dependency| !removed_ids.contains(dependency));
+            }
+        }
+        removed
+    }
+
+    /// Seed an initial list only when no todo state exists. The
+    /// emptiness check and installation are one operation.
+    pub async fn seed_todo_if_empty(&self, items: Vec<TodoItem>) -> bool {
+        let mut g = self.inner.write().await;
+        if !g.todo.is_empty() {
+            return false;
+        }
+        g.todo = items;
+        true
     }
 
     pub async fn todo_snapshot(&self) -> Vec<TodoItem> {
         self.inner.read().await.todo.clone()
     }
 
-    pub async fn mark_todo_status(&self, name: &str, status: TodoStatus) {
+    /// Publish successful executor completion before any continuation LLM
+    /// calls. This makes the resumable snapshot authoritative even when todo
+    /// inference is slow or the process exits during that inference.
+    pub async fn mark_todo_done(&self, identity: &str) -> bool {
         let mut g = self.inner.write().await;
-        if let Some(i) = g.todo.iter_mut().find(|i| i.name == name) {
-            i.status = status;
+        let Some(item) = g
+            .todo
+            .iter_mut()
+            .find(|item| (!item.id.is_empty() && item.id == identity) || item.name == identity)
+        else {
+            return false;
+        };
+        item.status = TodoStatus::Done;
+        if item.coverage.is_empty() {
+            item.coverage = "completed by the reaped task".to_string();
+        }
+        sync_plan_locked(&mut g);
+        true
+    }
+
+    /// Atomically select dependency-ready pending work and transfer its
+    /// ownership to the scheduler. A row changed or removed before this
+    /// lock is acquired cannot be dispatched from a stale snapshot.
+    pub async fn claim_ready_todos(&self, limit: usize) -> TodoClaims {
+        self.claim_ready_todos_with_turn_limit(limit, 0).await
+    }
+
+    /// Claim dependency-ready work without allowing newly-dispatched tasks
+    /// to exceed a finite session turn budget. The counter, active-task
+    /// count, and status transitions are inspected under the same lock so a
+    /// completion racing dispatch cannot open extra budget.
+    pub async fn claim_ready_todos_with_turn_limit(
+        &self,
+        limit: usize,
+        turns_limit: u32,
+    ) -> TodoClaims {
+        let mut g = self.inner.write().await;
+        let active = g
+            .tasks
+            .iter()
+            .filter(|entry| !matches!(entry.state, TaskState::Done | TaskState::Errored))
+            .count();
+        let turn_budget = if turns_limit == 0 {
+            usize::MAX
+        } else {
+            turns_limit
+                .saturating_sub(g.completed_run_count)
+                .saturating_sub(u32::try_from(active).unwrap_or(u32::MAX)) as usize
+        };
+        let claim_limit = limit.min(turn_budget);
+        let done: std::collections::BTreeSet<String> = g
+            .todo
+            .iter()
+            .filter(|item| item.status == TodoStatus::Done)
+            .flat_map(|item| [item.id.clone(), item.name.clone()])
+            .filter(|identity| !identity.is_empty())
+            .collect();
+        let mut result = TodoClaims::default();
+        for item in &mut g.todo {
+            if item.status != TodoStatus::Pending {
+                continue;
+            }
+            if !item
+                .depends_on
+                .iter()
+                .all(|dependency| done.contains(dependency))
+            {
+                result.blocked += 1;
+                continue;
+            }
+            if result.items.len() == claim_limit {
+                result.remaining += 1;
+                continue;
+            }
+            item.status = TodoStatus::InProgress;
+            result.items.push(item.clone());
+        }
+        result
+    }
+
+    pub async fn clear_active_todos(&self) {
+        self.inner.write().await.todo.clear();
+    }
+
+    #[cfg(test)]
+    async fn set_todo_status_for_test(&self, identity: &str, status: TodoStatus) {
+        let mut g = self.inner.write().await;
+        if let Some(item) = g.todo.iter_mut().find(|item| item.id == identity) {
+            item.status = status;
         }
     }
 
@@ -557,26 +1058,6 @@ impl TaskManager {
         n
     }
 
-    /// Remove and return all `Pending` and `Blocked` todos. Done and
-    /// Skipped items stay on the manager's list so the next
-    /// `sync_plan_from_todo` pass can still roll a plan step up to
-    /// Done when its remaining linked todos are all terminal — the
-    /// goal-met / --turns drains used to clear the todo list
-    /// wholesale via `replace_todo(Vec::new())`, which erased the
-    /// `step_id` linkage from completed work and pinned every plan
-    /// step at Pending for the rest of the session.
-    ///
-    /// Callers that want InProgress items drained too should flip
-    /// them first with `reset_in_progress_to_pending`.
-    pub async fn drain_pending_blocked(&self) -> Vec<TodoItem> {
-        let mut g = self.inner.write().await;
-        let (drain, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut g.todo)
-            .into_iter()
-            .partition(|i| matches!(i.status, TodoStatus::Pending | TodoStatus::Blocked));
-        g.todo = keep;
-        drain
-    }
-
     // -- plan ----------------------------------------------------------
 
     pub async fn plan_snapshot(&self) -> Option<crate::plan::Plan> {
@@ -592,17 +1073,16 @@ impl TaskManager {
     /// step. When the new plan is `None` (or carries no steps),
     /// strips `step_id` from every todo.
     pub async fn set_plan(&self, plan: Option<crate::plan::Plan>) {
-        let new_step_ids: std::collections::BTreeSet<String> = match plan.as_ref() {
-            Some(p) => p.steps.iter().map(|s| s.id.clone()).collect(),
-            None => std::collections::BTreeSet::new(),
-        };
         let mut g = self.inner.write().await;
-        g.plan = plan;
-        for t in g.todo.iter_mut() {
-            if !t.step_id.is_empty() && !new_step_ids.contains(&t.step_id) {
-                t.step_id = String::new();
-            }
-        }
+        install_plan_locked(&mut g, plan);
+    }
+
+    /// Apply a model-authored plan rewrite against the live plan in
+    /// one critical section, then derive execution status from the
+    /// live todo list before publishing it.
+    pub async fn apply_plan_rewrite(&self, rewrite: crate::plan::PlanRewrite) -> PlanChange {
+        let mut g = self.inner.write().await;
+        apply_plan_rewrite_locked(&mut g, rewrite)
     }
 
     /// Recompute plan step statuses from the current todo list.
@@ -610,17 +1090,40 @@ impl TaskManager {
     /// could flip a linked item's status.
     pub async fn sync_plan_from_todo(&self) {
         let mut g = self.inner.write().await;
-        let todo = g.todo.clone();
-        if let Some(plan) = g.plan.as_mut() {
-            plan.sync_from_todo(&todo);
-        }
+        sync_plan_locked(&mut g);
     }
 
-    /// Overwrite `completed_run_count`. Only used by the session
-    /// loader to restore a persisted count on resume — the normal
-    /// path is the `finish_ok` auto-increment.
-    pub async fn set_completed_run_count(&self, n: u32) {
-        self.inner.write().await.completed_run_count = n;
+    /// Synchronize the plan and take the manager-owned portion of a
+    /// resumable session snapshot under one lock. This prevents a
+    /// persisted plan from describing a different todo generation
+    /// than the rows stored beside it.
+    pub async fn sync_and_snapshot_runtime(
+        &self,
+    ) -> (Option<crate::plan::Plan>, Vec<TodoItem>, Vec<TodoItem>, u32) {
+        let mut g = self.inner.write().await;
+        sync_plan_locked(&mut g);
+        (
+            g.plan.clone(),
+            g.todo.clone(),
+            g.deferred.clone(),
+            g.completed_run_count,
+        )
+    }
+
+    /// Replace all resumable manager state during startup, before
+    /// task execution begins.
+    pub async fn load_runtime_state(
+        &self,
+        todo: Vec<TodoItem>,
+        deferred: Vec<TodoItem>,
+        plan: Option<crate::plan::Plan>,
+        completed_run_count: u32,
+    ) {
+        let mut g = self.inner.write().await;
+        g.todo = todo;
+        g.deferred = deferred;
+        g.completed_run_count = completed_run_count;
+        install_plan_locked(&mut g, plan);
     }
 
     // -- findings ------------------------------------------------------
@@ -632,6 +1135,19 @@ impl TaskManager {
     pub async fn replace_findings(&self, findings: Vec<Finding>) {
         let mut g = self.inner.write().await;
         g.findings = findings;
+    }
+
+    /// Apply a finding delta directly to the live manager mirror.
+    /// Used when no persistent FindingsStore exists; avoids a
+    /// snapshot/apply/replace race between completed tasks.
+    pub async fn apply_findings_delta(
+        &self,
+        delta: &[Finding],
+        task: Option<&str>,
+        task_analysis: Option<&str>,
+    ) -> crate::findings::DeltaCounts {
+        let mut g = self.inner.write().await;
+        crate::findings::apply_delta_to_list(&mut g.findings, delta, task, task_analysis)
     }
 
     /// Lock the findings extract lock for the duration of the passed
@@ -805,7 +1321,442 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_pending_blocked_keeps_terminal_items() {
+    async fn inferred_todo_cannot_redispatch_work_started_after_snapshot() {
+        let mgr = TaskManager::new();
+        let mut live = TodoItem::new("trace mmap", "review");
+        live.id = "review-mmap".into();
+        live.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![live]).await;
+
+        let mut stale = TodoItem::new("trace mmap", "review");
+        stale.id = "review-mmap".into();
+        stale.status = TodoStatus::Pending;
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![stale],
+            completed_todo_id: None,
+            inference_snapshot: vec![],
+            plan_rewrite: None,
+        })
+        .await;
+
+        assert_eq!(mgr.todo_snapshot().await[0].status, TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_cannot_reopen_completed_sibling() {
+        let mgr = TaskManager::new();
+        let mut live = TodoItem::new("trace read", "review");
+        live.id = "review-read".into();
+        live.status = TodoStatus::Done;
+        live.coverage = "verified read path".into();
+        mgr.replace_todo(vec![live]).await;
+
+        let mut stale = TodoItem::new("trace read", "review");
+        stale.id = "review-read".into();
+        stale.status = TodoStatus::InProgress;
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![stale],
+            completed_todo_id: None,
+            inference_snapshot: vec![],
+            plan_rewrite: None,
+        })
+        .await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        let item = &snapshot[0];
+        assert_eq!(item.status, TodoStatus::Done);
+        assert_eq!(item.coverage, "verified read path");
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_cannot_remove_live_dependencies_or_step_link() {
+        let mgr = TaskManager::new();
+        let mut live = TodoItem::new("cross-check", "review");
+        live.id = "cross-check".into();
+        live.step_id = "final-review".into();
+        live.depends_on = vec!["broad-pass".into(), "new-followup".into()];
+        let prerequisites: Vec<TodoItem> = ["broad-pass", "new-followup", "another-followup"]
+            .into_iter()
+            .map(|id| {
+                let mut item = TodoItem::new(id, "source");
+                item.id = id.into();
+                item
+            })
+            .collect();
+        let mut inference_snapshot = vec![live.clone()];
+        inference_snapshot.extend(prerequisites.clone());
+        mgr.replace_todo(inference_snapshot.clone()).await;
+
+        let mut proposed = TodoItem::new("cross-check", "review");
+        proposed.id = "cross-check".into();
+        proposed.step_id = "old-step".into();
+        proposed.depends_on = vec!["broad-pass".into(), "another-followup".into()];
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: std::iter::once(proposed).chain(prerequisites).collect(),
+            completed_todo_id: None,
+            inference_snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        let item = snapshot
+            .iter()
+            .find(|item| item.id == "cross-check")
+            .unwrap();
+        assert_eq!(item.step_id, "final-review");
+        assert_eq!(
+            item.depends_on,
+            vec!["broad-pass", "new-followup", "another-followup"]
+        );
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_drops_missing_self_and_cyclic_dependencies() {
+        let mgr = TaskManager::new();
+        let mut first = TodoItem::new("first", "review");
+        first.id = "first".into();
+        first.depends_on = vec!["second".into(), "missing".into(), "first".into()];
+        let mut second = TodoItem::new("second", "review");
+        second.id = "second".into();
+        second.depends_on = vec!["first".into()];
+
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![first, second],
+            completed_todo_id: None,
+            inference_snapshot: Vec::new(),
+            plan_rewrite: None,
+        })
+        .await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        assert_eq!(snapshot[0].depends_on, vec!["second"]);
+        assert!(snapshot[1].depends_on.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proposed_reverse_edge_cannot_displace_live_dependency() {
+        let mgr = TaskManager::new();
+        let mut first = TodoItem::new("first", "review");
+        first.id = "first".into();
+        first.depends_on = vec!["second".into()];
+        let mut second = TodoItem::new("second", "review");
+        second.id = "second".into();
+        let inference_snapshot = vec![first.clone(), second.clone()];
+        mgr.replace_todo(inference_snapshot.clone()).await;
+
+        second.depends_on = vec!["first".into()];
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![second, first],
+            completed_todo_id: None,
+            inference_snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        let first = snapshot.iter().find(|item| item.id == "first").unwrap();
+        let second = snapshot.iter().find(|item| item.id == "second").unwrap();
+        assert_eq!(first.depends_on, vec!["second"]);
+        assert!(second.depends_on.is_empty());
+    }
+
+    #[tokio::test]
+    async fn omitted_prerequisite_and_live_edge_survive_inference() {
+        let mgr = TaskManager::new();
+        let mut prerequisite = TodoItem::new("prerequisite", "source");
+        prerequisite.id = "prerequisite".into();
+        let mut dependent = TodoItem::new("dependent", "review");
+        dependent.id = "dependent".into();
+        dependent.depends_on = vec!["prerequisite".into()];
+        let inference_snapshot = vec![prerequisite.clone(), dependent.clone()];
+        mgr.replace_todo(inference_snapshot.clone()).await;
+
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![dependent],
+            completed_todo_id: None,
+            inference_snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        assert!(snapshot.iter().any(|item| item.id == "prerequisite"));
+        let dependent = snapshot.iter().find(|item| item.id == "dependent").unwrap();
+        assert_eq!(dependent.depends_on, vec!["prerequisite"]);
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_marks_just_reaped_task_done() {
+        let mgr = TaskManager::new();
+        let mut live = TodoItem::new("trace write", "review");
+        live.id = "review-write".into();
+        live.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![live.clone()]).await;
+
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![live],
+            completed_todo_id: Some("review-write".into()),
+            inference_snapshot: vec![],
+            plan_rewrite: None,
+        })
+        .await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        let item = &snapshot[0];
+        assert_eq!(item.status, TodoStatus::Done);
+        assert_eq!(item.coverage, "completed by the reaped task");
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_preserves_pending_item_added_after_snapshot() {
+        let mgr = TaskManager::new();
+        let mut original = TodoItem::new("original", "review");
+        original.id = "original".into();
+        let inference_snapshot = vec![original.clone()];
+
+        let mut concurrent = TodoItem::new("new followup", "question");
+        concurrent.id = "new-followup".into();
+        mgr.replace_todo(vec![original.clone(), concurrent]).await;
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![original],
+            completed_todo_id: None,
+            inference_snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        assert!(snapshot.iter().any(|item| item.id == "new-followup"));
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_can_dedup_unchanged_unreferenced_pending_item() {
+        let mgr = TaskManager::new();
+        let mut removable = TodoItem::new("duplicate followup", "question");
+        removable.id = "duplicate-followup".into();
+        let inference_snapshot = vec![removable.clone()];
+        mgr.replace_todo(vec![removable]).await;
+
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: Vec::new(),
+            completed_todo_id: None,
+            inference_snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+
+        assert!(mgr.todo_snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_cannot_remove_pending_item_changed_after_snapshot() {
+        let mgr = TaskManager::new();
+        let mut snapshot_item = TodoItem::new("followup", "question");
+        snapshot_item.id = "followup".into();
+        let mut live = snapshot_item.clone();
+        live.reason = "concurrently refined reason".into();
+        mgr.replace_todo(vec![live]).await;
+
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: Vec::new(),
+            completed_todo_id: None,
+            inference_snapshot: vec![snapshot_item],
+            plan_rewrite: None,
+        })
+        .await;
+
+        assert_eq!(mgr.todo_snapshot().await[0].id, "followup");
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_cannot_resurrect_concurrently_removed_item() {
+        let mgr = TaskManager::new();
+        let mut removed = TodoItem::new("operator removed", "question");
+        removed.id = "operator-removed".into();
+        let inference_snapshot = vec![removed.clone()];
+        mgr.replace_todo(Vec::new()).await;
+
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![removed],
+            completed_todo_id: None,
+            inference_snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+
+        assert!(mgr.todo_snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn append_todo_unique_preserves_live_execution_state() {
+        let mgr = TaskManager::new();
+        let mut running = TodoItem::new("running", "review");
+        running.id = "running".into();
+        running.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![running.clone()]).await;
+
+        let duplicate = running;
+        let mut added = TodoItem::new("new followup", "question");
+        added.id = "new-followup".into();
+        assert_eq!(mgr.append_todo_unique(vec![duplicate, added]).await, 1);
+
+        let snapshot = mgr.todo_snapshot().await;
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0].status, TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn append_todo_unique_keeps_distinct_followup_kinds() {
+        let mgr = TaskManager::new();
+        let source = TodoItem::new("folio_end_read", "source");
+        let callers = TodoItem::new("folio_end_read", "callers");
+
+        assert_eq!(mgr.append_todo_unique(vec![source, callers]).await, 2);
+        let snapshot = mgr.todo_snapshot().await;
+        assert_eq!(snapshot.len(), 2);
+        assert_ne!(snapshot[0].kind, snapshot[1].kind);
+        assert_ne!(snapshot[0].id, snapshot[1].id);
+        mgr.set_todo_status_for_test(&snapshot[1].id, TodoStatus::InProgress)
+            .await;
+        let snapshot = mgr.todo_snapshot().await;
+        assert_eq!(snapshot[0].status, TodoStatus::Pending);
+        assert_eq!(snapshot[1].status, TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn remove_todo_does_not_replace_sibling_state() {
+        let mgr = TaskManager::new();
+        let removable = TodoItem::new("remove", "question");
+        let mut running = TodoItem::new("running", "review");
+        running.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![removable, running]).await;
+
+        assert!(mgr.remove_todo("remove").await);
+        let snapshot = mgr.todo_snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].status, TodoStatus::InProgress);
+    }
+
+    #[tokio::test]
+    async fn remove_todo_scrubs_dependency_edges() {
+        let mgr = TaskManager::new();
+        let mut prerequisite = TodoItem::new("prerequisite", "source");
+        prerequisite.id = "prerequisite-id".into();
+        let mut dependent = TodoItem::new("dependent", "review");
+        dependent.id = "dependent".into();
+        dependent.depends_on = vec!["prerequisite-id".into(), "other".into()];
+        mgr.replace_todo(vec![prerequisite, dependent]).await;
+
+        assert!(mgr.remove_todo("prerequisite-id").await);
+        assert_eq!(mgr.todo_snapshot().await[0].depends_on, vec!["other"]);
+    }
+
+    #[tokio::test]
+    async fn turn_limited_claim_reserves_only_remaining_runs() {
+        let mgr = TaskManager::new();
+        let todo = (0..5)
+            .map(|n| {
+                let mut item = TodoItem::new(format!("todo-{n}"), "review");
+                item.id = format!("todo-{n}");
+                item
+            })
+            .collect();
+        mgr.load_runtime_state(todo, Vec::new(), None, 8).await;
+
+        let claims = mgr.claim_ready_todos_with_turn_limit(10, 10).await;
+        assert_eq!(claims.items.len(), 2);
+        assert_eq!(claims.remaining, 3);
+    }
+
+    #[tokio::test]
+    async fn mark_todo_done_publishes_completion_without_inference() {
+        let mgr = TaskManager::new();
+        let mut item = TodoItem::new("finished", "review");
+        item.id = "finished-id".into();
+        item.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![item]).await;
+
+        assert!(mgr.mark_todo_done("finished-id").await);
+        let item = &mgr.todo_snapshot().await[0];
+        assert_eq!(item.status, TodoStatus::Done);
+        assert_eq!(item.coverage, "completed by the reaped task");
+    }
+
+    #[tokio::test]
+    async fn inferred_todo_and_plan_rewrite_publish_one_consistent_generation() {
+        use crate::plan::{Plan, PlanRewrite, PlanStep, PlanStepStatus};
+
+        let mgr = TaskManager::new();
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Audit);
+        plan.steps.push(PlanStep::new("review", "Review"));
+        mgr.set_plan(Some(plan)).await;
+        let mut live = TodoItem::new("review", "review");
+        live.id = "review-todo".into();
+        live.step_id = "review".into();
+        live.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![live.clone()]).await;
+
+        let rewrite = PlanRewrite {
+            steps: vec![PlanStep::new("review", "Review updated")],
+        };
+        let change = mgr
+            .merge_inferred_state(InferredTodoUpdate {
+                items: vec![live],
+                completed_todo_id: Some("review-todo".into()),
+                inference_snapshot: vec![],
+                plan_rewrite: Some(rewrite),
+            })
+            .await;
+
+        assert!(change.is_some());
+        let (plan, todo, _, _) = mgr.sync_and_snapshot_runtime().await;
+        assert_eq!(todo[0].status, TodoStatus::Done);
+        assert_eq!(plan.unwrap().steps[0].status, PlanStepStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn plan_rewrite_cannot_mark_pending_scheduler_work_done() {
+        use crate::plan::{Plan, PlanRewrite, PlanStep, PlanStepStatus};
+
+        let mgr = TaskManager::new();
+        let mut plan = Plan::new("p", "g", crate::TaskMode::Audit);
+        plan.steps.push(PlanStep::new("review", "Review"));
+        mgr.set_plan(Some(plan)).await;
+        let mut todo = TodoItem::new("review", "review");
+        todo.id = "review-todo".into();
+        todo.step_id = "review".into();
+        mgr.replace_todo(vec![todo]).await;
+
+        let mut rewritten = PlanStep::new("review", "Review updated");
+        rewritten.status = PlanStepStatus::Done;
+        let change = mgr
+            .apply_plan_rewrite(PlanRewrite {
+                steps: vec![rewritten],
+            })
+            .await;
+
+        assert_eq!(change.current.steps[0].status, PlanStepStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn deferred_move_and_session_snapshot_are_one_generation() {
+        let mgr = TaskManager::new();
+        let pending = TodoItem::new("pending", "review");
+        let mut done = TodoItem::new("done", "review");
+        done.status = TodoStatus::Done;
+        mgr.replace_todo(vec![pending, done]).await;
+
+        assert_eq!(mgr.defer_pending().await, 1);
+        let (_, active, deferred, _) = mgr.sync_and_snapshot_runtime().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, TodoStatus::Done);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].name, "pending");
+    }
+
+    #[tokio::test]
+    async fn defer_pending_keeps_terminal_items() {
         // Goal-met / --turns drains used to wipe the todo list via
         // replace_todo(Vec::new()), erasing Done items' step_id
         // linkage so the plan could never roll up to Done. The new
@@ -820,7 +1771,8 @@ mod tests {
         let mut d = TodoItem::new("d", "investigate");
         d.status = TodoStatus::Skipped;
         mgr.replace_todo(vec![a, b, c, d]).await;
-        let drained = mgr.drain_pending_blocked().await;
+        assert_eq!(mgr.defer_pending().await, 2);
+        let drained = mgr.deferred_snapshot().await;
         let drained_names: Vec<_> = drained.iter().map(|i| i.name.clone()).collect();
         assert_eq!(drained_names, vec!["a".to_string(), "b".to_string()]);
         let snap = mgr.todo_snapshot().await;
@@ -848,9 +1800,8 @@ mod tests {
         b.step_id = "s1".into();
         b.status = TodoStatus::Pending;
         mgr.replace_todo(vec![a, b]).await;
-        let drained = mgr.drain_pending_blocked().await;
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].name, "b");
+        assert_eq!(mgr.defer_pending().await, 1);
+        assert_eq!(mgr.deferred_snapshot().await[0].name, "b");
         mgr.sync_plan_from_todo().await;
         let out = mgr.plan_snapshot().await.unwrap();
         assert_eq!(out.steps[0].status, PlanStepStatus::Done);
@@ -873,13 +1824,6 @@ mod tests {
         mgr.sync_plan_from_todo().await;
         let out = mgr.plan_snapshot().await.unwrap();
         assert_eq!(out.steps[0].status, PlanStepStatus::Done);
-    }
-
-    #[tokio::test]
-    async fn set_completed_run_count_overrides_counter() {
-        let mgr = TaskManager::new();
-        mgr.set_completed_run_count(42).await;
-        assert_eq!(mgr.completed_run_count().await, 42);
     }
 
     #[tokio::test]
@@ -926,6 +1870,46 @@ mod tests {
         mgr.replace_todo(vec![a]).await;
         mgr.set_plan(None).await;
         assert_eq!(mgr.todo_snapshot().await[0].step_id, "");
+    }
+
+    #[tokio::test]
+    async fn claim_ready_todos_transfers_only_ready_rows_atomically() {
+        let mgr = TaskManager::new();
+        let mut done = TodoItem::new("finished", "investigate");
+        done.id = "done-id".into();
+        done.status = TodoStatus::Done;
+        let mut ready = TodoItem::new("ready", "investigate");
+        ready.id = "ready-id".into();
+        ready.depends_on.push("done-id".into());
+        let mut blocked = TodoItem::new("blocked", "investigate");
+        blocked.id = "blocked-id".into();
+        blocked.depends_on.push("missing-id".into());
+        mgr.replace_todo(vec![done, ready, blocked]).await;
+
+        let claims = mgr.claim_ready_todos(1).await;
+        assert_eq!(claims.items.len(), 1);
+        assert_eq!(claims.items[0].id, "ready-id");
+        assert_eq!(claims.blocked, 1);
+        assert_eq!(claims.remaining, 0);
+        let todo = mgr.todo_snapshot().await;
+        assert_eq!(todo[1].status, TodoStatus::InProgress);
+        assert_eq!(todo[2].status, TodoStatus::Pending);
+
+        let second = mgr.claim_ready_todos(1).await;
+        assert!(second.items.is_empty());
+        assert_eq!(second.blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_defer_deduplicates_the_deferred_ledger() {
+        let mgr = TaskManager::new();
+        let mut item = TodoItem::new("same", "investigate");
+        item.id = "stable-id".into();
+        mgr.replace_todo(vec![item.clone()]).await;
+        assert_eq!(mgr.defer_pending().await, 1);
+        assert_eq!(mgr.append_todo_unique(vec![item]).await, 1);
+        assert_eq!(mgr.defer_pending().await, 1);
+        assert_eq!(mgr.deferred_snapshot().await.len(), 1);
     }
 
     #[tokio::test]

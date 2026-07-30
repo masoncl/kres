@@ -1295,13 +1295,14 @@ impl LlmDriver {
                     .ok_or_else(|| {
                         "commit-fix durable intent missing expected_message".to_string()
                     })?;
-                let commit = run_commit_fix_recoverable(
+                let commit = run_commit_fix_recoverable_with_shutdown(
                     &self.workspace,
                     &files,
                     &message_path,
                     amend,
                     pre_head,
                     expected_message,
+                    &self.shutdown,
                 )
                 .await?;
                 let mut out = Map::new();
@@ -2925,11 +2926,12 @@ async fn current_commit_fix_result(workspace: &Path) -> Result<CommitFixResult, 
     Ok(CommitFixResult { sha, message })
 }
 
-async fn run_commit_fix(
+async fn run_commit_fix_with_shutdown(
     workspace: &Path,
     files: &str,
     message_path: &str,
     amend: bool,
+    shutdown: &kres_core::Shutdown,
 ) -> Result<CommitFixResult, String> {
     let files: Vec<&str> = files.split_whitespace().collect();
     if files.is_empty() {
@@ -2943,13 +2945,11 @@ async fn run_commit_fix(
     }
 
     let mut add = tokio::process::Command::new("git");
-    add.kill_on_drop(true);
     add.current_dir(workspace).args(["add", "--"]).args(&files);
     add.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let add_out = tokio::time::timeout(std::time::Duration::from_secs(30), add.output())
-        .await
-        .map_err(|_| "git add timed out".to_string())?
-        .map_err(|e| format!("git add spawn: {e}"))?;
+    let add_out =
+        run_cancellable_command(add, std::time::Duration::from_secs(30), shutdown, "git add")
+            .await?;
     if !add_out.status.success() {
         return Err(format!(
             "git add exited {}: {}",
@@ -2959,7 +2959,6 @@ async fn run_commit_fix(
     }
 
     let mut commit = tokio::process::Command::new("git");
-    commit.kill_on_drop(true);
     commit.current_dir(workspace);
     if amend {
         commit.args(["commit", "--amend", "-s", "-F", message_path]);
@@ -2967,10 +2966,13 @@ async fn run_commit_fix(
         commit.args(["commit", "-s", "-F", message_path]);
     }
     commit.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let commit_out = tokio::time::timeout(std::time::Duration::from_secs(60), commit.output())
-        .await
-        .map_err(|_| "git commit timed out".to_string())?
-        .map_err(|e| format!("git commit spawn: {e}"))?;
+    let commit_out = run_cancellable_command(
+        commit,
+        std::time::Duration::from_secs(60),
+        shutdown,
+        "git commit",
+    )
+    .await?;
     if !commit_out.status.success() {
         let stderr = String::from_utf8_lossy(&commit_out.stderr)
             .trim()
@@ -2986,6 +2988,101 @@ async fn run_commit_fix(
     }
 
     current_commit_fix_result(workspace).await
+}
+
+#[cfg(test)]
+async fn run_commit_fix(
+    workspace: &Path,
+    files: &str,
+    message_path: &str,
+    amend: bool,
+) -> Result<CommitFixResult, String> {
+    run_commit_fix_with_shutdown(
+        workspace,
+        files,
+        message_path,
+        amend,
+        &kres_core::Shutdown::new(),
+    )
+    .await
+}
+
+struct CancellableCommandOutput {
+    status: std::process::ExitStatus,
+    stderr: Vec<u8>,
+}
+
+async fn run_cancellable_command(
+    mut command: tokio::process::Command,
+    timeout: std::time::Duration,
+    shutdown: &kres_core::Shutdown,
+    label: &str,
+) -> Result<CancellableCommandOutput, String> {
+    use tokio::io::AsyncReadExt;
+
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("{label} spawn: {error}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("{label} stdout was not piped"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("{label} stderr was not piped"))?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let wait_result = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Err(format!("{label} cancelled")),
+        _ = &mut deadline => Err(format!("{label} timed out")),
+        result = child.wait() => result.map_err(|error| format!("{label} wait: {error}")),
+    };
+    let status = match wait_result {
+        Ok(status) => status,
+        Err(error) => {
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                // Git hooks inherit the command's pipes and may outlive the
+                // git process itself. Kill the dedicated process group so
+                // reaping git also closes every inherited pipe before index
+                // restoration begins.
+                // SAFETY: `pid` came from this live child and the child was
+                // started as leader of a new process group above. A negative
+                // pid targets only that group.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Err(error);
+        }
+    };
+    let _stdout = stdout_task
+        .await
+        .map_err(|error| format!("{label} stdout task: {error}"))?
+        .map_err(|error| format!("{label} stdout read: {error}"))?;
+    let stderr = stderr_task
+        .await
+        .map_err(|error| format!("{label} stderr task: {error}"))?
+        .map_err(|error| format!("{label} stderr read: {error}"))?;
+    Ok(CancellableCommandOutput { status, stderr })
 }
 
 async fn git_commit_parents(workspace: &Path, revision: &str) -> Result<Vec<String>, String> {
@@ -3007,13 +3104,14 @@ async fn git_commit_parents(workspace: &Path, revision: &str) -> Result<Vec<Stri
         .collect())
 }
 
-async fn run_commit_fix_recoverable(
+async fn run_commit_fix_recoverable_with_shutdown(
     workspace: &Path,
     files: &str,
     message_path: &str,
     amend: bool,
     pre_head: &str,
     expected_message: &str,
+    shutdown: &kres_core::Shutdown,
 ) -> Result<CommitFixResult, String> {
     let message_body = std::fs::read_to_string(workspace.join(message_path))
         .map_err(|error| format!("read durable commit message {message_path}: {error}"))?;
@@ -3032,14 +3130,42 @@ async fn run_commit_fix_recoverable(
         return Ok(current);
     }
 
-    let mut index_guard = GitIndexRollback::capture(workspace, pre_head).await?;
-    let result = run_commit_fix(workspace, files, message_path, amend).await;
+    let index_guard = GitIndexRollback::capture(workspace, pre_head).await?;
+    let result =
+        run_commit_fix_with_shutdown(workspace, files, message_path, amend, shutdown).await;
     if let Ok(commit) = &result {
         validate_commit_matches_intent(workspace, commit, amend, pre_head, expected_message)
             .await?;
-        index_guard.disarm();
+    } else if let Err(original) = &result {
+        if let Err(error) = index_guard.restore_if_head_unchanged().await {
+            return Err(format!(
+                "{original}; restore git index {}: {error}",
+                index_guard.path.display()
+            ));
+        }
     }
     result
+}
+
+#[cfg(test)]
+async fn run_commit_fix_recoverable(
+    workspace: &Path,
+    files: &str,
+    message_path: &str,
+    amend: bool,
+    pre_head: &str,
+    expected_message: &str,
+) -> Result<CommitFixResult, String> {
+    run_commit_fix_recoverable_with_shutdown(
+        workspace,
+        files,
+        message_path,
+        amend,
+        pre_head,
+        expected_message,
+        &kres_core::Shutdown::new(),
+    )
+    .await
 }
 
 async fn validate_commit_matches_intent(
@@ -3608,7 +3734,6 @@ struct GitIndexRollback {
     contents: Option<Vec<u8>>,
     workspace: PathBuf,
     pre_head: String,
-    armed: bool,
 }
 
 impl GitIndexRollback {
@@ -3641,12 +3766,7 @@ impl GitIndexRollback {
             contents,
             workspace: workspace.to_path_buf(),
             pre_head: pre_head.to_string(),
-            armed: true,
         })
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
     }
 
     fn restore(&self) -> std::io::Result<()> {
@@ -3659,30 +3779,16 @@ impl GitIndexRollback {
             },
         }
     }
-}
 
-impl Drop for GitIndexRollback {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
+    async fn restore_if_head_unchanged(&self) -> std::io::Result<()> {
+        if git_rev_parse_head_optional(&self.workspace)
+            .await
+            .as_deref()
+            == Some(self.pre_head.as_str())
+        {
+            self.restore()?;
         }
-        let head_unchanged = std::process::Command::new("git")
-            .current_dir(&self.workspace)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim() == self.pre_head)
-            .unwrap_or(false);
-        if head_unchanged {
-            if let Err(error) = self.restore() {
-                tracing::error!(
-                    target: "kres_agents::workflow_runner",
-                    "failed to restore git index {} from cancelled commit attempt: {error}",
-                    self.path.display()
-                );
-            }
-        }
+        Ok(())
     }
 }
 
@@ -6580,18 +6686,88 @@ mod tests {
         }
 
         let pre_head = git_rev_parse_head_optional(repo.path()).await.unwrap();
-        let rollback = GitIndexRollback::capture(repo.path(), &pre_head)
-            .await
-            .unwrap();
-        let expected = rollback.contents.clone();
-        if run_commit_fix(repo.path(), "a.c", ".kres-commit-msg.tmp", false)
-            .await
-            .is_ok()
+        let expected = std::fs::read(repo.path().join(".git/index")).ok();
+        if run_commit_fix_recoverable(
+            repo.path(),
+            "a.c",
+            ".kres-commit-msg.tmp",
+            false,
+            &pre_head,
+            "test: fail",
+        )
+        .await
+        .is_ok()
         {
             panic!("commit unexpectedly succeeded");
         }
-        drop(rollback);
         assert_eq!(std::fs::read(repo.path().join(".git/index")).ok(), expected);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_commit_reaps_git_before_restoring_index() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("preexisting.txt"), "staged\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "preexisting.txt"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        let expected_index = std::fs::read(repo.path().join(".git/index")).unwrap();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        std::fs::write(repo.path().join(".kres-commit-msg.tmp"), "test: cancel\n").unwrap();
+        let marker = repo.path().join("hook-started");
+        let hook = repo.path().join(".git/hooks/pre-commit");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nsleep 30\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pre_head = git_rev_parse_head_optional(repo.path()).await.unwrap();
+        let shutdown = kres_core::Shutdown::new();
+        let cancel = shutdown.clone();
+        let marker_for_task = marker.clone();
+        let cancellation = tokio::spawn(async move {
+            for _ in 0..100 {
+                if marker_for_task.exists() {
+                    cancel.cancel();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("pre-commit hook did not start");
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_commit_fix_recoverable_with_shutdown(
+                repo.path(),
+                "a.c",
+                ".kres-commit-msg.tmp",
+                false,
+                &pre_head,
+                "test: cancel",
+                &shutdown,
+            ),
+        )
+        .await
+        .expect("cancellation must reap git and its hook promptly");
+        cancellation.await.unwrap();
+
+        assert!(matches!(result, Err(error) if error.contains("cancelled")));
+        assert_eq!(
+            std::fs::read(repo.path().join(".git/index")).unwrap(),
+            expected_index
+        );
+        assert!(!repo.path().join(".git/index.lock").exists());
+        assert_eq!(
+            git_rev_parse_head_optional(repo.path()).await.unwrap(),
+            pre_head
+        );
     }
 
     #[tokio::test]

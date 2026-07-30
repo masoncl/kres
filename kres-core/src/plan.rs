@@ -361,7 +361,7 @@ impl Plan {
     /// down-link used by tests and hand-built plans.
     ///
     /// Rules, in order of precedence:
-    ///   - step is already terminal (`Done`/`Skipped`) → leave alone
+    ///   - step is explicitly `Skipped` → leave alone
     ///   - no linkage resolves to any todo → leave alone (planner
     ///     hasn't wired up the links yet)
     ///   - every linked todo is terminal → `Done`
@@ -369,7 +369,7 @@ impl Plan {
     ///   - otherwise → `Pending`
     pub fn sync_from_todo(&mut self, todo: &[crate::TodoItem]) {
         for step in self.steps.iter_mut() {
-            if step.status.is_terminal() {
+            if step.status == PlanStepStatus::Skipped {
                 continue;
             }
             // Collect linked todos via step_id first (todo → step);
@@ -701,6 +701,19 @@ mod tests {
         a.status = TodoStatus::InProgress;
         p.sync_from_todo(&[a]);
         assert_eq!(p.steps[0].status, PlanStepStatus::Skipped);
+    }
+
+    #[test]
+    fn sync_from_todo_reopens_done_step_for_new_followup() {
+        let mut p = Plan::new("p", "g", TaskMode::Audit);
+        let mut step = PlanStep::new("s1", "one");
+        step.status = PlanStepStatus::Done;
+        p.steps.push(step);
+        let mut followup = TodoItem::new("new evidence", "source");
+        followup.step_id = "s1".into();
+
+        p.sync_from_todo(&[followup]);
+        assert_eq!(p.steps[0].status, PlanStepStatus::Pending);
     }
 
     #[test]

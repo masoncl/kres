@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::shutdown::Shutdown;
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{
+    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+};
 
 use crate::error::AgentError;
 
@@ -42,12 +44,39 @@ pub struct JsonRepairCall<'a> {
     pub model: Model,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
     pub contract: JsonContract<'a>,
     pub rejected_response: &'a str,
     pub validation_errors: &'a [String],
     pub logger: Option<Arc<TurnLogger>>,
     pub log_kind: RepairLogKind,
     pub shutdown: Option<Shutdown>,
+}
+
+fn repair_call_config(
+    model: Model,
+    max_tokens: u32,
+    max_input_tokens: Option<u32>,
+    thinking: Option<ThinkingBudget>,
+    label: String,
+) -> CallConfig {
+    let mut cfg = CallConfig::defaults_for(model)
+        .with_max_tokens(max_tokens)
+        .with_system(REPAIR_SYSTEM.to_string())
+        .with_stream_label(label);
+    if let Some(limit) = max_input_tokens {
+        cfg = cfg.with_max_input_tokens(limit);
+    }
+    if let Some(thinking) = thinking {
+        let thinking = match thinking {
+            ThinkingBudget::ExplicitBudget(tokens) => {
+                ThinkingBudget::enabled_clamped(tokens, max_tokens)
+            }
+            other => other,
+        };
+        cfg = cfg.with_thinking(thinking);
+    }
+    cfg
 }
 
 /// Strict whole-response serde contract used by goal, todo, and other control
@@ -256,13 +285,13 @@ pub async fn repair_json_response(
     let label = format!("json-repair contract={}", call.contract.name);
     log_turn(&call.logger, call.log_kind, "user", &label, &body, None);
 
-    let mut cfg = CallConfig::defaults_for(call.model)
-        .with_max_tokens(call.max_tokens.min(16_000))
-        .with_system(REPAIR_SYSTEM.to_string())
-        .with_stream_label(label.clone());
-    if let Some(limit) = call.max_input_tokens {
-        cfg = cfg.with_max_input_tokens(limit);
-    }
+    let cfg = repair_call_config(
+        call.model,
+        call.max_tokens,
+        call.max_input_tokens,
+        call.thinking,
+        label.clone(),
+    );
     let messages = vec![Message {
         role: "user".into(),
         content: body,
@@ -363,6 +392,37 @@ mod tests {
         assert!(contract
             .parse::<Decision>(r#"{"met":false,"met":true}"#)
             .is_err());
+    }
+
+    #[test]
+    fn repair_config_preserves_adaptive_thinking_override() {
+        let cfg = repair_call_config(
+            Model::sonnet_4_6(),
+            64_000,
+            None,
+            Some(ThinkingBudget::Adaptive(kres_llm::model::Effort::Medium)),
+            "repair".into(),
+        );
+        let meta = cfg.request_meta();
+        assert_eq!(meta.max_tokens, 64_000);
+        assert_eq!(meta.thinking.as_deref(), Some("adaptive"));
+        assert_eq!(meta.effort.as_deref(), Some("medium"));
+        assert_eq!(meta.budget_tokens, None);
+    }
+
+    #[test]
+    fn repair_config_clamps_explicit_budget_to_configured_output_limit() {
+        let cfg = repair_call_config(
+            Model::sonnet_4_6(),
+            64_000,
+            None,
+            Some(ThinkingBudget::ExplicitBudget(99_000)),
+            "repair".into(),
+        );
+        let meta = cfg.request_meta();
+        assert_eq!(meta.max_tokens, 64_000);
+        assert_eq!(meta.thinking.as_deref(), Some("enabled"));
+        assert!(meta.budget_tokens.is_some_and(|tokens| tokens < 64_000));
     }
 
     #[test]

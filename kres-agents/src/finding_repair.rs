@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use kres_core::findings::Finding;
 use kres_core::log::TurnLogger;
 use kres_core::UsageTracker;
-use kres_llm::{client::Client, Model};
+use kres_llm::{client::Client, model::ThinkingBudget, Model};
 
 use crate::error::AgentError;
 use crate::json_repair::{repair_json_response, JsonContract, JsonRepairCall, RepairLogKind};
@@ -38,6 +38,7 @@ pub enum FindingRepairCancel {
 
 pub struct FindingRepairRuntime {
     pub logger: Option<Arc<TurnLogger>>,
+    pub thinking: Option<ThinkingBudget>,
     pub cancel: Option<FindingRepairCancel>,
     pub usage: Option<Arc<UsageTracker>>,
     pub role: &'static str,
@@ -59,6 +60,7 @@ pub async fn repair_invalid_findings(
 ) -> Result<FindingRepairOutcome, AgentError> {
     let FindingRepairRuntime {
         logger,
+        thinking,
         cancel,
         usage,
         role,
@@ -90,6 +92,7 @@ pub async fn repair_invalid_findings(
             model: model.clone(),
             max_tokens,
             max_input_tokens,
+            thinking,
             contract: JsonContract {
                 name: "finding-repair",
                 schema: &schema,
@@ -224,6 +227,7 @@ mod tests {
             invalid,
             FindingRepairRuntime {
                 logger: None,
+                thinking: None,
                 cancel: Some(FindingRepairCancel::Shutdown(shutdown)),
                 usage: None,
                 role: "test",

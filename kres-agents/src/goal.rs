@@ -618,6 +618,7 @@ async fn parse_or_repair_goal_json<T: for<'de> Deserialize<'de> + schemars::Json
         model: gc.model.clone(),
         max_tokens: gc.max_tokens,
         max_input_tokens: gc.max_input_tokens,
+        thinking: gc.thinking,
         contract: crate::json_repair::JsonContract {
             name: contract_name,
             schema: &schema,

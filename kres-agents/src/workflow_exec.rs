@@ -1476,15 +1476,17 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     break;
                 }
             };
-            record(
-                &mut events,
-                &observer,
-                TraceEvent::StepProduced {
-                    id: step.id.clone(),
-                    attempt,
-                    outputs: effect_outputs.clone(),
-                },
-            );
+            if matches!(step.agent.or(workflow.defaults.agent), Some(Agent::Reaper)) {
+                record(
+                    &mut events,
+                    &observer,
+                    TraceEvent::StepProduced {
+                        id: step.id.clone(),
+                        attempt,
+                        outputs: effect_outputs.clone(),
+                    },
+                );
+            }
             {
                 let settled = state.get_mut(&step.id).unwrap();
                 settled.outputs.extend(effect_outputs);
@@ -3943,6 +3945,15 @@ mod tests {
         assert_eq!(*driver.discarded.lock().unwrap(), vec![1]);
         assert_eq!(*driver.accepted.lock().unwrap(), vec![2]);
         assert_eq!(*driver.ledger_updates.lock().unwrap(), vec![2]);
+        assert_eq!(
+            trace
+                .events
+                .iter()
+                .filter(|event| matches!(event, TraceEvent::StepProduced { .. }))
+                .count(),
+            2,
+            "effect application must not emit a second StepProduced for the accepted model attempt"
+        );
     }
 
     #[tokio::test]

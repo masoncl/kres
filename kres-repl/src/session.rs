@@ -260,9 +260,6 @@ pub struct Session {
     /// `{task, analysis}` list that `/summary` and `/report`
     /// consume (§6).
     accumulated: Arc<tokio::sync::Mutex<Vec<AccumulatedEntry>>>,
-    /// Items deferred by goal-met or --turns cap; `/followup` lists
-    /// them (§6).
-    deferred: Arc<tokio::sync::Mutex<Vec<kres_core::TodoItem>>>,
     /// §22: stashed interrupted prompt. When a ctrl-c lands during a
     /// long inference, the prompt text moves here so the next
     /// `/continue` can re-submit it verbatim.
@@ -316,8 +313,8 @@ pub struct Session {
     mcp_shutdown: Arc<tokio::sync::Mutex<Vec<Arc<tokio::sync::Mutex<kres_mcp::McpClient>>>>>,
 }
 
-/// Build a [`kres_core::SessionState`] from live manager + deferred
-/// state and persist it atomically to `path`. No-op on write errors
+/// Build a [`kres_core::SessionState`] from live manager state and
+/// persist it atomically to `path`. No-op on write errors
 /// (logged at warn level) — a persist failure should never crash a
 /// running pipeline. Shared between [`Session::persist_state`] and
 /// the reaper loop (which only has clones of the needed Arcs).
@@ -331,29 +328,22 @@ pub struct Session {
 async fn persist_session_state_to(
     path: &Path,
     mgr: &Arc<TaskManager>,
-    deferred: &tokio::sync::Mutex<Vec<kres_core::TodoItem>>,
     last_prompt: Option<String>,
     last_sig: Option<&std::sync::atomic::AtomicU64>,
 ) {
     use std::hash::{Hash, Hasher};
-    // Snapshot the plan BEFORE syncing so we can diff step
-    // statuses afterwards and log every transition (pending →
-    // done etc.). Cheap clone — the plan is usually a handful of
-    // steps — and only runs inside the reaper tick.
     let plan_before = mgr.plan_snapshot().await;
-    // Keep the plan in sync with the current todo statuses before
-    // snapshotting, so the persisted plan reflects what has actually
-    // completed rather than whatever the planner last wrote.
-    mgr.sync_plan_from_todo().await;
-    let plan_after = mgr.plan_snapshot().await;
+    // Sync and snapshot all manager-owned session state as one
+    // generation so plan, todo, and the turn counter cannot disagree.
+    let (plan_after, todo, deferred, completed_run_count) = mgr.sync_and_snapshot_runtime().await;
     log_plan_status_transitions(plan_before.as_ref(), plan_after.as_ref());
     let state = kres_core::SessionState {
         version: 1,
         last_prompt,
         plan: plan_after,
-        todo: mgr.todo_snapshot().await,
-        deferred: deferred.lock().await.clone(),
-        completed_run_count: mgr.completed_run_count().await,
+        todo,
+        deferred,
+        completed_run_count,
     };
     // Serialise once; hash the bytes for the change-detect latch AND
     // (on change) hand the same bytes to save() so we don't pay the
@@ -464,7 +454,6 @@ impl Session {
                 task_prompts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
                 session_goal: Arc::new(tokio::sync::Mutex::new(None)),
                 accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                 last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                 persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -498,7 +487,6 @@ impl Session {
             task_prompts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_goal: Arc::new(tokio::sync::Mutex::new(None)),
             accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
             last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
             persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -577,7 +565,7 @@ impl Session {
 
     /// Snapshot of the deferred todos (`/followup`).
     pub async fn deferred_snapshot(&self) -> Vec<kres_core::TodoItem> {
-        self.deferred.lock().await.clone()
+        self.mgr.deferred_snapshot().await
     }
 
     /// Persist session state (plan + todo + deferred + counters) to
@@ -590,14 +578,7 @@ impl Session {
             return;
         };
         let last_prompt = self.last_prompt.lock().await.clone();
-        persist_session_state_to(
-            path,
-            &self.mgr,
-            &self.deferred,
-            last_prompt,
-            Some(&self.persist_sig),
-        )
-        .await;
+        persist_session_state_to(path, &self.mgr, last_prompt, Some(&self.persist_sig)).await;
     }
 
     /// Load a prior session from `cfg.persist_path` (or an
@@ -629,10 +610,13 @@ impl Session {
         // Seed manager state. `SessionState::load` already flipped
         // InProgress → Pending, so re-seeded items come back ready
         // for /continue or auto-continue to pick them up.
-        self.mgr.replace_todo(state.todo.clone()).await;
-        self.mgr.set_plan(state.plan.clone()).await;
         self.mgr
-            .set_completed_run_count(state.completed_run_count)
+            .load_runtime_state(
+                state.todo.clone(),
+                state.deferred.clone(),
+                state.plan.clone(),
+                state.completed_run_count,
+            )
             .await;
         // Pull deferred items back into the active todo list as
         // Pending so auto-continue can dispatch them immediately
@@ -640,27 +624,11 @@ impl Session {
         // invisible to should_auto_continue (which checks the todo
         // list only), and --one / exit_on_idle sessions exit before
         // deferred work is ever dispatched.
-        {
-            use kres_core::TodoStatus;
-            let mut def = self.deferred.lock().await;
-            *def = state.deferred.clone();
-            if !def.is_empty() {
-                let carry = def.len();
-                let mut items = self.mgr.todo_snapshot().await;
-                let existing: std::collections::BTreeSet<String> =
-                    items.iter().map(|i| i.name.clone()).collect();
-                for mut d in def.drain(..) {
-                    if existing.contains(&d.name) {
-                        continue;
-                    }
-                    d.status = TodoStatus::Pending;
-                    items.push(d);
-                }
-                self.mgr.replace_todo(items).await;
-                kres_core::async_eprintln!(
-                    "resume: pulled {carry} deferred item(s) into todo list"
-                );
-            }
+        let (carry, added) = self.mgr.restore_deferred().await;
+        if carry > 0 {
+            kres_core::async_eprintln!(
+                "resume: pulled {carry} deferred item(s), added {added} to todo list"
+            );
         }
         if let Some(p) = state.last_prompt.clone() {
             *self.last_prompt.lock().await = Some(p);
@@ -898,7 +866,6 @@ impl Session {
         let root = self.mgr.root_shutdown().clone();
         let mgr_for_ctrlc = self.mgr.clone();
         let persist_for_ctrlc = self.cfg.persist_path.clone();
-        let deferred_for_ctrlc = self.deferred.clone();
         let last_prompt_for_ctrlc = self.last_prompt.clone();
         let persist_sig_for_ctrlc = self.persist_sig.clone();
         let usage_for_ctrlc = self.usage.clone();
@@ -927,14 +894,8 @@ impl Session {
                 // pressed ctrl-c.
                 if let Some(ref p) = persist_for_ctrlc {
                     let lp = last_prompt_for_ctrlc.lock().await.clone();
-                    persist_session_state_to(
-                        p,
-                        &mgr_for_ctrlc,
-                        &deferred_for_ctrlc,
-                        lp,
-                        Some(&persist_sig_for_ctrlc),
-                    )
-                    .await;
+                    persist_session_state_to(p, &mgr_for_ctrlc, lp, Some(&persist_sig_for_ctrlc))
+                        .await;
                 }
                 root.cancel();
                 tokio::select! {
@@ -971,7 +932,6 @@ impl Session {
         let task_goals_for_reaper = self.task_goals.clone();
         let task_prompts_for_reaper = self.task_prompts.clone();
         let accumulated_for_reaper = self.accumulated.clone();
-        let deferred_for_reaper = self.deferred.clone();
         let persist_path_for_reaper = self.cfg.persist_path.clone();
         let last_prompt_for_reaper = self.last_prompt.clone();
         let persist_sig_for_reaper = self.persist_sig.clone();
@@ -1038,7 +998,6 @@ impl Session {
                         persist_session_state_to(
                             p,
                             &mgr_for_reaper,
-                            &deferred_for_reaper,
                             lp,
                             Some(&persist_sig_for_reaper),
                         )
@@ -1060,6 +1019,20 @@ impl Session {
                     // re-submit a completed prompt.
                     if matches!(r.state, TaskState::Done | TaskState::Errored) {
                         *interrupted_for_reaper.lock().await = None;
+                    }
+                    // Non-coding completion has no deferred workspace side
+                    // effects. Publish it before any continuation inference.
+                    // Coding completion is checkpointed below only after its
+                    // file/edit/git actions have run.
+                    if matches!(r.state, TaskState::Done)
+                        && !matches!(r.mode, kres_core::TaskMode::Coding)
+                    {
+                        if let Some(todo_id) = r.todo_name.as_deref() {
+                            mgr_for_reaper.mark_todo_done(todo_id).await;
+                        }
+                    }
+                    if !matches!(r.mode, kres_core::TaskMode::Coding) {
+                        persist_reaper_tick!();
                     }
                     // Coding-mode side effects: persist code_output
                     // files and apply code_edits BEFORE we build the
@@ -1118,6 +1091,15 @@ impl Session {
                             );
                             git_results.push(result);
                         }
+                        // All deterministic coding side effects have now
+                        // been attempted. Only now may the resumable state
+                        // claim that this executor completed.
+                        if matches!(r.state, TaskState::Done) {
+                            if let Some(todo_id) = r.todo_name.as_deref() {
+                                mgr_for_reaper.mark_todo_done(todo_id).await;
+                            }
+                        }
+                        persist_reaper_tick!();
                     }
 
                     // For Coding-mode tasks the slow agent is told to
@@ -1426,12 +1408,16 @@ impl Session {
                         let prose_for_details = effective_analysis.clone();
                         if let Some(ref s) = store_for_reaper {
                             let s_c = s.clone();
+                            let mgr_c = mgr_for_reaper.clone();
                             let stamp_c = stamp.clone();
                             let prose_c = prose_for_details.clone();
                             let report = mgr_for_reaper
                                 .with_findings_extract_lock(|| async move {
-                                    s_c.apply_delta(&delta, Some(&stamp_c), Some(&prose_c))
-                                        .await
+                                    let report = s_c
+                                        .apply_delta(&delta, Some(&stamp_c), Some(&prose_c))
+                                        .await?;
+                                    mgr_c.replace_findings(report.merged.clone()).await;
+                                    Ok::<_, kres_core::findings::FindingsError>(report)
                                 })
                                 .await;
                             match report {
@@ -1441,7 +1427,6 @@ impl Session {
                                     apply_updated = rep.updated;
                                     apply_invalidated = rep.invalidated;
                                     apply_reactivated = rep.reactivated;
-                                    mgr_for_reaper.replace_findings(rep.merged).await;
                                 }
                                 Err(e) => {
                                     kres_core::async_eprintln!("findings apply: {e}");
@@ -1452,19 +1437,18 @@ impl Session {
                             // apply the same rules to the in-memory
                             // list so the pipeline still benefits
                             // from deterministic dedup.
-                            let mut current = mgr_for_reaper.findings_snapshot().await;
-                            let counts = kres_core::apply_delta_to_list(
-                                &mut current,
-                                &delta,
-                                Some(&stamp),
-                                Some(&prose_for_details),
-                            );
+                            let counts = mgr_for_reaper
+                                .apply_findings_delta(
+                                    &delta,
+                                    Some(&stamp),
+                                    Some(&prose_for_details),
+                                )
+                                .await;
                             apply_changed = counts.changed;
                             apply_added = counts.added;
                             apply_updated = counts.updated;
                             apply_invalidated = counts.invalidated;
                             apply_reactivated = counts.reactivated;
-                            mgr_for_reaper.replace_findings(current).await;
                         }
                     }
                     // Promoted-findings cross-reference trailer on
@@ -1681,23 +1665,22 @@ impl Session {
                                         .filter(|t| t.status == kres_core::TodoStatus::Done)
                                         .count(),
                                 );
-                                // When the todo agent rewrote the
-                                // plan, swap it in BEFORE replacing
-                                // the todo list so the next
-                                // sync_plan_from_todo tick sees the
-                                // new plan matching the new step_ids
-                                // the same turn emitted.
-                                if let Some(rewrite) = updated.plan {
-                                    let prior = mgr_for_reaper.plan_snapshot().await;
-                                    let new_plan = rewrite.apply_to(prior.as_ref());
+                                if let Some(change) = mgr_for_reaper
+                                    .merge_inferred_state(kres_core::task::InferredTodoUpdate {
+                                        items: updated.todo,
+                                        completed_todo_id: completed_todo_id.map(str::to_string),
+                                        inference_snapshot: current,
+                                        plan_rewrite: updated.plan,
+                                    })
+                                    .await
+                                {
                                     log_plan_change(
                                         "todo agent: plan rewrite",
-                                        prior.as_ref(),
-                                        &new_plan,
+                                        change.prior.as_ref(),
+                                        &change.current,
                                     );
-                                    mgr_for_reaper.set_plan(Some(new_plan)).await;
                                 }
-                                mgr_for_reaper.replace_todo(updated.todo).await;
+                                persist_reaper_tick!();
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1820,24 +1803,16 @@ impl Session {
                                         "[goal met, review followups remain: keeping {pending_or_blocked} pending/blocked item(s) as next-turn review work]"
                                     );
                                 } else {
-                                    // Any lingering InProgress items belong
-                                    // to tasks the reaper already handled;
-                                    // flip them to Pending so they join the
-                                    // deferred drain below instead of being
-                                    // silently dropped.
-                                    mgr_for_reaper.reset_in_progress_to_pending().await;
                                     // Drain pending todos into the deferred
                                     // ledger so /followup can list them.
+                                    // InProgress rows remain active until
+                                    // their executors finish and are reaped.
                                     // Done/Skipped items stay on the todo
                                     // list so their step_id linkage survives
                                     // — the next sync_plan_from_todo tick
                                     // can then flip any fully-covered plan
                                     // step to Done.
-                                    let drained = mgr_for_reaper.drain_pending_blocked().await;
-                                    let carry = drained.len();
-                                    let mut deferred = deferred_for_reaper.lock().await;
-                                    deferred.extend(drained);
-                                    drop(deferred);
+                                    let carry = mgr_for_reaper.defer_pending().await;
                                     if carry > 0 {
                                         if follow_followups && turns_limit > 0 {
                                             // --follow + --turns N: pull the
@@ -1848,21 +1823,8 @@ impl Session {
                                             // followups_drained fires, and
                                             // the session exits with turns
                                             // still remaining.
-                                            let mut def = deferred_for_reaper.lock().await;
-                                            let mut items = mgr_for_reaper.todo_snapshot().await;
-                                            let existing: std::collections::BTreeSet<String> =
-                                                items.iter().map(|i| i.name.clone()).collect();
-                                            let mut pulled = 0usize;
-                                            for mut d in def.drain(..) {
-                                                if existing.contains(&d.name) {
-                                                    continue;
-                                                }
-                                                d.status = kres_core::TodoStatus::Pending;
-                                                items.push(d);
-                                                pulled += 1;
-                                            }
-                                            drop(def);
-                                            mgr_for_reaper.replace_todo(items).await;
+                                            let (_, pulled) =
+                                                mgr_for_reaper.restore_deferred().await;
                                             kres_core::async_eprintln!(
                                                 "[goal met, --follow: pulled {pulled} deferred item(s) back into todo list ({} turns remaining)]",
                                                 turns_limit.saturating_sub(mgr_for_reaper.completed_run_count().await)
@@ -1940,18 +1902,24 @@ impl Session {
                                             updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Pending).count(),
                                             updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Done).count(),
                                         );
-                                                if let Some(rewrite) = updated.plan {
-                                                    let prior =
-                                                        mgr_for_reaper.plan_snapshot().await;
-                                                    let new_plan = rewrite.apply_to(prior.as_ref());
+                                                if let Some(change) = mgr_for_reaper
+                                                    .merge_inferred_state(
+                                                        kres_core::task::InferredTodoUpdate {
+                                                            items: updated.todo,
+                                                            completed_todo_id: None,
+                                                            inference_snapshot: current,
+                                                            plan_rewrite: updated.plan,
+                                                        },
+                                                    )
+                                                    .await
+                                                {
                                                     log_plan_change(
                                                         "todo agent: plan rewrite (goal-not-met)",
-                                                        prior.as_ref(),
-                                                        &new_plan,
+                                                        change.prior.as_ref(),
+                                                        &change.current,
                                                     );
-                                                    mgr_for_reaper.set_plan(Some(new_plan)).await;
                                                 }
-                                                mgr_for_reaper.replace_todo(updated.todo).await;
+                                                persist_reaper_tick!();
                                             }
                                             Err(e) => {
                                                 tracing::warn!(
@@ -1988,12 +1956,7 @@ impl Session {
                         // before re-firing, instead of re-printing the
                         // banner on every subsequent Errored reap.
                         consecutive_errors = 0;
-                        mgr_for_reaper.reset_in_progress_to_pending().await;
-                        let drained = mgr_for_reaper.drain_pending_blocked().await;
-                        let carry = drained.len();
-                        let mut deferred = deferred_for_reaper.lock().await;
-                        deferred.extend(drained);
-                        drop(deferred);
+                        let carry = mgr_for_reaper.defer_pending().await;
                         if carry > 0 {
                             kres_core::async_eprintln!(
                                 "[{carry} pending item(s) moved to /followup]"
@@ -2025,11 +1988,7 @@ impl Session {
                             );
                             turns_limit_announced = true;
                         }
-                        let drained = mgr_for_reaper.drain_pending_blocked().await;
-                        let carry = drained.len();
-                        let mut deferred = deferred_for_reaper.lock().await;
-                        deferred.extend(drained);
-                        drop(deferred);
+                        let carry = mgr_for_reaper.defer_pending().await;
                         if carry > 0 {
                             kres_core::async_eprintln!(
                                 "[{carry} pending item(s) deferred — see /followup]"
@@ -2171,23 +2130,14 @@ impl Session {
                             "REPL staying open; submit another prompt, /summary, or /quit"
                         };
                         kres_core::async_eprintln!("\n=== --turns 0: {reason} — {suffix} ===");
-                        // Flip InProgress → Pending before the drain
-                        // so the deferred list is complete; an item
-                        // mid-run at goal-met time shouldn't silently
-                        // disappear.
-                        mgr_for_reaper.reset_in_progress_to_pending().await;
                         // Move any leftover pending/blocked items to
                         // /followup's deferred list. Done/Skipped
-                        // items stay so the plan step rollup can
-                        // still see them. Unlike the --turns N path
+                        // items and executor-owned InProgress rows stay
+                        // active. Unlike the --turns N path
                         // we do NOT cancel the root shutdown — the
                         // user wants to keep driving the REPL after
                         // goal met.
-                        let drained = mgr_for_reaper.drain_pending_blocked().await;
-                        let carry = drained.len();
-                        let mut deferred = deferred_for_reaper.lock().await;
-                        deferred.extend(drained);
-                        drop(deferred);
+                        let carry = mgr_for_reaper.defer_pending().await;
                         if carry > 0 {
                             kres_core::async_eprintln!(
                                 "[{carry} pending item(s) moved to /followup]"
@@ -2767,14 +2717,14 @@ impl Session {
                 if let Some(plan) = plan {
                     log_plan_change("define_plan", existing.as_ref(), &plan);
                     self.mgr.set_plan(Some(plan.clone())).await;
-                    if review_submission && self.mgr.todo_snapshot().await.is_empty() {
+                    if review_submission {
                         let todos = review_todos_from_plan(&plan);
-                        if !todos.is_empty() {
+                        let todo_count = todos.len();
+                        if todo_count > 0 && self.mgr.seed_todo_if_empty(todos).await {
                             kres_core::async_eprintln!(
                                 "review planner: seeded {} linked todo(s)",
-                                todos.len()
+                                todo_count
                             );
-                            self.mgr.replace_todo(todos).await;
                             self.interrupted_prompt.lock().await.take();
                             return;
                         }
@@ -2915,16 +2865,12 @@ impl Session {
                         // the new plan.
                         if let Some(rewrite) = summary.plan {
                             if let Some(mgr) = handle.manager() {
-                                let prior = mgr.plan_snapshot().await;
-                                // Merge rewrite's steps with the
-                                // prior plan's metadata so a
-                                // forgotten prompt / goal / mode /
-                                // created_at in the LLM reply
-                                // cannot silently clobber
-                                // identifying fields.
-                                let new_plan = rewrite.apply_to(prior.as_ref());
-                                log_plan_change("slow: plan rewrite", prior.as_ref(), &new_plan);
-                                mgr.set_plan(Some(new_plan)).await;
+                                let change = mgr.apply_plan_rewrite(rewrite).await;
+                                log_plan_change(
+                                    "slow: plan rewrite",
+                                    change.prior.as_ref(),
+                                    &change.current,
+                                );
                             }
                         }
                         // findings.json is maintained by the reaper
@@ -3032,18 +2978,12 @@ impl Session {
         // deferred list. Done/Skipped items stay on the active
         // queue so the plan step rollup in sync_plan_from_todo can
         // still see their step_id linkage. Flip InProgress to
-        // Pending first so `drain_pending_blocked` carries them
-        // with the rest. Otherwise /stop leaves the queue full and
+        // Pending together with running work. Otherwise /stop leaves the queue full and
         // the next /continue (or the reaper's goal-not-met
         // injection after the next task completes) immediately
         // redispatches what the operator just stopped. Operator
         // can get them back with /followup.
-        self.mgr.reset_in_progress_to_pending().await;
-        let drained = self.mgr.drain_pending_blocked().await;
-        let carry = drained.len();
-        let mut deferred = self.deferred.lock().await;
-        deferred.extend(drained);
-        drop(deferred);
+        let carry = self.mgr.defer_all_after_stop().await;
         kres_core::async_eprintln!(
             "/stop: requested={} stopped={} grace_expired={} (auto-continue paused; {} pending item(s) moved to /followup; /continue or a new prompt resumes)",
             out.requested, out.stopped, out.grace_expired, carry
@@ -3051,7 +2991,6 @@ impl Session {
     }
 
     async fn cmd_continue(&self) {
-        use kres_core::TodoStatus;
         // Operator opted back in — clear the /stop auto-continue latch.
         self.stop_latched
             .store(false, std::sync::atomic::Ordering::Release);
@@ -3072,56 +3011,28 @@ impl Session {
         // dispatched here. The "/continue to pursue" message we
         // print on goal-met implies this will happen; without it
         // the operator has to re-type every deferred item by hand.
-        {
-            let mut deferred = self.deferred.lock().await;
-            if !deferred.is_empty() {
-                let carry = deferred.len();
-                let mut items = self.mgr.todo_snapshot().await;
-                let existing: std::collections::BTreeSet<String> =
-                    items.iter().map(|i| i.name.clone()).collect();
-                for mut d in deferred.drain(..) {
-                    if existing.contains(&d.name) {
-                        continue;
-                    }
-                    d.status = TodoStatus::Pending;
-                    items.push(d);
-                }
-                self.mgr.replace_todo(items).await;
-                kres_core::async_eprintln!(
-                    "/continue: pulled {carry} deferred item(s) into todo list"
-                );
-            }
+        let (carry, added) = self.mgr.restore_deferred().await;
+        if carry > 0 {
+            kres_core::async_eprintln!(
+                "/continue: pulled {carry} deferred item(s), added {added} to todo list"
+            );
         }
-        // §15: cap the batch at 10 items per `/continue` to match
-        //Items beyond the cap stay pending so the
+        // §15: cap the batch at 10 items per `/continue`.
+        // Items beyond the cap stay pending so the
         // operator can re-issue /continue or let the auto-continue
         // idle loop pick them up.
         const BATCH_CAP: usize = 10;
-        let items = self.mgr.todo_snapshot().await;
-        let done = done_id_set(&items);
-        let mut dispatched = 0usize;
-        let mut blocked = 0usize;
-        let mut remaining = 0usize;
-        for item in &items {
-            if item.status != TodoStatus::Pending {
-                continue;
-            }
-            if !item.depends_on.iter().all(|d| done.contains(d)) {
-                blocked += 1;
-                continue;
-            }
-            if dispatched >= BATCH_CAP {
-                remaining += 1;
-                continue;
-            }
+        let claims = self
+            .mgr
+            .claim_ready_todos_with_turn_limit(BATCH_CAP, self.cfg.turns_limit)
+            .await;
+        let dispatched = claims.items.len();
+        for item in &claims.items {
             let prompt = if item.reason.is_empty() {
                 format!("[{}] {}", item.kind, item.name)
             } else {
                 format!("[{}] {}: {}", item.kind, item.name, item.reason)
             };
-            self.mgr
-                .mark_todo_status(&item.name, TodoStatus::InProgress)
-                .await;
             let tag = if !item.id.is_empty() {
                 item.id.clone()
             } else {
@@ -3133,42 +3044,32 @@ impl Session {
                 Some(item.step_id.clone())
             };
             self.submit_from_pipeline(prompt, Some(tag), sid).await;
-            dispatched += 1;
         }
         let mut msg = format!("/continue: dispatched {dispatched} item(s)");
-        if blocked > 0 {
-            msg.push_str(&format!(", {blocked} blocked on unfinished deps"));
+        if claims.blocked > 0 {
+            msg.push_str(&format!(", {} blocked on unfinished deps", claims.blocked));
         }
-        if remaining > 0 {
+        if claims.remaining > 0 {
             msg.push_str(&format!(
-                ", {remaining} left — /continue again to process next batch"
+                ", {} left — /continue again to process next batch",
+                claims.remaining
             ));
         }
         kres_core::async_eprintln!("{msg}");
     }
 
     async fn cmd_next(&self) {
-        use kres_core::TodoStatus;
-        let items = self.mgr.todo_snapshot().await;
-        // Pick the first item whose dependencies are all done.
-        // depends_on contains ids; resolve via done_id_set so the
-        // match works for items that came in with explicit agent
-        // ids (matches /continue and should_auto_continue).
-        let done = done_id_set(&items);
-        let next = items.iter().find(|i| {
-            i.status == TodoStatus::Pending && i.depends_on.iter().all(|d| done.contains(d))
-        });
-        let Some(item) = next else {
-            let pending = items
-                .iter()
-                .filter(|i| i.status == TodoStatus::Pending)
-                .count();
-            if pending == 0 {
+        let mut claims = self
+            .mgr
+            .claim_ready_todos_with_turn_limit(1, self.cfg.turns_limit)
+            .await;
+        let Some(item) = claims.items.pop() else {
+            if claims.blocked == 0 {
                 kres_core::async_eprintln!("/next: nothing pending");
             } else {
                 kres_core::async_eprintln!(
                     "/next: {} pending item(s) but all are blocked on unfinished deps",
-                    pending
+                    claims.blocked
                 );
             }
             return;
@@ -3178,17 +3079,12 @@ impl Session {
         } else {
             format!("[{}] {}: {}", item.kind, item.name, item.reason)
         };
-        // Mark as in-progress so a second /next doesn't re-dispatch
-        // the same item while this one is still running.
-        self.mgr
-            .mark_todo_status(&item.name, TodoStatus::InProgress)
-            .await;
-        kres_core::async_eprintln!("/next: dispatching {}", truncate(&item.name, 80));
         let tag = if !item.id.is_empty() {
             item.id.clone()
         } else {
             item.name.clone()
         };
+        kres_core::async_eprintln!("/next: dispatching {}", truncate(&item.name, 80));
         let sid = if item.step_id.is_empty() {
             None
         } else {
@@ -3482,7 +3378,7 @@ impl Session {
     /// `/followup` — list items deferred by a goal-met or --turns
     /// cap. Matches command.
     async fn cmd_followup(&self) {
-        let def = self.deferred.lock().await;
+        let def = self.mgr.deferred_snapshot().await;
         // Always emit the banner so /followup is visibly acknowledged
         // even on an empty list — operators otherwise can't tell
         // whether the command ran or the main loop was busy.
@@ -4017,11 +3913,12 @@ impl Session {
             return;
         }
         let target_name = pending[index - 1].name.clone();
-        let new_list: Vec<kres_core::TodoItem> = items
-            .into_iter()
-            .filter(|t| t.name != target_name)
-            .collect();
-        self.mgr.replace_todo(new_list).await;
+        let target_id = if pending[index - 1].id.is_empty() {
+            target_name.clone()
+        } else {
+            pending[index - 1].id.clone()
+        };
+        self.mgr.remove_todo(&target_id).await;
         kres_core::async_eprintln!("/done: removed {}", truncate(&target_name, 80));
     }
 
@@ -4047,7 +3944,7 @@ impl Session {
 
     /// `/todo --clear` — drop every todo item.
     async fn cmd_todo_clear(&self) {
-        self.mgr.replace_todo(Vec::new()).await;
+        self.mgr.clear_active_todos().await;
         kres_core::async_eprintln!("/todo: cleared");
     }
 
@@ -4133,14 +4030,13 @@ impl Session {
         // bugs.md#C2: cancel first, reset state after.
         let out = self.mgr.stop_all(self.cfg.stop_grace).await;
         self.mgr.replace_findings(vec![]).await;
-        self.mgr.replace_todo(vec![]).await;
+        self.mgr.clear_session_work().await;
         // Also wipe the accumulated-analysis ledger so the next
         // prompt starts with a clean slate. Without this, the
         // "recent context" preamble submit_prompt injects would
         // keep referencing work the operator just said to forget.
         self.accumulated.lock().await.clear();
         *self.last_analysis.lock().await = None;
-        self.deferred.lock().await.clear();
         // Drop the cached session goal too. Without this, the
         // first pipeline-driven follow-up after /clear would
         // inherit the prior topic's goal — exactly the
@@ -4562,10 +4458,7 @@ pub async fn build_agent_runner(
         client: fast_client.clone(),
         model: fast_model.clone(),
         system: fast_cfg.system.clone(),
-        max_tokens: fast_cfg
-            .max_tokens
-            .unwrap_or(fast_model.max_output_tokens)
-            .min(32_000),
+        max_tokens: fast_max_tokens,
         max_input_tokens: fast_cfg.max_input_tokens,
         thinking: fast_thinking,
         usage: usage.clone(),
@@ -4578,7 +4471,7 @@ pub async fn build_agent_runner(
             "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Turn a vague target into a staged graph: (1) exactly one initial orientation/context step with no dependencies, describing the source inventory, callers, history, types, and contract evidence the fast gather agent must obtain; for a named source-file target, explicitly require a `survey` followup for that path followed in the SAME task by targeted source/type/caller/read requests selected from the survey. A survey is an intermediate inventory, never sufficient context for slow review and never a complete orientation step by itself; (2) a bounded middle wave of 3 or 4 independent semantic path/contract groups, each depending on the orientation step; and (3) exactly one final cross-contract completeness step depending on every middle-wave step. Never partition by generic review lenses. Do not create more than 6 total steps. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
             kres_agents::GOAL_INSTRUCTIONS
         )),
-        max_tokens: slow_max_tokens.min(8_000),
+        max_tokens: slow_max_tokens,
         max_input_tokens: slow_cfg.max_input_tokens,
         thinking: slow_thinking,
         logger: logger.clone(),
@@ -4591,7 +4484,7 @@ pub async fn build_agent_runner(
             "{}\n\nREVIEW PLANNING POLICY:\nThe todo list implements a staged review plan. Preserve existing depends_on edges and stable IDs unless concrete completed evidence makes a dependency obsolete. Orientation/context work must finish before semantic path groups become runnable. Keep the middle wave bounded to 3 or 4 independent groups. Keep the final cross-contract completeness todo dependent on every surviving middle-wave group. Do not flatten all pending review work into one parallel batch. When orientation evidence changes the decomposition, revise the middle groups and final dependencies explicitly while preserving completed history.",
             kres_agents::TODO_INSTRUCTIONS
         )),
-        max_tokens: slow_max_tokens.min(32_000),
+        max_tokens: slow_max_tokens,
         max_input_tokens: slow_cfg.max_input_tokens,
         thinking: slow_thinking,
         usage: usage.clone(),
@@ -5232,12 +5125,7 @@ async fn add_followups_as_pending(
     followups: &[serde_json::Value],
     default_reason: &str,
 ) -> usize {
-    let mut items = mgr.todo_snapshot().await;
-    let mut existing: std::collections::BTreeSet<(String, String)> = items
-        .iter()
-        .map(|t| (t.kind.clone(), t.name.clone()))
-        .collect();
-    let mut added = 0usize;
+    let mut candidates = Vec::new();
     for fu in followups {
         let kind = fu
             .get("type")
@@ -5257,10 +5145,6 @@ async fn add_followups_as_pending(
         if name.trim().is_empty() {
             continue;
         }
-        let key = (kind.clone(), name.clone());
-        if !existing.insert(key) {
-            continue;
-        }
         let mut item = kres_core::TodoItem::new(name, kind);
         item.reason = if reason.is_empty() {
             default_reason.to_string()
@@ -5272,13 +5156,9 @@ async fn add_followups_as_pending(
                 item.coverage = format!("path: {path}");
             }
         }
-        items.push(item);
-        added += 1;
+        candidates.push(item);
     }
-    if added > 0 {
-        mgr.replace_todo(items).await;
-    }
-    added
+    mgr.append_todo_unique(candidates).await
 }
 
 /// Execute a git followup from the reaper.
@@ -6002,9 +5882,9 @@ mod tests {
         assert_eq!(todo[0].kind, "source");
         assert_eq!(todo[0].name, "iptunnel_xmit_stats");
 
-        let drained = mgr.drain_pending_blocked().await;
-        assert_eq!(drained.len(), 1);
+        assert_eq!(mgr.defer_pending().await, 1);
         assert_eq!(mgr.todo_snapshot().await.len(), 0);
+        assert_eq!(mgr.deferred_snapshot().await.len(), 1);
     }
 
     #[test]

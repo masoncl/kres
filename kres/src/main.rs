@@ -1377,8 +1377,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         &settings,
                     );
                     let client = Arc::new(mc.client_builder()?.build()?);
-                    let ma_max_tokens =
-                        mc.max_tokens.unwrap_or(model.max_output_tokens).min(32_000);
+                    let ma_max_tokens = mc.max_tokens.unwrap_or(model.max_output_tokens);
                     // Deliberately NOT mc.system — the main-agent
                     // system prompt trains the model to reply
                     // `done` when no fetch actions are needed,
@@ -1391,12 +1390,12 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         client: client.clone(),
                         model: model.clone(),
                         system: Some(kres_agents::GOAL_INSTRUCTIONS.to_string()),
-                        max_tokens: ma_max_tokens.min(8_000),
+                        max_tokens: ma_max_tokens,
                         max_input_tokens: mc.max_input_tokens,
                         thinking: mc
                             .thinking
                             .as_ref()
-                            .map(|thinking| thinking.to_budget(ma_max_tokens.min(8_000))),
+                            .map(|thinking| thinking.to_budget(ma_max_tokens)),
                         logger: logger.clone(),
                         usage: usage.clone(),
                     }));
@@ -1521,10 +1520,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         &settings,
                     );
                     let client = Arc::new(tc_cfg.client_builder()?.build()?);
-                    let max_tokens = tc_cfg
-                        .max_tokens
-                        .unwrap_or(32_000)
-                        .min(model.max_output_tokens);
+                    let max_tokens = tc_cfg.max_tokens.unwrap_or(model.max_output_tokens);
                     let todo_client = Arc::new(kres_agents::TodoClient {
                         client,
                         model: model.clone(),
@@ -2098,10 +2094,11 @@ async fn run_test(args: TestArgs) -> Result<()> {
     kres_core::async_eprintln!("model: {}", model.id);
 
     let client = agent_cfg.client_builder()?.build()?;
-    // Defaults now pick the right thinking schema per model family
-    // (adaptive for opus-4-7+, explicit budget for older). Cap
-    // max_tokens to keep the smoke test small.
-    let cfg = CallConfig::defaults_for(model.clone()).with_max_tokens(16_384);
+    let max_tokens = agent_cfg.max_tokens.unwrap_or(model.max_output_tokens);
+    let mut cfg = CallConfig::defaults_for(model.clone()).with_max_tokens(max_tokens);
+    if let Some(thinking) = agent_cfg.thinking.as_ref() {
+        cfg = cfg.with_thinking(thinking.to_budget(max_tokens));
+    }
     let messages = vec![Message {
         role: "user".into(),
         content: args.prompt,

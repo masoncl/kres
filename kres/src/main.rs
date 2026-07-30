@@ -954,8 +954,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 ));
             }
         };
-        let (fast_client, fast_model, fast_max_tokens, fast_max_input) =
-            kres_repl::summary::load_fast_for_summary(&fast_cfg_path, &settings)?;
+        let summary_agent = kres_repl::summary::load_fast_for_summary(&fast_cfg_path, &settings)?;
         // `results_dir` is already cwd when --results was absent (see
         // the match at the top of run_repl), so the output lands
         // alongside the inputs either way. `--summary-markdown` flips
@@ -990,10 +989,11 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             template_path: args.template.clone(),
             markdown,
             original_prompt,
-            client: fast_client,
-            model: fast_model,
-            max_tokens: fast_max_tokens,
-            max_input_tokens: fast_max_input,
+            client: summary_agent.client,
+            model: summary_agent.model,
+            max_tokens: summary_agent.max_tokens,
+            max_input_tokens: summary_agent.max_input_tokens,
+            thinking: summary_agent.thinking,
         });
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -1393,6 +1393,10 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         system: Some(kres_agents::GOAL_INSTRUCTIONS.to_string()),
                         max_tokens: ma_max_tokens.min(8_000),
                         max_input_tokens: mc.max_input_tokens,
+                        thinking: mc
+                            .thinking
+                            .as_ref()
+                            .map(|thinking| thinking.to_budget(ma_max_tokens.min(8_000))),
                         logger: logger.clone(),
                         usage: usage.clone(),
                     }));
@@ -1517,15 +1521,20 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         &settings,
                     );
                     let client = Arc::new(tc_cfg.client_builder()?.build()?);
+                    let max_tokens = tc_cfg
+                        .max_tokens
+                        .unwrap_or(32_000)
+                        .min(model.max_output_tokens);
                     let todo_client = Arc::new(kres_agents::TodoClient {
                         client,
                         model: model.clone(),
                         system: tc_cfg.system,
-                        max_tokens: tc_cfg
-                            .max_tokens
-                            .unwrap_or(32_000)
-                            .min(model.max_output_tokens),
+                        max_tokens,
                         max_input_tokens: tc_cfg.max_input_tokens,
+                        thinking: tc_cfg
+                            .thinking
+                            .as_ref()
+                            .map(|thinking| thinking.to_budget(max_tokens)),
                         usage: usage.clone(),
                     });
                     session = session.with_todo_client(todo_client);

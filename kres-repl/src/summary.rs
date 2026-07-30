@@ -48,7 +48,9 @@ use kres_core::findings::{
 use serde_json::json;
 
 use kres_agents::{AgentConfig, AgentKind};
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{
+    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+};
 
 /// Conservative fallback when the caller didn't set max_input_tokens
 /// and we need a budget to decide staging. Claude's default 200K
@@ -97,6 +99,15 @@ pub struct SummaryInputs {
     pub model: Model,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
+}
+
+pub struct LoadedSummaryAgent {
+    pub client: Arc<Client>,
+    pub model: Model,
+    pub max_tokens: u32,
+    pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
 }
 
 /// Build the default output path for a summary given an optional
@@ -120,7 +131,7 @@ pub fn default_output_path(results_dir: Option<&Path>, filename: Option<&str>) -
 pub fn load_fast_for_summary(
     fast_cfg_path: &Path,
     settings: &crate::settings::Settings,
-) -> Result<(Arc<Client>, Model, u32, Option<u32>)> {
+) -> Result<LoadedSummaryAgent> {
     let fast_cfg = AgentConfig::load_for_role(fast_cfg_path, AgentKind::Fast)
         .with_context(|| format!("loading fast agent config {}", fast_cfg_path.display()))?;
     let fast_model = crate::settings::pick_model(
@@ -130,7 +141,24 @@ pub fn load_fast_for_summary(
     );
     let client = Arc::new(fast_cfg.client_builder()?.build()?);
     let max_tokens = fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens);
-    Ok((client, fast_model, max_tokens, fast_cfg.max_input_tokens))
+    let thinking = fast_cfg
+        .thinking
+        .as_ref()
+        .map(|thinking| thinking.to_budget(max_tokens));
+    Ok(LoadedSummaryAgent {
+        client,
+        model: fast_model,
+        max_tokens,
+        max_input_tokens: fast_cfg.max_input_tokens,
+        thinking,
+    })
+}
+
+fn apply_thinking_override(cfg: CallConfig, thinking: Option<ThinkingBudget>) -> CallConfig {
+    match thinking {
+        Some(thinking) => cfg.with_thinking(thinking),
+        None => cfg,
+    }
 }
 
 /// Resolve the render-pass system prompt template to a
@@ -249,6 +277,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
         .with_max_tokens(inputs.max_tokens)
         .with_stream_label("summary condense")
         .with_system(condense_system);
+    condense_cfg = apply_thinking_override(condense_cfg, inputs.thinking);
     if let Some(n) = inputs.max_input_tokens {
         condense_cfg = condense_cfg.with_max_input_tokens(n);
     }
@@ -273,6 +302,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
         .with_max_tokens(inputs.max_tokens)
         .with_stream_label("summary render")
         .with_system(template_text.clone());
+    render_cfg = apply_thinking_override(render_cfg, inputs.thinking);
     if let Some(n) = inputs.max_input_tokens {
         render_cfg = render_cfg.with_max_input_tokens(n);
     }
@@ -703,6 +733,7 @@ async fn stage_render(
         .with_max_tokens(inputs.max_tokens)
         .with_stream_label("summary combine")
         .with_system(combine_system);
+    combine_cfg = apply_thinking_override(combine_cfg, inputs.thinking);
     if let Some(n) = inputs.max_input_tokens {
         combine_cfg = combine_cfg.with_max_input_tokens(n);
     }
@@ -983,6 +1014,7 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 mod tests {
     use super::*;
     use kres_core::findings::{FindingDetail, RelevantFileSection, RelevantSymbol, TaskProse};
+    use kres_llm::model::Effort;
 
     fn f(id: &str, sev: Severity, status: Status, details: Vec<(&str, &str)>) -> Finding {
         Finding {
@@ -1042,6 +1074,27 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "live");
+    }
+
+    #[test]
+    fn summary_call_preserves_disabled_thinking_override() {
+        let cfg = apply_thinking_override(
+            CallConfig::defaults_for(Model::sonnet_4_6()).with_max_tokens(8_000),
+            Some(ThinkingBudget::Disabled),
+        );
+        assert!(cfg.request_meta().thinking.is_none());
+    }
+
+    #[test]
+    fn summary_call_preserves_adaptive_effort_override() {
+        let cfg = apply_thinking_override(
+            CallConfig::defaults_for(Model::opus_4_7()).with_max_tokens(8_000),
+            Some(ThinkingBudget::Adaptive(Effort::High)),
+        );
+        let meta = cfg.request_meta();
+        assert_eq!(meta.thinking.as_deref(), Some("adaptive"));
+        assert_eq!(meta.effort.as_deref(), Some("high"));
+        assert!(meta.budget_tokens.is_none());
     }
 
     #[test]

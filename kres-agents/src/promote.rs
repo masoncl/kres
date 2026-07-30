@@ -49,7 +49,9 @@ use tokio::sync::Notify;
 use kres_core::findings::Finding;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::UsageTracker;
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{
+    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+};
 
 use crate::{
     error::AgentError,
@@ -87,6 +89,7 @@ pub struct PromoteInputs<'a> {
     pub dedup_against: &'a [Finding],
     pub cancel: Option<Arc<Notify>>,
     pub usage: Option<Arc<UsageTracker>>,
+    pub thinking: Option<ThinkingBudget>,
 }
 
 #[derive(Debug, Default)]
@@ -136,6 +139,7 @@ pub async fn promote_prose_bugs_with_logger(
         dedup_against,
         cancel,
         usage,
+        thinking,
     } = inputs;
     // Prose nothing to audit.
     if analysis.trim().is_empty() {
@@ -162,6 +166,9 @@ pub async fn promote_prose_bugs_with_logger(
     }
     if let Some(n) = max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
+    }
+    if let Some(thinking) = thinking {
+        cfg = cfg.with_thinking(thinking);
     }
 
     // One-shot per task — tail cache would never be read.
@@ -476,6 +483,7 @@ mod tests {
                 dedup_against: &[],
                 cancel: None,
                 usage: None,
+                thinking: None,
             },
             None,
         )
@@ -516,6 +524,7 @@ mod tests {
                 dedup_against: &[],
                 cancel: Some(notify),
                 usage: None,
+                thinking: None,
             },
             None,
         )

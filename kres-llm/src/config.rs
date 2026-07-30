@@ -202,4 +202,11 @@ mod tests {
         assert_eq!(c.system.as_deref(), Some("you are a test agent"));
         assert_eq!(c.temperature, Some(0.3));
     }
+
+    #[test]
+    fn lowering_max_tokens_resizes_default_explicit_thinking() {
+        let c = CallConfig::defaults_for(Model::sonnet_4_6()).with_max_tokens(8_000);
+        assert_eq!(c.thinking.as_budget_tokens(), Some(2_000));
+        assert!(c.thinking.as_budget_tokens().unwrap() < c.max_tokens);
+    }
 }

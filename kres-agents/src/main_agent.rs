@@ -30,7 +30,9 @@ use tokio::sync::Mutex;
 
 use kres_core::cost::UsageTracker;
 use kres_core::log::{LoggedUsage, TurnLogger};
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{
+    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+};
 use kres_mcp::McpClient;
 
 use crate::{
@@ -61,6 +63,7 @@ pub struct MainAgent {
     pub system: Option<String>,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
     pub max_main_turns: u8,
     /// Per-fetch "user query" — the top-level prompt that spawned the
     /// current task. Set by the AgentRunner via a per-task clone
@@ -191,6 +194,9 @@ impl DataFetcher for MainAgent {
 
         let effective_system = self.effective_system().await;
         let mut cfg = CallConfig::defaults_for(self.model.clone()).with_max_tokens(self.max_tokens);
+        if let Some(thinking) = self.thinking {
+            cfg = cfg.with_thinking(thinking);
+        }
         if let Some(s) = effective_system {
             cfg = cfg.with_system(s);
         }
@@ -1148,6 +1154,7 @@ done"#;
             system: None,
             max_tokens: 1000,
             max_input_tokens: None,
+            thinking: None,
             max_main_turns: 1,
             user_query: "q".into(),
             task_brief: String::new(),

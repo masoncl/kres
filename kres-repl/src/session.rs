@@ -1326,6 +1326,7 @@ impl Session {
                                     dedup_against: &all_known_for_dedup,
                                     cancel: Some(stop_notify_for_reaper.clone()),
                                     usage: Some(usage_for_reaper.clone()),
+                                    thinking: promoter.thinking,
                                 },
                                 logger_for_reaper.clone(),
                             )
@@ -3589,6 +3590,7 @@ impl Session {
             model: orc.fast_model.clone(),
             max_tokens: orc.fast_max_tokens,
             max_input_tokens: orc.fast_max_input_tokens,
+            thinking: orc.fast_thinking,
         };
         let label = if markdown {
             "/summary-markdown"
@@ -4201,6 +4203,9 @@ impl Session {
         let mut cfg = kres_llm::config::CallConfig::defaults_for(orc.fast_model.clone())
             .with_max_tokens(4_000)
             .with_stream_label("compact");
+        if let Some(thinking) = orc.fast_thinking {
+            cfg = cfg.with_thinking(thinking);
+        }
         if let Some(s) = &orc.fast_system {
             cfg = cfg.with_system(s.clone());
         }
@@ -4562,6 +4567,7 @@ pub async fn build_agent_runner(
             .unwrap_or(fast_model.max_output_tokens)
             .min(32_000),
         max_input_tokens: fast_cfg.max_input_tokens,
+        thinking: fast_thinking,
         usage: usage.clone(),
     });
 
@@ -4574,6 +4580,7 @@ pub async fn build_agent_runner(
         )),
         max_tokens: slow_max_tokens.min(8_000),
         max_input_tokens: slow_cfg.max_input_tokens,
+        thinking: slow_thinking,
         logger: logger.clone(),
         usage: usage.clone(),
     });
@@ -4586,6 +4593,7 @@ pub async fn build_agent_runner(
         )),
         max_tokens: slow_max_tokens.min(32_000),
         max_input_tokens: slow_cfg.max_input_tokens,
+        thinking: slow_thinking,
         usage: usage.clone(),
     });
 

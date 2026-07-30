@@ -2285,6 +2285,7 @@ pub struct ConsolidatorClient {
     pub system: Option<String>,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
     pub usage: Option<Arc<UsageTracker>>,
 }
 

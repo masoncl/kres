@@ -26,7 +26,9 @@ use serde_json::json;
 
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::UsageTracker;
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{
+    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+};
 
 /// Dedicated system prompt for define_goal / check_goal. Swapped in
 /// for the main-agent's fetcher system prompt so the goal judge
@@ -42,6 +44,7 @@ pub struct GoalClient {
     pub system: Option<String>,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
     pub logger: Option<Arc<TurnLogger>>,
     pub usage: Option<Arc<UsageTracker>>,
 }
@@ -236,6 +239,9 @@ pub async fn define_goal(
     if let Some(n) = gc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
     }
+    if let Some(thinking) = gc.thinking {
+        cfg = cfg.with_thinking(thinking);
+    }
     // define_goal is one-shot per prompt — tail cache would never
     // be read. Skip the +25% write tax.
     let messages = vec![Message {
@@ -360,6 +366,9 @@ pub async fn check_goal(
     }
     if let Some(n) = gc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
+    }
+    if let Some(thinking) = gc.thinking {
+        cfg = cfg.with_thinking(thinking);
     }
     // check_goal is one-shot per completed task — no reader for a
     // tail cache. Skip the +25% write tax.
@@ -498,6 +507,9 @@ pub async fn define_plan(
     }
     if let Some(n) = gc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
+    }
+    if let Some(thinking) = gc.thinking {
+        cfg = cfg.with_thinking(thinking);
     }
     // define_plan is one-shot per top-level prompt — tail cache
     // would never be read. Skip the +25% write tax.

@@ -104,6 +104,9 @@ pub async fn consolidate_lenses_with_logger(
     if let Some(n) = max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
     }
+    if let Some(thinking) = consolidator.thinking {
+        cfg = cfg.with_thinking(thinking);
+    }
 
     // Consolidator is one-shot per task; tail cache would never be
     // read. Skip the +25% write tax.
@@ -526,6 +529,7 @@ mod tests {
                 system: None,
                 max_tokens: 32_000,
                 max_input_tokens: None,
+                thinking: None,
                 usage: None,
             };
             consolidate_lenses(&consolidator, "test", &[]).await

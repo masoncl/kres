@@ -32,7 +32,9 @@ use kres_core::lens::LensSpec;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::todo::{TodoItem, TodoStatus};
 use kres_core::UsageTracker;
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_llm::{
+    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+};
 
 use crate::error::AgentError;
 
@@ -46,6 +48,7 @@ pub struct TodoClient {
     pub system: Option<String>,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub thinking: Option<ThinkingBudget>,
     pub usage: Option<Arc<UsageTracker>>,
 }
 
@@ -190,6 +193,9 @@ pub async fn update_todo_via_agent_with_logger(
     }
     if let Some(n) = tc.max_input_tokens {
         cfg = cfg.with_max_input_tokens(n);
+    }
+    if let Some(thinking) = tc.thinking {
+        cfg = cfg.with_thinking(thinking);
     }
     // Each todo-update call is one-shot (one inference per reap);
     // the tail cache would never be read. Skip the +25% write tax.

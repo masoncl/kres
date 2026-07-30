@@ -37,9 +37,23 @@ or `<provider>.json:<model-id>` when disambiguation is required:
     "main": "vertex-dummy.json:claude-sonnet-4-6",
     "todo": "vertex-dummy.json:claude-sonnet-4-6",
     "classifier": "anthropic.json:claude-haiku-4-5"
+  },
+  "model_aliases": {
+    "sonnet": "vertex-dummy.json:claude-sonnet-5",
+    "opus": "anthropic.json:claude-opus-4-8"
   }
 }
 ```
+
+`model_aliases` defines operator-owned short names for model selectors. Alias
+values may be either an unqualified model id or a provider-qualified selector.
+They apply to role values under `models`, the `--*-model` flags, and `--slow`.
+Configured aliases take precedence over the legacy built-in `sonnet` and
+`opus` spellings. Aliases expand once, so an alias value must name a concrete
+selector rather than another alias.
+
+Project-local `.kres/settings.json` aliases override global aliases by name;
+unmentioned global aliases remain available.
 
 Each JSON file under `~/.kres/models/` describes one connection. Credentials,
 provider, endpoint, proxy, headers, and TLS settings are top-level and shared.
@@ -74,8 +88,9 @@ If multiple provider files contain the same model, an unqualified selector is
 an error listing the candidates. Select it as
 `foo.json:claude-opus-4-6`. Per-run `--fast-model`, `--slow-model`,
 `--main-model`, `--todo-model`, and `--classifier-model` accept the same
-selector syntax. `--slow sonnet` and `--slow opus` remain short spellings for
-their shipped model ids, but ambiguity still requires qualification.
+selector syntax. `--slow sonnet` and `--slow opus` use `model_aliases` when
+configured, then fall back to their shipped model ids. Ambiguity still
+requires qualification.
 
 Pointing fast and slow at the same model is fine: the fast/slow
 distinction is driven by per-agent system prompts and the

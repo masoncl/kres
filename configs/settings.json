@@ -5,5 +5,9 @@
     "main": "@MODEL@",
     "todo": "@MODEL@",
     "classifier": "anthropic-fast.json:claude-haiku-4-5"
+  },
+  "model_aliases": {
+    "sonnet": "@MODEL@",
+    "opus": "@SLOW_MODEL@"
   }
 }

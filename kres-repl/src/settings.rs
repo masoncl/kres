@@ -12,6 +12,10 @@
 //!     "todo": "vertex-dummy.json:claude-sonnet-4-6",
 //!     "classifier": "anthropic.json:claude-haiku-4-5"
 //!   },
+//!   "model_aliases": {
+//!     "sonnet": "vertex-dummy.json:claude-sonnet-4-6",
+//!     "opus": "anthropic.json:claude-opus-4-8"
+//!   },
 //!   "actions": {
 //!     "allowed": ["grep", "find", "read", "git", "edit", "bash"]
 //!   }
@@ -40,7 +44,7 @@
 //! explicit "deny every non-MCP action" signal and the dispatcher
 //! enforces it — see precedence list above.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -76,6 +80,8 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
 pub struct Settings {
     #[serde(default)]
     pub models: Models,
+    #[serde(default)]
+    pub model_aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub actions: ActionSettings,
 }
@@ -156,6 +162,7 @@ impl Settings {
     /// take precedence field-by-field:
     ///   - `models.*`: project's Some replaces global's Some;
     ///     project's None leaves the global value in place.
+    ///   - `model_aliases`: project entries replace global entries by name;
     ///   - `actions.allowed`: project's Some REPLACES global's Some
     ///     (allowlists don't union — the more specific config wins).
     ///
@@ -200,6 +207,7 @@ impl Settings {
         if proj.models.classifier.is_some() {
             self.models.classifier = proj.models.classifier;
         }
+        self.model_aliases.extend(proj.model_aliases);
         if proj.actions.allowed.is_some() {
             self.actions.allowed = proj.actions.allowed;
         }
@@ -293,8 +301,18 @@ impl Settings {
         out
     }
 
-    /// Model id for a role, or `None` when settings.json did not
-    /// specify one.
+    /// Expand one configured short model name, leaving concrete selectors
+    /// unchanged. Aliases intentionally expand once: values must name a model
+    /// id or a provider-qualified selector, not another alias.
+    pub fn resolve_model_selector<'a>(&'a self, selector: &'a str) -> &'a str {
+        self.model_aliases
+            .get(selector)
+            .map(String::as_str)
+            .unwrap_or(selector)
+    }
+
+    /// Model selector for a role, or `None` when settings.json did not
+    /// specify one. Configured short names are expanded before returning.
     pub fn model_for(&self, role: ModelRole) -> Option<&str> {
         let slot = match role {
             ModelRole::Fast => &self.models.fast,
@@ -303,7 +321,7 @@ impl Settings {
             ModelRole::Todo => &self.models.todo,
             ModelRole::Classifier => &self.models.classifier,
         };
-        slot.as_deref()
+        slot.as_deref().map(|id| self.resolve_model_selector(id))
     }
 
     /// Override the model id for a single role. `Some(id)` replaces
@@ -383,6 +401,11 @@ mod tests {
         let settings: Settings = serde_json::from_str(&rendered).unwrap();
         assert_eq!(settings.models.fast.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(settings.models.slow.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(
+            settings.resolve_model_selector("sonnet"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(settings.resolve_model_selector("opus"), "claude-opus-4-8");
     }
 
     #[test]
@@ -417,6 +440,16 @@ mod tests {
             "claude-sonnet-4-6"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_roles_expand_configured_aliases() {
+        let s: Settings = serde_json::from_str(
+            r#"{"models":{"slow":"deep"},"model_aliases":{"deep":"provider.json:model-v2"}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.model_for(ModelRole::Slow), Some("provider.json:model-v2"));
+        assert_eq!(s.resolve_model_selector("unaliased"), "unaliased");
     }
 
     #[test]
@@ -576,6 +609,20 @@ mod tests {
         let a: Vec<String> = s.effective_allowed_actions(&[]).iter().cloned().collect();
         assert_eq!(a, vec!["grep".to_string(), "read".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn project_model_aliases_override_by_name() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"model_aliases":{"sonnet":"sonnet-v1","opus":"opus-v1"}}"#)
+                .unwrap();
+        let project: Settings =
+            serde_json::from_str(r#"{"model_aliases":{"sonnet":"sonnet-v2"}}"#).unwrap();
+
+        global.apply_project_overrides(project);
+
+        assert_eq!(global.resolve_model_selector("sonnet"), "sonnet-v2");
+        assert_eq!(global.resolve_model_selector("opus"), "opus-v1");
     }
 
     #[test]

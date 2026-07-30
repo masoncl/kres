@@ -767,9 +767,15 @@ fn resolve_classifier_agent_for_model(
 
 fn resolve_slow_selector_in_dirs(
     selector: &str,
+    settings: &kres_repl::Settings,
     dirs: &[PathBuf],
 ) -> Result<(PathBuf, Option<String>)> {
-    let selector = slow_tag_to_model_id(selector).unwrap_or(selector);
+    let configured = settings.resolve_model_selector(selector);
+    let selector = if configured == selector {
+        slow_tag_to_model_id(selector).unwrap_or(selector)
+    } else {
+        configured
+    };
     if let Some(path) = resolve_agent_for_model_in_dirs(None, Some(selector), dirs)? {
         return Ok((path, Some(selector.to_string())));
     }
@@ -859,7 +865,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         let dirs = kres_config_dirs();
         args.slow
             .iter()
-            .map(|selector| resolve_slow_selector_in_dirs(selector, &dirs))
+            .map(|selector| resolve_slow_selector_in_dirs(selector, &settings, &dirs))
             .collect::<Result<Vec<_>>>()?
     };
     if let Some(spec) = slow_agent_specs.first() {
@@ -1809,7 +1815,8 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         config_dirs,
     )?;
     let slow_model_cfg = if let Some(selector) = args.slow.as_deref() {
-        let spec = resolve_slow_selector_in_dirs(selector, std::slice::from_ref(&kres_dir))?;
+        let spec =
+            resolve_slow_selector_in_dirs(selector, &settings, std::slice::from_ref(&kres_dir))?;
         apply_slow_model_override_from_spec(&mut settings, &spec);
         let (path, _) = spec;
         Some(path)
@@ -2539,8 +2546,12 @@ mod tests {
         let provider = models.join("provider.json");
         std::fs::write(&provider, r#"{"models":{"foo":{}}}"#).unwrap();
 
-        let (found, selected) =
-            resolve_slow_selector_in_dirs("foo", std::slice::from_ref(&base)).unwrap();
+        let (found, selected) = resolve_slow_selector_in_dirs(
+            "foo",
+            &kres_repl::Settings::default(),
+            std::slice::from_ref(&base),
+        )
+        .unwrap();
         assert_eq!(found, qualified_model_path(&provider, "foo"));
         assert_eq!(selected.as_deref(), Some("foo"));
 
@@ -2564,8 +2575,12 @@ mod tests {
         std::fs::write(&first, r#"{"models":{"foo":{}}}"#).unwrap();
         std::fs::write(&second, r#"{"models":{"foo":{}}}"#).unwrap();
 
-        let (found, model_override) =
-            resolve_slow_selector_in_dirs("second.json:foo", std::slice::from_ref(&base)).unwrap();
+        let (found, model_override) = resolve_slow_selector_in_dirs(
+            "second.json:foo",
+            &kres_repl::Settings::default(),
+            std::slice::from_ref(&base),
+        )
+        .unwrap();
         assert_eq!(found, qualified_model_path(&second, "foo"));
         assert_eq!(model_override.as_deref(), Some("second.json:foo"));
 
@@ -2587,8 +2602,12 @@ mod tests {
         std::fs::write(models.join("first.json"), r#"{"models":{"foo":{}}}"#).unwrap();
         std::fs::write(models.join("second.json"), r#"{"models":{"foo":{}}}"#).unwrap();
 
-        let err = resolve_slow_selector_in_dirs("foo", std::slice::from_ref(&base))
-            .expect_err("ambiguous selector must fail");
+        let err = resolve_slow_selector_in_dirs(
+            "foo",
+            &kres_repl::Settings::default(),
+            std::slice::from_ref(&base),
+        )
+        .expect_err("ambiguous selector must fail");
         assert!(err.to_string().contains("ambiguous"));
 
         std::fs::remove_dir_all(base).ok();
@@ -2609,10 +2628,40 @@ mod tests {
         let provider = models.join("anthropic.json");
         std::fs::write(&provider, r#"{"models":{"claude-sonnet-4-6":{}}}"#).unwrap();
 
-        let (found, model_override) =
-            resolve_slow_selector_in_dirs("sonnet", std::slice::from_ref(&base)).unwrap();
+        let (found, model_override) = resolve_slow_selector_in_dirs(
+            "sonnet",
+            &kres_repl::Settings::default(),
+            std::slice::from_ref(&base),
+        )
+        .unwrap();
         assert_eq!(found, qualified_model_path(&provider, "claude-sonnet-4-6"));
         assert_eq!(model_override.as_deref(), Some("claude-sonnet-4-6"));
+
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn configured_slow_alias_overrides_shipped_alias() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-slow-selector-configured-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let provider = models.join("provider.json");
+        std::fs::write(&provider, r#"{"models":{"claude-sonnet-5":{}}}"#).unwrap();
+        let settings: kres_repl::Settings =
+            serde_json::from_str(r#"{"model_aliases":{"sonnet":"claude-sonnet-5"}}"#).unwrap();
+
+        let (found, model_override) =
+            resolve_slow_selector_in_dirs("sonnet", &settings, std::slice::from_ref(&base))
+                .unwrap();
+        assert_eq!(found, qualified_model_path(&provider, "claude-sonnet-5"));
+        assert_eq!(model_override.as_deref(), Some("claude-sonnet-5"));
 
         std::fs::remove_dir_all(base).ok();
     }

@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use kres_core::lens::LensSpec;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::todo::{TodoItem, TodoStatus};
+use kres_core::UsageTracker;
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 use crate::error::AgentError;
@@ -45,13 +46,27 @@ pub struct TodoClient {
     pub system: Option<String>,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub usage: Option<Arc<UsageTracker>>,
+}
+
+fn record_usage(tc: &TodoClient, usage: &kres_llm::request::Usage) {
+    if let Some(tracker) = &tc.usage {
+        tracker.record(
+            "todo",
+            tc.model.id.clone(),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+        );
+    }
 }
 
 /// Parsed response shape from the todo agent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TodoUpdateResponse {
-    #[serde(default)]
-    todo: Value,
+    todo: Vec<TodoItem>,
     /// Optional rewritten plan the agent wants to substitute. Agents
     /// may emit this when the existing plan no longer matches the
     /// work actually being done (e.g. a step is complete and the
@@ -63,7 +78,6 @@ struct TodoUpdateResponse {
     /// `kres_core::PlanRewrite::apply_to` at the apply site. Parsing
     /// just the steps means a forgotten metadata field cannot
     /// silently drop the rewrite.
-    #[serde(default)]
     plan: Option<kres_core::PlanRewrite>,
 }
 
@@ -97,7 +111,7 @@ pub async fn update_todo_via_agent(
     tc: &TodoClient,
     inputs: TodoAgentInputs<'_>,
 ) -> Result<TodoUpdate, AgentError> {
-    update_todo_via_agent_with_logger(tc, inputs, None).await
+    update_todo_via_agent_with_logger(tc, inputs, None, None).await
 }
 
 /// Same as `update_todo_via_agent` but also logs the user+assistant
@@ -106,6 +120,7 @@ pub async fn update_todo_via_agent_with_logger(
     tc: &TodoClient,
     inputs: TodoAgentInputs<'_>,
     logger: Option<Arc<TurnLogger>>,
+    shutdown: Option<kres_core::Shutdown>,
 ) -> Result<TodoUpdate, AgentError> {
     let TodoAgentInputs {
         completed_query,
@@ -187,7 +202,19 @@ pub async fn update_todo_via_agent_with_logger(
     if let Some(lg) = &logger {
         lg.log_main("user", &request_text, None, None);
     }
-    let resp_result = tc.client.messages_streaming(&cfg, &messages).await;
+    let resp_result = if let Some(shutdown) = shutdown.clone() {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                return Ok(TodoUpdate {
+                    todo: fallback_dedup(&todo_list, new_followups),
+                    plan: None,
+                });
+            }
+            result = tc.client.messages_streaming(&cfg, &messages) => result,
+        }
+    } else {
+        tc.client.messages_streaming(&cfg, &messages).await
+    };
     let resp = match resp_result {
         Ok(r) => r,
         Err(e) => {
@@ -198,6 +225,7 @@ pub async fn update_todo_via_agent_with_logger(
             });
         }
     };
+    record_usage(tc, &resp.usage);
     let text = extract_text(&resp);
     if let Some(lg) = &logger {
         lg.log_main(
@@ -213,24 +241,54 @@ pub async fn update_todo_via_agent_with_logger(
         );
     }
     // --- Parse response ------------------------------------------------
-    // Try the combined (todo + plan) envelope first so the agent's
-    // optional plan rewrite survives; fall back to the todo-only
-    // parser for responses that only carry the todo array.
-    let (mut parsed, returned_plan) = match parse_todo_update_full(&text) {
-        Some((todo, plan)) => (todo, plan),
-        None => match parse_todo_response(&text) {
-            Some(v) => (v, None),
-            None => {
-                tracing::warn!(
-                    target: "kres_agents",
-                    "todo agent returned no parseable list; falling back"
-                );
-                return Ok(TodoUpdate {
-                    todo: fallback_dedup(&todo_list, new_followups),
-                    plan: None,
-                });
+    let initial = parse_todo_update_full(&text);
+    let mut parsed_envelope = initial.as_ref().ok().cloned();
+    if let Err(errors) = initial {
+        let schema = serde_json::to_string(&schemars::schema_for!(TodoUpdateResponse))
+            .expect("generated todo schema is serializable");
+        if let Ok(repaired) = crate::json_repair::repair_json_response(crate::json_repair::JsonRepairCall {
+            client: tc.client.clone(),
+            model: tc.model.clone(),
+            max_tokens: tc.max_tokens,
+            max_input_tokens: tc.max_input_tokens,
+            contract: crate::json_repair::JsonContract {
+                name: "todo-update",
+                schema: &schema,
+                instructions: "Preserve every todo id, status, dependency, reason, coverage field, and plan decision. Correct representation and field types only.",
+            },
+            rejected_response: &text,
+            validation_errors: &errors,
+            logger: logger.clone(),
+            log_kind: crate::json_repair::RepairLogKind::Main,
+            shutdown,
+        })
+        .await
+        {
+            record_usage(tc, &repaired.usage);
+            let contract = crate::json_repair::JsonObjectContract {
+                name: "todo-update",
+                fields: &["todo", "plan"],
+            };
+            if let Ok(response) = contract.accept_repair::<TodoUpdateResponse>(&repaired.text)
+            {
+                parsed_envelope = Some((response.todo, response.plan));
+            } else {
+                tracing::warn!(target: "kres_agents", "todo JSON repair failed the strict response contract");
             }
-        },
+        }
+    }
+    let (mut parsed, returned_plan) = match parsed_envelope {
+        Some((todo, plan)) => (todo, plan),
+        None => {
+            tracing::warn!(
+                target: "kres_agents",
+                "todo agent returned no parseable list; falling back"
+            );
+            return Ok(TodoUpdate {
+                todo: fallback_dedup(&todo_list, new_followups),
+                plan: None,
+            });
+        }
     };
 
     reconcile_agent_identities(&mut parsed, &todo_list, completed_todo_id);
@@ -895,7 +953,7 @@ fn followup_to_todo(fu: &Value) -> Result<TodoItem, serde_json::Error> {
 
 fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
     let mut s = String::from(
-        "Update the todo list. Return JSON only:\n\
+        "Update the todo list. Return raw, unfenced JSON only:\n\
          {\"todo\": [{\"id\":\"ID\",\"type\":\"T\",\"name\":\"N\",\"reason\":\"R\",\
          \"status\":\"pending|done\",\"coverage\":\"C\",\"depends_on\":[\"ID1\",\"ID2\"],\
          \"step_id\":\"PLAN_STEP_ID_OR_EMPTY\"}]}\n\n",
@@ -1045,56 +1103,30 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
 
 /// Extract both the `todo` array and an optional rewritten `plan`
 /// from the todo-agent response. Mirrors `parse_todo_response`'s
-/// parse-then-brace-match discipline but preserves the full
+/// strict whole-response discipline while preserving the full
 /// envelope. Returns `Some((todo, Option<Plan>))` when the response
 /// carried a parseable `todo` field; returns `None` when the
 /// envelope itself couldn't be parsed (callers fall back to the
 /// todo-only parser, which tries harder on malformed replies).
-fn parse_todo_update_full(text: &str) -> Option<(Vec<TodoItem>, Option<kres_core::PlanRewrite>)> {
-    if let Ok(r) = serde_json::from_str::<TodoUpdateResponse>(text) {
-        if let Some(items) = todo_list_from_value(r.todo) {
-            return Some((items, r.plan));
-        }
+fn parse_todo_update_full(
+    text: &str,
+) -> Result<(Vec<TodoItem>, Option<kres_core::PlanRewrite>), Vec<String>> {
+    let r = crate::json_repair::JsonObjectContract {
+        name: "todo-update",
+        fields: &["todo", "plan"],
     }
-    // The shared scanner is string-aware and clamps stray `}` so a
-    // JSON value containing `}` or a prose preamble with an
-    // unbalanced close doesn't hide the canonical envelope.
-    kres_core::brace::first_top_level_brace(text, |slice| {
-        let r: TodoUpdateResponse = serde_json::from_str(slice).ok()?;
-        let items = todo_list_from_value(r.todo)?;
-        Some((items, r.plan))
-    })
+    .parse::<TodoUpdateResponse>(text)?;
+    Ok((r.todo, r.plan))
 }
 
-/// Extract the `todo` array from the agent's response text. Tries
-/// strict JSON first, then brace-matching.
-pub fn parse_todo_response(text: &str) -> Option<Vec<TodoItem>> {
-    if let Ok(r) = serde_json::from_str::<TodoUpdateResponse>(text) {
-        if let Some(items) = todo_list_from_value(r.todo) {
-            return Some(items);
-        }
+/// Extract the `todo` array from one strict JSON response object.
+pub fn parse_todo_response(text: &str) -> Result<Vec<TodoItem>, Vec<String>> {
+    let r = crate::json_repair::JsonObjectContract {
+        name: "todo-update",
+        fields: &["todo", "plan"],
     }
-    // Same shared scanner as parse_todo_response_with_plan.
-    kres_core::brace::first_top_level_brace(text, |slice| {
-        let r: TodoUpdateResponse = serde_json::from_str(slice).ok()?;
-        todo_list_from_value(r.todo)
-    })
-}
-
-fn todo_list_from_value(v: Value) -> Option<Vec<TodoItem>> {
-    let Value::Array(items) = v else {
-        return None;
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for it in items {
-        match serde_json::from_value::<TodoItem>(it) {
-            Ok(item) => out.push(item),
-            Err(e) => {
-                tracing::debug!(target: "kres_agents", "skipping malformed todo entry: {e}");
-            }
-        }
-    }
-    Some(out)
+    .parse::<TodoUpdateResponse>(text)?;
+    Ok(r.todo)
 }
 
 fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
@@ -1307,17 +1339,43 @@ mod tests {
     }
 
     #[test]
-    fn parse_todo_response_embedded_object() {
-        let text =
-            r#"Here you go: {"todo": [{"name": "y", "type": "read", "status": "done"}]} bye."#;
-        let got = parse_todo_response(text).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].status, TodoStatus::Done);
+    fn parse_todo_response_rejects_transport_wrapper() {
+        let text = r#"{"result":{"todo":[]}}"#;
+        assert!(parse_todo_response(text).is_err());
     }
 
     #[test]
-    fn parse_todo_response_bad_json_returns_none() {
-        assert!(parse_todo_response("not a json object").is_none());
+    fn parse_todo_response_rejects_entire_array_when_one_item_is_invalid() {
+        let text = r#"{"todo":[{"id":"good","name":"good","type":"review","status":"pending"},{"id":42}]}"#;
+        assert!(parse_todo_response(text).is_err());
+    }
+
+    #[test]
+    fn parse_todo_response_rejects_embedded_object() {
+        let text =
+            r#"Here you go: {"todo": [{"name": "y", "type": "read", "status": "done"}]} bye."#;
+        assert!(parse_todo_response(text).is_err());
+    }
+
+    #[test]
+    fn parse_todo_response_rejects_multiple_candidates() {
+        let text = r#"Example: {"todo":[{"name":"example","status":"pending"}]}
+Actual: {"todo":[{"name":"actual","status":"done"}]}"#;
+        assert!(parse_todo_response(text).is_err());
+    }
+
+    #[test]
+    fn parse_todo_response_bad_json_returns_error() {
+        assert!(parse_todo_response("not a json object").is_err());
+        assert!(parse_todo_response("{}").is_err());
+        let error = parse_todo_response(r#"{"todo":[]} trailing"#).unwrap_err();
+        assert!(error.iter().any(|message| message.contains("trailing")));
+    }
+
+    #[test]
+    fn parse_todo_response_rejects_unknown_item_fields() {
+        let text = r#"{"todo":[{"name":"x","status":"pending","depends_onn":[]}]}"#;
+        assert!(parse_todo_response(text).is_err());
     }
 
     #[test]

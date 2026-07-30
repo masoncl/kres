@@ -1,7 +1,7 @@
 //! Agent roles: fast, slow, main, todo, consolidator.
 //!
 //! Phase 4 landed: agent configs, response parsing (prose-then-JSON
-//! fallback, fenced-block extraction, brace-match), followup types,
+//! strict serde response contracts, followup types,
 //! prompt builders. The actual fast/slow pipeline runner is a follow-
 //! on phase.
 //!
@@ -17,6 +17,7 @@ pub mod fetcher;
 pub mod finding_repair;
 pub mod followup;
 pub mod goal;
+pub mod json_repair;
 pub mod main_agent;
 pub mod mcp_fetcher;
 pub mod pipeline;
@@ -49,7 +50,7 @@ pub use pipeline::{
     AgentRunner, ConsolidatorClient, DataFetcher, FetchResult, NullFetcher, RunContext, TaskSummary,
 };
 pub use prompt_file::{parse as parse_prompt_file, PromptFile};
-pub use response::{parse_code_response, CodeResponse};
+pub use response::CodeResponse;
 pub use skills::{InvocationPolicy, Skill, Skills};
 pub use symbol::{
     append_context, append_symbol, ctx_identity, parse_semcode_symbol, previously_fetched_manifest,

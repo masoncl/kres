@@ -5,9 +5,5 @@
     "main": "@MODEL@",
     "todo": "@MODEL@",
     "classifier": "anthropic-fast.json:claude-haiku-4-5"
-  },
-  "_actions_doc": "Uncomment the 'actions' block below to gate the main agent's non-MCP tools. When omitted, the default allowlist is grep/find/read/git/edit (bash is off by default). An explicit list REPLACES the default. Per-session overrides: --allow bash, --allow all. A project-local <cwd>/.kres/settings.json overrides this global one.",
-  "_actions_example": {
-    "allowed": ["grep", "find", "read", "git", "edit"]
   }
 }

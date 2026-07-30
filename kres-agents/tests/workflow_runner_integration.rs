@@ -27,6 +27,15 @@ use kres_llm::client::Client;
 /// content block. Mirrors the subset of the Anthropic response
 /// shape the kres-llm client deserialises.
 fn fake_messages_response(text: &str) -> Value {
+    // Most fixtures historically included a prose lead-in before their JSON.
+    // Production now requires exactly one JSON value, so make ordinary canned
+    // responses strict while leaving single-line malformed fixtures malformed.
+    let text = if text.trim_start().starts_with('{') {
+        text
+    } else {
+        text.split_once('\n')
+            .map_or(text, |(_, structured)| structured.trim())
+    };
     json!({
         "id": "msg_test",
         "type": "message",
@@ -180,8 +189,7 @@ fn clean_review_responses(workflow: &kres_agents::workflow::Workflow) -> Vec<Val
         .map(|_| {
             fake_messages_response(
                 "Review clean.\n\
-                 {\"clean\": true, \"defects\": [], \"analysis\": \"review clean\", \
-                  \"correction_step\": \"write-patch\"}",
+                 {\"clean\": true, \"defects\": [], \"analysis\": \"review clean\"}",
             )
         })
         .collect()
@@ -197,18 +205,16 @@ fn dirty_source_review_responses(workflow: &kres_agents::workflow::Workflow) -> 
     responses.push(fake_messages_response(
         "Source defect found.\n\
          {\"clean\": false, \
-          \"defects\": [{\"where\": \"a.c\", \"what\": \"use the reviewed correction\"}], \
-          \"source_defects\": [{\"where\": \"a.c\", \"what\": \"use the reviewed correction\"}], \
+          \"defects\": [{\"lens\": \"lifetime\", \"where\": \"a.c\", \"what\": \"use the reviewed correction\"}], \
+          \"source_defects\": [{\"lens\": \"lifetime\", \"where\": \"a.c\", \"what\": \"use the reviewed correction\"}], \
           \"commit_message_defects\": [], \
-          \"analysis\": \"a.c still has the wrong value\", \
-          \"correction_step\": \"write-patch\"}",
+          \"analysis\": \"a.c still has the wrong value\"}",
     ));
     for _ in 1..review.lenses.len() {
         responses.push(fake_messages_response(
             "Review clean.\n\
              {\"clean\": true, \"defects\": [], \"source_defects\": [], \
-              \"commit_message_defects\": [], \"analysis\": \"review clean\", \
-              \"correction_step\": \"write-patch\"}",
+              \"commit_message_defects\": [], \"analysis\": \"review clean\"}",
         ));
     }
     // Consolidate LLM call (semantic dedup of typed lists; routing
@@ -221,8 +227,7 @@ fn dirty_source_review_responses(workflow: &kres_agents::workflow::Workflow) -> 
           \"commit_message_defects\": [], \
           \"unresolved_risks\": [], \
           \"outcomes\": [], \
-          \"analysis\": \"consolidated\", \
-          \"correction_step\": \"write-patch\"}",
+          \"analysis\": \"consolidated\"}",
     ));
     responses
 }
@@ -237,18 +242,16 @@ fn dirty_commit_message_review_responses(workflow: &kres_agents::workflow::Workf
     responses.push(fake_messages_response(
         "Commit message defect found.\n\
          {\"clean\": false, \
-          \"defects\": [{\"where\": \"commit message\", \"what\": \"rewrite the stale claim\"}], \
+          \"defects\": [{\"lens\": \"maintainer\", \"where\": \"commit message\", \"what\": \"rewrite the stale claim\"}], \
           \"source_defects\": [], \
-          \"commit_message_defects\": [{\"where\": \"commit message\", \"what\": \"rewrite the stale claim\"}], \
-          \"analysis\": \"the message overstates the fix\", \
-          \"correction_step\": \"write-commit-message\"}",
+          \"commit_message_defects\": [{\"lens\": \"maintainer\", \"where\": \"commit message\", \"what\": \"rewrite the stale claim\"}], \
+          \"analysis\": \"the message overstates the fix\"}",
     ));
     for _ in 1..review.lenses.len() {
         responses.push(fake_messages_response(
             "Review clean.\n\
              {\"clean\": true, \"defects\": [], \"source_defects\": [], \
-              \"commit_message_defects\": [], \"analysis\": \"review clean\", \
-              \"correction_step\": \"write-patch\"}",
+              \"commit_message_defects\": [], \"analysis\": \"review clean\"}",
         ));
     }
     responses.push(fake_messages_response(
@@ -259,8 +262,7 @@ fn dirty_commit_message_review_responses(workflow: &kres_agents::workflow::Workf
           \"commit_message_defects\": [{\"where\": \"commit message\", \"what\": \"rewrite the stale claim\", \"lens\": \"maintainer\"}], \
           \"unresolved_risks\": [], \
           \"outcomes\": [], \
-          \"analysis\": \"consolidated\", \
-          \"correction_step\": \"write-commit-message\"}",
+          \"analysis\": \"consolidated\"}",
     ));
     responses
 }
@@ -1269,8 +1271,8 @@ async fn missing_declared_output_retries_then_surfaces_as_driver_error() {
                 "expected final research-step retry error, got: {msg}"
             );
             assert!(
-                msg.contains("output extraction") || msg.contains("declared key"),
-                "expected output-extraction error, got: {msg}"
+                msg.contains("response contract") || msg.contains("declared key"),
+                "expected structured-response error, got: {msg}"
             );
         }
         other => panic!("expected Failure, got {other:?}"),
@@ -1339,7 +1341,7 @@ async fn results_dir_gets_findings_and_report() {
             "agent": "fast",
             "prompt": "scan the target",
             "outputs": {
-                "findings": {"type": "array<object>"},
+                "findings": {"type": "array<Finding>"},
                 "analysis": {"type": "string"}
             }
         }]
@@ -1351,8 +1353,8 @@ async fn results_dir_gets_findings_and_report() {
     let responses = VecDeque::from(vec![fake_messages_response(
         "I traced two bugs. Here is the structured payload:\n\
          {\"findings\": [\
-           {\"file\": \"net/foo.c:10\", \"what\": \"leak\", \"severity\": \"high\"},\
-           {\"file\": \"fs/bar.c:42\", \"what\": \"uaf\",  \"severity\": \"high\"}\
+           {\"id\":\"leak\",\"title\":\"leak\",\"severity\":\"high\",\"summary\":\"net/foo.c:10 leaks a reference\"},\
+           {\"id\":\"uaf\",\"title\":\"uaf\",\"severity\":\"high\",\"summary\":\"fs/bar.c:42 uses freed memory\"}\
          ], \"analysis\": \"two refcount bugs in foo and bar\"}",
     )]);
     let port = spawn_mock(responses).await;
@@ -1387,10 +1389,10 @@ async fn results_dir_gets_findings_and_report() {
     let findings: Value = serde_json::from_str(&findings_body).unwrap();
     let arr = findings.as_array().expect("findings.json is an array");
     assert_eq!(arr.len(), 2, "two findings persisted");
-    let what0 = arr[0].get("what").and_then(|v| v.as_str()).unwrap_or("");
+    let what0 = arr[0].get("summary").and_then(|v| v.as_str()).unwrap_or("");
     assert!(
         what0.contains("leak"),
-        "first finding kept its `what`: {what0}"
+        "first finding kept its summary: {what0}"
     );
 
     let report_body = std::fs::read_to_string(&report_path).unwrap();

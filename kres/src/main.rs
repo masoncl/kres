@@ -102,9 +102,9 @@ struct RunWorkflowArgs {
     /// left off. Pair with --resume to load.
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
-    /// Resume from <state-dir>/workflow-<id>.json instead of starting
-    /// clean. Requires --state-dir. Inputs from the snapshot override
-    /// any --input values supplied on the command line.
+    /// Resume from workflow-<id>.json instead of starting clean. Uses
+    /// --state-dir, then --results, then the workspace state directory.
+    /// Inputs from the snapshot override command-line --input values.
     #[arg(long, default_value_t = false)]
     resume: bool,
     /// Cap on total step executions before the run aborts. Mostly a
@@ -1394,6 +1394,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                         max_tokens: ma_max_tokens.min(8_000),
                         max_input_tokens: mc.max_input_tokens,
                         logger: logger.clone(),
+                        usage: usage.clone(),
                     }));
                     kres_core::async_eprintln!("goal agent: configured from {}", p.display());
                 }
@@ -1525,6 +1526,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                             .unwrap_or(32_000)
                             .min(model.max_output_tokens),
                         max_input_tokens: tc_cfg.max_input_tokens,
+                        usage: usage.clone(),
                     });
                     session = session.with_todo_client(todo_client);
                     kres_core::async_eprintln!("todo agent: ready");
@@ -2739,7 +2741,8 @@ mod tests {
             kres_repl::review_prompt_file_from_prompt(c.repl.prompt.as_deref().unwrap(), None)
                 .expect("review prompt conversion")
                 .expect("review prompt file");
-        assert_eq!(cfg.prompt_file.lenses.len(), 6);
+        assert_eq!(cfg.prompt_file.lenses.len(), 5);
+        assert_eq!(cfg.prompt_file.lenses[0].id, "memory-lifetime");
         assert!(cfg.prompt_file.lenses.iter().any(|l| l.id == "assertions"));
         assert!(cfg.prompt_file.prompt.contains("TARGET: HEAD"));
         assert!(cfg.prompt_file.prompt.contains("full Finding records"));

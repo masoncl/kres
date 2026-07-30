@@ -14,7 +14,7 @@ Read the user message carefully. It tells you:
 - the exact set of allowed output values
 - the JSON schema for your response
 
-Reply with one JSON object and nothing else:
+Reply with one raw, unfenced JSON object—no Markdown backticks—and nothing else:
 - no prose preamble, no Markdown fences, no explanation outside the
   JSON
 - exactly the keys the user message names; do not add extras

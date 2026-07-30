@@ -61,7 +61,7 @@ FIXES AND PATCHES — do NOT code from memory:
   (`timeout_secs` up to 600 if you need more). Only run commands
   you are confident are safe in the operator's workspace.
 
-Output: JSON only, no fences, no preamble.
+Output: raw, unfenced JSON only—no Markdown backticks and no preamble.
 {"analysis": "prose commentary with inline code snippets", "code_output": [<CodeFile>, ...], "code_edits": [<CodeEdit>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}], "plan": <optional rewritten Plan — see PLAN REWRITE>}
 
 PLAN REWRITE — optional top-level `plan` field:

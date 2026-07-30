@@ -6,7 +6,7 @@ The input 'lens_outputs' is a list of {lens: {type, name, id, reason},
 slow_model: str, analysis: str, findings: [Finding, ...], followups: [Followup, ...]}.
 'task_brief' names the todo item this task was started for.
 
-Return JSON only, no fences, no preamble:
+Return raw, unfenced JSON only—no Markdown backticks and no preamble:
 {"analysis": "unified prose narrative", "findings": [<Finding>, ...], "followups": [<Followup>, ...], "comparison": {"summary": "...", "per_model": [{"slow_model": "...", "quality": "...", "depth": "...", "unique_contributions": ["..."], "weaknesses": ["..."]}], "selection_notes": ["..."]}}
 
 MODEL COMPARISON:

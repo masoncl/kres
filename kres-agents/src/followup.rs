@@ -7,7 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Followup {
     /// "survey", "source", "type", "callers", "callees", "search", "file",
     /// "read", "git", "question".

@@ -8,9 +8,8 @@
 //! exhausts, etc.).
 //!
 //! The executor is workflow-driven, not LLM-driven: it does not
-//! interpolate variables into prompt strings, run post_actions, or
-//! call out to the network. Those concerns belong to the (still
-//! unwritten) production runner. What this module exists to do is
+//! interpolate variables into prompt strings or directly call out to the
+//! network. Those concerns belong to the production driver. What this module exists to do is
 //! exercise the **control-flow** semantics encoded in the workflow
 //! schema, so that authoring fix.json (or any future workflow) is
 //! testable without standing up the agent pipeline.
@@ -49,7 +48,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 
-use crate::workflow::{Aggregate, Lens, OnExhausted, OnFailAction, Step, Workflow};
+use crate::workflow::{Agent, Aggregate, Lens, OnExhausted, OnFailAction, Step, Workflow};
 
 /// Synthetic workflow step that carries review-history state across
 /// fix loops. It is not schedulable, but prompt interpolation can
@@ -74,6 +73,11 @@ pub struct StepState {
     pub attempt: u32,
     pub eval_failures: u32,
     pub outputs: Map<String, Value>,
+    /// Exact driver effect payload accepted for this attempt. Present only
+    /// while `status == EffectsPending`; persisted so resume replays the
+    /// accepted effect instead of regenerating model output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_effects: Option<Value>,
     /// Outputs from the last settled run that should survive a
     /// future skip. Kept separate from `outputs` while the step is
     /// Pending so downstream expressions cannot observe stale data
@@ -255,6 +259,7 @@ impl StepState {
 /// addressable by `workflow.id`; multiple in-flight workflows can
 /// coexist in the same dir.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowSnapshot {
     pub schema_version: u32,
     pub workflow_id: String,
@@ -266,7 +271,7 @@ pub struct WorkflowSnapshot {
 impl WorkflowSnapshot {
     /// Current snapshot schema version. Bump when the on-disk shape
     /// changes in a way that would crash old loaders.
-    pub const SCHEMA_VERSION: u32 = 1;
+    pub const SCHEMA_VERSION: u32 = 2;
 
     /// Latest persisted snapshot for the given workflow id. Returns
     /// None when the file is missing OR carries a `schema_version`
@@ -298,12 +303,21 @@ impl WorkflowSnapshot {
 
     /// Atomically write to `<dir>/workflow-<id>.json` (tmp + rename).
     pub fn save(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+
         std::fs::create_dir_all(dir)?;
         let target = dir.join(format!("workflow-{}.json", self.workflow_id));
         let tmp = dir.join(format!("workflow-{}.json.tmp", self.workflow_id));
         let body = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&tmp, body)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
         std::fs::rename(tmp, target)?;
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 }
@@ -314,6 +328,9 @@ pub enum StepStatus {
     /// Hasn't run yet, or has been reset for a re-entry.
     #[default]
     Pending,
+    /// Eval and ledger processing succeeded and the exact effect payload is
+    /// durable, but effect application has not yet been durably completed.
+    EffectsPending,
     /// `run_if` was false (or `skip_if` true).
     Skipped,
     /// Eval passed, or no eval configured and the step settled.
@@ -388,18 +405,38 @@ pub trait Driver: Sync {
         lens: Option<&Lens>,
     ) -> Result<Map<String, Value>, DriverError>;
 
-    /// Run a step's `post_actions` after its eval has passed (or
-    /// after a no-eval step has settled). Default is a no-op so
-    /// scripted tests don't have to implement it. The
-    /// [`crate::workflow_runner::LlmDriver`] override executes typed
-    /// git / make / publish-fix actions in the workspace.
-    async fn run_post_actions(
+    /// Return the exact, serializable side effects staged by `run`. The
+    /// executor persists this value before allowing the driver to apply it.
+    async fn attempt_effects(
         &self,
         _step: &Step,
+        _attempt: u32,
         _ctx: &ExecContext<'_>,
-    ) -> Result<Vec<String>, String> {
-        Ok(Vec::new())
+    ) -> Result<Value, String> {
+        Ok(Value::Null)
     }
+
+    /// Apply a previously persisted effect payload. Implementations must be
+    /// idempotent because resume may replay an effect whose first application
+    /// completed immediately before cancellation.
+    async fn apply_attempt_effects(
+        &self,
+        step: &Step,
+        attempt: u32,
+        _effects: &Value,
+        ctx: &ExecContext<'_>,
+    ) -> Result<Map<String, Value>, String> {
+        if matches!(step.agent, Some(Agent::Reaper)) {
+            self.run(step, attempt, ctx, None)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(Map::new())
+        }
+    }
+
+    /// Drop process-local side effects staged by a rejected attempt.
+    async fn discard_attempt(&self, _step: &Step, _attempt: u32) {}
 
     /// Run an N+1 consolidate call for a lensed step whose
     /// `aggregate` is `Consolidate`. `per_lens` is the list of
@@ -445,6 +482,7 @@ pub trait Driver: Sync {
     async fn lens_fan_out_consolidate(
         &self,
         _step: &Step,
+        _attempt: u32,
         _ctx: &ExecContext<'_>,
     ) -> Result<LensFanOutConsolidate, String> {
         Ok(LensFanOutConsolidate::Unsupported)
@@ -463,6 +501,34 @@ pub trait Driver: Sync {
     ) -> Result<Option<Map<String, Value>>, String> {
         Ok(None)
     }
+}
+
+async fn update_accepted_review_ledger<D: Driver + ?Sized>(
+    driver: &D,
+    step: &Step,
+    attempt: u32,
+    inputs: &Map<String, Value>,
+    state: &mut HashMap<String, StepState>,
+) -> Result<(), String> {
+    let ledger_ctx = ExecContext {
+        workflow_inputs: inputs,
+        steps: state,
+    };
+    match driver
+        .update_review_ledger(step, attempt, &ledger_ctx)
+        .await
+    {
+        Ok(Some(outputs)) => {
+            let ledger = state
+                .entry(REVIEW_LEDGER_STEP_ID.to_string())
+                .or_insert_with(empty_review_ledger_state);
+            ledger.status = StepStatus::Done;
+            ledger.outputs = outputs;
+        }
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
 }
 
 /// Read-only view exposed to `Driver::run`. Has the workflow inputs
@@ -558,10 +624,6 @@ pub enum TraceEvent {
         on_exhausted: String,
         attempts: u32,
     },
-    PostAction {
-        id: String,
-        log: Vec<String>,
-    },
     /// A lensed step is about to fan out N concurrent driver calls.
     FanOut {
         id: String,
@@ -656,12 +718,6 @@ pub fn format_event(ev: &TraceEvent) -> String {
                 out,
                 "! exhausted {id} after {attempts} attempts → {on_exhausted}"
             );
-        }
-        TraceEvent::PostAction { id, log } => {
-            let _ = writeln!(out, "➤ post   {id}");
-            for line in log {
-                let _ = writeln!(out, "    {line}");
-            }
         }
         TraceEvent::FanOut {
             id,
@@ -765,12 +821,6 @@ impl Trace {
                     out.push_str(&format!(
                         "! exhausted {id} after {attempts} attempts → {on_exhausted}\n"
                     ));
-                }
-                TraceEvent::PostAction { id, log } => {
-                    out.push_str(&format!("➤ post   {id}\n"));
-                    for line in log {
-                        out.push_str(&format!("    {line}\n"));
-                    }
                 }
                 TraceEvent::FanOut {
                     id,
@@ -1207,6 +1257,27 @@ pub async fn run_with_persistence<D: Driver + ?Sized + Send>(
     .await
 }
 
+/// Persist workflow state while also publishing live trace events.
+pub async fn run_with_persistence_and_observer<D: Driver + ?Sized + Send>(
+    workflow: &Workflow,
+    driver: &mut D,
+    inputs: Map<String, Value>,
+    iteration_cap: usize,
+    snapshot_dir: std::path::PathBuf,
+    observer: EventObserver,
+) -> Trace {
+    run_internal(
+        workflow,
+        driver,
+        inputs,
+        iteration_cap,
+        None,
+        Some(snapshot_dir),
+        Some(observer),
+    )
+    .await
+}
+
 fn empty_review_ledger_state() -> StepState {
     let mut outputs = Map::new();
     outputs.insert("items".into(), Value::Array(Vec::new()));
@@ -1326,7 +1397,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             return;
         };
         let snap = WorkflowSnapshot {
-            schema_version: 1,
+            schema_version: WorkflowSnapshot::SCHEMA_VERSION,
             workflow_id: workflow.id.clone(),
             inputs: inputs.clone(),
             steps: snapshot_steps(workflow, state),
@@ -1336,6 +1407,21 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             tracing::warn!(target: "kres_agents::workflow_exec", "snapshot save failed: {e}");
         }
     };
+    let snapshot_save_required =
+        |state: &HashMap<String, StepState>, events_count: usize| -> Result<(), String> {
+            let Some(dir) = snapshot_dir.as_ref() else {
+                return Ok(());
+            };
+            WorkflowSnapshot {
+                schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+                workflow_id: workflow.id.clone(),
+                inputs: inputs.clone(),
+                steps: snapshot_steps(workflow, state),
+                events_count,
+            }
+            .save(dir)
+            .map_err(|error| format!("persist workflow effect boundary: {error}"))
+        };
 
     // Initial snapshot — useful when --resume picks up a workflow
     // that hasn't dispatched any step yet.
@@ -1359,6 +1445,79 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         // captures every status transition before the next step
         // dispatches.
         snapshot_save(&state, events.len());
+
+        // Accepted effects are recovered before any new model work. The
+        // payload came from the snapshot, so this path neither increments the
+        // attempt nor re-runs evaluation or ledger inference.
+        if let Some(step) = workflow
+            .steps
+            .iter()
+            .find(|step| state[&step.id].status == StepStatus::EffectsPending)
+        {
+            let attempt = state[&step.id].attempt;
+            let effects = state[&step.id]
+                .pending_effects
+                .clone()
+                .unwrap_or(Value::Null);
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effect_outputs = match driver
+                .apply_attempt_effects(step, attempt, &effects, &effect_ctx)
+                .await
+            {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' accepted effect application failed: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            record(
+                &mut events,
+                &observer,
+                TraceEvent::StepProduced {
+                    id: step.id.clone(),
+                    attempt,
+                    outputs: effect_outputs.clone(),
+                },
+            );
+            {
+                let settled = state.get_mut(&step.id).unwrap();
+                settled.outputs.extend(effect_outputs);
+                settled.status = StepStatus::Done;
+                settled.pending_effects = None;
+            }
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                let unsettled = state.get_mut(&step.id).unwrap();
+                unsettled.status = StepStatus::EffectsPending;
+                unsettled.pending_effects = Some(effects);
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' completion was not durable: {error}",
+                    step.id
+                ));
+                break;
+            }
+            if step.terminal_on_success {
+                status = WorkflowStatus::TerminalSuccess(step.id.clone());
+                record(
+                    &mut events,
+                    &observer,
+                    TraceEvent::Terminated {
+                        status: status.clone(),
+                    },
+                );
+                return Trace {
+                    events,
+                    status,
+                    final_state: state,
+                };
+            }
+            continue;
+        }
 
         // Check Workflow.completion expressions before scheduling
         // the next step. failure_when_any wins over success_when_any
@@ -1520,6 +1679,33 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 attempt,
             },
         );
+        if matches!(step.agent.or(workflow.defaults.agent), Some(Agent::Reaper)) {
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effects = match driver.attempt_effects(step, attempt, &effect_ctx).await {
+                Ok(effects) => effects,
+                Err(error) => {
+                    status = WorkflowStatus::Failure(format!(
+                        "reaper step '{}' could not serialize intent: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            let accepted = state.get_mut(&step.id).unwrap();
+            accepted.status = StepStatus::EffectsPending;
+            accepted.pending_effects = Some(effects);
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                status = WorkflowStatus::Failure(format!(
+                    "reaper step '{}' intent was not durable: {error}",
+                    step.id
+                ));
+                break;
+            }
+            continue;
+        }
         let driver_ctx = ExecContext {
             workflow_inputs: &inputs,
             steps: &state,
@@ -1559,6 +1745,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             match driver_result {
                 Ok(o) => o,
                 Err(e) => {
+                    driver.discard_attempt(step, attempt).await;
                     if retry_driver_error(
                         &mut state,
                         &mut events,
@@ -1627,7 +1814,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             // path first when aggregate=Consolidate AND the driver
             // advertises support for it. On success, return the
             // aggregated map out of the lens block so the standard
-            // eval + post_actions code below runs. Runtime/schema
+            // eval and durable effect acceptance below run. Runtime/schema
             // errors from a supported optimised path consume the
             // step retry budget instead of silently falling back to
             // the old repeated-gather loop.
@@ -1637,7 +1824,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 Aggregate::Consolidate
             ) {
                 match driver
-                    .lens_fan_out_consolidate(&active_step, &driver_ctx)
+                    .lens_fan_out_consolidate(&active_step, attempt, &driver_ctx)
                     .await
                 {
                     Ok(LensFanOutConsolidate::Outputs(aggregated)) => {
@@ -1664,6 +1851,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     }
                     Ok(LensFanOutConsolidate::Unsupported) => {}
                     Err(e) => {
+                        driver.discard_attempt(step, attempt).await;
                         if retry_driver_error(
                             &mut state,
                             &mut events,
@@ -1697,7 +1885,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             }
             // If the optimised path produced an aggregate, return
             // it out of the lens block so the standard eval +
-            // post_actions code below runs. The per-lens fall-back
+            // durable effect acceptance below runs. The per-lens fall-back
             // only fires when optimised is None.
             if let Some(aggregated) = optimised {
                 aggregated
@@ -1785,6 +1973,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     .collect();
                 per_lens.sort_by_key(|(id, _)| *lens_order.get(id.as_str()).unwrap_or(&usize::MAX));
                 if let Some((lens_id, e)) = first_err {
+                    driver.discard_attempt(step, attempt).await;
                     if retry_driver_error(
                         &mut state,
                         &mut events,
@@ -1839,6 +2028,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                         match driver.consolidate(&active_step, &cctx, &per_lens).await {
                             Ok(m) => m,
                             Err(e) => {
+                                driver.discard_attempt(step, attempt).await;
                                 // A consolidate failure means the fan-in could not
                                 // trust the per-lens outputs it just merged. Clear
                                 // cached lens outputs before retrying so the next
@@ -1910,73 +2100,45 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 outputs,
             },
         );
-        let ledger_ctx = ExecContext {
-            workflow_inputs: &inputs,
-            steps: &state,
-        };
-        match driver
-            .update_review_ledger(step, attempt, &ledger_ctx)
-            .await
-        {
-            Ok(Some(outputs)) => {
-                let st = state
-                    .entry(REVIEW_LEDGER_STEP_ID.to_string())
-                    .or_insert_with(empty_review_ledger_state);
-                st.status = StepStatus::Done;
-                st.outputs = outputs;
-                snapshot_save(&state, events.len());
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "kres_agents::workflow_exec",
-                    "step '{}' review ledger update failed: {e}",
-                    step.id
-                );
-            }
-        }
-
         // Eval, if configured.
         let Some(eval) = &step.eval else {
-            // No eval: settle, run post_actions, then move on.
-            if !step.post_actions.is_empty() {
-                let pa_ctx = ExecContext {
-                    workflow_inputs: &inputs,
-                    steps: &state,
-                };
-                match driver.run_post_actions(step, &pa_ctx).await {
-                    Ok(log) => record(
-                        &mut events,
-                        &observer,
-                        TraceEvent::PostAction {
-                            id: step.id.clone(),
-                            log,
-                        },
-                    ),
-                    Err(e) => {
-                        status = WorkflowStatus::Failure(format!(
-                            "step '{}' post_actions failed: {e}",
-                            step.id
-                        ));
-                        break;
-                    }
-                }
+            if let Err(error) =
+                update_accepted_review_ledger(driver, step, attempt, &inputs, &mut state).await
+            {
+                driver.discard_attempt(step, attempt).await;
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' review ledger update failed before acceptance: {error}",
+                    step.id
+                ));
+                break;
             }
-            state.get_mut(&step.id).unwrap().status = StepStatus::Done;
-            if step.terminal_on_success {
-                status = WorkflowStatus::TerminalSuccess(step.id.clone());
-                record(
-                    &mut events,
-                    &observer,
-                    TraceEvent::Terminated {
-                        status: status.clone(),
-                    },
-                );
-                return Trace {
-                    events,
-                    status,
-                    final_state: state,
-                };
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effects = match driver.attempt_effects(step, attempt, &effect_ctx).await {
+                Ok(effects) => effects,
+                Err(error) => {
+                    driver.discard_attempt(step, attempt).await;
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' could not serialize accepted effects: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            {
+                let accepted = state.get_mut(&step.id).unwrap();
+                accepted.status = StepStatus::EffectsPending;
+                accepted.pending_effects = Some(effects);
+            }
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                driver.discard_attempt(step, attempt).await;
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' accepted effects were not durable: {error}",
+                    step.id
+                ));
+                break;
             }
             continue;
         };
@@ -1989,6 +2151,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 let expr_str = match eval.expr.as_deref() {
                     Some(s) => s,
                     None => {
+                        driver.discard_attempt(step, attempt).await;
                         status = WorkflowStatus::Failure(format!(
                             "step '{}' field_check eval missing expr",
                             step.id
@@ -1999,6 +2162,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 match expr::eval(expr_str, &ctx_for_eval, Some(&step.id)) {
                     Ok(b) => (b, None),
                     Err(e) => {
+                        driver.discard_attempt(step, attempt).await;
                         status = WorkflowStatus::Failure(format!(
                             "step '{}' eval expr error: {e}",
                             step.id
@@ -2011,6 +2175,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 let name = match eval.name.as_deref() {
                     Some(s) => s,
                     None => {
+                        driver.discard_attempt(step, attempt).await;
                         status = WorkflowStatus::Failure(format!(
                             "step '{}' builtin eval missing name",
                             step.id
@@ -2021,6 +2186,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 match eval_builtin(name, step, &ctx_for_eval) {
                     Ok(result) => result,
                     Err(e) => {
+                        driver.discard_attempt(step, attempt).await;
                         status = WorkflowStatus::Failure(format!(
                             "step '{}' builtin eval error: {e}",
                             step.id
@@ -2039,6 +2205,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     (p, reason)
                 }
                 Err(e) => {
+                    driver.discard_attempt(step, attempt).await;
                     status = WorkflowStatus::Failure(format!(
                         "step '{}' judge_llm eval error: {e}",
                         step.id
@@ -2057,49 +2224,49 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     attempt,
                 },
             );
-            if !step.post_actions.is_empty() {
-                let pa_ctx = ExecContext {
-                    workflow_inputs: &inputs,
-                    steps: &state,
-                };
-                match driver.run_post_actions(step, &pa_ctx).await {
-                    Ok(log) => record(
-                        &mut events,
-                        &observer,
-                        TraceEvent::PostAction {
-                            id: step.id.clone(),
-                            log,
-                        },
-                    ),
-                    Err(e) => {
-                        status = WorkflowStatus::Failure(format!(
-                            "step '{}' post_actions failed: {e}",
-                            step.id
-                        ));
-                        break;
-                    }
-                }
+            if let Err(error) =
+                update_accepted_review_ledger(driver, step, attempt, &inputs, &mut state).await
+            {
+                driver.discard_attempt(step, attempt).await;
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' review ledger update failed before acceptance: {error}",
+                    step.id
+                ));
+                break;
             }
-            state.get_mut(&step.id).unwrap().status = StepStatus::Done;
-            if step.terminal_on_success {
-                status = WorkflowStatus::TerminalSuccess(step.id.clone());
-                record(
-                    &mut events,
-                    &observer,
-                    TraceEvent::Terminated {
-                        status: status.clone(),
-                    },
-                );
-                return Trace {
-                    events,
-                    status,
-                    final_state: state,
-                };
+            let effect_ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &state,
+            };
+            let effects = match driver.attempt_effects(step, attempt, &effect_ctx).await {
+                Ok(effects) => effects,
+                Err(error) => {
+                    driver.discard_attempt(step, attempt).await;
+                    status = WorkflowStatus::Failure(format!(
+                        "step '{}' could not serialize accepted effects: {error}",
+                        step.id
+                    ));
+                    break;
+                }
+            };
+            {
+                let accepted = state.get_mut(&step.id).unwrap();
+                accepted.status = StepStatus::EffectsPending;
+                accepted.pending_effects = Some(effects);
+            }
+            if let Err(error) = snapshot_save_required(&state, events.len()) {
+                driver.discard_attempt(step, attempt).await;
+                status = WorkflowStatus::Failure(format!(
+                    "step '{}' accepted effects were not durable: {error}",
+                    step.id
+                ));
+                break;
             }
             continue;
         }
 
         // Eval failed.
+        driver.discard_attempt(step, attempt).await;
         let st = state.get_mut(&step.id).unwrap();
         st.eval_failures += 1;
         let eval_failures = st.eval_failures;
@@ -3711,6 +3878,222 @@ mod tests {
         assert!(!consolidate.contains("set `lenses`"));
     }
 
+    #[tokio::test]
+    async fn executor_discards_failed_attempt_before_accepting_retry() {
+        struct TransactionDriver {
+            accepted: std::sync::Mutex<Vec<u32>>,
+            discarded: std::sync::Mutex<Vec<u32>>,
+            ledger_updates: std::sync::Mutex<Vec<u32>>,
+        }
+
+        #[async_trait]
+        impl Driver for TransactionDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                Ok(serde_json::from_value(json!({
+                    "analysis": if attempt == 1 { "" } else { "accepted" },
+                    "findings": [],
+                    "followups": []
+                }))
+                .unwrap())
+            }
+
+            async fn apply_attempt_effects(
+                &self,
+                _step: &Step,
+                attempt: u32,
+                _effects: &Value,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Map<String, Value>, String> {
+                self.accepted.lock().unwrap().push(attempt);
+                Ok(Map::new())
+            }
+
+            async fn discard_attempt(&self, _step: &Step, attempt: u32) {
+                self.discarded.lock().unwrap().push(attempt);
+            }
+
+            async fn update_review_ledger(
+                &self,
+                _step: &Step,
+                attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Option<Map<String, Value>>, String> {
+                self.ledger_updates.lock().unwrap().push(attempt);
+                Ok(None)
+            }
+        }
+
+        let mut workflow = review_workflow();
+        workflow.steps.truncate(1);
+        workflow.steps[0].lenses.clear();
+        let mut driver = TransactionDriver {
+            accepted: std::sync::Mutex::new(Vec::new()),
+            discarded: std::sync::Mutex::new(Vec::new()),
+            ledger_updates: std::sync::Mutex::new(Vec::new()),
+        };
+        let trace = run(&workflow, &mut driver, target_inputs()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*driver.discarded.lock().unwrap(), vec![1]);
+        assert_eq!(*driver.accepted.lock().unwrap(), vec![2]);
+        assert_eq!(*driver.ledger_updates.lock().unwrap(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn resume_replays_durable_effects_without_rerunning_model() {
+        struct EffectDriver {
+            runs: std::sync::Mutex<u32>,
+            applies: std::sync::Mutex<u32>,
+            fail_apply: bool,
+        }
+
+        #[async_trait]
+        impl Driver for EffectDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                *self.runs.lock().unwrap() += 1;
+                Ok(Map::from_iter([("analysis".into(), json!("accepted"))]))
+            }
+
+            async fn attempt_effects(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Value, String> {
+                Ok(json!([{"path": "/tmp/result", "body": "accepted"}]))
+            }
+
+            async fn apply_attempt_effects(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _effects: &Value,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Map<String, Value>, String> {
+                *self.applies.lock().unwrap() += 1;
+                if self.fail_apply {
+                    Err("injected interruption".into())
+                } else {
+                    Ok(Map::new())
+                }
+            }
+        }
+
+        let workflow = crate::workflow::parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "effect-resume",
+                "steps": [{"id": "write", "agent": "slow", "prompt": "write"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshots = tempfile::tempdir().unwrap();
+        let mut first = EffectDriver {
+            runs: std::sync::Mutex::new(0),
+            applies: std::sync::Mutex::new(0),
+            fail_apply: true,
+        };
+        let first_trace = run_with_persistence(
+            &workflow,
+            &mut first,
+            Map::new(),
+            20,
+            snapshots.path().to_path_buf(),
+        )
+        .await;
+        assert!(matches!(first_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(*first.runs.lock().unwrap(), 1);
+        assert_eq!(*first.applies.lock().unwrap(), 1);
+
+        let snapshot = WorkflowSnapshot::load(snapshots.path(), "effect-resume").unwrap();
+        assert_eq!(snapshot.steps[0].status, StepStatus::EffectsPending);
+        assert!(snapshot.steps[0].pending_effects.is_some());
+        let mut resumed = EffectDriver {
+            runs: std::sync::Mutex::new(0),
+            applies: std::sync::Mutex::new(0),
+            fail_apply: false,
+        };
+        let resumed_trace = run_resume(
+            &workflow,
+            &mut resumed,
+            snapshot,
+            Some(snapshots.path().to_path_buf()),
+            20,
+        )
+        .await;
+        assert_eq!(resumed_trace.status, WorkflowStatus::Success);
+        assert_eq!(*resumed.runs.lock().unwrap(), 0);
+        assert_eq!(*resumed.applies.lock().unwrap(), 1);
+        assert_eq!(resumed_trace.final_state["write"].status, StepStatus::Done);
+        assert!(resumed_trace.final_state["write"].pending_effects.is_none());
+    }
+
+    #[tokio::test]
+    async fn ledger_failure_happens_before_effect_application() {
+        struct LedgerFailure {
+            applied: std::sync::Mutex<bool>,
+        }
+        #[async_trait]
+        impl Driver for LedgerFailure {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                Ok(Map::from_iter([("analysis".into(), json!("accepted"))]))
+            }
+            async fn update_review_ledger(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Option<Map<String, Value>>, String> {
+                Err("ledger unavailable".into())
+            }
+            async fn apply_attempt_effects(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _effects: &Value,
+                _ctx: &ExecContext<'_>,
+            ) -> Result<Map<String, Value>, String> {
+                *self.applied.lock().unwrap() = true;
+                Ok(Map::new())
+            }
+        }
+
+        let workflow = crate::workflow::parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "fix",
+                "steps": [{"id": "review", "agent": "slow", "prompt": "review"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut driver = LedgerFailure {
+            applied: std::sync::Mutex::new(false),
+        };
+        let trace = run(&workflow, &mut driver, Map::new()).await;
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
+        assert!(!*driver.applied.lock().unwrap());
+    }
+
     #[test]
     fn research_prompt_overrides_stale_metadata_yaml_status() {
         // Regression: in the coredump_dump_head_double_handoff
@@ -4249,7 +4632,7 @@ mod tests {
             ) -> Result<Map<String, Value>, DriverError> {
                 Ok(serde_json::from_value(json!({"findings": []})).unwrap())
             }
-            // run_post_actions + consolidate fall back to defaults;
+            // effect application + consolidate fall back to defaults;
             // the default consolidate impl returns Err.
         }
         let wf = lensed_review_workflow();
@@ -5043,7 +5426,7 @@ mod tests {
     }
 
     /// Regression: the optimised lens path must NOT skip eval or
-    /// post_actions. Found during a self-review pass — earlier
+    /// accepted-effect persistence. Found during a self-review pass — earlier
     /// version called `continue` after StepProduced and bypassed
     /// the eval block entirely. A step with eval that fails MUST
     /// retry (or fail the workflow per its on_fail), not silently
@@ -5067,6 +5450,7 @@ mod tests {
             async fn lens_fan_out_consolidate(
                 &self,
                 _step: &Step,
+                _attempt: u32,
                 _ctx: &ExecContext<'_>,
             ) -> Result<LensFanOutConsolidate, String> {
                 let mut n = self.calls.lock().unwrap();
@@ -5217,6 +5601,7 @@ mod tests {
             async fn lens_fan_out_consolidate(
                 &self,
                 _step: &Step,
+                _attempt: u32,
                 _ctx: &ExecContext<'_>,
             ) -> Result<LensFanOutConsolidate, String> {
                 Ok(LensFanOutConsolidate::Outputs(
@@ -5275,6 +5660,7 @@ mod tests {
             async fn lens_fan_out_consolidate(
                 &self,
                 _step: &Step,
+                _attempt: u32,
                 _ctx: &ExecContext<'_>,
             ) -> Result<LensFanOutConsolidate, String> {
                 let mut n = self.calls.lock().unwrap();

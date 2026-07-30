@@ -22,7 +22,7 @@ SCOPE CHECK — do this BEFORE analyzing:
 - Negative coverage claims require evidence. Do not write "no remaining users", "no stale path", "all callers updated", "unreachable", "the only reader/writer", or equivalent unless the input includes concrete source, type, search, caller/callee, or history results that prove the claim. If that evidence is missing, emit typed followups for the exact source/type/search/callgraph/history needed instead of declaring the lens clean.
 - Unverified concrete suspicions must be routed, not parked in prose. If you write `[UNVERIFIED]`, `[FLAG]`, `needs verification`, `not in context`, `worth confirming`, or equivalent language about a concrete code path, object, field, callback, allocator, lock, lifetime, state transition, cleanup path, or contract claim, you must either run it down with the provided context, emit a Finding with `open_questions`, or emit a typed followup for the exact missing evidence. A clean result is valid only when no unresolved concrete suspicion remains in `analysis`.
 
-Output: JSON only, no fences, no preamble.
+Output: raw, unfenced JSON only—no Markdown backticks and no preamble.
 {"analysis": "detailed prose narrative with inline code snippets (see RULES)", "findings": [<Finding>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}], "plan": <optional rewritten Plan — see PLAN REWRITE>}
 
 PLAN REWRITE — optional top-level `plan` field on the response:

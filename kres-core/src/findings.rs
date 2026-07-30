@@ -44,7 +44,9 @@ pub enum FindingsError {
     NoParent(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Low,
@@ -52,7 +54,7 @@ pub enum Severity {
     High,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum Status {
@@ -63,7 +65,8 @@ pub enum Status {
     Invalidated,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RelevantSymbol {
     pub name: String,
     pub filename: String,
@@ -71,7 +74,8 @@ pub struct RelevantSymbol {
     pub definition: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RelevantFileSection {
     pub filename: String,
     pub line_start: u32,
@@ -92,7 +96,8 @@ pub struct RelevantFileSection {
 /// (which come from freshly-deserialised agent replies and don't
 /// carry it anyway), and the promoter's narrowed existing_findings
 /// all run through [`Finding::redacted_for_agent`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindingDetail {
     /// Provenance stamp. Same format as `last_updated_task` —
     /// `"<uuid-simple>/<todo-tag>"` or bare uuid.
@@ -101,7 +106,8 @@ pub struct FindingDetail {
     pub analysis: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Finding {
     pub id: String,
     pub title: String,
@@ -126,8 +132,10 @@ pub struct Finding {
     pub open_questions: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub first_seen_task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub last_updated_task: Option<String>,
 
     /// Wall-clock timestamp of the first apply_delta that inserted
@@ -137,6 +145,7 @@ pub struct Finding {
     /// findings.json files — those have no authoritative discovery
     /// date on record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub first_seen_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_finding_ids: Vec<String>,
@@ -146,6 +155,7 @@ pub struct Finding {
     /// forwarded to another LLM. Call [`Finding::redacted_for_agent`]
     /// before handing findings to any agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(skip)]
     pub details: Vec<FindingDetail>,
 
     /// Wire-only signal: when `true` on an incoming delta AND the
@@ -169,7 +179,8 @@ pub struct Finding {
     pub introduced_by: Option<IntroducedBy>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct IntroducedBy {
     pub sha: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -182,10 +193,13 @@ fn is_false(b: &bool) -> bool {
 
 impl Finding {
     /// Return a clone suitable for inclusion in an LLM prompt —
-    /// `details` cleared so the agent doesn't see the per-task
-    /// narrative captured for /summary. Keep every other field.
+    /// Store-owned provenance and details are cleared so they cannot become
+    /// part of the model-facing wire contract.
     pub fn redacted_for_agent(&self) -> Finding {
         let mut c = self.clone();
+        c.first_seen_task = None;
+        c.last_updated_task = None;
+        c.first_seen_at = None;
         c.details.clear();
         c
     }
@@ -450,10 +464,6 @@ pub fn apply_delta_to_list(
                     }
                     new_entry.last_updated_task = Some(t.to_string());
                 }
-                // Stamp discovery time on first insert. An incoming
-                // delta that already carries a first_seen_at (e.g.
-                // a migration import) is preserved; otherwise use
-                // wall-clock now. Never updated by subsequent merges.
                 if new_entry.first_seen_at.is_none() {
                     new_entry.first_seen_at = Some(Utc::now());
                 }
@@ -914,6 +924,25 @@ mod tests {
             introduced_by: None,
             first_seen_at: None,
         }
+    }
+
+    #[test]
+    fn model_schema_and_redaction_exclude_store_owned_provenance() {
+        let schema = serde_json::to_value(schemars::schema_for!(Finding)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("first_seen_task"));
+        assert!(!properties.contains_key("last_updated_task"));
+        assert!(!properties.contains_key("first_seen_at"));
+        assert!(!properties.contains_key("details"));
+
+        let mut finding = sample_finding("owned");
+        finding.first_seen_task = Some("forged".into());
+        finding.last_updated_task = Some("forged".into());
+        finding.first_seen_at = Some(Utc::now());
+        let redacted = finding.redacted_for_agent();
+        assert!(redacted.first_seen_task.is_none());
+        assert!(redacted.last_updated_task.is_none());
+        assert!(redacted.first_seen_at.is_none());
     }
 
     #[tokio::test]

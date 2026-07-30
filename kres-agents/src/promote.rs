@@ -48,11 +48,12 @@ use tokio::sync::Notify;
 
 use kres_core::findings::Finding;
 use kres_core::log::{LoggedUsage, TurnLogger};
+use kres_core::UsageTracker;
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 use crate::{
     error::AgentError,
-    response::{parse_code_response, InvalidFinding, ParseStrategy},
+    response::{CodeResponseContract, InvalidFinding},
 };
 
 pub const PROMOTE_INSTRUCTIONS: &str = include_str!("prompts/promote.txt");
@@ -85,6 +86,7 @@ pub struct PromoteInputs<'a> {
     pub prose_relevant_existing: &'a [Finding],
     pub dedup_against: &'a [Finding],
     pub cancel: Option<Arc<Notify>>,
+    pub usage: Option<Arc<UsageTracker>>,
 }
 
 #[derive(Debug, Default)]
@@ -133,6 +135,7 @@ pub async fn promote_prose_bugs_with_logger(
         prose_relevant_existing,
         dedup_against,
         cancel,
+        usage,
     } = inputs;
     // Prose nothing to audit.
     if analysis.trim().is_empty() {
@@ -186,6 +189,16 @@ pub async fn promote_prose_bugs_with_logger(
         None => client.messages_streaming(&cfg, &messages).await,
     }
     .map_err(|e| AgentError::Other(e.to_string()))?;
+    if let Some(usage) = &usage {
+        usage.record(
+            "promote",
+            model.id.clone(),
+            resp.usage.input_tokens,
+            resp.usage.output_tokens,
+            resp.usage.cache_creation_input_tokens,
+            resp.usage.cache_read_input_tokens,
+        );
+    }
 
     let text = extract_text(&resp);
     if let Some(lg) = &logger {
@@ -201,7 +214,61 @@ pub async fn promote_prose_bugs_with_logger(
             None,
         );
     }
-    let mut parsed = parse_code_response(&text);
+    let response_contract = CodeResponseContract::default().requiring(["findings"]);
+    let tolerant_contract = response_contract.clone().allowing_invalid_findings();
+    let mut parsed = match tolerant_contract.validate(&text) {
+        Ok(parsed) => parsed,
+        Err(errors) => {
+            let schema = response_contract.schema_json().to_string();
+            let repair = crate::json_repair::repair_json_response(
+                crate::json_repair::JsonRepairCall {
+                    client: client.clone(),
+                    model: model.clone(),
+                    max_tokens,
+                    max_input_tokens,
+                    contract: crate::json_repair::JsonContract {
+                        name: "promoter",
+                        schema: &schema,
+                        instructions: "Preserve every candidate claim and Finding id. Return the required findings array and correct representation only.",
+                    },
+                    rejected_response: &text,
+                    validation_errors: &errors,
+                    logger: logger.clone(),
+                    log_kind: crate::json_repair::RepairLogKind::Code,
+                    shutdown: None,
+                },
+            );
+            let repaired = match &cancel {
+                Some(notify) => tokio::select! {
+                    biased;
+                    _ = notify.notified() => return Ok(PromoteOutcome::default()),
+                    result = repair => result,
+                },
+                None => repair.await,
+            }?;
+            if let Some(usage) = &usage {
+                usage.record(
+                    "promote",
+                    model.id.clone(),
+                    repaired.usage.input_tokens,
+                    repaired.usage.output_tokens,
+                    repaired.usage.cache_creation_input_tokens,
+                    repaired.usage.cache_read_input_tokens,
+                );
+            }
+            match tolerant_contract.accept_repair(&repaired.text) {
+                Ok(parsed) => parsed,
+                Err(repair_errors) => {
+                    tracing::warn!(
+                        target: "kres_agents",
+                        errors = %repair_errors.join("; "),
+                        "promoter JSON repair remained invalid"
+                    );
+                    return Ok(PromoteOutcome::default());
+                }
+            }
+        }
+    };
     // A RawText strategy on the promoter's OWN reply means the
     // dedicated PROMOTE_SYSTEM judge-mode prompt didn't hold — the
     // model emitted free-form prose instead of the required
@@ -210,13 +277,6 @@ pub async fn promote_prose_bugs_with_logger(
     // fires repeatedly the prompt (or the model) needs attention.
     // bytes_out is included so operators can spot a huge silent
     // dump vs a truly empty reply.
-    if parsed.strategy == ParseStrategy::RawText {
-        tracing::warn!(
-            target: "kres_agents",
-            bytes_out = text.len(),
-            "promoter reply had no parseable JSON; PROMOTE_SYSTEM drift suspected, returning empty"
-        );
-    }
     let mut unrepaired = Vec::new();
     if !parsed.invalid_findings.is_empty() {
         let outcome = crate::finding_repair::repair_invalid_findings(
@@ -225,11 +285,15 @@ pub async fn promote_prose_bugs_with_logger(
             max_tokens,
             max_input_tokens,
             std::mem::take(&mut parsed.invalid_findings),
-            logger,
-            cancel,
+            crate::finding_repair::FindingRepairRuntime {
+                logger,
+                cancel: cancel.map(crate::finding_repair::FindingRepairCancel::Notify),
+                usage,
+                role: "promote",
+            },
         )
         .await?;
-        parsed.findings.extend(outcome.findings);
+        parsed.merge_repaired_findings(outcome.findings);
         unrepaired = outcome.unrepaired;
     }
     Ok(PromoteOutcome {
@@ -411,6 +475,7 @@ mod tests {
                 prose_relevant_existing: &[],
                 dedup_against: &[],
                 cancel: None,
+                usage: None,
             },
             None,
         )
@@ -450,6 +515,7 @@ mod tests {
                 prose_relevant_existing: &[],
                 dedup_against: &[],
                 cancel: Some(notify),
+                usage: None,
             },
             None,
         )

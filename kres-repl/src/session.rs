@@ -977,6 +977,7 @@ impl Session {
         let persist_sig_for_reaper = self.persist_sig.clone();
         let store_for_reaper = self.findings_store.clone();
         let promoter_for_reaper = self.consolidator.clone();
+        let usage_for_reaper = self.usage.clone();
         let interrupted_for_reaper = self.interrupted_prompt.clone();
         let report_path_for_reaper = self.cfg.report_path.clone();
         let turns_cap_reached = Arc::new(AtomicBool::new(false));
@@ -1324,6 +1325,7 @@ impl Session {
                                     prose_relevant_existing: &prose_relevant,
                                     dedup_against: &all_known_for_dedup,
                                     cancel: Some(stop_notify_for_reaper.clone()),
+                                    usage: Some(usage_for_reaper.clone()),
                                 },
                                 logger_for_reaper.clone(),
                             )
@@ -1659,6 +1661,7 @@ impl Session {
                                 plan: plan_for_todo.as_ref(),
                             },
                             logger_for_reaper.clone(),
+                            Some(mgr_for_reaper.root_shutdown().clone()),
                         )
                         .await
                         {
@@ -1780,6 +1783,7 @@ impl Session {
                                 &goal,
                                 &combined,
                                 plan_for_check.as_ref(),
+                                Some(mgr_for_reaper.root_shutdown().clone()),
                             )
                             .await;
                             kres_core::async_eprintln!(
@@ -1924,6 +1928,7 @@ impl Session {
                                                 plan: plan_for_todo.as_ref(),
                                             },
                                             logger_for_reaper.clone(),
+                                            Some(mgr_for_reaper.root_shutdown().clone()),
                                         )
                                         .await
                                         {
@@ -2448,7 +2453,8 @@ impl Session {
         let Some(gc) = client else {
             return (None, kres_agents::TaskMode::default());
         };
-        match kres_agents::define_goal(gc, text, plan).await {
+        match kres_agents::define_goal(gc, text, plan, Some(self.mgr.root_shutdown().clone())).await
+        {
             Some(def) => {
                 kres_core::async_eprintln!(
                     "goal ({}, {label}): {}",
@@ -2728,8 +2734,15 @@ impl Session {
                 let plan = if let Some(steps) = embedded_steps {
                     let steps = kres_core::plan::normalize_steps(steps);
                     if steps.is_empty() {
-                        kres_agents::define_plan(gc, &text, goal, task_mode, existing.as_ref())
-                            .await
+                        kres_agents::define_plan(
+                            gc,
+                            &text,
+                            goal,
+                            task_mode,
+                            existing.as_ref(),
+                            Some(self.mgr.root_shutdown().clone()),
+                        )
+                        .await
                     } else {
                         kres_core::async_eprintln!(
                             "[embedded plan] {} step(s) from prompt template",
@@ -2740,7 +2753,15 @@ impl Session {
                         Some(plan)
                     }
                 } else {
-                    kres_agents::define_plan(gc, &text, goal, task_mode, existing.as_ref()).await
+                    kres_agents::define_plan(
+                        gc,
+                        &text,
+                        goal,
+                        task_mode,
+                        existing.as_ref(),
+                        Some(self.mgr.root_shutdown().clone()),
+                    )
+                    .await
                 };
                 if let Some(plan) = plan {
                     log_plan_change("define_plan", existing.as_ref(), &plan);
@@ -4168,7 +4189,7 @@ impl Session {
         let request = serde_json::json!({
             "task": "compact_accumulated",
             "ledger": joined,
-            "instructions": "Compress the preceding task-by-task analysis ledger into a single TERSE summary — 2 to 6 sentences total — that preserves: (a) what code was examined, (b) what files were written, if any, (c) key findings or decisions, (d) open questions still worth pulling on. Omit per-task boilerplate and restated code. Return JSON only: {\"summary\": \"the compressed text\"}"
+            "instructions": "Compress the preceding task-by-task analysis ledger into a single TERSE summary — 2 to 6 sentences total — that preserves: (a) what code was examined, (b) what files were written, if any, (c) key findings or decisions, (d) open questions still worth pulling on. Omit per-task boilerplate and restated code. Return raw, unfenced JSON only—no Markdown backticks: {\"summary\": \"the compressed text\"}"
         });
         let body = match serde_json::to_string_pretty(&request) {
             Ok(s) => s,
@@ -4226,26 +4247,7 @@ impl Session {
                 None,
             );
         }
-        // The fast agent is expected to reply with
-        // {"summary": "..."}. Tolerate prose-wrapped JSON.
-        let summary: Option<String> = (|| {
-            #[derive(serde::Deserialize)]
-            struct CompactResp {
-                #[serde(default)]
-                summary: String,
-            }
-            if let Ok(r) = serde_json::from_str::<CompactResp>(text.trim()) {
-                return (!r.summary.is_empty()).then_some(r.summary);
-            }
-            // Brace-match fallback.
-            let (start, end) = (text.find('{'), text.rfind('}'));
-            if let (Some(s), Some(e)) = (start, end) {
-                if let Ok(r) = serde_json::from_str::<CompactResp>(&text[s..=e]) {
-                    return (!r.summary.is_empty()).then_some(r.summary);
-                }
-            }
-            None
-        })();
+        let summary = parse_compact_response(&text);
         let summary = match summary {
             Some(s) => s,
             None => {
@@ -4267,6 +4269,18 @@ impl Session {
             summary.len()
         );
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompactResponse {
+    summary: String,
+}
+
+fn parse_compact_response(text: &str) -> Option<String> {
+    kres_agents::json_repair::parse_strict_json::<CompactResponse>("compact", text)
+        .ok()
+        .and_then(|response| (!response.summary.trim().is_empty()).then_some(response.summary))
 }
 
 fn review_todos_from_plan(plan: &kres_core::Plan) -> Vec<kres_core::TodoItem> {
@@ -4548,6 +4562,7 @@ pub async fn build_agent_runner(
             .unwrap_or(fast_model.max_output_tokens)
             .min(32_000),
         max_input_tokens: fast_cfg.max_input_tokens,
+        usage: usage.clone(),
     });
 
     let review_goal_client = Arc::new(kres_agents::GoalClient {
@@ -4560,6 +4575,7 @@ pub async fn build_agent_runner(
         max_tokens: slow_max_tokens.min(8_000),
         max_input_tokens: slow_cfg.max_input_tokens,
         logger: logger.clone(),
+        usage: usage.clone(),
     });
     let review_todo_client = Arc::new(kres_agents::TodoClient {
         client: slow_client.clone(),
@@ -4570,6 +4586,7 @@ pub async fn build_agent_runner(
         )),
         max_tokens: slow_max_tokens.min(32_000),
         max_input_tokens: slow_cfg.max_input_tokens,
+        usage: usage.clone(),
     });
 
     let slow_coding_system = load_slow_coding_system();
@@ -5815,6 +5832,17 @@ pub fn expand_inline_load(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_response_requires_one_exact_json_object() {
+        assert_eq!(
+            parse_compact_response(r#"{"summary":"kept"}"#).as_deref(),
+            Some("kept")
+        );
+        assert!(parse_compact_response("prose {\"summary\":\"hidden\"}").is_none());
+        assert!(parse_compact_response(r#"{"summary":"","extra":true}"#).is_none());
+        assert!(parse_compact_response(r#"{"summary":"   "}"#).is_none());
+    }
 
     #[tokio::test]
     async fn session_without_agent_runner_drops_prompt() {

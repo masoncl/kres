@@ -127,8 +127,6 @@ pub struct Step {
     pub outputs: serde_json::Map<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub eval: Option<Eval>,
-    #[serde(default)]
-    pub post_actions: Vec<PostAction>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub action: Option<ReaperAction>,
     #[serde(default)]
@@ -361,16 +359,6 @@ pub enum OnExhausted {
     ExitFailure,
     Continue,
     BranchTo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostAction {
-    #[serde(rename = "type")]
-    pub kind: ActionType,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub args: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -615,6 +603,12 @@ fn validate_cross_field(wf: &Workflow) -> Result<()> {
         return Err(anyhow!("duplicate step id: {dup}"));
     }
     for step in &wf.steps {
+        if matches!(step.agent, Some(Agent::Reaper)) && step.eval.is_some() {
+            return Err(anyhow!(
+                "reaper step '{}' cannot declare eval; its action is the acceptance boundary",
+                step.id
+            ));
+        }
         for reserved in RESERVED_STEP_OUTPUT_NAMES {
             if step.outputs.contains_key(*reserved) {
                 return Err(anyhow!(
@@ -753,7 +747,8 @@ mod tests {
         assert_eq!(wf.steps.len(), 1);
         let step = &wf.steps[0];
         assert_eq!(step.id, "investigate");
-        assert_eq!(step.lenses.len(), 6);
+        assert_eq!(step.lenses.len(), 5);
+        assert_eq!(step.lenses[0].id, "memory-lifetime");
         let assertions = step
             .lenses
             .iter()
@@ -1401,6 +1396,38 @@ mod tests {
         }"#;
         let err = parse_workflow(body).unwrap_err().to_string();
         assert!(err.contains("schema validation failed"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_reaper_step_with_eval() {
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "reaper",
+                "action": {"type": "make", "args": {"target": "all"}},
+                "eval": {"type": "field_check", "expr": "true", "on_fail": {"action": "repeat"}}
+            }]
+        }"#;
+        let error = parse_workflow(body).unwrap_err().to_string();
+        assert!(error.contains("cannot declare eval"), "got: {error}");
+    }
+
+    #[test]
+    fn rejects_removed_post_actions_path() {
+        let body = r#"{
+            "$schema_version": 1,
+            "id": "x",
+            "steps": [{
+                "id": "s",
+                "agent": "slow",
+                "prompt": "p",
+                "post_actions": [{"type": "git", "name": "status"}]
+            }]
+        }"#;
+        let error = parse_workflow(body).unwrap_err().to_string();
+        assert!(error.contains("schema validation failed"), "got: {error}");
     }
 
     #[test]

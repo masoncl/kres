@@ -72,6 +72,7 @@ pub const KNOWN_ACTION_TYPES: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default)]
     pub models: Models,
@@ -80,6 +81,7 @@ pub struct Settings {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActionSettings {
     /// Explicit allowlist. When `Some`, replaces the built-in
     /// `DEFAULT_ALLOWED_ACTIONS` entirely. When `None`, the default
@@ -91,6 +93,7 @@ pub struct ActionSettings {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Models {
     #[serde(default)]
     pub fast: Option<String>,
@@ -371,6 +374,16 @@ pub fn pick_model(cfg_model: Option<&str>, role: ModelRole, settings: &Settings)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_settings_template_matches_strict_schema() {
+        let rendered = include_str!("../../configs/settings.json")
+            .replace("@MODEL@", "claude-sonnet-4-6")
+            .replace("@SLOW_MODEL@", "claude-opus-4-8");
+        let settings: Settings = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(settings.models.fast.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(settings.models.slow.as_deref(), Some("claude-opus-4-8"));
+    }
 
     #[test]
     fn missing_file_yields_defaults() {

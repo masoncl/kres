@@ -57,7 +57,7 @@ Per-Finding schema (same as the main pipeline):
    related_finding_ids (optional),
    reactivate (optional boolean)}
 
-Return JSON only, no fences, no preamble:
+Return raw, unfenced JSON only—no Markdown backticks and no preamble:
 {"findings": [<Finding>, ...]}
 
 An empty list is valid and expected whenever every prose-mentioned

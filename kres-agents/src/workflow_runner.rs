@@ -92,17 +92,8 @@
 //! Both happen before later workflow steps run, so a deterministic
 //! reaper step can commit a file that an earlier LLM step wrote.
 //!
-//! ## Post actions
-//!
-//! After eval passes, the runner executes the step's
-//! `post_actions` in order:
-//!
-//! - `{type: "git", name: "<args>"}` → `git <args>` in the workspace
-//! - `{type: "make", name: "<args>"}` → `make <args>` in the workspace
-//! - `{type: "meson", name: "<args>"}` → `meson <args>` in the workspace
-//! - `{type: "publish-fix", args: {finding_dir}}` → write the patch
-//! - `{type: "commit-fix", args: {...}}` → add + commit/amend the fix
-//! - `{type: "set-finding-status", args: {...}}` → mark a finding status
+//! Deterministic actions are explicit reaper steps. The executor persists a
+//! reaper step's intent before dispatch and safely replays it after restart.
 //!
 //! Failures abort the workflow (the executor records the error and
 //! moves to `WorkflowStatus::Failure`).
@@ -116,9 +107,9 @@ use crate::followup::Followup;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use kres_core::findings::Finding;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use kres_core::brace::extract_brace_objects;
 use kres_core::cost::UsageTracker;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
@@ -126,8 +117,24 @@ use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 use crate::workflow::{Agent as AgentRole, Aggregate, Mode, Step, Workflow};
 use crate::workflow_exec::{Driver, ExecContext, LensFanOutConsolidate, REVIEW_LEDGER_STEP_ID};
 
-const JSON_REPAIR_RETRIES: usize = 3;
-const JSON_REPAIR_PREFIX: &str = "IMPORTANT: This step requires a valid JSON object matching OUTPUT SCHEMA; reply with that JSON object as the last top-level JSON in this response.";
+/// Full step reruns after a response (and its one generic repair call) fails
+/// validation. This is not a budget for repeatedly repairing one response.
+const WORKFLOW_RESPONSE_RETRIES: usize = 3;
+const JSON_REPAIR_PREFIX: &str = "IMPORTANT: Reply with exactly one raw, unfenced JSON object matching OUTPUT SCHEMA, with no prose or Markdown backticks.";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewLedgerResponse {
+    ledger: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JudgeResponse {
+    pass: bool,
+    #[serde(default)]
+    reason: String,
+}
 const CODE_EDIT_REPAIR_PREFIX: &str = "IMPORTANT: The previous reply's code_edits failed to apply. Re-read the file you intend to edit using a `read` followup before re-emitting code_edits. Every `old_string` MUST be copied verbatim from the current file contents byte-for-byte — match tabs vs spaces and column alignment exactly. If you are uncertain about indentation, widen the snippet so the surrounding lines anchor the exact byte sequence.\nApply error from the previous attempt:";
 const FAST_GATHER_ALLOWED_FIELDS: &str = "analysis, followups, skill_reads, ready_for_slow";
 const DEFAULT_GATHER_DISALLOWED_FIELDS: &[&str] = &[
@@ -272,6 +279,11 @@ pub struct LlmDriver {
     /// already fetched instead of re-requesting it. Interior-mutable
     /// so the `&self` step path can populate it.
     gathered_cache: std::sync::Mutex<std::collections::HashMap<String, GatheredData>>,
+    /// Code changes staged by a completed driver call. The workflow executor
+    /// owns the accept/reject decision and commits or discards these after eval.
+    pending_changes: std::sync::Mutex<
+        std::collections::HashMap<(String, u32), std::collections::BTreeMap<PathBuf, String>>,
+    >,
 }
 
 fn append_skill_block(block: &mut String, label: &str, body: &str) {
@@ -300,7 +312,41 @@ impl LlmDriver {
             usage: None,
             shutdown: kres_core::Shutdown::new(),
             gathered_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pending_changes: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    fn stage_attempt(
+        &self,
+        step: &Step,
+        attempt: u32,
+        changes: std::collections::BTreeMap<PathBuf, String>,
+    ) -> Result<(), String> {
+        let mut pending = self
+            .pending_changes
+            .lock()
+            .map_err(|_| "pending code-change lock poisoned".to_string())?;
+        let key = (step.id.clone(), attempt);
+        let mut merged = pending.get(&key).cloned().unwrap_or_default();
+        for (target, body) in changes {
+            if let Some(existing) = merged.get(&target) {
+                if existing != &body {
+                    return Err(format!(
+                        "step '{}' staged conflicting contents for {}",
+                        step.id,
+                        target.display()
+                    ));
+                }
+            } else {
+                merged.insert(target, body);
+            }
+        }
+        pending.insert(key, merged);
+        Ok(())
     }
 
     /// Seed a step's gather loop from the symbols/context its
@@ -593,32 +639,18 @@ impl LlmDriver {
                 None,
             );
         }
-        for blob in extract_brace_objects(&text).iter().rev() {
-            let Ok(Value::Object(mut m)) = serde_json::from_str::<Value>(blob) else {
-                continue;
-            };
-            let Some(ledger) = m.remove("ledger") else {
-                continue;
-            };
-            if !matches!(ledger, Value::Array(_)) {
-                return Err(format!(
-                    "step '{}' review ledger response `ledger` must be an array",
-                    step.id
-                ));
-            }
-            let rendered = serde_json::to_string_pretty(&ledger)
-                .map_err(|e| format!("review ledger render: {e}"))?;
-            let mut out = Map::new();
-            out.insert("items".into(), ledger);
-            out.insert("ledger".into(), Value::String(rendered));
-            out.insert("updated_by_step".into(), Value::String(step.id.clone()));
-            out.insert("updated_attempt".into(), Value::Number(attempt.into()));
-            return Ok(Some(out));
-        }
-        Err(format!(
-            "step '{}' review ledger response had no JSON object with a `ledger` array",
-            step.id
-        ))
+        let parsed =
+            crate::json_repair::parse_strict_json::<ReviewLedgerResponse>("review-ledger", &text)
+                .map_err(|errors| format!("step '{}' {}", step.id, errors.join("; ")))?;
+        let ledger = Value::Array(parsed.ledger);
+        let rendered = serde_json::to_string_pretty(&ledger)
+            .map_err(|e| format!("review ledger render: {e}"))?;
+        let mut out = Map::new();
+        out.insert("items".into(), ledger);
+        out.insert("ledger".into(), Value::String(rendered));
+        out.insert("updated_by_step".into(), Value::String(step.id.clone()));
+        out.insert("updated_attempt".into(), Value::Number(attempt.into()));
+        Ok(Some(out))
     }
 
     /// Fallback for when no AgentEnv is wired but the AgentRunner
@@ -802,22 +834,10 @@ impl LlmDriver {
             // dependencies already fetched, so e.g. validate-reachability
             // does not re-pull what validate-claims gathered.
             let (seed_symbols, seed_context) = self.seed_gather_from_deps(&step.depends_on);
-            // Raw text of the previous attempt's reply, plus the gather
-            // it produced. `prior_raw` drives the #3 JSON-reformat path;
-            // `captured_gathered` preserves the original run's gather
-            // across reformat attempts (which gather nothing of their
-            // own) so the success path can still cache it.
-            let mut prior_raw: Option<String> = None;
+            // Preserve validated gather results across full synthesis retries
+            // so a successful attempt can seed dependent steps.
             let mut captured_gathered: Option<(Vec<Value>, Vec<Value>)> = None;
-            // Most recent non-empty code_output across attempts. A
-            // reformat reply (#3) that only fixes typed JSON fields can
-            // omit the files it already wrote on an earlier attempt; the
-            // files are still on disk, but summary_written/
-            // severity_written are computed from THIS reply's
-            // code_output, so the omission would falsely report them
-            // unwritten. Carry the files forward to re-credit them.
-            let mut carried_code_output: Vec<kres_core::CodeFile> = Vec::new();
-            for json_retry in 0..=JSON_REPAIR_RETRIES {
+            for json_retry in 0..=WORKFLOW_RESPONSE_RETRIES {
                 let allowed = effective_actions(step, &self.workflow);
                 let runner = agent_runner_with_gated_fetcher(runner_base, allowed);
                 let runner = &runner;
@@ -841,105 +861,58 @@ impl LlmDriver {
                 let synthesis_use_routing_prompt =
                     use_routing_prompt_for_synth(&step.id, synthesis_use_fast);
 
-                // #3: a JSON/schema failure (not a code_edits apply
-                // failure) with a prior reply in hand is repaired by
-                // asking the model to convert that reply into the
-                // required JSON, instead of re-running the whole
-                // gather+synthesis. The reformat consumes the pending
-                // parse error; if the reformat CALL itself fails we fall
-                // through to a full retry with the error re-applied.
-                let mut summary = None;
-                if json_retry > 0 && last_apply_err.is_none() {
-                    if let Some(prior) = prior_raw.as_deref() {
-                        let validator = last_parse_err.clone().unwrap_or_default();
-                        if let Some(s) = runner
-                            .reformat_response_to_schema(
-                                &prompt_texts.user_text_base,
-                                prior,
-                                &validator,
-                                crate::pipeline::ReformatRouting {
-                                    use_fast: synthesis_use_fast,
-                                    use_routing_prompt: synthesis_use_routing_prompt,
-                                    mode,
-                                },
-                                &self.shutdown,
-                            )
-                            .await
-                        {
-                            last_parse_err = None;
-                            summary = Some(s);
-                        }
-                    }
-                }
-                let mut summary = match summary {
-                    Some(s) => s,
-                    None => {
-                        let user_text = build_retry_user_text(
-                            &prompt_texts.user_text_base,
-                            json_retry,
-                            &mut last_apply_err,
-                            &mut last_parse_err,
-                        );
-                        let task_brief = match lens {
-                            Some(l) => format!("{}|{}", step.id, l.id),
-                            None => step.id.clone(),
-                        };
-                        let rctx = crate::pipeline::RunContext {
-                            task_brief,
-                            mode,
-                            gather_prompt: Some(prompt_texts.gather_user_text_base.clone()),
-                            surface_over_input_limit: true,
-                            synthesis_use_fast,
-                            synthesis_use_routing_prompt,
-                            seed_symbols: seed_symbols.clone(),
-                            seed_context: seed_context.clone(),
-                            ..crate::pipeline::RunContext::default()
-                        };
-                        runner
-                            .run_once_with_ctx(&user_text, &rctx, &self.shutdown)
-                            .await
-                            .map_err(|e| match e {
-                                crate::AgentError::OverInputLimit { actual, limit } => {
-                                    crate::workflow_exec::DriverError::OverInputLimit {
-                                        step: step.id.clone(),
-                                        actual,
-                                        limit,
-                                    }
+                let summary = {
+                    let user_text = build_retry_user_text(
+                        &prompt_texts.user_text_base,
+                        json_retry,
+                        &mut last_apply_err,
+                        &mut last_parse_err,
+                    );
+                    let task_brief = match lens {
+                        Some(l) => format!("{}|{}", step.id, l.id),
+                        None => step.id.clone(),
+                    };
+                    let rctx = crate::pipeline::RunContext {
+                        task_brief,
+                        mode,
+                        allowed_response_extensions: step.outputs.keys().cloned().collect(),
+                        gather_prompt: Some(prompt_texts.gather_user_text_base.clone()),
+                        surface_over_input_limit: true,
+                        synthesis_use_fast,
+                        synthesis_use_routing_prompt,
+                        seed_symbols: seed_symbols.clone(),
+                        seed_context: seed_context.clone(),
+                        ..crate::pipeline::RunContext::default()
+                    };
+                    runner
+                        .run_once_with_ctx(&user_text, &rctx, &self.shutdown)
+                        .await
+                        .map_err(|e| match e {
+                            crate::AgentError::OverInputLimit { actual, limit } => {
+                                crate::workflow_exec::DriverError::OverInputLimit {
+                                    step: step.id.clone(),
+                                    actual,
+                                    limit,
                                 }
-                                other => crate::workflow_exec::DriverError::Other(format!(
-                                    "step '{}' AgentRunner run: {other}",
-                                    step.id
-                                )),
-                            })?
-                    }
+                            }
+                            other => crate::workflow_exec::DriverError::Other(format!(
+                                "step '{}' AgentRunner run: {other}",
+                                step.id
+                            )),
+                        })?
                 };
-                prior_raw = Some(summary.raw_response.clone());
                 if !summary.gathered_symbols.is_empty() || !summary.gathered_context.is_empty() {
                     captured_gathered = Some((
                         summary.gathered_symbols.clone(),
                         summary.gathered_context.clone(),
                     ));
                 }
-                // Carry code_output across reformat attempts (see the
-                // declaration above). Re-persisting is safe: code_output
-                // entries are full-file overwrites. code_edits are NOT
-                // carried — they are anchored to bytes that an earlier
-                // attempt already replaced, and validate/triage write via
-                // code_output, not edits.
-                if !summary.code_output.is_empty() {
-                    carried_code_output = summary.code_output.clone();
-                } else if !carried_code_output.is_empty() {
-                    summary.code_output = carried_code_output.clone();
-                }
-
                 // Map TaskSummary fields onto step.outputs before
-                // applying side effects. Validation failures can
-                // still retry after code_output writes because those
-                // are full-file overwrites; anchored code_edits are
-                // not assumed idempotent.
+                // applying side effects. Invalid attempts contribute no file
+                // output to later retries.
                 let mut outputs = match map_task_summary_to_outputs(step, &summary) {
                     Ok(outputs) => outputs,
-                    Err(e) if json_retry < JSON_REPAIR_RETRIES => {
+                    Err(e) if json_retry < WORKFLOW_RESPONSE_RETRIES => {
                         last_parse_err = Some(e.to_string());
                         continue;
                     }
@@ -947,28 +920,28 @@ impl LlmDriver {
                         return Err(format!("step '{}' output mapping: {e}", step.id).into());
                     }
                 };
+                if let Err(e) = validate_model_outputs_before_side_effects(step, &outputs) {
+                    if json_retry < WORKFLOW_RESPONSE_RETRIES {
+                        last_parse_err = Some(e.to_string());
+                        continue;
+                    }
+                    return Err(format!("step '{}' model output validation: {e}", step.id).into());
+                }
 
-                // Apply code-mode side effects to the workspace.
-                if !summary.code_output.is_empty() {
-                    if let Err(e) = persist_code_output(&self.workspace, &summary.code_output) {
-                        if json_retry < JSON_REPAIR_RETRIES && summary.code_edits.is_empty() {
-                            last_apply_err = Some(format!("code_output persist failed: {e}"));
+                let staged_changes = match stage_code_changes(
+                    &self.workspace,
+                    &summary.code_output,
+                    &summary.code_edits,
+                ) {
+                    Ok(staged) => staged,
+                    Err(e) => match classify_apply_failure(e, &step.id, json_retry) {
+                        ApplyFailure::Retry(msg) => {
+                            last_apply_err = Some(msg);
                             continue;
                         }
-                        return Err(format!("step '{}' code_output persist: {e}", step.id).into());
-                    }
-                }
-                if !summary.code_edits.is_empty() {
-                    if let Err(e) = apply_code_edits(&self.workspace, &summary.code_edits) {
-                        match classify_apply_failure(e, &step.id, json_retry) {
-                            ApplyFailure::Retry(msg) => {
-                                last_apply_err = Some(msg);
-                                continue;
-                            }
-                            ApplyFailure::Fatal(msg) => return Err(msg.into()),
-                        }
-                    }
-                }
+                        ApplyFailure::Fatal(msg) => return Err(msg.into()),
+                    },
+                };
 
                 add_side_effect_outputs(
                     step,
@@ -977,17 +950,20 @@ impl LlmDriver {
                     ctx,
                     &summary.code_output,
                     &summary.code_edits,
+                    &staged_changes,
                 )
                 .await?;
                 if let Err(e) = validate_required_outputs(step, &outputs) {
-                    if json_retry < JSON_REPAIR_RETRIES && summary.code_edits.is_empty() {
+                    if json_retry < WORKFLOW_RESPONSE_RETRIES {
                         last_parse_err = Some(e.to_string());
                         continue;
                     }
                     return Err(format!("step '{}' output validation: {e}", step.id).into());
                 }
+                self.stage_attempt(step, attempt, staged_changes)
+                    .map_err(crate::workflow_exec::DriverError::Other)?;
                 // #4: cache the gather (from the original run, preserved
-                // across any reformat attempts) so dependent steps can
+                // across full response retries) so dependent steps can
                 // seed from it.
                 if let Some((symbols, context)) = captured_gathered.take() {
                     self.store_gathered(&step.id, symbols, context);
@@ -995,9 +971,9 @@ impl LlmDriver {
                 return Ok(outputs);
             }
             return Err(format!(
-                "step '{}' output mapping failed after {} JSON repair retries: {}",
+                "step '{}' output mapping failed after {} full response retries: {}",
                 step.id,
-                JSON_REPAIR_RETRIES,
+                WORKFLOW_RESPONSE_RETRIES,
                 last_parse_err.unwrap_or_else(|| "unknown parse error".into())
             )
             .into());
@@ -1013,7 +989,7 @@ impl LlmDriver {
         };
         let mut last_parse_err: Option<String> = None;
         let mut last_apply_err: Option<String> = None;
-        for json_retry in 0..=JSON_REPAIR_RETRIES {
+        for json_retry in 0..=WORKFLOW_RESPONSE_RETRIES {
             let user_text = build_retry_user_text(
                 &prompt_texts.user_text_base,
                 json_retry,
@@ -1080,7 +1056,23 @@ impl LlmDriver {
                 );
             }
 
-            let code_response = crate::response::parse_code_response(&text);
+            let response_contract =
+                crate::response::CodeResponseContract::new(step.outputs.keys().cloned());
+            let code_response = match response_contract.validate(&text) {
+                Ok(response) => response,
+                Err(errors) if json_retry < WORKFLOW_RESPONSE_RETRIES => {
+                    last_parse_err = Some(errors.join("; "));
+                    continue;
+                }
+                Err(errors) => {
+                    return Err(format!(
+                        "step '{}' response contract: {}",
+                        step.id,
+                        errors.join("; ")
+                    )
+                    .into());
+                }
+            };
 
             // Even on the fallback path, surface findings + followups
             // when the step declares them, so the workflow's view of a
@@ -1093,35 +1085,12 @@ impl LlmDriver {
                 {
                     Map::new()
                 }
-                Err(e) if json_retry < JSON_REPAIR_RETRIES => {
+                Err(e) if json_retry < WORKFLOW_RESPONSE_RETRIES => {
                     last_parse_err = Some(e.to_string());
                     continue;
                 }
                 Err(e) => return Err(format!("step '{}' output extraction: {e}", step.id).into()),
             };
-
-            // Now that the response yielded parseable workflow
-            // outputs, apply any side effects it requested.
-            if !code_response.code_output.is_empty() {
-                if let Err(e) = persist_code_output(&self.workspace, &code_response.code_output) {
-                    if json_retry < JSON_REPAIR_RETRIES && code_response.code_edits.is_empty() {
-                        last_apply_err = Some(format!("code_output persist failed: {e}"));
-                        continue;
-                    }
-                    return Err(format!("step '{}' code_output persist: {e}", step.id).into());
-                }
-            }
-            if !code_response.code_edits.is_empty() {
-                if let Err(e) = apply_code_edits(&self.workspace, &code_response.code_edits) {
-                    match classify_apply_failure(e, &step.id, json_retry) {
-                        ApplyFailure::Retry(msg) => {
-                            last_apply_err = Some(msg);
-                            continue;
-                        }
-                        ApplyFailure::Fatal(msg) => return Err(msg.into()),
-                    }
-                }
-            }
 
             if step.outputs.contains_key("findings") && !outputs.contains_key("findings") {
                 if let Ok(v) = serde_json::to_value(&code_response.findings) {
@@ -1149,6 +1118,34 @@ impl LlmDriver {
                     outputs.insert("code_edits".to_string(), v);
                 }
             }
+            preserve_lens_analysis_for_consolidate(
+                step,
+                lens,
+                &code_response.analysis,
+                &mut outputs,
+            );
+            if let Err(e) = validate_model_outputs_before_side_effects(step, &outputs) {
+                if json_retry < WORKFLOW_RESPONSE_RETRIES {
+                    last_parse_err = Some(e.to_string());
+                    continue;
+                }
+                return Err(format!("step '{}' model output validation: {e}", step.id).into());
+            }
+
+            let staged_changes = match stage_code_changes(
+                &self.workspace,
+                &code_response.code_output,
+                &code_response.code_edits,
+            ) {
+                Ok(staged) => staged,
+                Err(e) => match classify_apply_failure(e, &step.id, json_retry) {
+                    ApplyFailure::Retry(msg) => {
+                        last_apply_err = Some(msg);
+                        continue;
+                    }
+                    ApplyFailure::Fatal(msg) => return Err(msg.into()),
+                },
+            };
             add_side_effect_outputs(
                 step,
                 &mut outputs,
@@ -1156,27 +1153,24 @@ impl LlmDriver {
                 ctx,
                 &code_response.code_output,
                 &code_response.code_edits,
+                &staged_changes,
             )
             .await?;
-            preserve_lens_analysis_for_consolidate(
-                step,
-                lens,
-                &code_response.analysis,
-                &mut outputs,
-            );
             if let Err(e) = validate_required_outputs(step, &outputs) {
-                if json_retry < JSON_REPAIR_RETRIES && code_response.code_edits.is_empty() {
+                if json_retry < WORKFLOW_RESPONSE_RETRIES {
                     last_parse_err = Some(e.to_string());
                     continue;
                 }
                 return Err(format!("step '{}' output validation: {e}", step.id).into());
             }
+            self.stage_attempt(step, attempt, staged_changes)
+                .map_err(crate::workflow_exec::DriverError::Other)?;
             return Ok(outputs);
         }
         Err(format!(
-            "step '{}' output extraction failed after {} JSON repair retries: {}",
+            "step '{}' output extraction failed after {} full response retries: {}",
             step.id,
-            JSON_REPAIR_RETRIES,
+            WORKFLOW_RESPONSE_RETRIES,
             last_parse_err.unwrap_or_else(|| "unknown parse error".into())
         )
         .into())
@@ -1186,6 +1180,15 @@ impl LlmDriver {
         &self,
         step: &Step,
         ctx: &ExecContext<'_>,
+    ) -> Result<Map<String, Value>, String> {
+        self.run_reaper_with_effects(step, ctx, &Value::Null).await
+    }
+
+    async fn run_reaper_with_effects(
+        &self,
+        step: &Step,
+        ctx: &ExecContext<'_>,
+        effects: &Value,
     ) -> Result<Map<String, Value>, String> {
         let action = step
             .action
@@ -1224,28 +1227,34 @@ impl LlmDriver {
                 if fix_index == 0 {
                     return Err("publish-fix fix_index must be >= 1".to_string());
                 }
-                let patch_path = run_publish_fix(&self.workspace, &dir, fix_index).await?;
-                let mut out = Map::new();
-                out.insert("patch_path".into(), Value::String(patch_path));
-                if research_is_latent(ctx) && latent_status_covers_whole_finding(ctx) {
-                    if let Some(status) = action
-                        .args
-                        .as_ref()
-                        .and_then(|a| a.get("status_when_research_is_latent"))
-                        .and_then(|v| v.as_str())
-                    {
-                        let status = interpolate(status, &self.workflow, ctx, Some(&step.id))
-                            .map_err(|e| format!("publish-fix latent status interpolation: {e}"))?;
-                        validate_research_status_transition(ctx, &status)?;
-                        let files_updated = run_set_finding_status(&dir, &status, None, None)?;
-                        out.insert("status".into(), Value::String(status));
-                        out.insert(
-                            "files_updated".into(),
-                            Value::Array(files_updated.into_iter().map(Value::String).collect()),
-                        );
+                {
+                    let patch_path = run_publish_fix(&self.workspace, &dir, fix_index).await?;
+                    let mut out = Map::new();
+                    out.insert("patch_path".into(), Value::String(patch_path));
+                    if research_is_latent(ctx) && latent_status_covers_whole_finding(ctx) {
+                        if let Some(status) = action
+                            .args
+                            .as_ref()
+                            .and_then(|a| a.get("status_when_research_is_latent"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let status = interpolate(status, &self.workflow, ctx, Some(&step.id))
+                                .map_err(|e| {
+                                format!("publish-fix latent status interpolation: {e}")
+                            })?;
+                            validate_research_status_transition(ctx, &status)?;
+                            let files_updated = run_set_finding_status(&dir, &status, None, None)?;
+                            out.insert("status".into(), Value::String(status));
+                            out.insert(
+                                "files_updated".into(),
+                                Value::Array(
+                                    files_updated.into_iter().map(Value::String).collect(),
+                                ),
+                            );
+                        }
                     }
+                    Ok(out)
                 }
-                Ok(out)
             }
             crate::workflow::ActionType::CommitFix => {
                 let args = action
@@ -1276,7 +1285,25 @@ impl LlmDriver {
                         .map(|st| st.attempt)
                         .unwrap_or_default(),
                 ) >= amend_from_attempt;
-                let commit = run_commit_fix(&self.workspace, &files, &message_path, amend).await?;
+                let pre_head = effects
+                    .get("pre_head")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "commit-fix durable intent missing pre_head".to_string())?;
+                let expected_message = effects
+                    .get("expected_message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "commit-fix durable intent missing expected_message".to_string()
+                    })?;
+                let commit = run_commit_fix_recoverable(
+                    &self.workspace,
+                    &files,
+                    &message_path,
+                    amend,
+                    pre_head,
+                    expected_message,
+                )
+                .await?;
                 let mut out = Map::new();
                 out.insert("commit_sha".into(), Value::String(commit.sha));
                 out.insert("commit_message".into(), Value::String(commit.message));
@@ -1485,55 +1512,110 @@ impl Driver for LlmDriver {
         self.run_llm_step(step, attempt, ctx, role, lens).await
     }
 
-    async fn run_post_actions(
+    async fn attempt_effects(
         &self,
         step: &Step,
+        attempt: u32,
         ctx: &ExecContext<'_>,
-    ) -> Result<Vec<String>, String> {
-        let allowed = effective_actions(step, &self.workflow);
-        let mut log = Vec::new();
-        for pa in &step.post_actions {
-            // Allowlist gate: every post-action's `type` must
-            // appear in step.actions or workflow.defaults.actions.
-            // When neither is set the gate is closed — refuse to
-            // run anything. This keeps a step that declared
-            // `actions: ["read"]` from sneaking in a git commit
-            // via a post_action.
-            if !allowed.contains(&pa.kind) {
+    ) -> Result<Value, String> {
+        if matches!(self.role_for(step), Ok(AgentRole::Reaper)) {
+            if matches!(
+                step.action.as_ref().map(|action| action.kind),
+                Some(crate::workflow::ActionType::CommitFix)
+            ) {
+                let action = step.action.as_ref().unwrap();
+                let args = action
+                    .args
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| format!("commit-fix step '{}' missing args", step.id))?;
+                let message_path = args
+                    .get("message_path")
+                    .and_then(Value::as_str)
+                    .unwrap_or(".kres-commit-msg.tmp");
+                let message_path = interpolate(message_path, &self.workflow, ctx, Some(&step.id))
+                    .map_err(|error| {
+                    format!("commit-fix message_path interpolation: {error}")
+                })?;
+                let message = std::fs::read_to_string(self.workspace.join(&message_path))
+                    .map_err(|error| format!("read commit message {message_path}: {error}"))?;
+                let pre_head = git_rev_parse_head_optional(&self.workspace)
+                    .await
+                    .ok_or_else(|| "commit-fix could not resolve pre-action HEAD".to_string())?;
+                return Ok(serde_json::json!({
+                    "kind": "commit-fix",
+                    "pre_head": pre_head,
+                    "expected_message": message.trim(),
+                }));
+            }
+            return Ok(Value::Null);
+        }
+        let pending = self
+            .pending_changes
+            .lock()
+            .map_err(|_| "pending code-change lock poisoned".to_string())?;
+        let staged = pending
+            .get(&(step.id.clone(), attempt))
+            .cloned()
+            .unwrap_or_default();
+        Ok(Value::Array(
+            staged
+                .into_iter()
+                .map(|(path, body)| {
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "body": body,
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    async fn apply_attempt_effects(
+        &self,
+        step: &Step,
+        attempt: u32,
+        effects: &Value,
+        ctx: &ExecContext<'_>,
+    ) -> Result<Map<String, Value>, String> {
+        if matches!(self.role_for(step), Ok(AgentRole::Reaper)) {
+            return self.run_reaper_with_effects(step, ctx, effects).await;
+        }
+        let entries = effects
+            .as_array()
+            .ok_or_else(|| format!("step '{}' effect payload must be an array", step.id))?;
+        let mut staged = std::collections::BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let path = entry
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("step '{}' effect[{index}] missing path", step.id))?;
+            let body = entry
+                .get("body")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("step '{}' effect[{index}] missing body", step.id))?;
+            let path = PathBuf::from(path);
+            if !path.is_absolute() {
                 return Err(format!(
-                    "post_action type {:?} not in step's allowlist {:?} (set step.actions or workflow.defaults.actions)",
-                    pa.kind, allowed
+                    "step '{}' effect[{index}] path is not absolute: {}",
+                    step.id,
+                    path.display()
                 ));
             }
-            let name = pa.name.as_deref().unwrap_or("");
-            let interpolated = interpolate(name, &self.workflow, ctx, Some(&step.id))
-                .map_err(|e| format!("post-action interpolation: {e}"))?;
-            match pa.kind {
-                crate::workflow::ActionType::Git => {
-                    log.push(format!("git {interpolated}"));
-                    let out = spawn_in_workspace(&self.workspace, "git", &interpolated).await?;
-                    log.push(format!("  → {out}"));
-                }
-                crate::workflow::ActionType::Make => {
-                    log.push(format!("make {interpolated}"));
-                    let out = spawn_in_workspace(&self.workspace, "make", &interpolated).await?;
-                    log.push(format!("  → {out}"));
-                }
-                crate::workflow::ActionType::Meson => {
-                    log.push(format!("meson {interpolated}"));
-                    let out = spawn_in_workspace(&self.workspace, "meson", &interpolated).await?;
-                    log.push(format!("  → {out}"));
-                }
-                crate::workflow::ActionType::PublishFix => {
-                    let path = run_publish_fix(&self.workspace, &interpolated, 1).await?;
-                    log.push(format!("publish-fix → {path}"));
-                }
-                other => {
-                    return Err(format!("post-action type {other:?} not supported"));
-                }
-            }
+            staged.insert(path, body.to_string());
         }
-        Ok(log)
+        commit_staged_files(&self.workspace, staged)
+            .map_err(|error| format!("step '{}' code changes commit: {error}", step.id))?;
+        if let Ok(mut pending) = self.pending_changes.lock() {
+            pending.remove(&(step.id.clone(), attempt));
+        }
+        Ok(Map::new())
+    }
+
+    async fn discard_attempt(&self, step: &Step, attempt: u32) {
+        if let Ok(mut pending) = self.pending_changes.lock() {
+            pending.remove(&(step.id.clone(), attempt));
+        }
     }
 
     /// LLM-judged eval. Sends the step's outputs as JSON plus the
@@ -1576,7 +1658,7 @@ impl Driver for LlmDriver {
         let interpolated_prompt = interpolate(judge_prompt, &self.workflow, ctx, Some(&step.id))
             .map_err(|e| format!("judge prompt interpolation: {e}"))?;
         let user_text = format!(
-            "JUDGE STEP OUTPUTS\n\nstep: {sid}\n\n--- JUDGE INSTRUCTIONS ---\n{rules}\n\n--- STEP OUTPUTS ---\n{outputs_json}\n\n--- OUTPUT SCHEMA ---\nReply with a single JSON object:\n  {{\"pass\": true|false, \"reason\": \"one-line explanation\"}}\nThe object must be the LAST top-level JSON in your reply.",
+            "JUDGE STEP OUTPUTS\n\nstep: {sid}\n\n--- JUDGE INSTRUCTIONS ---\n{rules}\n\n--- STEP OUTPUTS ---\n{outputs_json}\n\n--- OUTPUT SCHEMA ---\nReply with a single raw, unfenced JSON object—no Markdown backticks:\n  {{\"pass\": true|false, \"reason\": \"one-line explanation\"}}\nThe object must be the only top-level JSON in your reply.",
             sid = step.id,
             rules = interpolated_prompt
         );
@@ -1620,24 +1702,9 @@ impl Driver for LlmDriver {
                 None,
             );
         }
-        // Parse the LAST top-level JSON object that has a `pass` key.
-        let candidates = extract_brace_objects(&text);
-        for blob in candidates.iter().rev() {
-            if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(blob) {
-                if let Some(p) = m.get("pass").and_then(|v| v.as_bool()) {
-                    let reason = m
-                        .get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    return Ok((p, reason));
-                }
-            }
-        }
-        Err(format!(
-            "step '{}' judge response had no JSON object with a `pass` key",
-            step.id
-        ))
+        let parsed = crate::json_repair::parse_strict_json::<JudgeResponse>("judge", &text)
+            .map_err(|errors| format!("step '{}' {}", step.id, errors.join("; ")))?;
+        Ok((parsed.pass, parsed.reason))
     }
 
     /// Consolidate per-lens outputs via the step's LLM consolidator.
@@ -1782,6 +1849,7 @@ impl Driver for LlmDriver {
     async fn lens_fan_out_consolidate(
         &self,
         step: &Step,
+        attempt: u32,
         ctx: &ExecContext<'_>,
     ) -> Result<LensFanOutConsolidate, String> {
         let Some(runner) = self.agent_runner.as_ref() else {
@@ -1797,7 +1865,6 @@ impl Driver for LlmDriver {
             .map(crate::workflow::lens_to_spec)
             .collect();
 
-        let attempt = ctx.steps.get(&step.id).map(|st| st.attempt).unwrap_or(1);
         let prompt_texts = self
             .build_step_prompt_texts(
                 step,
@@ -1817,6 +1884,7 @@ impl Driver for LlmDriver {
         let rctx = crate::pipeline::RunContext {
             task_brief: step.id.clone(),
             mode,
+            allowed_response_extensions: step.outputs.keys().cloned().collect(),
             gather_prompt: Some(prompt_texts.gather_user_text_base),
             ..crate::pipeline::RunContext::default()
         };
@@ -1827,6 +1895,8 @@ impl Driver for LlmDriver {
                  Reuse the same gathered source/context. Reply only with the required JSON object for this \
                  lens; do not request more gathering unless the missing evidence is truly unavailable."
             );
+            let repair_schema = serde_json::to_string(&workflow_response_schema(step)?)
+                .map_err(|error| format!("serialize workflow response schema: {error}"))?;
             let fanout = runner
                 .run_lenses_shared_gather_repairing(
                     &prompt_texts.user_text_base,
@@ -1834,8 +1904,10 @@ impl Driver for LlmDriver {
                     &rctx,
                     &self.shutdown,
                     crate::pipeline::LensRepairPolicy {
-                        max_retries: JSON_REPAIR_RETRIES,
+                        max_retries: WORKFLOW_RESPONSE_RETRIES,
                         repair_instruction: &repair_instruction,
+                        contract_name: "workflow-review-lens",
+                        schema: &repair_schema,
                     },
                     |output| validate_structured_review_lens_output(step, output),
                 )
@@ -1875,18 +1947,14 @@ impl Driver for LlmDriver {
             .await
             .map_err(|e| format!("step '{}' run_with_lenses: {e}", step.id))?;
 
-        // Apply code side-effects, then map the consolidated
-        // TaskSummary onto step outputs.
-        if !summary.code_output.is_empty() {
-            persist_code_output(&self.workspace, &summary.code_output)
-                .map_err(|e| format!("step '{}' code_output persist: {e}", step.id))?;
-        }
-        if !summary.code_edits.is_empty() {
-            apply_code_edits(&self.workspace, &summary.code_edits)
-                .map_err(|e| format!("step '{}' code_edits apply: {e}", step.id))?;
-        }
         let outputs = map_task_summary_to_outputs(step, &summary)
             .map_err(|e| format!("step '{}' output mapping: {e}", step.id))?;
+        validate_model_outputs_before_side_effects(step, &outputs)
+            .map_err(|e| format!("step '{}' model output validation: {e}", step.id))?;
+
+        let staged = stage_code_changes(&self.workspace, &summary.code_output, &summary.code_edits)
+            .map_err(|e| format!("step '{}' code changes stage: {e}", step.id))?;
+        self.stage_attempt(step, attempt, staged)?;
         Ok(LensFanOutConsolidate::Outputs(outputs))
     }
 
@@ -2017,7 +2085,7 @@ fn build_review_ledger_prompt(
          {ledger_json}\n\n\
          CURRENT STEP OUTPUTS JSON\n\
          {outputs_json}\n\n\
-         Reply with one JSON object and no prose. The `ledger` value must be a JSON array \
+         Reply with one raw, unfenced JSON object and no prose or Markdown backticks. The `ledger` value must be a JSON array \
          of entry objects. If the ledger is empty, return exactly this shape:\n\
          {{\"ledger\": []}}\n",
         step_id = step.id
@@ -2377,7 +2445,7 @@ fn build_output_schema_tail(step: &Step) -> String {
         return "(no outputs required — emit any free-form response)".into();
     }
     let mut s = String::from(
-        "Reply with a single JSON object. Standard kres response keys are allowed, \
+        "Reply with a single raw, unfenced JSON object—no Markdown backticks. Standard kres response keys are allowed, \
          including analysis, findings, followups, code_edits, and code_output. \
          The same JSON object must also contain these workflow output keys:\n\n",
     );
@@ -2393,10 +2461,8 @@ fn build_output_schema_tail(step: &Step) -> String {
         s.push_str(&format!("- {k}: {ty}{opt}{rw} — {desc}\n"));
     }
     s.push_str(
-        "\nThe JSON object must be the LAST top-level JSON in your reply. \
-         Prose / analysis above the JSON is fine, but the JSON itself \
-         must parse as-is and contain every required workflow field. \
-         Do not emit workflow fields as a second JSON object.",
+        "\nReturn only that one JSON object. Put any prose in its `analysis` field. \
+         Do not emit a preamble, trailing text, Markdown fence, or second JSON object.",
     );
     s
 }
@@ -2487,7 +2553,7 @@ enum ApplyFailure {
 }
 
 fn classify_apply_failure(err: anyhow::Error, step_id: &str, json_retry: usize) -> ApplyFailure {
-    if json_retry < JSON_REPAIR_RETRIES {
+    if json_retry < WORKFLOW_RESPONSE_RETRIES {
         tracing::warn!(
             target: "kres_agents",
             step = %step_id,
@@ -2511,45 +2577,64 @@ pub fn extract_outputs(text: &str, step: &Step) -> Result<Map<String, Value>> {
         // free-form steps without an eval.
         return Ok(Map::new());
     }
-    let candidates = extract_brace_objects(text);
-    if candidates.is_empty() {
-        return Err(anyhow!(
-            "response had no top-level JSON object (declared keys: {:?})",
-            declared
-        ));
-    }
-    // Prefer the LAST object that mentions any declared key, so the
-    // model can think in prose / earlier JSON snippets first.
-    let mut chosen: Option<Map<String, Value>> = None;
-    for blob in candidates.iter().rev() {
-        if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(blob) {
-            if declared.iter().any(|k| m.contains_key(k.as_str())) {
-                chosen = Some(m);
-                break;
-            }
-        }
-    }
-    let Some(map) = chosen else {
-        return Err(anyhow!(
-            "response had JSON but none mentioned a declared key (looked for {:?})",
-            declared
-        ));
+    let Value::Object(map) = crate::json_repair::parse_strict_json::<Value>("workflow-step", text)
+        .map_err(|errors| {
+            anyhow!(
+                "response is not exactly one JSON object: {}",
+                errors.join("; ")
+            )
+        })?
+    else {
+        return Err(anyhow!("response must be one JSON object"));
     };
+    if !declared.iter().any(|key| map.contains_key(key.as_str())) {
+        return Err(anyhow!(
+            "response JSON mentioned none of the declared keys {:?}",
+            declared
+        ));
+    }
+    const SHARED_FIELDS: &[&str] = &[
+        "analysis",
+        "followups",
+        "skill_reads",
+        "findings",
+        "ready_for_slow",
+        "code_output",
+        "code_edits",
+        "plan",
+    ];
+    let unknown: Vec<&str> = map
+        .keys()
+        .filter(|key| !step.outputs.contains_key(*key) && !SHARED_FIELDS.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(anyhow!(
+            "unknown top-level workflow output field(s): {}",
+            unknown.join(", ")
+        ));
+    }
     // Project onto declared keys; preserve declaration order so
     // pretty-printing is stable.
     let mut out = Map::new();
     for k in declared {
         if let Some(v) = map.get(k) {
-            out.insert(k.clone(), v.clone());
+            let value =
+                if step.outputs[k].get("type").and_then(Value::as_str) == Some("array<Finding>") {
+                    let findings = serde_json::from_value::<Vec<Finding>>(v.clone())
+                        .with_context(|| format!("workflow output `{k}` is not array<Finding>"))?
+                        .into_iter()
+                        .map(|finding| finding.redacted_for_agent())
+                        .collect::<Vec<_>>();
+                    serde_json::to_value(findings)?
+                } else {
+                    v.clone()
+                };
+            out.insert(k.clone(), value);
         }
     }
     Ok(out)
 }
-
-// The brace-scanner lives in kres_core::brace; this file imports
-// `extract_brace_objects` at the top alongside the other kres_core
-// uses, and the other kres-agents callers (response, goal,
-// todo_agent) reach the helpers via `kres_core::brace::*` directly.
 
 /// Apply the workflow's `inputs.*.derive` rules to a user-supplied
 /// inputs map. Known derives:
@@ -2811,39 +2896,6 @@ fn expand_tilde_path_with_home(s: &str, home: Option<PathBuf>) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Run `<cmd> <args>` in the workspace, capturing stdout/stderr.
-/// `args` is split on whitespace (no shell). 60-second timeout.
-async fn spawn_in_workspace(workspace: &Path, cmd: &str, args: &str) -> Result<String, String> {
-    let split: Vec<&str> = args.split_whitespace().collect();
-    let mut command = tokio::process::Command::new(cmd);
-    command.current_dir(workspace);
-    command.args(&split);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = match tokio::time::timeout(std::time::Duration::from_secs(60), command.output()).await
-    {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("{cmd} spawn: {e}")),
-        Err(_) => return Err(format!("{cmd} timed out")),
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() {
-        return Err(format!(
-            "{cmd} {args} exited {}: {}",
-            out.status.code().unwrap_or(-1),
-            stderr.trim()
-        ));
-    }
-    let mut summary = format!("ok ({} bytes stdout)", stdout.len());
-    if !stderr.is_empty() {
-        summary.push_str(&format!(
-            ", stderr: {}",
-            stderr.lines().next().unwrap_or("")
-        ));
-    }
-    Ok(summary)
-}
-
 struct CommitFixResult {
     sha: String,
     message: String,
@@ -2891,6 +2943,7 @@ async fn run_commit_fix(
     }
 
     let mut add = tokio::process::Command::new("git");
+    add.kill_on_drop(true);
     add.current_dir(workspace).args(["add", "--"]).args(&files);
     add.stdout(Stdio::piped()).stderr(Stdio::piped());
     let add_out = tokio::time::timeout(std::time::Duration::from_secs(30), add.output())
@@ -2906,6 +2959,7 @@ async fn run_commit_fix(
     }
 
     let mut commit = tokio::process::Command::new("git");
+    commit.kill_on_drop(true);
     commit.current_dir(workspace);
     if amend {
         commit.args(["commit", "--amend", "-s", "-F", message_path]);
@@ -2932,6 +2986,88 @@ async fn run_commit_fix(
     }
 
     current_commit_fix_result(workspace).await
+}
+
+async fn git_commit_parents(workspace: &Path, revision: &str) -> Result<Vec<String>, String> {
+    let output = tokio::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["show", "-s", "--format=%P", revision])
+        .output()
+        .await
+        .map_err(|error| format!("git show parents for {revision}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git show parents for {revision} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(str::to_string)
+        .collect())
+}
+
+async fn run_commit_fix_recoverable(
+    workspace: &Path,
+    files: &str,
+    message_path: &str,
+    amend: bool,
+    pre_head: &str,
+    expected_message: &str,
+) -> Result<CommitFixResult, String> {
+    let message_body = std::fs::read_to_string(workspace.join(message_path))
+        .map_err(|error| format!("read durable commit message {message_path}: {error}"))?;
+    if message_body.trim() != expected_message {
+        return Err(format!(
+            "commit-fix recovery conflict: {message_path} changed after intent was persisted"
+        ));
+    }
+    let current_head = git_rev_parse_head_optional(workspace)
+        .await
+        .ok_or_else(|| "commit-fix could not resolve current HEAD".to_string())?;
+    if current_head != pre_head {
+        let current = current_commit_fix_result(workspace).await?;
+        validate_commit_matches_intent(workspace, &current, amend, pre_head, expected_message)
+            .await?;
+        return Ok(current);
+    }
+
+    let mut index_guard = GitIndexRollback::capture(workspace, pre_head).await?;
+    let result = run_commit_fix(workspace, files, message_path, amend).await;
+    if let Ok(commit) = &result {
+        validate_commit_matches_intent(workspace, commit, amend, pre_head, expected_message)
+            .await?;
+        index_guard.disarm();
+    }
+    result
+}
+
+async fn validate_commit_matches_intent(
+    workspace: &Path,
+    commit: &CommitFixResult,
+    amend: bool,
+    pre_head: &str,
+    expected_message: &str,
+) -> Result<(), String> {
+    if !commit.message.starts_with(expected_message) {
+        return Err(format!(
+            "commit-fix recovery conflict: HEAD moved from {pre_head} to {} with a different message",
+            commit.sha
+        ));
+    }
+    let current_parents = git_commit_parents(workspace, &commit.sha).await?;
+    let relationship_matches = if amend {
+        current_parents == git_commit_parents(workspace, pre_head).await?
+    } else {
+        current_parents.first().map(String::as_str) == Some(pre_head)
+    };
+    if !relationship_matches {
+        return Err(format!(
+            "commit-fix recovery conflict: commit {} does not have the expected parent relationship to {pre_head}",
+            commit.sha
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3155,6 +3291,7 @@ async fn changed_object_targets(workspace: &Path) -> Result<Vec<String>, String>
 
 async fn git_lines(workspace: &Path, args: &[&str]) -> Result<Vec<String>, String> {
     let mut cmd = tokio::process::Command::new("git");
+    cmd.kill_on_drop(true);
     cmd.current_dir(workspace)
         .args(args)
         .stdout(Stdio::piped())
@@ -3466,6 +3603,89 @@ fn run_set_finding_status(
     Ok(files)
 }
 
+struct GitIndexRollback {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+    workspace: PathBuf,
+    pre_head: String,
+    armed: bool,
+}
+
+impl GitIndexRollback {
+    async fn capture(workspace: &Path, pre_head: &str) -> Result<Self, String> {
+        let output = tokio::process::Command::new("git")
+            .current_dir(workspace)
+            .args(["rev-parse", "--git-path", "index"])
+            .output()
+            .await
+            .map_err(|error| format!("git rev-parse --git-path index: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git rev-parse --git-path index failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let path = if Path::new(&raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            workspace.join(raw)
+        };
+        let contents = match std::fs::read(&path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("read git index {}: {error}", path.display())),
+        };
+        Ok(Self {
+            path,
+            contents,
+            workspace: workspace.to_path_buf(),
+            pre_head: pre_head.to_string(),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn restore(&self) -> std::io::Result<()> {
+        match &self.contents {
+            Some(contents) => std::fs::write(&self.path, contents),
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(remove) => Err(remove),
+            },
+        }
+    }
+}
+
+impl Drop for GitIndexRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let head_unchanged = std::process::Command::new("git")
+            .current_dir(&self.workspace)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim() == self.pre_head)
+            .unwrap_or(false);
+        if head_unchanged {
+            if let Err(error) = self.restore() {
+                tracing::error!(
+                    target: "kres_agents::workflow_runner",
+                    "failed to restore git index {} from cancelled commit attempt: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
 fn step_output_string(ctx: &ExecContext<'_>, step_id: &str, key: &str) -> Option<String> {
     ctx.steps
         .get(step_id)
@@ -3503,12 +3723,12 @@ async fn run_publish_fix(
     if !dir.is_absolute() {
         return Err(format!("finding_dir must be absolute: {finding_dir}"));
     }
-    kres_core::ensure_artifact_dir_files(&dir)
-        .map_err(|e| format!("prepare {finding_dir}: {e}"))?;
     let fix_name = kres_core::auto_generated_fix_name(fix_index);
     let fix_path = dir.join(&fix_name);
     if let Some(head_sha) = git_rev_parse_head_optional(workspace).await {
         if kres_core::patch_file_matches_head_named(&dir, &fix_name, &head_sha).unwrap_or(false) {
+            kres_core::ensure_artifact_dir_files(&dir)
+                .map_err(|e| format!("prepare {finding_dir}: {e}"))?;
             kres_core::clear_invalidation_artifacts(&dir)
                 .map_err(|e| format!("clear invalidation artifacts in {finding_dir}: {e}"))?;
             return Ok(fix_path.display().to_string());
@@ -3535,6 +3755,8 @@ async fn run_publish_fix(
     if patch.is_empty() {
         return Err("git format-patch produced empty output".into());
     }
+    kres_core::ensure_artifact_dir_files(&dir)
+        .map_err(|e| format!("prepare {finding_dir}: {e}"))?;
     std::fs::write(&fix_path, &patch).map_err(|e| format!("write {}: {e}", fix_path.display()))?;
     kres_core::record_auto_generated_fix_named(&dir, &fix_name)
         .map_err(|e| format!("record auto-generated fix in {finding_dir}: {e}"))?;
@@ -3712,8 +3934,8 @@ pub fn map_task_summary_to_outputs(
         .filter(|k| !out.contains_key(k.as_str()))
         .collect();
     if !unhandled.is_empty() {
-        // Reuse extract_outputs's brace-match + last-JSON-with-key
-        // logic against the analysis text. Build a synthetic Step
+        // Reuse extract_outputs's strict whole-response validation against
+        // the analysis text. Build a synthetic Step
         // that declares only the unhandled keys so extract_outputs
         // ignores the well-known ones we already populated.
         let mut synthetic = step.clone();
@@ -3739,13 +3961,7 @@ fn only_machine_populated_outputs(step: &Step) -> bool {
         return false;
     }
     step.outputs.iter().all(|(k, def)| {
-        let machine_populated = matches!(
-            k.as_str(),
-            "code_changes_emitted"
-                | "commit_message_written"
-                | "affected_files_changed"
-                | "summary_written"
-        );
+        let machine_populated = is_machine_populated_output(k);
         if machine_populated {
             return true;
         }
@@ -3758,6 +3974,48 @@ fn only_machine_populated_outputs(step: &Step) -> bool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     })
+}
+
+fn is_machine_populated_output(name: &str) -> bool {
+    matches!(
+        name,
+        "build_target"
+            | "changed_files"
+            | "code_changes_emitted"
+            | "commit_message_written"
+            | "affected_files_changed"
+            | "summary_written"
+            | "severity_written"
+            | "review_dispute"
+    )
+}
+
+/// Validate everything supplied by the model before any file write or edit.
+/// Outputs computed from those side effects are excluded from the required
+/// check and validated by `validate_required_outputs` after derivation.
+fn validate_model_outputs_before_side_effects(
+    step: &Step,
+    outputs: &Map<String, Value>,
+) -> Result<()> {
+    let missing: Vec<&str> = step
+        .outputs
+        .iter()
+        .filter_map(|(name, definition)| {
+            let optional = definition
+                .get("optional")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            (!optional && !is_machine_populated_output(name) && !outputs.contains_key(name))
+                .then_some(name.as_str())
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "missing required model output(s): {}",
+            missing.join(", ")
+        ));
+    }
+    validate_output_types(step, outputs)
 }
 
 fn validate_required_outputs(step: &Step, outputs: &Map<String, Value>) -> Result<()> {
@@ -3814,6 +4072,10 @@ fn validate_output_types(step: &Step, outputs: &Map<String, Value>) -> Result<()
                 Some(items) if items.iter().all(Value::is_string) => {}
                 _ => errors.push(format!("{name} is not array<string>")),
             },
+            "array<object>" => match value.as_array() {
+                Some(items) if items.iter().all(Value::is_object) => {}
+                _ => errors.push(format!("{name} is not array<object>")),
+            },
             "array<CodeFile>"
                 if serde_json::from_value::<Vec<kres_core::CodeFile>>(value.clone()).is_err() =>
             {
@@ -3838,10 +4100,15 @@ fn validate_output_types(step: &Step, outputs: &Map<String, Value>) -> Result<()
             "object" if !value.is_object() => {
                 errors.push(format!("{name} is not object"));
             }
-            _ => {}
+            "integer" if !value.is_i64() && !value.is_u64() => {
+                errors.push(format!("{name} is not integer"));
+            }
+            "string" | "boolean" | "object" | "integer" | "array<Finding>" | "array<Followup>"
+            | "array<CodeFile>" | "array<CodeEdit>" => {}
+            other => errors.push(format!("{name} has unsupported output type `{other}`")),
         }
         if let Some(schema) = def.get("schema") {
-            if let Err(e) = validate_output_json_schema(name, value, schema) {
+            if let Err(e) = validate_output_json_schema(name, ty, value, schema) {
                 errors.push(e);
             }
         }
@@ -3853,8 +4120,14 @@ fn validate_output_types(step: &Step, outputs: &Map<String, Value>) -> Result<()
     }
 }
 
-fn validate_output_json_schema(name: &str, value: &Value, schema: &Value) -> Result<(), String> {
-    let validator = jsonschema::validator_for(schema)
+fn validate_output_json_schema(
+    name: &str,
+    output_type: &str,
+    value: &Value,
+    schema: &Value,
+) -> Result<(), String> {
+    let schema = compile_output_schema(output_type, schema)?;
+    let validator = jsonschema::validator_for(&schema)
         .map_err(|e| format!("{name} schema failed to compile: {e}"))?;
     if validator.is_valid(value) {
         return Ok(());
@@ -3868,6 +4141,115 @@ fn validate_output_json_schema(name: &str, value: &Value, schema: &Value) -> Res
     Err(format!("{name} does not match schema: {details}"))
 }
 
+fn compile_output_schema(output_type: &str, schema: &Value) -> Result<Value, String> {
+    if !schema.is_object() && !schema.is_boolean() {
+        return Err("output schema must be an object".to_string());
+    }
+    if let Some(schema_type) = schema.get("type").and_then(Value::as_str) {
+        let compatible = match output_type {
+            "object" => schema_type == "object",
+            ty if ty.starts_with("array<") => schema_type == "array",
+            "string" | "boolean" | "integer" => schema_type == output_type,
+            _ => true,
+        };
+        if !compatible {
+            return Err(format!(
+                "schema type `{schema_type}` is incompatible with output type `{output_type}`"
+            ));
+        }
+    }
+    Ok(schema.clone())
+}
+
+/// Build the actual JSON Schema accepted from a workflow model step. Shared
+/// envelope fields retain their generated DTO schemas; workflow extensions
+/// replace the permissive placeholders with their declared output schemas.
+fn workflow_response_schema(step: &Step) -> Result<Value, String> {
+    let contract = crate::response::CodeResponseContract::new(step.outputs.keys().cloned());
+    let mut root = contract.schema_json();
+    let properties = root
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "generated code response schema has no properties object".to_string())?;
+    let mut required = Vec::new();
+    for (name, definition) in &step.outputs {
+        let output_type = definition
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("output `{name}` has no string type"))?;
+        if let Some(declared) = definition.get("schema") {
+            properties.insert(name.clone(), compile_output_schema(output_type, declared)?);
+        } else {
+            let generated = properties
+                .get(name)
+                .filter(|schema| *schema != &Value::Bool(true))
+                .cloned();
+            let schema = match generated {
+                Some(schema) => disallow_top_level_null(schema),
+                None => output_type_schema(output_type, definition)?,
+            };
+            properties.insert(name.clone(), schema);
+        }
+        let optional = definition
+            .get("optional")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !optional && !is_machine_populated_output(name) {
+            required.push(Value::String(name.clone()));
+        }
+    }
+    root.as_object_mut()
+        .ok_or_else(|| "generated code response schema is not an object".to_string())?
+        .insert("required".into(), Value::Array(required));
+    Ok(root)
+}
+
+fn disallow_top_level_null(mut schema: Value) -> Value {
+    if let Some(object) = schema.as_object_mut() {
+        let sole_type = if let Some(Value::Array(types)) = object.get_mut("type") {
+            types.retain(|value| value.as_str() != Some("null"));
+            (types.len() == 1).then(|| types[0].clone())
+        } else {
+            None
+        };
+        if let Some(sole_type) = sole_type {
+            object.insert("type".into(), sole_type);
+        }
+        for keyword in ["anyOf", "oneOf"] {
+            if let Some(Value::Array(branches)) = object.get_mut(keyword) {
+                branches
+                    .retain(|branch| branch.get("type").and_then(Value::as_str) != Some("null"));
+            }
+        }
+    }
+    schema
+}
+
+fn output_type_schema(output_type: &str, definition: &Value) -> Result<Value, String> {
+    let schema = match output_type {
+        "string" => serde_json::json!({"type": "string"}),
+        "boolean" => serde_json::json!({"type": "boolean"}),
+        "integer" => serde_json::json!({"type": "integer"}),
+        "object" => serde_json::json!({"type": "object"}),
+        "array<string>" => serde_json::json!({"type": "array", "items": {"type": "string"}}),
+        "array<object>" => serde_json::json!({"type": "array", "items": {"type": "object"}}),
+        "enum" => serde_json::json!({
+            "type": "string",
+            "enum": definition.get("values").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        }),
+        // These should already be present in the generated shared-envelope
+        // properties. Reaching this arm means a custom output reused a typed
+        // name, for which there is no safe handwritten substitute.
+        "array<Finding>" | "array<Followup>" | "array<CodeFile>" | "array<CodeEdit>" => {
+            return Err(format!(
+                "typed output `{output_type}` is missing from the generated response schema"
+            ));
+        }
+        other => return Err(format!("unsupported output type `{other}`")),
+    };
+    Ok(schema)
+}
+
 async fn add_side_effect_outputs(
     step: &Step,
     outputs: &mut Map<String, Value>,
@@ -3875,6 +4257,7 @@ async fn add_side_effect_outputs(
     _ctx: &ExecContext<'_>,
     code_output: &[kres_core::CodeFile],
     code_edits: &[kres_core::CodeEdit],
+    staged: &std::collections::BTreeMap<PathBuf, String>,
 ) -> Result<(), String> {
     let changed_files = emitted_code_paths(code_output, code_edits);
     let is_kernel_workspace =
@@ -3908,13 +4291,13 @@ async fn add_side_effect_outputs(
     if step.outputs.contains_key("commit_message_written") {
         outputs.insert(
             "commit_message_written".into(),
-            Value::Bool(commit_message_written(code_output, workspace)),
+            Value::Bool(commit_message_written(code_output, workspace, staged)),
         );
     }
     if step.outputs.contains_key("summary_written") {
         outputs.insert(
             "summary_written".into(),
-            Value::Bool(summary_written(code_output, code_edits, workspace)),
+            Value::Bool(summary_written(code_output, code_edits, workspace, staged)),
         );
     }
     if step.outputs.contains_key("severity_written") {
@@ -3923,13 +4306,18 @@ async fn add_side_effect_outputs(
             "severity_written".into(),
             Value::Bool(
                 severity
-                    .map(|s| severity_written(code_output, code_edits, workspace, s))
+                    .map(|s| severity_written(code_output, code_edits, workspace, staged, s))
                     .unwrap_or(false),
             ),
         );
     }
     if step.outputs.contains_key("affected_files_changed") {
-        let changed = git_paths_have_changes(workspace, &changed_files).await?;
+        let staged_change = staged.iter().any(|(path, body)| {
+            std::fs::read_to_string(path)
+                .map(|current| current != *body)
+                .unwrap_or(true)
+        });
+        let changed = staged_change || git_paths_have_changes(workspace, &changed_files).await?;
         outputs.insert("affected_files_changed".into(), Value::Bool(changed));
     }
     if step.outputs.contains_key("review_dispute") && !outputs.contains_key("review_dispute") {
@@ -4006,16 +4394,20 @@ fn is_kres_aux_path(path: &str) -> bool {
     ) || base.starts_with(".commit-msg")
 }
 
-fn commit_message_written(code_output: &[kres_core::CodeFile], workspace: &Path) -> bool {
+fn commit_message_written(
+    code_output: &[kres_core::CodeFile],
+    workspace: &Path,
+    staged: &std::collections::BTreeMap<PathBuf, String>,
+) -> bool {
     code_output.iter().any(|f| {
         if f.path.trim() != ".kres-commit-msg.tmp" {
             return false;
         }
-        let path = workspace.join(".kres-commit-msg.tmp");
-        path.is_file()
-            && std::fs::read_to_string(path)
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
+        let path = resolve_workspace_path(workspace, ".kres-commit-msg.tmp").ok();
+        path.as_ref()
+            .and_then(|path| staged.get(path))
+            .map(|body| !body.trim().is_empty())
+            .unwrap_or(false)
     })
 }
 
@@ -4023,6 +4415,7 @@ fn summary_written(
     code_output: &[kres_core::CodeFile],
     code_edits: &[kres_core::CodeEdit],
     workspace: &Path,
+    staged: &std::collections::BTreeMap<PathBuf, String>,
 ) -> bool {
     let paths = code_output
         .iter()
@@ -4039,7 +4432,7 @@ fn summary_written(
         .any(|p| {
             resolve_workspace_path(workspace, p)
                 .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok())
+                .and_then(|path| staged.get(&path))
                 .map(|body| !body.trim().is_empty())
                 .unwrap_or(false)
         })
@@ -4049,6 +4442,7 @@ fn severity_written(
     code_output: &[kres_core::CodeFile],
     code_edits: &[kres_core::CodeEdit],
     workspace: &Path,
+    staged: &std::collections::BTreeMap<PathBuf, String>,
     severity: &str,
 ) -> bool {
     let Some(summary_path) = emitted_path_named(code_output, code_edits, workspace, "summary.md")
@@ -4070,9 +4464,9 @@ fn severity_written(
     if metadata_path.parent() != Some(dir) || finding_path.parent() != Some(dir) {
         return false;
     }
-    let summary = std::fs::read_to_string(&summary_path).unwrap_or_default();
-    let metadata = std::fs::read_to_string(&metadata_path).unwrap_or_default();
-    let finding = std::fs::read_to_string(&finding_path).unwrap_or_default();
+    let summary = staged.get(&summary_path).cloned().unwrap_or_default();
+    let metadata = staged.get(&metadata_path).cloned().unwrap_or_default();
+    let finding = staged.get(&finding_path).cloned().unwrap_or_default();
     summary_has_severity(&summary, severity)
         && metadata_has_severity(&metadata, severity)
         && finding_has_severity(&finding, severity)
@@ -4531,8 +4925,7 @@ fn agent_runner_with_gated_fetcher(
 
 /// Effective action allowlist for a step: step.actions wins,
 /// otherwise workflow.defaults.actions. An empty allowlist means
-/// "no actions permitted" — the runner refuses to dispatch any
-/// post_action under that condition.
+/// "no actions permitted".
 fn effective_actions(step: &Step, wf: &Workflow) -> Vec<crate::workflow::ActionType> {
     if let Some(list) = &step.actions {
         return list.clone();
@@ -4571,7 +4964,14 @@ fn resolve_workspace_path(workspace: &Path, path: &str) -> Result<PathBuf> {
                 }
             }
         }
-        return Ok(ws_canon.join(rel));
+        let candidate = ws_canon.join(rel);
+        let resolved = canonical_walk_up(&candidate);
+        if resolved.starts_with(&ws_canon) || consent_allows(&resolved) {
+            return Ok(resolved);
+        }
+        return Err(anyhow!(
+            "path escapes workspace through a symbolic link and no consent is on file: {path}"
+        ));
     }
 
     let resolved = p.to_path_buf();
@@ -4586,8 +4986,8 @@ fn resolve_workspace_path(workspace: &Path, path: &str) -> Result<PathBuf> {
 
     let normalised = normalise_lexical(&resolved);
     let consent_probe = canonical_walk_up(&normalised);
-    if normalised.starts_with(&ws_canon) || consent_allows(&consent_probe) {
-        return Ok(normalised);
+    if consent_probe.starts_with(&ws_canon) || consent_allows(&consent_probe) {
+        return Ok(consent_probe);
     }
     Err(anyhow!(
         "path escapes workspace and no consent is on file: {path}"
@@ -4661,22 +5061,22 @@ pub fn persist_code_output(
     workspace: &Path,
     files: &[kres_core::CodeFile],
 ) -> Result<Vec<PathBuf>> {
-    let mut written = Vec::new();
+    let mut staged = std::collections::BTreeMap::new();
     for f in files {
         if f.path.trim().is_empty() {
             return Err(anyhow!("code_output entry has empty path"));
         }
         let target = resolve_workspace_path(workspace, &f.path)?;
-        kres_core::validate_metadata_yaml_content(&target, &f.content)?;
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir -p {}", parent.display()))?;
+        if staged.contains_key(&target) {
+            return Err(anyhow!(
+                "code_output contains duplicate target {}",
+                target.display()
+            ));
         }
-        std::fs::write(&target, &f.content)
-            .with_context(|| format!("write {}", target.display()))?;
-        written.push(target);
+        kres_core::validate_metadata_yaml_content(&target, &f.content)?;
+        staged.insert(target, f.content.clone());
     }
-    Ok(written)
+    commit_staged_files(workspace, staged)
 }
 
 /// Apply a list of CodeEdit entries as string-replacement edits
@@ -4691,10 +5091,42 @@ pub fn persist_code_output(
 /// `old_string` to anchor an in-place edit, or `code_output` to
 /// overwrite a file wholesale.
 pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Result<Vec<PathBuf>> {
-    use std::collections::BTreeMap;
+    apply_code_changes(workspace, &[], edits)
+}
 
-    let mut touched = Vec::new();
-    let mut staged: BTreeMap<PathBuf, String> = BTreeMap::new();
+/// Preflight full-file outputs and anchored edits into one final file map, then
+/// commit that map with same-directory temporary files. No filesystem content
+/// changes until every path, metadata body, and edit anchor has validated.
+pub fn apply_code_changes(
+    workspace: &Path,
+    files: &[kres_core::CodeFile],
+    edits: &[kres_core::CodeEdit],
+) -> Result<Vec<PathBuf>> {
+    commit_staged_files(workspace, stage_code_changes(workspace, files, edits)?)
+}
+
+fn stage_code_changes(
+    workspace: &Path,
+    files: &[kres_core::CodeFile],
+    edits: &[kres_core::CodeEdit],
+) -> Result<std::collections::BTreeMap<PathBuf, String>> {
+    let mut staged = std::collections::BTreeMap::<PathBuf, String>::new();
+    for file in files {
+        if file.path.trim().is_empty() {
+            return Err(anyhow!("code_output entry has empty path"));
+        }
+        let target = resolve_workspace_path(workspace, &file.path)?;
+        if staged
+            .insert(target.clone(), file.content.clone())
+            .is_some()
+        {
+            return Err(anyhow!(
+                "code_output contains duplicate target {}",
+                target.display()
+            ));
+        }
+        kres_core::validate_metadata_yaml_content(&target, &file.content)?;
+    }
     for e in edits {
         if e.file_path.trim().is_empty() {
             return Err(anyhow!("code_edit has empty file_path"));
@@ -4717,8 +5149,7 @@ pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Resu
                     e.file_path
                 ));
             }
-            staged.insert(target.clone(), e.new_string.clone());
-            touched.push(target);
+            staged.insert(target, e.new_string.clone());
             continue;
         }
         let body = match staged.get(&target) {
@@ -4733,7 +5164,7 @@ pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Resu
             let n = body.matches(&e.old_string).count();
             if n == 0 {
                 if body.matches(&e.new_string).count() == 1 {
-                    touched.push(target);
+                    staged.insert(target, body);
                     continue;
                 }
                 return Err(anyhow!(
@@ -4749,21 +5180,297 @@ pub fn apply_code_edits(workspace: &Path, edits: &[kres_core::CodeEdit]) -> Resu
             }
             body.replacen(&e.old_string, &e.new_string, 1)
         };
-        staged.insert(target.clone(), updated);
-        touched.push(target);
+        staged.insert(target, updated);
     }
-    for (target, body) in staged {
-        kres_core::validate_metadata_yaml_content(&target, &body)?;
-        // mkdir -p the parent so create-new-file edits for paths under
-        // a not-yet-existing subdir work the same way as code_output
-        // (persist_code_output, this file).
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir -p {}", parent.display()))?;
+    for (target, body) in &staged {
+        kres_core::validate_metadata_yaml_content(target, body)?;
+    }
+    Ok(staged)
+}
+
+fn commit_staged_files(
+    workspace: &Path,
+    staged: std::collections::BTreeMap<PathBuf, String>,
+) -> Result<Vec<PathBuf>> {
+    use std::io::Write;
+
+    let mut created_dirs = Vec::new();
+    let mut prepared = Vec::with_capacity(staged.len());
+    let prepare_result = (|| -> Result<()> {
+        for (target, body) in &staged {
+            let (parent, name) = bind_target_parent(workspace, target, &mut created_dirs)?;
+            let parent_path = proc_fd_path(&parent);
+            let bound_target = parent_path.join(&name);
+            let original = open_existing_target_nofollow(&bound_target, target)?;
+            let mut temp = tempfile::NamedTempFile::new_in(&parent_path)
+                .with_context(|| format!("create temporary file for {}", target.display()))?;
+            temp.write_all(body.as_bytes())
+                .with_context(|| format!("stage {}", target.display()))?;
+            temp.as_file_mut()
+                .sync_all()
+                .with_context(|| format!("sync staged {}", target.display()))?;
+            if let Some((_, permissions)) = &original {
+                temp.as_file()
+                    .set_permissions(permissions.clone())
+                    .with_context(|| format!("set permissions on staged {}", target.display()))?;
+            }
+            prepared.push((target.clone(), parent, name, original, Some(temp)));
         }
-        std::fs::write(&target, body).with_context(|| format!("write {}", target.display()))?;
+        Ok(())
+    })();
+    if let Err(error) = prepare_result {
+        drop(prepared);
+        cleanup_created_dirs(&created_dirs);
+        return Err(error);
     }
-    Ok(touched)
+
+    for (committed, index) in (0..prepared.len()).enumerate() {
+        let target = prepared[index].0.clone();
+        let bound_target = proc_fd_path(&prepared[index].1).join(&prepared[index].2);
+        let temp = prepared[index]
+            .4
+            .take()
+            .expect("prepared temporary file consumed once");
+        if let Err(error) = temp.persist(&bound_target) {
+            let mut rollback_errors = Vec::new();
+            for rollback in (0..committed).rev() {
+                let (rollback_target, parent, name, original, _) = &prepared[rollback];
+                let result = match original {
+                    Some((bytes, permissions)) => {
+                        atomic_replace_bound_bytes(parent, name, bytes, permissions.clone())
+                    }
+                    None => std::fs::remove_file(proc_fd_path(parent).join(name)),
+                };
+                if let Err(rollback_error) = result {
+                    rollback_errors
+                        .push(format!("{}: {rollback_error}", rollback_target.display()));
+                }
+            }
+            let suffix = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; rollback failed for {}", rollback_errors.join(", "))
+            };
+            drop(prepared);
+            cleanup_created_dirs(&created_dirs);
+            return Err(anyhow!(
+                "commit {}: {}{suffix}",
+                target.display(),
+                error.error
+            ));
+        }
+    }
+    Ok(staged.into_keys().collect())
+}
+
+fn bind_target_parent(
+    workspace: &Path,
+    target: &Path,
+    created_dirs: &mut Vec<CreatedDirectory>,
+) -> Result<(std::fs::File, std::ffi::OsString)> {
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("target has no parent: {}", target.display()))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| anyhow!("target has no filename: {}", target.display()))?
+        .to_os_string();
+    let mut anchor = target_parent;
+    while !anchor.is_dir() {
+        match std::fs::symlink_metadata(anchor) {
+            Ok(_) => {
+                return Err(anyhow!(
+                    "target parent is not a directory: {}",
+                    anchor.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(anyhow!("stat {}: {error}", anchor.display())),
+        }
+        anchor = anchor
+            .parent()
+            .ok_or_else(|| anyhow!("no existing ancestor for {}", target.display()))?;
+    }
+    let mut directory = std::fs::File::open(anchor)
+        .with_context(|| format!("open directory anchor {}", anchor.display()))?;
+    validate_bound_directory(workspace, &directory, &name)?;
+    let relative = target_parent
+        .strip_prefix(anchor)
+        .with_context(|| format!("derive relative parent for {}", target.display()))?;
+    for component in relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(anyhow!(
+                "invalid target parent component in {}",
+                target.display()
+            ));
+        };
+        let child = proc_fd_path(&directory).join(segment);
+        let created = match std::fs::symlink_metadata(&child) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!("refusing symbolic-link parent {}", child.display()));
+            }
+            Ok(metadata) if metadata.is_dir() => false,
+            Ok(_) => {
+                return Err(anyhow!(
+                    "target parent is not a directory: {}",
+                    child.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&child)
+                    .with_context(|| format!("create target directory {}", child.display()))?;
+                true
+            }
+            Err(error) => return Err(anyhow!("stat {}: {error}", child.display())),
+        };
+        directory = std::fs::File::open(&child)
+            .with_context(|| format!("open target directory {}", child.display()))?;
+        validate_bound_directory(workspace, &directory, &name)?;
+        if created {
+            created_dirs.push(CreatedDirectory::capture(&directory)?);
+        }
+    }
+    let actual_parent = std::fs::canonicalize(proc_fd_path(&directory))
+        .context("resolve final bound target directory")?;
+    if actual_parent != target_parent {
+        return Err(anyhow!(
+            "target parent changed between staging and commit: expected {}, found {}",
+            target_parent.display(),
+            actual_parent.display()
+        ));
+    }
+    Ok((directory, name))
+}
+
+fn validate_bound_directory(
+    workspace: &Path,
+    directory: &std::fs::File,
+    filename: &std::ffi::OsStr,
+) -> Result<()> {
+    let actual =
+        std::fs::canonicalize(proc_fd_path(directory)).context("resolve bound target directory")?;
+    let workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("canonicalize workspace {}", workspace.display()))?;
+    let actual_target = actual.join(filename);
+    if actual.starts_with(&workspace) || consent_allows(&actual_target) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "bound target escapes workspace and no consent is on file: {}",
+            actual_target.display()
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn proc_fd_path(file: &std::fs::File) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(not(unix))]
+fn proc_fd_path(_file: &std::fs::File) -> PathBuf {
+    compile_error!("secure workflow file commits require Unix directory descriptors");
+}
+
+#[derive(Debug)]
+struct CreatedDirectory {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl CreatedDirectory {
+    #[cfg(unix)]
+    fn capture(directory: &std::fs::File) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = directory.metadata().context("stat created directory")?;
+        let path =
+            std::fs::canonicalize(proc_fd_path(directory)).context("resolve created directory")?;
+        Ok(Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn still_same_directory(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::symlink_metadata(&self.path)
+            .ok()
+            .filter(|metadata| metadata.is_dir())
+            .is_some_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode)
+    }
+}
+
+fn cleanup_created_dirs(dirs: &[CreatedDirectory]) {
+    for dir in dirs.iter().rev() {
+        if dir.still_same_directory() {
+            let _ = std::fs::remove_dir(&dir.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_existing_target_nofollow(
+    bound_target: &Path,
+    display_target: &Path,
+) -> Result<Option<(Vec<u8>, std::fs::Permissions)>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(bound_target)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(anyhow!(
+                "refusing to replace symbolic link {}",
+                display_target.display()
+            ));
+        }
+        Err(error) => {
+            return Err(anyhow!("open {}: {error}", display_target.display()));
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("stat {}", display_target.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "target is not a file: {}",
+            display_target.display()
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("snapshot {}", display_target.display()))?;
+    Ok(Some((bytes, metadata.permissions())))
+}
+
+fn atomic_replace_bound_bytes(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    bytes: &[u8],
+    permissions: std::fs::Permissions,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent_path = proc_fd_path(parent);
+    let mut temp = tempfile::NamedTempFile::new_in(&parent_path)?;
+    temp.write_all(bytes)?;
+    temp.as_file_mut().sync_all()?;
+    temp.as_file().set_permissions(permissions)?;
+    temp.persist(parent_path.join(name))
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Convenience: parse `KEY=VALUE` strings from the CLI into a
@@ -4792,7 +5499,10 @@ pub fn write_workflow_artefacts(
         if let Some(state) = trace.final_state.get(&step.id) {
             if let Some(Value::Array(arr)) = state.outputs.get("findings") {
                 for f in arr {
-                    all_findings.push(f.clone());
+                    let finding = serde_json::from_value::<Finding>(f.clone())
+                        .with_context(|| format!("step '{}' emitted invalid Finding", step.id))?
+                        .redacted_for_agent();
+                    all_findings.push(serde_json::to_value(finding)?);
                 }
             }
             if let Some(Value::String(s)) = state.outputs.get("analysis") {
@@ -5247,13 +5957,13 @@ mod tests {
 
         // Retry without a specific error: generic prefix only.
         let s = with_json_repair_prefix(base, 1, None);
-        assert!(s.starts_with("IMPORTANT: This step requires a valid JSON object"));
+        assert!(s.starts_with("IMPORTANT: Reply with exactly one raw, unfenced JSON object"));
         assert!(s.ends_with("\ndo the thing"));
         assert!(!s.contains("Validator error"));
 
         // Retry with a specific error: prefix + validator line + base.
         let s = with_json_repair_prefix(base, 1, Some("findings is not array<Finding>"));
-        assert!(s.contains("IMPORTANT: This step requires a valid JSON object"));
+        assert!(s.contains("IMPORTANT: Reply with exactly one raw, unfenced JSON object"));
         assert!(
             s.contains("Validator error from the previous attempt: findings is not array<Finding>")
         );
@@ -5849,6 +6559,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_commit_action_restores_git_index() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("preexisting.txt"), "staged\n").unwrap();
+        let output = std::process::Command::new("git")
+            .args(["add", "preexisting.txt"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        std::fs::write(repo.path().join(".kres-commit-msg.tmp"), "test: fail\n").unwrap();
+        let hooks = repo.path().join(".git/hooks");
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let pre_head = git_rev_parse_head_optional(repo.path()).await.unwrap();
+        let rollback = GitIndexRollback::capture(repo.path(), &pre_head)
+            .await
+            .unwrap();
+        let expected = rollback.contents.clone();
+        if run_commit_fix(repo.path(), "a.c", ".kres-commit-msg.tmp", false)
+            .await
+            .is_ok()
+        {
+            panic!("commit unexpectedly succeeded");
+        }
+        drop(rollback);
+        assert_eq!(std::fs::read(repo.path().join(".git/index")).ok(), expected);
+    }
+
+    #[tokio::test]
+    async fn commit_fix_replay_recognizes_completed_new_commit() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        std::fs::write(repo.path().join(".kres-commit-msg.tmp"), "test: replay\n").unwrap();
+        let pre_head = git_rev_parse_head_optional(repo.path()).await.unwrap();
+
+        let first = run_commit_fix_recoverable(
+            repo.path(),
+            "a.c",
+            ".kres-commit-msg.tmp",
+            false,
+            &pre_head,
+            "test: replay",
+        )
+        .await
+        .unwrap();
+        let replay = run_commit_fix_recoverable(
+            repo.path(),
+            "a.c",
+            ".kres-commit-msg.tmp",
+            false,
+            &pre_head,
+            "test: replay",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(replay.sha, first.sha);
+        let count = std::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "2");
+    }
+
+    #[tokio::test]
+    async fn commit_fix_replay_recognizes_completed_amend() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        std::fs::write(
+            repo.path().join(".kres-commit-msg.tmp"),
+            "test: amend replay\n",
+        )
+        .unwrap();
+        let pre_head = git_rev_parse_head_optional(repo.path()).await.unwrap();
+
+        let first = run_commit_fix_recoverable(
+            repo.path(),
+            "a.c",
+            ".kres-commit-msg.tmp",
+            true,
+            &pre_head,
+            "test: amend replay",
+        )
+        .await
+        .unwrap();
+        let replay = run_commit_fix_recoverable(
+            repo.path(),
+            "a.c",
+            ".kres-commit-msg.tmp",
+            true,
+            &pre_head,
+            "test: amend replay",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(replay.sha, first.sha);
+        let count = std::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+    }
+
+    #[tokio::test]
     async fn publish_fix_updates_metadata_summary_and_skips_current_head() {
         let repo = init_test_git_repo();
         std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
@@ -6139,61 +6963,60 @@ mod tests {
     }
 
     #[test]
-    fn extract_outputs_picks_last_json_with_declared_keys() {
+    fn extract_outputs_accepts_strict_json_with_declared_keys() {
         let wf = fix_workflow();
         let step = wf
             .steps
             .iter()
             .find(|s| s.id == "fixes-tag-search")
             .unwrap();
-        // Model emits prose, then JSON; runner picks the JSON.
-        let body = "I looked at the code. Some prose with a {stray brace}.\n\
-                    Now the structured output:\n\
-                    {\"fixes_sha\": \"abc123def456\", \
-                     \"fixes_subject\": \"x\", \
-                     \"analysis\": \"proved by candidate diff\"}";
+        let body = r#"{"fixes_sha":"abc123def456","fixes_subject":"x","analysis":"proved by candidate diff"}"#;
         let m = extract_outputs(body, step).unwrap();
         assert_eq!(m.get("fixes_sha"), Some(&json!("abc123def456")));
+        let fenced = format!("```json\n{body}\n```");
+        let fenced_outputs = extract_outputs(&fenced, step).unwrap();
+        assert_eq!(
+            fenced_outputs.get("fixes_sha"),
+            Some(&json!("abc123def456"))
+        );
     }
 
-    // Tests for first_top_level_brace itself live in
-    // kres_core::brace::tests; the kres-agents callers exercise the
-    // helper indirectly through extract_outputs and parse_code_response.
+    #[test]
+    fn extract_outputs_strips_store_provenance_from_findings() {
+        let workflow = review_workflow();
+        let step = workflow
+            .steps
+            .iter()
+            .find(|step| {
+                step.outputs
+                    .values()
+                    .any(|definition| definition["type"] == "array<Finding>")
+            })
+            .unwrap();
+        let finding_key = step
+            .outputs
+            .iter()
+            .find(|(_, definition)| definition["type"] == "array<Finding>")
+            .map(|(name, _)| name)
+            .unwrap();
+        let body = serde_json::json!({
+            (finding_key): [{
+                "id": "f", "title": "bug", "severity": "high", "summary": "s",
+                "first_seen_task": "forged", "first_seen_at": "2020-01-02T03:04:05Z"
+            }]
+        })
+        .to_string();
+        let outputs = extract_outputs(&body, step).unwrap();
+        let finding = &outputs[finding_key][0];
+        assert!(finding.get("first_seen_task").is_none());
+        assert!(finding.get("first_seen_at").is_none());
+    }
 
     #[test]
-    fn extract_outputs_finds_envelope_after_stray_closing_brace_in_prose() {
-        // Real-run regression (linux.coredump_dump_head_double_handoff
-        // session 18827a26): the slow agent quoted the tail of a C
-        // function with a closing `}` whose opening `{` was elided.
-        // Without depth clamping the scanner went to -1 and missed
-        // the canonical JSON envelope further down, so the validator
-        // reported every declared field as missing. Verify the
-        // canonical envelope is now found.
+    fn extract_outputs_rejects_prose_around_envelope() {
         let wf = fix_workflow();
         let step = wf.steps.iter().find(|s| s.id == "research").unwrap();
-        let body = "Looking at workspace HEAD:\n\
-                    ```c\n\
-                    dev_coredumpv(&hdev->dev, hdev->dump.head, size, GFP_KERNEL);\n\
-                    }\n\
-                    /* alias not cleared */\n\
-                    ```\n\
-                    Now the structured output:\n\
-                    {\"research_status\": \"confirmed\", \
-                     \"valid\": true, \
-                     \"invalid_evidence\": \"\", \
-                     \"invalid_evidence_kind\": \"none\", \
-                     \"affected_files\": [\"net/bluetooth/coredump.c\"], \
-                     \"affected_symbols\": [\"hci_devcd_dump\"], \
-                     \"research_decision\": {\"bug_proven\": true, \
-                                              \"fix_contract_proven\": true, \
-                                              \"invalidity_proven\": false, \
-                                              \"needs_more_audit\": false}, \
-                     \"analysis\": \"verified at HEAD\"}";
-        let m = extract_outputs(body, step).unwrap();
-        assert_eq!(m.get("research_status"), Some(&json!("confirmed")));
-        assert_eq!(m.get("valid"), Some(&json!(true)));
-        assert_eq!(m.get("invalid_evidence_kind"), Some(&json!("none")));
-        assert!(m.get("research_decision").is_some());
+        assert!(extract_outputs("prose {\"research_status\":\"confirmed\"}", step).is_err());
     }
 
     #[test]
@@ -6202,7 +7025,140 @@ mod tests {
         let step = wf.steps.iter().find(|s| s.id == "research").unwrap();
         let body = "Here is some text. {\"unrelated\": 1}";
         let err = extract_outputs(body, step).unwrap_err().to_string();
-        assert!(err.contains("none mentioned a declared key"), "got: {err}");
+        assert!(err.contains("not exactly one JSON object"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_outputs_rejects_undeclared_top_level_fields() {
+        let wf = fix_workflow();
+        let step = wf.steps.iter().find(|s| s.id == "research").unwrap();
+        let body = r#"{"research_status":"confirmed","valid":true,"typo_field":1}"#;
+        let err = extract_outputs(body, step).unwrap_err().to_string();
+        assert!(err.contains("typo_field"), "got: {err}");
+    }
+
+    #[test]
+    fn model_outputs_must_validate_before_side_effect_fields_are_derived() {
+        let step = serde_json::from_value::<Step>(json!({
+            "id": "write",
+            "agent": "code",
+            "prompt": "write",
+            "outputs": {
+                "verdict": {"type":"string"},
+                "code_edits": {"type":"array<object>", "optional":true},
+                "code_changes_emitted": {"type":"boolean"}
+            }
+        }))
+        .unwrap();
+        let outputs = Map::from_iter([("code_edits".into(), json!([]))]);
+        let error = validate_model_outputs_before_side_effects(&step, &outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("verdict"));
+        assert!(!error.contains("code_changes_emitted"));
+    }
+
+    #[test]
+    fn standard_workflow_schema_enforces_array_items() {
+        let step = serde_json::from_value::<Step>(json!({
+            "id": "schema",
+            "agent": "slow",
+            "prompt": "schema",
+            "outputs": {
+                "items": {
+                    "type":"array<object>",
+                    "schema": {
+                        "type":"array",
+                        "items": {
+                            "type":"object",
+                            "additionalProperties":false,
+                            "required":["name","enabled"],
+                            "properties":{
+                                "name":{"type":"string"},
+                                "enabled":{"type":"boolean"}
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(validate_output_types(
+            &step,
+            &Map::from_iter([("items".into(), json!([{"name":"x","enabled":true}]))]),
+        )
+        .is_ok());
+        assert!(validate_output_types(
+            &step,
+            &Map::from_iter([("items".into(), json!([{"name":7}]))]),
+        )
+        .is_err());
+        assert!(validate_output_types(
+            &step,
+            &Map::from_iter([("items".into(), json!([{"name":"x","typo":true}]))]),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn workflow_repair_schema_is_the_runtime_output_contract() {
+        let step = serde_json::from_value::<Step>(json!({
+            "id": "schema",
+            "agent": "slow",
+            "prompt": "schema",
+            "outputs": {
+                "clean": {"type":"boolean"},
+                "findings": {"type":"array<Finding>", "optional":true},
+                "defects": {
+                    "type":"array<object>",
+                    "schema": {
+                        "type":"array",
+                        "items": {
+                            "type":"object",
+                            "additionalProperties":false,
+                            "required":["where"],
+                            "properties":{"where":{"type":"string"}}
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let schema = workflow_response_schema(&step).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"clean":true,"defects":[{"where":"x.c:1"}]})));
+        assert!(!validator.is_valid(&json!({"clean":true,"defects":[{"where":7}]})));
+        assert!(!validator.is_valid(&json!({"clean":true})));
+        assert!(!validator.is_valid(&json!({"clean":null,"defects":[]})));
+        assert!(!validator.is_valid(&json!({"clean":true,"defects":[],"findings":null})));
+        assert!(!validator.is_valid(&json!({"clean":true,"defects":[],"typo":1})));
+    }
+
+    #[test]
+    fn array_schema_applies_to_each_item() {
+        let schema = json!({
+            "type":"array",
+            "items": {
+                "type":"object",
+                "required":["name"],
+                "properties":{"name":{"type":"string"}},
+                "additionalProperties":false
+            }
+        });
+        assert!(validate_output_json_schema(
+            "items",
+            "array<object>",
+            &json!([{"name":"ok"}]),
+            &schema,
+        )
+        .is_ok());
+        assert!(validate_output_json_schema(
+            "items",
+            "array<object>",
+            &json!([{"name":3}]),
+            &schema,
+        )
+        .is_err());
     }
 
     #[test]
@@ -6226,7 +7182,8 @@ mod tests {
         for key in research.outputs.keys() {
             assert!(tail.contains(key.as_str()), "schema must mention {key}");
         }
-        assert!(tail.contains("LAST top-level JSON"));
+        assert!(tail.contains("Return only that one JSON object"));
+        assert!(tail.contains("Put any prose in its `analysis` field"));
     }
 
     #[test]
@@ -6941,6 +7898,27 @@ mod tests {
     }
 
     #[test]
+    fn persist_code_output_does_not_make_new_files_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        persist_code_output(
+            tmp.path(),
+            &[kres_core::CodeFile {
+                path: "private.txt".into(),
+                content: "secret".into(),
+                purpose: String::new(),
+            }],
+        )
+        .unwrap();
+        let mode = std::fs::metadata(tmp.path().join("private.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "new output mode was {mode:o}");
+    }
+
+    #[test]
     fn persist_code_output_rejects_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         let files = vec![kres_core::CodeFile {
@@ -6978,6 +7956,67 @@ mod tests {
     }
 
     #[test]
+    fn persist_code_output_validates_entire_batch_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            kres_core::CodeFile {
+                path: "first.txt".into(),
+                content: "must not be written".into(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "../escape.txt".into(),
+                content: "invalid later entry".into(),
+                purpose: String::new(),
+            },
+        ];
+        assert!(persist_code_output(tmp.path(), &files).is_err());
+        assert!(!tmp.path().join("first.txt").exists());
+    }
+
+    #[test]
+    fn persist_code_output_rejects_duplicate_targets_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            kres_core::CodeFile {
+                path: "same.txt".into(),
+                content: "first".into(),
+                purpose: String::new(),
+            },
+            kres_core::CodeFile {
+                path: "same.txt".into(),
+                content: "second".into(),
+                purpose: String::new(),
+            },
+        ];
+        assert!(persist_code_output(tmp.path(), &files).is_err());
+        assert!(!tmp.path().join("same.txt").exists());
+    }
+
+    #[test]
+    fn combined_code_change_preflight_leaves_outputs_untouched_on_bad_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_target = tmp.path().join("generated.txt");
+        let edit_target = tmp.path().join("existing.txt");
+        std::fs::write(&edit_target, "original\n").unwrap();
+        let outputs = vec![kres_core::CodeFile {
+            path: "generated.txt".into(),
+            content: "generated\n".into(),
+            purpose: String::new(),
+        }];
+        let edits = vec![kres_core::CodeEdit {
+            file_path: "existing.txt".into(),
+            old_string: "missing anchor".into(),
+            new_string: "replacement".into(),
+            replace_all: false,
+        }];
+
+        assert!(apply_code_changes(tmp.path(), &outputs, &edits).is_err());
+        assert!(!output_target.exists());
+        assert_eq!(std::fs::read_to_string(edit_target).unwrap(), "original\n");
+    }
+
+    #[test]
     fn persist_code_output_writes_to_consented_outside_dir() {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -7007,19 +8046,29 @@ mod tests {
             content: "# Subject: real triage\n".into(),
             purpose: "triage summary".into(),
         }];
-        persist_code_output(workspace.path(), &files).unwrap();
-
-        assert!(summary_written(&files, &[], workspace.path()));
+        let staged = stage_code_changes(workspace.path(), &files, &[]).unwrap();
+        assert!(summary_written(&files, &[], workspace.path(), &staged));
 
         let wrong_file = vec![kres_core::CodeFile {
             path: "not-summary.md".into(),
             content: "# Subject: real triage\n".into(),
             purpose: "triage summary".into(),
         }];
-        assert!(!summary_written(&wrong_file, &[], workspace.path()));
+        let wrong_staged = stage_code_changes(workspace.path(), &wrong_file, &[]).unwrap();
+        assert!(!summary_written(
+            &wrong_file,
+            &[],
+            workspace.path(),
+            &wrong_staged
+        ));
 
-        std::fs::write(summary, "   \n").unwrap();
-        assert!(!summary_written(&files, &[], workspace.path()));
+        let blank = vec![kres_core::CodeFile {
+            path: summary.display().to_string(),
+            content: "   \n".into(),
+            purpose: "triage summary".into(),
+        }];
+        let staged = stage_code_changes(workspace.path(), &blank, &[]).unwrap();
+        assert!(!summary_written(&blank, &[], workspace.path(), &staged));
     }
 
     #[test]
@@ -7043,17 +8092,34 @@ mod tests {
             purpose: "triage finding".into(),
         };
         let files = vec![summary.clone(), metadata, finding];
-        persist_code_output(workspace.path(), &files).unwrap();
+        let staged = stage_code_changes(workspace.path(), &files, &[]).unwrap();
+        assert!(severity_written(
+            &files,
+            &[],
+            workspace.path(),
+            &staged,
+            "high"
+        ));
+        let summary_only = vec![summary];
+        let staged = stage_code_changes(workspace.path(), &summary_only, &[]).unwrap();
+        assert!(!severity_written(
+            &summary_only,
+            &[],
+            workspace.path(),
+            &staged,
+            "high"
+        ));
 
-        assert!(severity_written(&files, &[], workspace.path(), "high"));
-        assert!(!severity_written(&[summary], &[], workspace.path(), "high"));
-
-        std::fs::write(
-            finding_dir.join("metadata.yaml"),
-            "id: f\nseverity: medium\n",
-        )
-        .unwrap();
-        assert!(!severity_written(&files, &[], workspace.path(), "high"));
+        let mut mismatched = files;
+        mismatched[1].content = "id: f\nseverity: medium\n".into();
+        let staged = stage_code_changes(workspace.path(), &mismatched, &[]).unwrap();
+        assert!(!severity_written(
+            &mismatched,
+            &[],
+            workspace.path(),
+            &staged,
+            "high"
+        ));
     }
 
     #[test]
@@ -7165,6 +8231,190 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path).unwrap(), "first\nsecond\n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn code_output_follows_in_workspace_symlink_without_replacing_it() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("real.txt"), "old").unwrap();
+        symlink("real.txt", workspace.path().join("link.txt")).unwrap();
+        let files = vec![kres_core::CodeFile {
+            path: "link.txt".into(),
+            content: "new".into(),
+            purpose: String::new(),
+        }];
+
+        apply_code_changes(workspace.path(), &files, &[]).unwrap();
+
+        assert!(std::fs::symlink_metadata(workspace.path().join("link.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("real.txt")).unwrap(),
+            "new"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_symlink_cannot_escape_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), workspace.path().join("outside")).unwrap();
+        let files = vec![kres_core::CodeFile {
+            path: "outside/file.txt".into(),
+            content: "escape".into(),
+            purpose: String::new(),
+        }];
+
+        assert!(apply_code_changes(workspace.path(), &files, &[]).is_err());
+        assert!(!outside.path().join("file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_nonexistent_path_cannot_escape_through_workspace_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), workspace.path().join("outside")).unwrap();
+        let target = workspace.path().join("outside/new.txt");
+        let files = vec![kres_core::CodeFile {
+            path: target.display().to_string(),
+            content: "escape".into(),
+            purpose: String::new(),
+        }];
+
+        assert!(apply_code_changes(workspace.path(), &files, &[]).is_err());
+        assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[test]
+    fn failed_commit_never_leaves_staged_files_in_created_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("z-blocked"), "not a directory").unwrap();
+        let mut staged = std::collections::BTreeMap::new();
+        staged.insert(workspace.path().join("a-created/file.txt"), "one".into());
+        staged.insert(workspace.path().join("z-blocked/file.txt"), "two".into());
+
+        assert!(commit_staged_files(workspace.path(), staged).is_err());
+        assert!(!workspace.path().join("a-created/file.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_directory_cleanup_does_not_remove_replacement_or_new_contents() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("created");
+        std::fs::create_dir(&path).unwrap();
+        let opened = std::fs::File::open(&path).unwrap();
+        let tracked = CreatedDirectory::capture(&opened).unwrap();
+
+        let moved = workspace.path().join("moved-original");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        cleanup_created_dirs(&[tracked]);
+        assert!(path.is_dir(), "replacement directory must survive cleanup");
+
+        let opened = std::fs::File::open(&path).unwrap();
+        let tracked = CreatedDirectory::capture(&opened).unwrap();
+        std::fs::write(path.join("concurrent.txt"), "owned elsewhere").unwrap();
+        cleanup_created_dirs(&[tracked]);
+        assert!(path.join("concurrent.txt").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_rejects_parent_replaced_by_external_symlink_after_staging() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = workspace.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let files = vec![kres_core::CodeFile {
+            path: "parent/result.txt".into(),
+            content: "secret".into(),
+            purpose: String::new(),
+        }];
+        let staged = stage_code_changes(workspace.path(), &files, &[]).unwrap();
+        std::fs::rename(&parent, workspace.path().join("original-parent")).unwrap();
+        symlink(outside.path(), &parent).unwrap();
+
+        assert!(commit_staged_files(workspace.path(), staged).is_err());
+        assert!(!outside.path().join("result.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_rejects_dangling_target_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        symlink("missing-target", workspace.path().join("result.txt")).unwrap();
+        let staged = std::collections::BTreeMap::from([(
+            workspace.path().join("result.txt"),
+            "replacement".into(),
+        )]);
+
+        assert!(commit_staged_files(workspace.path(), staged).is_err());
+        assert!(
+            std::fs::symlink_metadata(workspace.path().join("result.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_driver_commits_only_accepted_staged_attempts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workflow = fix_workflow();
+        let step = workflow
+            .steps
+            .iter()
+            .find(|step| step.id == "write-patch")
+            .unwrap();
+        let driver = LlmDriver::new(workspace.path().to_path_buf(), workflow.clone());
+        let target = workspace.path().join("result.txt");
+        let staged = std::collections::BTreeMap::from([(target.clone(), "rejected".into())]);
+        driver.stage_attempt(step, 1, staged).unwrap();
+        driver.discard_attempt(step, 1).await;
+        assert!(!target.exists());
+
+        let staged = std::collections::BTreeMap::from([(target.clone(), "accepted".into())]);
+        driver.stage_attempt(step, 2, staged).unwrap();
+        let effects = driver
+            .attempt_effects(
+                step,
+                2,
+                &ExecContext {
+                    workflow_inputs: &Map::new(),
+                    steps: &HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        driver
+            .apply_attempt_effects(
+                step,
+                2,
+                &effects,
+                &ExecContext {
+                    workflow_inputs: &Map::new(),
+                    steps: &HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "accepted");
+    }
+
     #[test]
     fn apply_code_edits_replace_all_handles_repeat_matches() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7215,6 +8465,8 @@ mod tests {
         std::fs::write(tmp.path().join("meson.build"), "").unwrap();
         std::fs::create_dir_all(tmp.path().join("src/systemd")).unwrap();
         std::fs::create_dir_all(tmp.path().join("units")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/core")).unwrap();
+        std::fs::write(tmp.path().join("src/core/main.c"), "old").unwrap();
         let ctx_steps = HashMap::new();
         let ctx_inputs = Map::new();
         let ctx = ExecContext {
@@ -7230,7 +8482,8 @@ mod tests {
             replace_all: false,
         }];
 
-        add_side_effect_outputs(&step, &mut outputs, tmp.path(), &ctx, &[], &edits)
+        let staged = stage_code_changes(tmp.path(), &[], &edits).unwrap();
+        add_side_effect_outputs(&step, &mut outputs, tmp.path(), &ctx, &[], &edits, &staged)
             .await
             .unwrap();
 
@@ -7252,6 +8505,8 @@ mod tests {
         std::fs::write(tmp.path().join("Kbuild"), "").unwrap();
         std::fs::write(tmp.path().join("Makefile"), "").unwrap();
         std::fs::create_dir_all(tmp.path().join("include/linux")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("drivers/example")).unwrap();
+        std::fs::write(tmp.path().join("drivers/example/example.c"), "old").unwrap();
         let ctx_steps = HashMap::new();
         let ctx_inputs = Map::new();
         let ctx = ExecContext {
@@ -7267,7 +8522,8 @@ mod tests {
             replace_all: false,
         }];
 
-        add_side_effect_outputs(&step, &mut outputs, tmp.path(), &ctx, &[], &edits)
+        let staged = stage_code_changes(tmp.path(), &[], &edits).unwrap();
+        add_side_effect_outputs(&step, &mut outputs, tmp.path(), &ctx, &[], &edits, &staged)
             .await
             .unwrap();
 
@@ -7615,7 +8871,7 @@ mod tests {
         let wf = crate::workflow::parse_workflow(&wf_json.to_string()).unwrap();
         let summary = TaskSummary {
             raw_response: String::new(),
-            analysis: "I looked at the build log. {\"result\": \"clean\"}".into(),
+            analysis: r#"{"result":"clean"}"#.into(),
             findings: vec![],
             followups: vec![],
             fast_rounds: 1,
@@ -7650,9 +8906,7 @@ mod tests {
         });
         let wf = crate::workflow::parse_workflow(&wf_json.to_string()).unwrap();
         let summary = TaskSummary {
-            raw_response:
-                "Analysis\n```json\n{\"valid\": true, \"affected_files\": [\"drivers/example/example.c\"]}\n```"
-                    .into(),
+            raw_response: r#"{"valid":true,"affected_files":["drivers/example/example.c"]}"#.into(),
             analysis: String::new(),
             findings: vec![],
             followups: vec![],
@@ -7978,75 +9232,6 @@ mod tests {
         let body = read_at_path("/not/a/checkout/configs/prompts/triage-template.md").unwrap();
         assert!(body.contains("# Subject:"), "{body}");
         assert!(body.contains("triage summary"), "{body}");
-    }
-
-    #[tokio::test]
-    async fn post_action_rejected_when_not_in_allowlist() {
-        // Step declares actions: ["read"] but tries to run a git
-        // post_action — should reject before spawning git.
-        let wf_json = serde_json::json!({
-            "$schema_version": 1,
-            "id": "allowlist-test",
-            "steps": [{
-                "id": "s",
-                "agent": "fast",
-                "prompt": "p",
-                "actions": ["read"],
-                "post_actions": [{"type": "git", "name": "status"}]
-            }]
-        });
-        let wf = crate::workflow::parse_workflow(&wf_json.to_string()).unwrap();
-        let driver = LlmDriver::new(std::env::temp_dir(), wf.clone());
-        let inputs = Map::new();
-        let states = HashMap::new();
-        let ctx = ExecContext {
-            workflow_inputs: &inputs,
-            steps: &states,
-        };
-        let err = driver
-            .run_post_actions(&wf.steps[0], &ctx)
-            .await
-            .unwrap_err();
-        assert!(err.contains("not in step's allowlist"), "got: {err}");
-        assert!(err.contains("Git"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn post_action_allowed_when_in_step_allowlist() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Create a real git repo so `git status` succeeds.
-        for args in [
-            vec!["init", "-q", "-b", "main"],
-            vec!["config", "user.email", "t@t"],
-            vec!["config", "user.name", "T"],
-        ] {
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(tmp.path())
-                .output()
-                .unwrap();
-        }
-        let wf_json = serde_json::json!({
-            "$schema_version": 1,
-            "id": "allowlist-ok",
-            "steps": [{
-                "id": "s",
-                "agent": "fast",
-                "prompt": "p",
-                "actions": ["git"],
-                "post_actions": [{"type": "git", "name": "status"}]
-            }]
-        });
-        let wf = crate::workflow::parse_workflow(&wf_json.to_string()).unwrap();
-        let driver = LlmDriver::new(tmp.path().to_path_buf(), wf.clone());
-        let inputs = Map::new();
-        let states = HashMap::new();
-        let ctx = ExecContext {
-            workflow_inputs: &inputs,
-            steps: &states,
-        };
-        let log = driver.run_post_actions(&wf.steps[0], &ctx).await.unwrap();
-        assert!(log.iter().any(|l| l.contains("git status")));
     }
 
     #[test]

@@ -8,9 +8,9 @@
 //! are needed; that trained reflex was firing on check_goal calls
 //! and blowing past the JSON envelope the caller expects (observed
 //! in session e84c7fac: reply=`done`, parse failed,
-//! `assume_met()` fired). [`GOAL_INSTRUCTIONS`] is the dedicated
+//! the old fail-open completion fallback fired). [`GOAL_INSTRUCTIONS`] is the dedicated
 //! system prompt for this agent — it tells the model it's a judge,
-//! not a fetcher, and to return JSON only.
+//! not a fetcher, and to return raw, unfenced JSON only.
 //!
 //! Ownership: the session calls `define_goal` after each top-level
 //! prompt (or `--prompt FILE` initial run), stores the returned
@@ -25,6 +25,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use kres_core::log::{LoggedUsage, TurnLogger};
+use kres_core::UsageTracker;
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 /// Dedicated system prompt for define_goal / check_goal. Swapped in
@@ -42,6 +43,36 @@ pub struct GoalClient {
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
     pub logger: Option<Arc<TurnLogger>>,
+    pub usage: Option<Arc<UsageTracker>>,
+}
+
+fn record_usage(gc: &GoalClient, usage: &kres_llm::request::Usage) {
+    if let Some(tracker) = &gc.usage {
+        tracker.record(
+            "goal",
+            gc.model.id.clone(),
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_creation_input_tokens,
+            usage.cache_read_input_tokens,
+        );
+    }
+}
+
+async fn call_with_shutdown(
+    gc: &GoalClient,
+    cfg: &CallConfig,
+    messages: &[Message],
+    shutdown: Option<kres_core::Shutdown>,
+) -> Result<kres_llm::request::MessagesResponse, kres_llm::LlmError> {
+    if let Some(shutdown) = shutdown {
+        tokio::select! {
+            _ = shutdown.cancelled() => Err(kres_llm::LlmError::Other("cancelled".into())),
+            result = gc.client.messages_streaming(cfg, messages) => result,
+        }
+    } else {
+        gc.client.messages_streaming(cfg, messages).await
+    }
 }
 
 /// Result of a `check_goal` call.
@@ -64,29 +95,26 @@ pub struct GoalDefinition {
 
 pub use kres_core::TaskMode;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DefineResponse {
-    #[serde(default)]
     goal: String,
-    #[serde(default)]
     mode: Option<TaskMode>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CheckResponse {
-    #[serde(default)]
     met: bool,
-    #[serde(default)]
     reason: String,
-    #[serde(default)]
     missing: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PlanStepRaw {
     #[serde(default)]
     id: String,
-    #[serde(default)]
     title: String,
     #[serde(default)]
     description: String,
@@ -94,9 +122,9 @@ struct PlanStepRaw {
     depends_on: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PlanResponse {
-    #[serde(default)]
     steps: Vec<PlanStepRaw>,
 }
 
@@ -176,7 +204,7 @@ fn build_define_goal_request(prompt: &str, plan: Option<&kres_core::Plan>) -> se
                          in the current workspace repository, not to a \
                          whole-tree audit unless the prompt explicitly \
                          asks for one.\n\
-                         Return JSON only:\n\
+                         Return raw, unfenced JSON only:\n\
                          {\"goal\": \"specific completion criteria\", \
                           \"mode\": \"audit\" | \"generic\" | \"coding\"}"
     });
@@ -195,6 +223,7 @@ pub async fn define_goal(
     gc: &GoalClient,
     prompt: &str,
     plan: Option<&kres_core::Plan>,
+    shutdown: Option<kres_core::Shutdown>,
 ) -> Option<GoalDefinition> {
     let request = build_define_goal_request(prompt, plan);
     let body = serde_json::to_string_pretty(&request).ok()?;
@@ -218,13 +247,14 @@ pub async fn define_goal(
     if let Some(lg) = &gc.logger {
         lg.log_main("user", &body, None, None);
     }
-    let resp = match gc.client.messages_streaming(&cfg, &messages).await {
+    let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "kres_agents", "define_goal failed: {e}");
             return None;
         }
     };
+    record_usage(gc, &resp.usage);
     let text = extract_text(&resp);
     if let Some(lg) = &gc.logger {
         lg.log_main(
@@ -239,7 +269,9 @@ pub async fn define_goal(
             None,
         );
     }
-    let parsed = extract_json_with_key::<DefineResponse>(&text, "goal")?;
+    let parsed =
+        parse_or_repair_goal_json::<DefineResponse>(gc, &text, "define-goal", "goal", shutdown)
+            .await?;
     if parsed.goal.is_empty() {
         return None;
     }
@@ -250,9 +282,9 @@ pub async fn define_goal(
 }
 
 /// Ask the main agent whether `goal` has been met by `analysis`.
-/// Returns `(met, reason, missing)`. On any failure returns
-/// `(true, "check failed, assuming met", [])` — matches 's
-/// policy of not stranding a task because of a flaky check call.
+/// Returns `(met, reason, missing)`. Failures are fail-closed: they return a
+/// non-complete check with an explicit retry item so malformed JSON or a flaky
+/// call cannot drain pending work.
 ///
 /// `original_prompt` is the operator's raw query. Including it as a
 /// separate field lets the judge weigh the literal intent ("check
@@ -292,7 +324,7 @@ fn build_check_goal_request(
                          analysis only asserts that this was checked without \
                          naming the concrete evidence, set met=false and \
                          put the missing source/type/search/callgraph/history \
-                         item in `missing`. Return JSON only:\n\
+                         item in `missing`. Return raw, unfenced JSON only:\n\
                          {\"met\": true/false, \"reason\": \"why or why not\", \
                          \"missing\": [\"what still needs to be done\"]}"
     });
@@ -313,11 +345,12 @@ pub async fn check_goal(
     goal: &str,
     analysis: &str,
     plan: Option<&kres_core::Plan>,
+    shutdown: Option<kres_core::Shutdown>,
 ) -> GoalCheck {
     let request = build_check_goal_request(original_prompt, goal, analysis, plan);
     let body = match serde_json::to_string_pretty(&request) {
         Ok(s) => s,
-        Err(_) => return assume_met(),
+        Err(_) => return failed_goal_check("could not serialize goal-check request"),
     };
     let mut cfg = CallConfig::defaults_for(gc.model.clone())
         .with_max_tokens(gc.max_tokens)
@@ -339,13 +372,14 @@ pub async fn check_goal(
     if let Some(lg) = &gc.logger {
         lg.log_main("user", &body, None, None);
     }
-    let resp = match gc.client.messages_streaming(&cfg, &messages).await {
+    let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "kres_agents", "check_goal failed: {e}");
-            return assume_met();
+            return failed_goal_check(&format!("goal-check request failed: {e}"));
         }
     };
+    record_usage(gc, &resp.usage);
     let text = extract_text(&resp);
     if let Some(lg) = &gc.logger {
         lg.log_main(
@@ -360,21 +394,22 @@ pub async fn check_goal(
             None,
         );
     }
-    match extract_json_with_key::<CheckResponse>(&text, "met") {
+    match parse_or_repair_goal_json::<CheckResponse>(gc, &text, "check-goal", "met", shutdown).await
+    {
         Some(r) => GoalCheck {
             met: r.met,
             reason: r.reason,
             missing: r.missing,
         },
-        None => assume_met(),
+        None => failed_goal_check("goal-check response was malformed and could not be repaired"),
     }
 }
 
-fn assume_met() -> GoalCheck {
+fn failed_goal_check(reason: &str) -> GoalCheck {
     GoalCheck {
-        met: true,
-        reason: "check failed, assuming met".into(),
-        missing: Vec::new(),
+        met: false,
+        reason: reason.into(),
+        missing: vec!["retry the completion check".into()],
     }
 }
 
@@ -397,6 +432,7 @@ pub async fn define_plan(
     goal: &str,
     mode: TaskMode,
     existing: Option<&kres_core::Plan>,
+    shutdown: Option<kres_core::Shutdown>,
 ) -> Option<kres_core::Plan> {
     let mut request = json!({
         "task": "define_plan",
@@ -441,7 +477,7 @@ pub async fn define_plan(
                          diff/stat; do not add a repo-survey step or \
                          whole-tree audit unless the prompt explicitly \
                          asks for one. Do not invent a project layout \
-                         from the tool/schema wording. Return JSON only:\n\
+                         from the tool/schema wording. Return raw, unfenced JSON only:\n\
                          {\"steps\": [{\"id\": \"audit-...\", \"title\": \"...\", \
                          \"description\": \"...\"}]}"
     });
@@ -474,13 +510,14 @@ pub async fn define_plan(
     if let Some(lg) = &gc.logger {
         lg.log_main("user", &body, None, None);
     }
-    let resp = match gc.client.messages_streaming(&cfg, &messages).await {
+    let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(target: "kres_agents", "define_plan failed: {e}");
             return None;
         }
     };
+    record_usage(gc, &resp.usage);
     let text = extract_text(&resp);
     if let Some(lg) = &gc.logger {
         lg.log_main(
@@ -495,7 +532,9 @@ pub async fn define_plan(
             None,
         );
     }
-    let parsed = extract_json_with_key::<PlanResponse>(&text, "steps")?;
+    let parsed =
+        parse_or_repair_goal_json::<PlanResponse>(gc, &text, "define-plan", "steps", shutdown)
+            .await?;
     if parsed.steps.is_empty() {
         return None;
     }
@@ -536,23 +575,52 @@ fn build_plan_from_raw(
 /// Find the first `{...}` block containing the requested key and
 /// deserialise it into `T`. Matches (text, key)`
 /// for the narrow "expect a JSON object with this field" case.
+#[cfg(test)]
 fn extract_json_with_key<T: for<'de> Deserialize<'de>>(text: &str, key: &str) -> Option<T> {
-    // Try strict parse first.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
-        if v.get(key).is_some() {
-            return serde_json::from_value(v).ok();
-        }
+    crate::json_repair::JsonObjectContract {
+        name: "goal-agent",
+        fields: &[key],
     }
-    // Brace-match for the first `{...}` containing "<key>". The
-    // shared scanner is string-aware and clamps a stray `}` so
-    // prose preambles with code snippets don't desync it.
-    let marker = format!("\"{key}\"");
-    kres_core::brace::first_top_level_brace(text, |slice| {
-        if !slice.contains(&marker) {
-            return None;
-        }
-        serde_json::from_str(slice).ok()
+    .parse(text)
+    .ok()
+}
+
+async fn parse_or_repair_goal_json<T: for<'de> Deserialize<'de> + schemars::JsonSchema>(
+    gc: &GoalClient,
+    text: &str,
+    contract_name: &str,
+    key: &str,
+    shutdown: Option<kres_core::Shutdown>,
+) -> Option<T> {
+    let contract = crate::json_repair::JsonObjectContract {
+        name: contract_name,
+        fields: &[key],
+    };
+    let errors = match contract.parse(text) {
+        Ok(parsed) => return Some(parsed),
+        Err(errors) => errors,
+    };
+    let schema = serde_json::to_string(&schemars::schema_for!(T)).ok()?;
+    let repaired = crate::json_repair::repair_json_response(crate::json_repair::JsonRepairCall {
+        client: gc.client.clone(),
+        model: gc.model.clone(),
+        max_tokens: gc.max_tokens,
+        max_input_tokens: gc.max_input_tokens,
+        contract: crate::json_repair::JsonContract {
+            name: contract_name,
+            schema: &schema,
+            instructions: "Correct representation and field types only; preserve the original decision and text.",
+        },
+        rejected_response: text,
+        validation_errors: &errors,
+        logger: gc.logger.clone(),
+        log_kind: crate::json_repair::RepairLogKind::Main,
+        shutdown,
     })
+    .await
+    .ok()?;
+    record_usage(gc, &repaired.usage);
+    contract.accept_repair(&repaired.text).ok()
 }
 
 fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
@@ -577,20 +645,33 @@ mod tests {
     }
 
     #[test]
-    fn extract_json_embedded() {
-        let r: CheckResponse = extract_json_with_key(
+    fn extract_json_rejects_embedded_object() {
+        let response: Option<CheckResponse> = extract_json_with_key(
             r#"prefix {"met": true, "reason": "ok", "missing": []} suffix"#,
             "met",
-        )
-        .unwrap();
-        assert!(r.met);
-        assert_eq!(r.reason, "ok");
+        );
+        assert!(response.is_none());
+    }
+
+    #[test]
+    fn extract_json_rejects_multiple_candidates() {
+        let text = r#"first {"goal":42} then {"goal":"real","mode":"audit"}"#;
+        let response: Option<DefineResponse> = extract_json_with_key(text, "goal");
+        assert!(response.is_none());
     }
 
     #[test]
     fn extract_json_missing_key() {
         let r: Option<DefineResponse> = extract_json_with_key(r#"{"other": "x"}"#, "goal");
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn control_responses_reject_missing_required_fields() {
+        assert!(extract_json_with_key::<DefineResponse>("{}", "goal").is_none());
+        assert!(extract_json_with_key::<CheckResponse>("{}", "met").is_none());
+        assert!(extract_json_with_key::<PlanResponse>("{}", "steps").is_none());
+        assert!(extract_json_with_key::<CheckResponse>(r#"{"met":false}"#, "met").is_none());
     }
 
     #[test]
@@ -626,10 +707,10 @@ mod tests {
     }
 
     #[test]
-    fn assume_met_default_is_truthy() {
-        let c = assume_met();
-        assert!(c.met);
-        assert!(c.missing.is_empty());
+    fn failed_goal_check_does_not_claim_completion() {
+        let c = failed_goal_check("bad response");
+        assert!(!c.met);
+        assert!(!c.missing.is_empty());
     }
 
     fn sample_plan() -> kres_core::Plan {

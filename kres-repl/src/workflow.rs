@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 
 use kres_agents::workflow_exec::{
     active_lenses, run_resume, run_with_cap, run_with_observer, run_with_persistence,
-    EventObserver, ExecContext, Trace, WorkflowSnapshot, WorkflowStatus,
+    run_with_persistence_and_observer, EventObserver, ExecContext, Trace, WorkflowSnapshot,
+    WorkflowStatus,
 };
 use kres_agents::workflow_runner::{derive_inputs, LlmDriver};
 use kres_agents::{
@@ -295,6 +296,11 @@ pub async fn run_workflow_driver(
         results_dir,
         observer,
     } = options;
+    let fallback_state_dir = driver.workspace().join(".kres/workflow-state");
+    let default_state_dir = state_dir
+        .clone()
+        .or_else(|| results_dir.clone())
+        .unwrap_or(fallback_state_dir);
 
     if workflow.id == "fix"
         && !inputs.contains_key("current_fix_todo")
@@ -311,6 +317,7 @@ pub async fn run_workflow_driver(
             inputs.clone(),
             iteration_cap,
             observer.clone(),
+            Some(&default_state_dir),
         )
         .await;
         let written_artifacts = if let Some(results_dir) = results_dir.as_ref() {
@@ -324,7 +331,7 @@ pub async fn run_workflow_driver(
         });
     }
 
-    let trace = match (resume, state_dir.as_ref(), observer) {
+    let trace = match (resume, Some(&default_state_dir), observer) {
         (true, Some(state_dir), None) => {
             let snap = WorkflowSnapshot::load(state_dir, &workflow.id).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -342,26 +349,26 @@ pub async fn run_workflow_driver(
             )
             .await
         }
-        (true, None, _) => {
-            return Err(anyhow::anyhow!("--resume requires --state-dir DIR"));
-        }
         (false, Some(state_dir), None) => {
             run_with_persistence(workflow, driver, inputs, iteration_cap, state_dir.clone()).await
         }
-        (false, None, Some(observer)) => {
-            run_with_observer(workflow, driver, inputs, iteration_cap, observer).await
-        }
-        (false, Some(_), Some(_)) => {
-            return Err(anyhow::anyhow!(
-                "workflow observer cannot be combined with persisted state yet"
-            ));
+        (false, Some(state_dir), Some(observer)) => {
+            run_with_persistence_and_observer(
+                workflow,
+                driver,
+                inputs,
+                iteration_cap,
+                state_dir.clone(),
+                observer,
+            )
+            .await
         }
         (true, Some(_), Some(_)) => {
             return Err(anyhow::anyhow!(
                 "workflow observer cannot be combined with resume yet"
             ));
         }
-        (false, None, None) => run_with_cap(workflow, driver, inputs, iteration_cap).await,
+        (true, None, _) | (false, None, _) => unreachable!("default state directory is set"),
     };
 
     let written_artifacts = if let Some(results_dir) = results_dir.as_ref() {
@@ -382,6 +389,7 @@ async fn run_fix_series_driver(
     inputs: Map<String, Value>,
     iteration_cap: usize,
     observer: Option<EventObserver>,
+    results_dir: Option<&Path>,
 ) -> Trace {
     let mut planning_workflow = workflow.clone();
     planning_workflow
@@ -391,19 +399,15 @@ async fn run_fix_series_driver(
     let mut planning_inputs = inputs.clone();
     planning_inputs.insert("fix_run_mode".into(), Value::String("planning".to_string()));
 
-    let planning_trace = match observer.clone() {
-        Some(obs) => {
-            run_with_observer(
-                &planning_workflow,
-                driver,
-                planning_inputs,
-                iteration_cap,
-                obs,
-            )
-            .await
-        }
-        None => run_with_cap(&planning_workflow, driver, planning_inputs, iteration_cap).await,
-    };
+    let planning_trace = run_with_optional_observer(
+        &planning_workflow,
+        driver,
+        planning_inputs,
+        iteration_cap,
+        observer.clone(),
+        results_dir.map(|dir| dir.join("workflow-state/planning")),
+    )
+    .await;
 
     if !matches!(
         planning_trace.status,
@@ -491,6 +495,12 @@ async fn run_fix_series_driver(
                 item_inputs,
                 iteration_cap,
                 observer.clone(),
+                results_dir.map(|dir| {
+                    dir.join(format!(
+                        "workflow-state/todo-{}-revision-{revisions}",
+                        idx + 1
+                    ))
+                }),
             )
             .await;
             let item_research_status =
@@ -616,10 +626,27 @@ async fn run_with_optional_observer(
     inputs: Map<String, Value>,
     iteration_cap: usize,
     observer: Option<EventObserver>,
+    snapshot_dir: Option<PathBuf>,
 ) -> Trace {
-    match observer {
-        Some(obs) => run_with_observer(workflow, driver, inputs, iteration_cap, obs).await,
-        None => run_with_cap(workflow, driver, inputs, iteration_cap).await,
+    match (observer, snapshot_dir) {
+        (Some(observer), Some(dir)) => {
+            run_with_persistence_and_observer(
+                workflow,
+                driver,
+                inputs,
+                iteration_cap,
+                dir,
+                observer,
+            )
+            .await
+        }
+        (None, Some(dir)) => {
+            run_with_persistence(workflow, driver, inputs, iteration_cap, dir).await
+        }
+        (Some(observer), None) => {
+            run_with_observer(workflow, driver, inputs, iteration_cap, observer).await
+        }
+        (None, None) => run_with_cap(workflow, driver, inputs, iteration_cap).await,
     }
 }
 
@@ -1222,16 +1249,15 @@ mod tests {
                 "agent": "fast",
                 "prompt": "scan the target",
                 "outputs": {
-                    "findings": {"type": "array<object>"},
+                    "findings": {"type": "array<Finding>"},
                     "analysis": {"type": "string"}
                 }
             }]
         });
         let workflow = kres_agents::workflow::parse_workflow(&wf_json.to_string()).unwrap();
         let responses = VecDeque::from(vec![fake_messages_response(
-            "found one\n\
-             {\"findings\": [{\"file\": \"kernel/a.c:7\", \"what\": \"leak\"}], \
-              \"analysis\": \"one leak\"}",
+            "{\"findings\": [{\"id\":\"leak\",\"title\":\"leak\",\"severity\":\"high\",\"summary\":\"kernel/a.c:7 leaks a reference\"}], \
+             \"analysis\": \"one leak\"}",
         )]);
         let port = spawn_mock(responses).await;
 

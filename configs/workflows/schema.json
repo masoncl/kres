@@ -219,17 +219,6 @@
       "required": ["type"]
     },
 
-    "post_action": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "type": {"$ref": "#/$defs/action_value"},
-        "name": {"type": "string"},
-        "args": {"type": "object", "additionalProperties": true}
-      },
-      "required": ["type"]
-    },
-
     "reaper_action": {
       "type": "object",
       "additionalProperties": false,
@@ -363,10 +352,6 @@
           "additionalProperties": {"$ref": "#/$defs/output_def"}
         },
         "eval": {"$ref": "#/$defs/eval"},
-        "post_actions": {
-          "type": "array",
-          "items": {"$ref": "#/$defs/post_action"}
-        },
         "action": {"$ref": "#/$defs/reaper_action"},
         "terminal_on_success": {"type": "boolean"},
         "lenses": {

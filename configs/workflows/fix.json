@@ -42,7 +42,7 @@
     ],
     "failure_and_retries": [
       "A step with `eval` first produces outputs, then the eval decides whether those outputs are",
-      "acceptable. Passing eval marks the step done and then runs deterministic `post_actions`.",
+      "acceptable. Passing eval records the accepted effect before deterministic reaper steps run.",
       "Failing eval follows `eval.on_fail.action`: `repeat` reruns the same step, `branch_to` moves",
       "control back to another step and invalidates dependent work, `continue` keeps going, and",
       "`exit_failure` terminates.",
@@ -376,10 +376,15 @@
         "research_decision": {
           "type": "object",
           "schema": {
-            "bug_proven": "boolean",
-            "fix_contract_proven": "boolean",
-            "invalidity_proven": "boolean",
-            "needs_more_audit": "boolean"
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["bug_proven", "fix_contract_proven", "invalidity_proven", "needs_more_audit"],
+            "properties": {
+              "bug_proven": {"type": "boolean"},
+              "fix_contract_proven": {"type": "boolean"},
+              "invalidity_proven": {"type": "boolean"},
+              "needs_more_audit": {"type": "boolean"}
+            }
           },
           "description": "Structured routing rationale. Must agree with research_status and valid; do not rely on analysis prose for routing."
         },
@@ -574,10 +579,18 @@
           "type": "array<object>",
           "optional": true,
           "schema": {
-            "msgid": "string",
-            "subject": "string",
-            "url": "string",
-            "relevance": "string"
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["msgid", "subject", "url", "relevance"],
+              "properties": {
+                "msgid": {"type": "string"},
+                "subject": {"type": "string"},
+                "url": {"type": "string"},
+                "relevance": {"type": "string"}
+              }
+            }
           },
           "description": "Lore threads that may propose the same fix. msgid is the Message-ID; url is the lore.kernel.org permalink if available; relevance is a short prose note about why this thread matches."
         },
@@ -1284,9 +1297,17 @@
         "defects": {
           "type": "array<object>",
           "schema": {
-            "lens": "string",
-            "where": "string",
-            "what": "string"
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["lens", "where", "what"],
+              "properties": {
+                "lens": {"type": "string"},
+                "where": {"type": "string"},
+                "what": {"type": "string"}
+              }
+            }
           }
         },
         "source_defects": {
@@ -1303,10 +1324,18 @@
           "type": "array<object>",
           "optional": true,
           "schema": {
-            "lens": "string",
-            "where": "string",
-            "what": "string",
-            "evidence_needed": "string"
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["lens", "where", "what", "evidence_needed"],
+              "properties": {
+                "lens": {"type": "string"},
+                "where": {"type": "string"},
+                "what": {"type": "string"},
+                "evidence_needed": {"type": "string"}
+              }
+            }
           },
           "description": "Concrete risks the lens noticed but could not run down from gathered evidence. clean=true is incompatible with a non-empty unresolved_risks[]. Read as input by the post-review orchestrator."
         },
@@ -1317,9 +1346,17 @@
           "type": "array<object>",
           "optional": true,
           "schema": {
-            "bug": "string",
-            "outcome": "string",
-            "evidence": "string"
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["bug", "outcome", "evidence"],
+              "properties": {
+                "bug": {"type": "string"},
+                "outcome": {"type": "string"},
+                "evidence": {"type": "string"}
+              }
+            }
           },
           "description": "Per-bug coverage outcomes from the bug-coverage lens. Each entry has a bug id (from metadata.bugs or research.fix_plan, may be empty for single-bug findings), an outcome (fixed | invalidated | deferred | unresolved), and evidence (file:line, commit ref, or todo id). Consumed by the record-results reaper step to persist per-bug results into the finding's metadata.yaml."
         }

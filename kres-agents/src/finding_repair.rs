@@ -4,33 +4,49 @@
 //! raw objects and exact serde errors, may only correct their shape, and must
 //! preserve ids and substantive claims. Rust validates the result again.
 
-use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::Deserialize;
 use tokio::sync::Notify;
 
 use kres_core::findings::Finding;
-use kres_core::log::{LoggedUsage, TurnLogger};
-use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
+use kres_core::log::TurnLogger;
+use kres_core::UsageTracker;
+use kres_llm::{client::Client, Model};
 
 use crate::error::AgentError;
-use crate::response::{parse_code_response, InvalidFinding};
-
-const REPAIR_SYSTEM: &str = "You repair malformed JSON Finding records. Return JSON only with exactly one top-level `findings` array. Correct schema and type errors only. Preserve every id and substantive claim. Do not add evidence, findings, code paths, or conclusions.";
+use crate::json_repair::{repair_json_response, JsonContract, JsonRepairCall, RepairLogKind};
+use crate::response::InvalidFinding;
 
 #[derive(Debug, Default)]
 pub struct FindingRepairOutcome {
-    pub findings: Vec<Finding>,
+    pub findings: Vec<RepairedFinding>,
     pub unrepaired: Vec<InvalidFinding>,
 }
 
-#[derive(Serialize)]
-struct RepairRequest<'a> {
-    task: &'static str,
-    schema: &'static str,
-    invalid_findings: &'a [InvalidFinding],
-    instructions: &'static str,
+#[derive(Debug)]
+pub struct RepairedFinding {
+    pub index: usize,
+    pub finding: Finding,
+}
+
+pub enum FindingRepairCancel {
+    Notify(Arc<Notify>),
+    Shutdown(kres_core::Shutdown),
+}
+
+pub struct FindingRepairRuntime {
+    pub logger: Option<Arc<TurnLogger>>,
+    pub cancel: Option<FindingRepairCancel>,
+    pub usage: Option<Arc<UsageTracker>>,
+    pub role: &'static str,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct FindingRepairResponse {
+    findings: [Finding; 1],
 }
 
 pub async fn repair_invalid_findings(
@@ -39,104 +55,100 @@ pub async fn repair_invalid_findings(
     max_tokens: u32,
     max_input_tokens: Option<u32>,
     invalid: Vec<InvalidFinding>,
-    logger: Option<Arc<TurnLogger>>,
-    cancel: Option<Arc<Notify>>,
+    runtime: FindingRepairRuntime,
 ) -> Result<FindingRepairOutcome, AgentError> {
+    let FindingRepairRuntime {
+        logger,
+        cancel,
+        usage,
+        role,
+    } = runtime;
     if invalid.is_empty() {
         return Ok(FindingRepairOutcome::default());
     }
-    let request = RepairRequest {
-        task: "repair_invalid_findings",
-        schema: "{id:string,title:string,severity:low|medium|high,status:active|unconfirmed|fixed|invalidated,relevant_symbols:[{name:string,filename:string,line:u32,definition:string}],relevant_file_sections:[{filename:string,line_start:u32,line_end:u32,content:string}],summary:string,reproducer_sketch:string,impact:string,mechanism_detail?:string,fix_sketch?:string,open_questions?:[string],related_finding_ids?:[string],reactivate?:bool}",
-        invalid_findings: &invalid,
-        instructions: "Repair each object using its exact error. Keep the same id. Never invent a line number or other evidence. When a relevant_symbols or relevant_file_sections entry lacks a required numeric location, remove that entire evidence entry; the finding may retain the prose claim and open question. Convert a scalar to an array only when doing so preserves the supplied text. Return one repaired entry per input, in input order. JSON only.",
-    };
-    let body = serde_json::to_string(&request)?;
-    let mut cfg = CallConfig::defaults_for(model)
-        .with_max_tokens(max_tokens.min(16_000))
-        .with_system(REPAIR_SYSTEM.to_string())
-        .with_stream_label("repair invalid findings");
-    if let Some(limit) = max_input_tokens {
-        cfg = cfg.with_max_input_tokens(limit);
-    }
-    let messages = vec![Message {
-        role: "user".into(),
-        content: body.clone(),
-        cache: false,
-        cached_prefix: None,
-    }];
-    if let Some(log) = &logger {
-        log.log_code_labeled("user", Some("phase=finding-repair"), &body, None, None);
-    }
-    let response = match cancel {
-        Some(notify) => tokio::select! {
-            biased;
-            _ = notify.notified() => return Ok(FindingRepairOutcome { findings: vec![], unrepaired: invalid }),
-            result = client.messages_streaming(&cfg, &messages) => result,
-        },
-        None => client.messages_streaming(&cfg, &messages).await,
-    }
-    .map_err(|error| AgentError::Other(error.to_string()))?;
-    let text = response
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            kres_llm::request::ContentBlock::Text { text } => Some(text.as_str()),
+    let schema = serde_json::to_string(&schemars::schema_for!(FindingRepairResponse))?;
+    let mut outcome = FindingRepairOutcome::default();
+    let mut pending = VecDeque::from(invalid);
+    while let Some(mut item) = pending.pop_front() {
+        let Some(expected_id) = item
+            .raw
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            outcome.unrepaired.push(item);
+            continue;
+        };
+        let rejected_response = serde_json::json!({"findings": [item.raw.clone()]}).to_string();
+        let validation_errors = vec![format!("findings[0]: {}", item.error)];
+        let shutdown = match &cancel {
+            Some(FindingRepairCancel::Shutdown(shutdown)) => Some(shutdown.clone()),
             _ => None,
-        })
-        .collect::<String>();
-    if let Some(log) = &logger {
-        log.log_code_labeled(
-            "assistant",
-            Some("phase=finding-repair"),
-            &text,
-            Some(LoggedUsage {
-                input: response.usage.input_tokens,
-                output: response.usage.output_tokens,
-                cache_creation: response.usage.cache_creation_input_tokens,
-                cache_read: response.usage.cache_read_input_tokens,
+        };
+        let repair = repair_json_response(JsonRepairCall {
+            client: client.clone(),
+            model: model.clone(),
+            max_tokens,
+            max_input_tokens,
+            contract: JsonContract {
+                name: "finding-repair",
+                schema: &schema,
+                instructions: "Return exactly one Finding with the same id. Correct field representation only; do not invent evidence or conclusions.",
+            },
+            rejected_response: &rejected_response,
+            validation_errors: &validation_errors,
+            logger: logger.clone(),
+            log_kind: RepairLogKind::Code,
+            shutdown,
+        });
+        let repaired = match match &cancel {
+            Some(FindingRepairCancel::Notify(notify)) => tokio::select! {
+                biased;
+                _ = notify.notified() => {
+                    outcome.unrepaired.push(item);
+                    outcome.unrepaired.extend(pending);
+                    return Ok(outcome);
+                },
+                result = repair => result,
+            },
+            _ => repair.await,
+        } {
+            Ok(repaired) => repaired,
+            Err(error) => {
+                item.error
+                    .push_str(&format!("; repair request failed: {error}"));
+                outcome.unrepaired.push(item);
+                outcome.unrepaired.extend(pending);
+                return Ok(outcome);
+            }
+        };
+        if let Some(usage) = &usage {
+            usage.record(
+                role,
+                model.id.clone(),
+                repaired.usage.input_tokens,
+                repaired.usage.output_tokens,
+                repaired.usage.cache_creation_input_tokens,
+                repaired.usage.cache_read_input_tokens,
+            );
+        }
+        match accept_repaired_finding(&expected_id, &repaired.text) {
+            Some(finding) => outcome.findings.push(RepairedFinding {
+                index: item.index,
+                finding,
             }),
-            None,
-        );
+            None => outcome.unrepaired.push(item),
+        }
     }
-
-    let parsed = parse_code_response(&text);
-    Ok(accept_repaired_findings(invalid, parsed.findings))
+    Ok(outcome)
 }
 
-fn accept_repaired_findings(
-    invalid: Vec<InvalidFinding>,
-    candidate_findings: Vec<Finding>,
-) -> FindingRepairOutcome {
-    let expected_ids: BTreeSet<String> = invalid
-        .iter()
-        .filter_map(|item| item.raw.get("id").and_then(|id| id.as_str()))
-        .map(str::to_string)
-        .collect();
-    let mut repaired_ids = BTreeSet::new();
-    let findings = candidate_findings
-        .into_iter()
-        .filter(|finding| {
-            let accepted = expected_ids.contains(&finding.id) && repaired_ids.insert(finding.id.clone());
-            if !accepted {
-                tracing::warn!(target: "kres_agents", id = %finding.id, "finding repair changed or duplicated an id; rejecting entry");
-            }
-            accepted
-        })
-        .collect();
-    let unrepaired = invalid
-        .into_iter()
-        .filter(|item| {
-            item.raw
-                .get("id")
-                .and_then(|id| id.as_str())
-                .map_or(true, |id| !repaired_ids.contains(id))
-        })
-        .collect();
-    FindingRepairOutcome {
-        findings,
-        unrepaired,
-    }
+fn accept_repaired_finding(expected_id: &str, text: &str) -> Option<Finding> {
+    let parsed =
+        crate::json_repair::parse_strict_json::<FindingRepairResponse>("finding-repair", text)
+            .ok()?;
+    let [finding] = parsed.findings;
+    (finding.id == expected_id).then(|| finding.redacted_for_agent())
 }
 
 pub fn format_unrepaired_findings(items: &[InvalidFinding]) -> String {
@@ -154,52 +166,7 @@ pub fn format_unrepaired_findings(items: &[InvalidFinding]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kres_core::findings::{Severity, Status};
     use serde_json::json;
-
-    fn finding(id: &str) -> Finding {
-        Finding {
-            id: id.into(),
-            title: "title".into(),
-            severity: Severity::Medium,
-            status: Status::Active,
-            relevant_symbols: vec![],
-            relevant_file_sections: vec![],
-            summary: "summary".into(),
-            reproducer_sketch: "reproducer".into(),
-            impact: "impact".into(),
-            mechanism_detail: None,
-            fix_sketch: None,
-            open_questions: vec!["question".into()],
-            first_seen_task: None,
-            last_updated_task: None,
-            first_seen_at: None,
-            related_finding_ids: vec![],
-            details: vec![],
-            reactivate: false,
-            introduced_by: None,
-        }
-    }
-
-    #[test]
-    fn accepts_same_id_repair_and_rejects_changed_id() {
-        let invalid = vec![InvalidFinding {
-            index: 0,
-            raw: json!({"id":"stale_file_end","open_questions":"question"}),
-            error: "invalid type: string, expected a sequence".into(),
-        }];
-        let outcome = accept_repaired_findings(
-            invalid.clone(),
-            vec![finding("stale_file_end"), finding("invented")],
-        );
-        assert_eq!(outcome.findings.len(), 1);
-        assert_eq!(outcome.findings[0].id, "stale_file_end");
-        assert!(outcome.unrepaired.is_empty());
-
-        let changed = accept_repaired_findings(invalid, vec![finding("renamed")]);
-        assert!(changed.findings.is_empty());
-        assert_eq!(changed.unrepaired.len(), 1);
-    }
 
     #[test]
     fn unrepaired_note_preserves_error_and_raw_object() {
@@ -212,5 +179,61 @@ mod tests {
         assert!(note.contains("findings[2]"));
         assert!(note.contains("expected u32"));
         assert!(note.contains("\"line\":null"));
+    }
+
+    fn valid_finding(id: &str) -> serde_json::Value {
+        json!({
+            "id": id,
+            "title": "title",
+            "severity": "medium",
+            "summary": "summary"
+        })
+    }
+
+    #[test]
+    fn repaired_finding_requires_exactly_one_same_id_record() {
+        let one = json!({"findings":[valid_finding("f1")]}).to_string();
+        assert!(accept_repaired_finding("f1", &one).is_some());
+        assert!(accept_repaired_finding("other", &one).is_none());
+        assert!(accept_repaired_finding("f1", r#"{"findings":[]}"#).is_none());
+        let two = json!({"findings":[valid_finding("f1"), valid_finding("f1")]}).to_string();
+        assert!(accept_repaired_finding("f1", &two).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_repair_preserves_current_and_remaining_records() {
+        let shutdown = kres_core::Shutdown::new();
+        shutdown.cancel();
+        let invalid = vec![
+            InvalidFinding {
+                index: 0,
+                raw: json!({"id":"one"}),
+                error: "missing title".into(),
+            },
+            InvalidFinding {
+                index: 1,
+                raw: json!({"id":"two"}),
+                error: "missing title".into(),
+            },
+        ];
+        let outcome = repair_invalid_findings(
+            Arc::new(Client::new("unused").unwrap()),
+            Model::opus_4_7(),
+            1_000,
+            None,
+            invalid,
+            FindingRepairRuntime {
+                logger: None,
+                cancel: Some(FindingRepairCancel::Shutdown(shutdown)),
+                usage: None,
+                role: "test",
+            },
+        )
+        .await
+        .unwrap();
+        assert!(outcome.findings.is_empty());
+        assert_eq!(outcome.unrepaired.len(), 2);
+        assert_eq!(outcome.unrepaired[0].raw["id"], "one");
+        assert_eq!(outcome.unrepaired[1].raw["id"], "two");
     }
 }

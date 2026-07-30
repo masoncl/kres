@@ -19,10 +19,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 jsonschema = { workspace = true }
+schemars = { workspace = true }
+serde_path_to_error = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+tempfile = "3"
+libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
-tempfile = "3"

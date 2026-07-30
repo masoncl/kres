@@ -24,7 +24,9 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskMode {
     Audit,
@@ -43,7 +45,8 @@ pub enum TaskMode {
 /// verbatim file body; `purpose` is a one-line description the
 /// reaper can log when persisting. The Session writes each
 /// CodeFile under `<results>/code/<path>`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CodeFile {
     pub path: String,
     pub content: String,
@@ -56,7 +59,8 @@ pub struct CodeFile {
 /// resolved via the workspace / consent path the same way `read`
 /// and `edit` actions are. Reaper applies each entry via
 /// `kres_agents::tools::edit_file`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CodeEdit {
     #[serde(alias = "path", alias = "filename")]
     pub file_path: String,

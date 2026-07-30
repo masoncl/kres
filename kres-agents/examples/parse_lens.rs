@@ -1,5 +1,5 @@
-//! Debug tool: feed a text file through parse_code_response and
-//! print what the parser sees. Used to triage empty-parse reports.
+//! Debug tool: feed a text file through the strict response contract and
+//! print the accepted response or its validation errors.
 //!
 //! Run: `cargo run -p kres-agents --example parse_lens -- /tmp/lens17.raw`
 use std::env;
@@ -8,7 +8,13 @@ use std::fs;
 fn main() {
     let path = env::args().nth(1).expect("usage: parse_lens <file>");
     let text = fs::read_to_string(&path).expect("read");
-    let r = kres_agents::response::parse_code_response(&text);
+    let r = match kres_agents::response::CodeResponseContract::default().validate(&text) {
+        Ok(response) => response,
+        Err(errors) => {
+            eprintln!("invalid response:\n- {}", errors.join("\n- "));
+            std::process::exit(1);
+        }
+    };
     println!("strategy: {:?}", r.strategy);
     println!("analysis: {} chars", r.analysis.len());
     println!("followups: {}", r.followups.len());

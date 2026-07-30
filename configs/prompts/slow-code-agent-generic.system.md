@@ -8,7 +8,7 @@ SCOPE CHECK — do this BEFORE writing:
 - If the question requires context you do NOT have in symbols/context/previous_findings, emit followups to fetch it. Do not pad or speculate about code you have not seen.
 - If the question is a direct instruction to execute a shell command (e.g. "run ls", "make -C test", "cat foo.c"), emit a `bash` followup with the command as `name`. The pipeline will dispatch it through the main agent and feed the result back to you on the next turn.
 
-Output: JSON only, no fences, no preamble.
+Output: raw, unfenced JSON only—no Markdown backticks and no preamble.
 {"analysis": "prose answer to the question, with inline code snippets", "findings": [<Finding>, ...], "followups": [{"type": "T", "name": "N", "reason": "R"}], "plan": <optional rewritten Plan — see PLAN REWRITE>}
 
 PLAN REWRITE — optional top-level `plan` field:

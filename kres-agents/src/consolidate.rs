@@ -9,14 +9,14 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use kres_core::findings::Finding;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{config::CallConfig, request::Message};
 
-use crate::{error::AgentError, followup::Followup, response::parse_code_response};
+use crate::{error::AgentError, followup::Followup, response::CodeResponseContract};
 
 pub const CONSOLIDATOR_INSTRUCTIONS: &str = include_str!("prompts/consolidator.txt");
 
@@ -38,20 +38,6 @@ struct ConsolidatorRequest<'a> {
     instructions: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ConsolidatorResponse {
-    #[serde(default)]
-    analysis: String,
-    #[serde(default)]
-    findings: Vec<Finding>,
-    #[serde(default)]
-    followups: Vec<Followup>,
-    #[serde(default)]
-    comparison: Option<Value>,
-    #[serde(default)]
-    comparison_details: Option<Value>,
-}
-
 #[derive(Debug, Clone)]
 pub struct ConsolidatedTask {
     pub analysis: String,
@@ -69,7 +55,7 @@ pub async fn consolidate_lenses(
     task_brief: &str,
     lens_outputs: &[LensOutput<'_>],
 ) -> Result<ConsolidatedTask, AgentError> {
-    consolidate_lenses_with_logger(consolidator, task_brief, lens_outputs, None, None).await
+    consolidate_lenses_with_logger(consolidator, task_brief, lens_outputs, None, None, None).await
 }
 
 /// Same as [`consolidate_lenses`] but appends user+assistant turns
@@ -80,6 +66,7 @@ pub async fn consolidate_lenses_with_logger(
     lens_outputs: &[LensOutput<'_>],
     workflow_rules: Option<&str>,
     logger: Option<Arc<TurnLogger>>,
+    shutdown: Option<kres_core::Shutdown>,
 ) -> Result<ConsolidatedTask, AgentError> {
     if lens_outputs.is_empty() {
         return Ok(ConsolidatedTask {
@@ -133,12 +120,27 @@ pub async fn consolidate_lenses_with_logger(
         "[consolidator] merging {} lens output(s)",
         lens_outputs.len()
     );
-    let resp = client
-        .messages_streaming(&cfg, &messages)
-        .await
-        .map_err(|e| AgentError::Other(e.to_string()))?;
+    let resp = if let Some(shutdown) = shutdown.clone() {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during consolidation".into())),
+            result = client.messages_streaming(&cfg, &messages) => result,
+        }
+    } else {
+        client.messages_streaming(&cfg, &messages).await
+    }
+    .map_err(|e| AgentError::Other(e.to_string()))?;
+    if let Some(usage) = &consolidator.usage {
+        usage.record(
+            "consolidator",
+            model.id.clone(),
+            resp.usage.input_tokens,
+            resp.usage.output_tokens,
+            resp.usage.cache_creation_input_tokens,
+            resp.usage.cache_read_input_tokens,
+        );
+    }
 
-    let text = extract_text(&resp);
+    let mut text = extract_text(&resp);
     if let Some(lg) = &logger {
         let mut thinking = String::new();
         for b in &resp.content {
@@ -162,7 +164,61 @@ pub async fn consolidate_lenses_with_logger(
             },
         );
     }
-    let mut parsed = parse_code_response(&text);
+    let response_contract =
+        CodeResponseContract::new(["comparison".to_string(), "comparison_details".to_string()]);
+    let response_schema = response_contract.schema_json().to_string();
+    // A structurally valid envelope owns malformed Finding entries at the
+    // per-record repair boundary. Other envelope failures get exactly one
+    // whole-response repair and never fall through to a second repair path.
+    let tolerant_contract = response_contract.clone().allowing_invalid_findings();
+    let mut parsed = match tolerant_contract.validate(&text) {
+        Ok(parsed) => parsed,
+        Err(envelope_errors) => {
+            let repaired = match crate::json_repair::repair_json_response(crate::json_repair::JsonRepairCall {
+            client: client.clone(),
+            model: model.clone(),
+            max_tokens,
+            max_input_tokens,
+            contract: crate::json_repair::JsonContract {
+                name: "lens-consolidator",
+                schema: &response_schema,
+                instructions: "Preserve every lens conclusion, finding id, followup, and comparison. Correct representation and field types only.",
+            },
+            rejected_response: &text,
+            validation_errors: &envelope_errors,
+            logger: logger.clone(),
+            log_kind: crate::json_repair::RepairLogKind::Code,
+            shutdown: shutdown.clone(),
+        })
+        .await
+            {
+                Ok(repaired) => repaired,
+                Err(error) => {
+                    tracing::warn!(target: "kres_agents", "consolidator JSON repair failed: {error}; using deterministic lens union");
+                    return Ok(naive_fallback(lens_outputs));
+                }
+            };
+            if let Some(usage) = &consolidator.usage {
+                usage.record(
+                    "consolidator",
+                    model.id.clone(),
+                    repaired.usage.input_tokens,
+                    repaired.usage.output_tokens,
+                    repaired.usage.cache_creation_input_tokens,
+                    repaired.usage.cache_read_input_tokens,
+                );
+            }
+            let repaired_parsed = match tolerant_contract.accept_repair(&repaired.text) {
+                Ok(parsed) => parsed,
+                Err(errors) => {
+                    tracing::warn!(target: "kres_agents", "consolidator JSON repair remained invalid: {}; using deterministic lens union", errors.join("; "));
+                    return Ok(naive_fallback(lens_outputs));
+                }
+            };
+            text = repaired.text;
+            repaired_parsed
+        }
+    };
     if !parsed.invalid_findings.is_empty() {
         let outcome = crate::finding_repair::repair_invalid_findings(
             client.clone(),
@@ -170,11 +226,15 @@ pub async fn consolidate_lenses_with_logger(
             max_tokens,
             max_input_tokens,
             std::mem::take(&mut parsed.invalid_findings),
-            logger.clone(),
-            None,
+            crate::finding_repair::FindingRepairRuntime {
+                logger: logger.clone(),
+                cancel: shutdown.map(crate::finding_repair::FindingRepairCancel::Shutdown),
+                usage: consolidator.usage.clone(),
+                role: "consolidator",
+            },
         )
         .await?;
-        parsed.findings.extend(outcome.findings);
+        parsed.merge_repaired_findings(outcome.findings);
         if !outcome.unrepaired.is_empty() {
             let note = crate::finding_repair::format_unrepaired_findings(&outcome.unrepaired);
             if !parsed.analysis.is_empty() {
@@ -212,14 +272,6 @@ pub async fn consolidate_lenses_with_logger(
             findings: parsed.findings,
             followups: parsed.followups,
             comparison,
-        });
-    }
-    if let Ok(c) = serde_json::from_str::<ConsolidatorResponse>(&text) {
-        return Ok(ConsolidatedTask {
-            analysis: c.analysis,
-            findings: c.findings,
-            followups: c.followups,
-            comparison: c.comparison.or(c.comparison_details),
         });
     }
     Ok(naive_fallback(lens_outputs))
@@ -289,10 +341,11 @@ pub fn naive_fallback(lens_outputs: &[LensOutput<'_>]) -> ConsolidatedTask {
 }
 
 fn extract_comparison(text: &str) -> Option<Value> {
-    let v = serde_json::from_str::<Value>(text.trim()).ok()?;
-    v.get("comparison")
+    let value = crate::json_repair::parse_strict_json::<Value>("lens-consolidator", text).ok()?;
+    value
+        .get("comparison")
         .cloned()
-        .or_else(|| v.get("comparison_details").cloned())
+        .or_else(|| value.get("comparison_details").cloned())
 }
 
 fn naive_comparison(lens_outputs: &[LensOutput<'_>]) -> Value {
@@ -435,6 +488,25 @@ mod tests {
     }
 
     #[test]
+    fn comparison_extraction_uses_strict_response() {
+        let text = r#"{"analysis":"done","comparison":{"winner":"actual"}}"#;
+        assert_eq!(extract_comparison(text), Some(json!({"winner":"actual"})));
+        let fenced = format!("```json\n{text}\n```");
+        assert_eq!(
+            extract_comparison(&fenced),
+            Some(json!({"winner":"actual"}))
+        );
+        assert!(extract_comparison(&format!("prose\n{fenced}")).is_none());
+    }
+
+    #[test]
+    fn consolidator_rejects_transport_wrapper() {
+        assert!(CodeResponseContract::default()
+            .validate(r#"{"result":{"analysis":"real","findings":[],"followups":[]}}"#)
+            .is_err());
+    }
+
+    #[test]
     fn workflow_rules_extend_consolidator_instructions() {
         let rules = "Return full Finding records.";
         let instructions = consolidator_instructions(Some(rules));
@@ -454,6 +526,7 @@ mod tests {
                 system: None,
                 max_tokens: 32_000,
                 max_input_tokens: None,
+                usage: None,
             };
             consolidate_lenses(&consolidator, "test", &[]).await
         })

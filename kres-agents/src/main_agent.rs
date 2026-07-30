@@ -211,7 +211,15 @@ impl DataFetcher for MainAgent {
             followups.len(),
             self.mcp_servers.len()
         );
-        for turn in 0..self.max_main_turns {
+        // A malformed framed action earns one corrective call beyond the
+        // ordinary gather-turn budget. Otherwise an invalid response on the
+        // final turn would receive an error that the model can never see.
+        let mut protocol_retry_pending = false;
+        for turn in 0..=self.max_main_turns {
+            if turn == self.max_main_turns && !protocol_retry_pending {
+                break;
+            }
+            protocol_retry_pending = false;
             tracing::debug!(
                 target: "kres_agents::main_agent",
                 turn = turn + 1,
@@ -251,13 +259,43 @@ impl DataFetcher for MainAgent {
             }
             let text = extract_text(&resp);
             self.log_assistant(&text, &resp.usage);
-            let (actions, _display) = parse_actions(&text);
+            let parsed_actions = parse_actions(&text);
+            let history_content = match &parsed_actions {
+                Ok((actions, _)) => assistant_history_content(&text, actions),
+                Err(_) => "<invalid-actions-response-omitted/>".to_string(),
+            };
             history.push(Message {
                 role: "assistant".into(),
-                content: assistant_history_content(&text, &actions),
+                content: history_content,
                 cache: false,
                 cached_prefix: None,
             });
+            let actions = match parsed_actions {
+                Ok((actions, _display)) => actions,
+                Err(error) => {
+                    protocol_retry_pending = true;
+                    kres_core::async_eprintln!(
+                        "[main turn {}/{}] invalid action protocol: {error}",
+                        turn + 1,
+                        self.max_main_turns,
+                    );
+                    let correction = json!({
+                        "tools": 0,
+                        "error": format!(
+                            "Your action block was rejected before dispatch: {error}. Re-emit one valid <actions> JSON array or <action> JSON object, or return no action tag if gathering is complete."
+                        )
+                    })
+                    .to_string();
+                    self.log_user(&correction);
+                    history.push(Message {
+                        role: "user".into(),
+                        content: correction,
+                        cache: false,
+                        cached_prefix: None,
+                    });
+                    continue;
+                }
+            };
             if !actions.is_empty() {
                 let labels: Vec<String> = actions.iter().take(6).map(action_label).collect();
                 let tail = if actions.len() > labels.len() {
@@ -660,6 +698,7 @@ async fn dispatch_non_mcp(
             let args = GitArgs {
                 command: action
                     .get("command")
+                    .or_else(|| action.get("name"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
@@ -827,26 +866,164 @@ fn action_label(action: &Value) -> String {
 /// the main-agent's text reply. Returns `(list_of_actions, display)`
 /// where `display` is the text with the tag-wrapped JSON stripped out
 /// .
-pub fn parse_actions(text: &str) -> (Vec<Value>, String) {
+pub fn parse_actions(text: &str) -> Result<(Vec<Value>, String), String> {
     if let Some((start, end, inner)) = find_tag_body(text, "actions") {
         let trimmed = inner.trim();
-        if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(trimmed) {
-            let mut display = String::new();
-            display.push_str(&text[..start]);
-            display.push_str(&text[end..]);
-            return (arr, display.trim().to_string());
+        let value = serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("<actions> body is invalid JSON: {error}"))?;
+        let Value::Array(arr) = value else {
+            return Err("<actions> body must be a JSON array".into());
+        };
+        if arr.is_empty() {
+            return Err("<actions> array must contain at least one action; omit the tag when gathering is complete".into());
         }
+        if let Some(index) = arr.iter().position(|action| !valid_action_envelope(action)) {
+            return Err(format!(
+                "<actions> entry {index} has invalid or unknown arguments"
+            ));
+        }
+        let mut display = String::new();
+        display.push_str(&text[..start]);
+        display.push_str(&text[end..]);
+        if contains_action_tag(&display) {
+            return Err("response must contain at most one action block".into());
+        }
+        return Ok((arr, display.trim().to_string()));
     }
     if let Some((start, end, inner)) = find_tag_body(text, "action") {
         let trimmed = inner.trim();
-        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-            let mut display = String::new();
-            display.push_str(&text[..start]);
-            display.push_str(&text[end..]);
-            return (vec![v], display.trim().to_string());
+        let value = serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("<action> body is invalid JSON: {error}"))?;
+        if !valid_action_envelope(&value) {
+            return Err("<action> object has invalid or unknown arguments".into());
         }
+        let mut display = String::new();
+        display.push_str(&text[..start]);
+        display.push_str(&text[end..]);
+        if contains_action_tag(&display) {
+            return Err("response must contain at most one action block".into());
+        }
+        return Ok((vec![value], display.trim().to_string()));
     }
-    (Vec::new(), text.to_string())
+    if contains_action_tag(text) {
+        return Err("response contains an incomplete or mismatched action block".into());
+    }
+    Ok((Vec::new(), text.to_string()))
+}
+
+fn contains_action_tag(text: &str) -> bool {
+    ["<action>", "</action>", "<actions>", "</actions>"]
+        .iter()
+        .any(|tag| text.contains(tag))
+}
+
+fn valid_action_envelope(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(kind) = object.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    let nonempty = |names: &[&str]| {
+        names.iter().any(|name| {
+            object
+                .get(*name)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    };
+    let only = |names: &[&str]| object.keys().all(|key| names.contains(&key.as_str()));
+    let optional_string = |name: &str| object.get(name).map_or(true, Value::is_string);
+    let optional_u64 = |name: &str| {
+        object
+            .get(name)
+            .map_or(true, |value| value.as_u64().is_some())
+    };
+    match kind {
+        "grep" => {
+            only(&["type", "pattern", "path", "max_count", "limit", "glob"])
+                && nonempty(&["pattern"])
+                && optional_string("path")
+                && optional_string("glob")
+                && optional_u64("max_count")
+                && optional_u64("limit")
+        }
+        "find" => {
+            only(&[
+                "type",
+                "path",
+                "name",
+                "pattern",
+                "glob",
+                "file_type",
+                "kind",
+            ]) && ["path", "name", "pattern", "glob", "file_type", "kind"]
+                .iter()
+                .all(|name| optional_string(name))
+        }
+        "read" => {
+            only(&[
+                "type",
+                "file",
+                "path",
+                "line",
+                "startLine",
+                "count",
+                "end_line",
+                "endLine",
+                "name",
+                "symbol_type",
+            ]) && nonempty(&["file", "path"])
+                && ["name", "symbol_type"]
+                    .iter()
+                    .all(|name| optional_string(name))
+                && ["line", "startLine", "count", "end_line", "endLine"]
+                    .iter()
+                    .all(|name| optional_u64(name))
+        }
+        "git" => only(&["type", "command", "name"]) && nonempty(&["command", "name"]),
+        "edit" => {
+            only(&[
+                "type",
+                "file_path",
+                "path",
+                "file",
+                "old_string",
+                "new_string",
+                "replace_all",
+            ]) && nonempty(&["file_path", "path", "file"])
+                && object.get("old_string").is_some_and(Value::is_string)
+                && object.get("new_string").is_some_and(Value::is_string)
+                && object.get("replace_all").map_or(true, Value::is_boolean)
+        }
+        "make" | "meson" | "cargo" => {
+            only(&["type", "command", "cmd", "name", "timeout_secs", "timeout"])
+                && nonempty(&["command", "cmd", "name"])
+                && optional_u64("timeout_secs")
+                && optional_u64("timeout")
+        }
+        "bash" => {
+            only(&[
+                "type",
+                "command",
+                "cmd",
+                "name",
+                "timeout_secs",
+                "timeout",
+                "cwd",
+            ]) && nonempty(&["command", "cmd", "name"])
+                && optional_u64("timeout_secs")
+                && optional_u64("timeout")
+                && optional_string("cwd")
+        }
+        "mcp" => {
+            only(&["type", "server", "tool", "args"])
+                && nonempty(&["server"])
+                && nonempty(&["tool"])
+                && object.get("args").map_or(true, Value::is_object)
+        }
+        _ => false,
+    }
 }
 
 /// Content retained in the main-agent conversation after parsing an
@@ -894,7 +1071,7 @@ mod tests {
     #[test]
     fn parse_actions_single() {
         let text = "some prose\n<action>{\"type\":\"grep\",\"pattern\":\"foo\"}</action>\ntrailing";
-        let (a, disp) = parse_actions(text);
+        let (a, disp) = parse_actions(text).unwrap();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].get("type").unwrap(), "grep");
         assert!(disp.contains("some prose"));
@@ -905,7 +1082,7 @@ mod tests {
     #[test]
     fn parse_actions_plural() {
         let text = "<actions>[{\"type\":\"grep\",\"pattern\":\"x\"},{\"type\":\"read\",\"file\":\"a.c\"}]</actions>";
-        let (a, disp) = parse_actions(text);
+        let (a, disp) = parse_actions(text).unwrap();
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].get("type").unwrap(), "grep");
         assert_eq!(a[1].get("type").unwrap(), "read");
@@ -923,7 +1100,7 @@ Author: Jane Developer <jane@example.com>
 ```
 
 done"#;
-        let (actions, _) = parse_actions(text);
+        let (actions, _) = parse_actions(text).unwrap();
         let kept = assistant_history_content(text, &actions);
         assert!(kept.contains("\"show HEAD\""), "lost action: {kept}");
         assert!(
@@ -937,15 +1114,28 @@ done"#;
     }
 
     #[test]
-    fn parse_actions_malformed_returns_empty() {
+    fn parse_actions_malformed_returns_error() {
         let text = "<action>{not json}</action>";
-        let (a, _) = parse_actions(text);
-        assert!(a.is_empty());
+        assert!(parse_actions(text).is_err());
+        assert!(parse_actions(r#"<action>{"pattern":"missing type"}</action>"#).is_err());
+        assert!(parse_actions(
+            r#"<actions>[{"type":"read","file":"a.c"},{"file":"b.c"}]</actions>"#
+        )
+        .is_err());
+        assert!(parse_actions(r#"<action>{"type":"read","fiel":"a.c"}</action>"#).is_err());
+        assert!(parse_actions(r#"<action>{"type":"grep","pattern":42}</action>"#).is_err());
+        assert!(parse_actions(r#"<action>{"type":"typo","name":"x"}</action>"#).is_err());
+        assert!(parse_actions("<actions>[]</actions>").is_err());
+        assert!(parse_actions(r#"<action>{"type":"grep","pattern":"x"}"#).is_err());
+        assert!(parse_actions(
+            r#"<action>{"type":"grep","pattern":"x"}</action><action>{"type":"grep","pattern":"y"}</action>"#
+        )
+        .is_err());
     }
 
     #[test]
     fn parse_actions_no_tag_returns_empty() {
-        let (a, d) = parse_actions("just prose here");
+        let (a, d) = parse_actions("just prose here").unwrap();
         assert!(a.is_empty());
         assert_eq!(d, "just prose here");
     }

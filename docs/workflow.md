@@ -28,7 +28,10 @@ That means LLM steps use the fast-gather -> main-fetch -> synthesis loop:
 
 Deterministic workflow steps run in the reaper without an LLM. Reaper
 steps are used for git commits, builds, finding invalidation, and patch
-publication. The AgentEnv one-shot path exists only for tests and
+publication. Reaper actions cannot declare a later eval: successful completion
+of the deterministic action is their acceptance boundary. Finding-artifact
+mutations restore a directory snapshot on failure, and failed commit actions
+restore the exact pre-action Git index. The AgentEnv one-shot path exists only for tests and
 minimally wired callers.
 
 Workflow output parsing preserves the raw slow-agent response before it
@@ -42,9 +45,7 @@ describes the workflow-specific keys that must be present, but the
 response is still the normal kres JSON envelope. Standard kres response
 keys such as `analysis`, `findings`, `followups`, `code_edits`, and
 `code_output` are allowed. Workflow keys and standard kres keys must be
-in the same final top-level JSON object. Do not emit a separate JSON
-object for workflow fields after an earlier object containing
-`code_edits` or `findings`.
+in the same top-level JSON object. Do not emit any other JSON object or prose.
 
 When a workflow step runs through the orchestrator, the fast gather
 phase receives a gather-only prompt instead of that final `OUTPUT
@@ -59,19 +60,48 @@ metadata only; it is not sent to the model and does not affect prompt
 caching. Use it to pair interleaved lensed user/assistant records
 instead of relying on adjacent JSONL lines.
 
-If an LLM response does not produce a parseable JSON object matching the
-step schema, the runner retries that LLM step with the JSON repair
-prefix plus the specific validator/parse error from the previous
-attempt (e.g. "findings is not array<Finding>", "missing required
-output 'analysis'") so the model knows which field tripped the schema
-instead of guessing. It tries the original response plus three repair
-retries. If the driver still cannot map the response and the workflow
+All structured agent responses must be exactly one JSON value with no prose,
+embedded JSON string, or transport wrapper. Prompts require raw, unfenced JSON.
+As a deterministic transport normalization, Rust removes one Markdown JSON
+fence only when it wraps the entire trimmed response, then runs the unchanged
+strict contract before considering inference repair. Serde DTOs are the
+acceptance boundary; nested DTOs reject unknown fields, and
+`serde_path_to_error` identifies the exact invalid field. `schemars` derives
+the repair schema from the same Rust DTO, so prompts and deserialization do not
+maintain separate representations of the contract. Workflow-defined extension
+fields are allowed only when declared by that step and are subsequently checked
+against the workflow's JSON Schema.
+
+On failure, one repair inference receives the untouched response, generated
+schema, and serde/schema errors. Its replacement is accepted only by
+deserializing it through the identical contract. Rust does not brace-scan,
+unwrap, normalize, or attempt to infer semantic equivalence between malformed
+and repaired prose. If strict repair fails, the caller retries or fails the
+step. The original response remains in logs.
+
+If representation-only repair still fails, the existing caller-specific retry
+runs. Workflow steps rerun the complete model step with the specific
+validator/parse error from the previous attempt (e.g. "findings is not
+array<Finding>", "missing required output 'analysis'"). Each newly rejected
+response is independently eligible for exactly one generic repair call; the
+same rejected response is never repaired repeatedly. The workflow permits the
+original step call plus three full response retries. If the driver still cannot map the response and the workflow
 step has an eval retry budget, the executor repeats that same step
-instead of terminating the workflow immediately. Side effects are
-applied only after the response has been mapped, and `code_edits` are
-staged in memory before any file is written, so a malformed or
-partially matching coding response does not leave partial edits behind
-before the retry.
+instead of terminating the workflow immediately. Side effects are staged only
+after every model-owned required output and type has validated; machine-owned
+outputs are derived and validated against that staged view. `code_output` and
+`code_edits` are preflighted together into one final file map. The executor
+commits that map only after eval accepts the attempt; rejected attempts discard
+it. Commits bind opened directory descriptors and address targets through those
+descriptors, so replacing a parent path with a symlink between staging and eval
+cannot redirect a write. Existing contents and permissions are retained for
+rollback, and rollback failures are surfaced. New targets retain the
+temporary file's private creation mode; kres never forces a world-readable mode
+that could bypass an operator's restrictive umask.
+
+Workflow output definitions use ordinary JSON Schema in `schema`. There is no
+compact shorthand or schema-detection heuristic. Array schemas describe the
+array itself and place their object contract under `items`.
 
 After side-effect and machine-populated outputs are added, the runner
 validates that every required workflow output is present. A step that
@@ -133,8 +163,17 @@ workflow step.
 Evals control retries and branching. After a step produces outputs and
 machine-populated outputs are added, `field_check` evaluates a small
 local expression, `builtin` runs a named Rust-side validator, and
-`judge_llm` asks an agent for `{pass, reason}`. Passing eval marks the
-step complete and then runs `post_actions`. Failing eval follows
+`judge_llm` asks an agent for `{pass, reason}`. Passing eval finishes review
+ledger inference, serializes the exact staged effect, and persists the step as
+`effects_pending` before touching files. The executor then applies that effect
+and persists `done`. Resume from `effects_pending` replays the recorded effect
+without calling the model or eval again. Deterministic commands are separate
+reaper steps; the former `post_actions` mechanism has been removed.
+Production dispatch always supplies persistence: an explicit state directory
+wins, then the results directory, with `<workspace>/.kres/workflow-state` as
+the fallback. Live observers do not disable snapshots. Fix-series planning and
+each todo revision use separate subdirectories under `workflow-state`.
+Failing eval follows
 `eval.on_fail.action`: `repeat` reruns the step, `branch_to` moves
 control back to a named step and invalidates dependent work, `continue`
 keeps going, and `exit_failure` terminates. `max_attempts` and
@@ -812,11 +851,12 @@ that per-todo workflow run. Later todos see the already-committed earlier
 fixes in workspace history, but patch-writing is instructed to edit only
 the current todo's scope.
 
-Top-level fix series runs do not currently support workflow
-`--resume`/`--state-dir` snapshots. A per-todo workflow run may still use
-the normal executor path when `current_fix_todo` is provided explicitly,
-but the automatic planning-plus-series driver rejects snapshot flags
-instead of silently falling back to an older single-run path.
+Top-level fix series runs persist planning and every todo/revision in distinct
+`workflow-state` subdirectories. Automatic series-level `--resume` is not yet
+supported because the outer todo list itself is not a workflow snapshot; the
+driver rejects explicit series resume flags rather than pretending that one
+inner step snapshot represents the entire series. A per-todo workflow run can
+still resume normally when `current_fix_todo` is provided explicitly.
 
 ### Fix Flow Invariants
 
@@ -934,8 +974,8 @@ raw rejected object separately for the repair path described below.
 Malformed full-Finding attempts are retained with their raw JSON and exact
 serde error rather than silently discarded. After lens consolidation, and
 again after the prose-promotion pass, kres gives the fast formatting agent one
-schema-only repair attempt. Rust accepts only repaired records with an original
-id and validates them normally. A record that remains invalid is preserved in
+strict-schema repair attempt. The complete replacement response must pass the
+same derived serde contract. A record that remains invalid is preserved in
 `report.md` and `findings.json.task_prose`, and a blocking typed retry followup
 is added; no missing line number or other evidence is fabricated.
 

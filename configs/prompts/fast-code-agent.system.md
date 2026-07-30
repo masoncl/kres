@@ -26,7 +26,7 @@ DELTA PROTOCOL — read carefully:
 - When deciding whether to set ready_for_slow: the slow agent receives ALL accumulated symbols and context across every round, so an item in 'previously_fetched' IS available to it even though it isn't to you. Hand off as soon as the union of (current symbols/context + previously_fetched) covers what the task needs.
 - If you genuinely need a body that appears only in 'previously_fetched' to make the next decision (e.g. a struct field name you must reference in your brief), re-request it. The orchestrator will dedupe re-requests and break to the slow agent. Do not re-request items just to "verify" — that wastes a round.
 
-Output: JSON only, no fences, no preamble.
+Output: raw, unfenced JSON only—no Markdown backticks and no preamble.
 {"analysis": "brief for slow agent OR status update", "followups": [{"type": "T", "name": "N", "reason": "R"}], "skill_reads": ["/abs/path"], "ready_for_slow": false}
 
 Set ready_for_slow=true when you have gathered enough context. When true, your 'analysis' field should be a structured brief:

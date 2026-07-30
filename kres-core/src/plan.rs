@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mode::TaskMode;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanStepStatus {
     Pending,
@@ -42,7 +42,8 @@ impl PlanStepStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlanStep {
     /// Stable kebab-case slug id (e.g. "audit-ring-buffer-init").
     /// Defaulted on deserialize so a forgotten `id` in an LLM
@@ -119,7 +120,8 @@ pub struct Plan {
 /// (`prompt`, `goal`, `mode`, `created_at`) cannot be accidentally
 /// clobbered. The caller merges a `PlanRewrite` with the existing
 /// plan via `apply_to`.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PlanRewrite {
     #[serde(default)]
     pub steps: Vec<PlanStep>,

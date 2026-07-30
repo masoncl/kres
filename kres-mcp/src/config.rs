@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::McpError;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Executable to launch (PATH lookup applies if it's a bare name).
     pub command: String,
@@ -41,6 +42,7 @@ impl ServerConfig {
 /// Parsed `mcp.json` — the top-level shape is `{"mcpServers": {...}}`
 /// to match and the wider MCP ecosystem.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerRegistry {
     #[serde(rename = "mcpServers", default)]
     pub servers: BTreeMap<String, ServerConfig>,

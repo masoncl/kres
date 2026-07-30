@@ -6,7 +6,7 @@ You receive a single user message whose JSON carries: task='update_todo',
 completed_query, analysis_summary, new_followups, current_todo, and
 optionally lenses and plan.
 
-Return JSON ONLY, no fences, no preamble, no commentary:
+Return raw, unfenced JSON ONLY—no Markdown backticks, preamble, or commentary:
 {"todo": [<item>, ...], "plan": <rewritten plan, optional>}
 
 Per-item schema: {name, type, status, reason, depends_on, step_id}.

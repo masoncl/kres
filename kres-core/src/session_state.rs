@@ -33,6 +33,8 @@ pub enum SessionStateError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("unsupported session version {0}")]
+    UnsupportedVersion(u32),
 }
 
 /// Versioned snapshot of everything needed to resume a session.
@@ -40,8 +42,8 @@ pub enum SessionStateError {
 /// The `version` field is for forward compat: future schema
 /// changes bump it and loaders decide how to migrate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionState {
-    #[serde(default = "default_version")]
     pub version: u32,
     /// Last operator prompt submitted. Useful for `--resume`
     /// reporting; not required for correctness.
@@ -95,6 +97,9 @@ impl SessionState {
         match std::fs::read_to_string(path) {
             Ok(s) => {
                 let mut state: Self = serde_json::from_str(&s)?;
+                if state.version != default_version() {
+                    return Err(SessionStateError::UnsupportedVersion(state.version));
+                }
                 state.normalise_inprogress();
                 Ok(Some(state))
             }
@@ -253,12 +258,23 @@ mod tests {
     }
 
     #[test]
-    fn version_field_defaults_when_missing() {
+    fn missing_or_unsupported_version_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let p = SessionState::path_in(dir.path());
         std::fs::write(&p, "{}").unwrap();
-        let loaded = SessionState::load(&p).unwrap().unwrap();
-        assert_eq!(loaded.version, 1);
+        assert!(matches!(
+            SessionState::load(&p),
+            Err(SessionStateError::Json(_))
+        ));
+        let state = SessionState {
+            version: 99,
+            ..SessionState::default()
+        };
+        state.save(&p).unwrap();
+        assert!(matches!(
+            SessionState::load(&p),
+            Err(SessionStateError::UnsupportedVersion(99))
+        ));
     }
 
     #[test]

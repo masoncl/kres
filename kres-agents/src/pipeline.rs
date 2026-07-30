@@ -33,8 +33,9 @@ use crate::{
     consolidate::{consolidate_lenses_with_logger, LensOutput},
     error::AgentError,
     followup::Followup,
+    json_repair::{repair_json_response, JsonContract, JsonRepairCall, RepairLogKind},
     prompt::CodePrompt,
-    response::{parse_code_response, CodeResponse, ParseStrategy},
+    response::{diagnose_code_response, CodeResponse, CodeResponseContract, ParseStrategy},
 };
 
 const GENERIC_LENS_REPAIR_RETRIES: usize = 1;
@@ -43,11 +44,8 @@ const FAST_GATHER_KINDS: &[&str] = &[
     "git", "make", "meson", "cargo", "bash", "lore", "question",
 ];
 
-fn validate_fast_gather_response(response: &CodeResponse) -> Result<(), Vec<String>> {
-    let mut errors = response.validation_errors.clone();
-    if response.strategy == ParseStrategy::RawText {
-        errors.push("return one JSON object, not prose".to_string());
-    }
+fn fast_gather_semantic_errors(response: &CodeResponse) -> Vec<String> {
+    let mut errors = Vec::new();
     for (index, followup) in response.followups.iter().enumerate() {
         let kind = followup.kind.trim();
         if !FAST_GATHER_KINDS.contains(&kind) {
@@ -77,13 +75,29 @@ fn validate_fast_gather_response(response: &CodeResponse) -> Result<(), Vec<Stri
             errors.push(format!("skill_reads[{index}] must not be empty"));
         }
     }
+    errors
+}
+
+fn validate_fast_gather_text(text: &str) -> Result<CodeResponse, Vec<String>> {
+    CodeResponseContract::default().validate_with(text, fast_gather_semantic_errors)
+}
+
+#[cfg(test)]
+fn validate_fast_gather_response(response: &CodeResponse) -> Result<(), Vec<String>> {
+    let mut errors = response.validation_errors.clone();
+    errors.extend(
+        response
+            .unknown_fields
+            .keys()
+            .map(|field| format!("unknown top-level field `{field}`")),
+    );
+    if response.strategy == ParseStrategy::RawText {
+        errors.push("response must be one JSON object, not prose".to_string());
+    }
+    errors.extend(fast_gather_semantic_errors(response));
     errors.sort();
     errors.dedup();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
+    errors.is_empty().then_some(()).ok_or(errors)
 }
 
 /// CodePrompt fields that go into the cached-prefix block.
@@ -162,6 +176,7 @@ pub struct LensRunOutput {
     pub slow_model: Option<String>,
     pub raw_response: String,
     pub parsed: CodeResponse,
+    pub allowed_response_extensions: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +215,8 @@ impl LensFanoutOutput {
 pub struct LensRepairPolicy<'a> {
     pub max_retries: usize,
     pub repair_instruction: &'a str,
+    pub contract_name: &'a str,
+    pub schema: &'a str,
 }
 
 struct PreparedLensFanout {
@@ -258,6 +275,7 @@ struct LensFanoutCall<'a> {
     all_lenses: &'a [LensSpec],
     extra_lens_instruction: Option<&'a str>,
     cache_mode: CacheMode,
+    run_keys: Option<&'a BTreeSet<(String, Option<String>)>>,
 }
 
 /// No-op fetcher used in tests. It returns empty results regardless
@@ -385,6 +403,10 @@ pub struct SlowAgentVariant {
 /// its own previous_findings / task_brief / original_prompt.
 #[derive(Debug, Clone, Default)]
 pub struct RunContext {
+    /// Workflow-declared top-level response fields. The shared envelope
+    /// rejects every other extension, so misspellings cannot be consumed as
+    /// successful output while workflows can still define typed results.
+    pub allowed_response_extensions: BTreeSet<String>,
     /// Findings from prior turns; attached to the slow-agent prompt
     /// via CodePrompt::with_previous_findings.
     pub previous_findings: Vec<Finding>,
@@ -453,17 +475,6 @@ pub struct RunContext {
     /// Context items already gathered by an earlier workflow step,
     /// seeded the same way as [`Self::seed_symbols`].
     pub seed_context: Vec<Value>,
-}
-
-/// How a [`AgentRunner::reformat_response_to_schema`] call should route
-/// its single LLM request. Mirrors the three-way synthesis routing in
-/// `run_once_with_ctx` (routing-agent prompt vs fast-gather prompt vs
-/// per-mode slow prompt) so the reformat retry speaks the same dialect
-/// the original reply did.
-pub struct ReformatRouting {
-    pub use_fast: bool,
-    pub use_routing_prompt: bool,
-    pub mode: kres_core::TaskMode,
 }
 
 fn record_usage(
@@ -604,7 +615,7 @@ fn build_lens_call_future(
                             th.as_deref(),
                         );
                     }
-                    let parsed = parse_code_response(&t);
+                    let parsed = diagnose_code_response(&t);
                     Ok((lens_id, lens_value, model_label, t, parsed))
                 }
                 Err(e) => {
@@ -668,7 +679,7 @@ pub struct TaskSummary {
     /// runner caches these per step id so a dependent step can seed
     /// its own gather via [`RunContext::seed_symbols`] and avoid
     /// re-fetching the same source. Empty for runs that did no gather
-    /// (e.g. the JSON-reformat path).
+    /// (for example, a direct one-shot response).
     pub gathered_symbols: Vec<Value>,
     /// Context items this run accumulated, cached the same way as
     /// [`Self::gathered_symbols`].
@@ -683,55 +694,34 @@ impl AgentRunner {
         label: &str,
         shutdown: &Shutdown,
     ) -> Result<CodeResponse, AgentError> {
-        let content = format!(
-            "Your previous fast-gather response was rejected before any tools ran.\n\nValidation errors:\n- {}\n\nReturn a corrected JSON object only. Preserve the intended analysis and requests. Shape: {{\"analysis\":\"...\",\"followups\":[{{\"type\":\"survey|source|type|callers|callees|search|grep|read|file|find|git|make|meson|cargo|bash|lore|question\",\"name\":\"non-empty target\",\"reason\":\"non-empty justification\"}}],\"skill_reads\":[],\"ready_for_slow\":false}}. Do not use unknown request types.\n\nRejected response:\n{invalid}",
-            errors.join("\n- ")
-        );
-        let messages = vec![Message {
-            role: "user".into(),
-            content: content.clone(),
-            cache: false,
-            cached_prefix: None,
-        }];
-        let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
-            .with_max_tokens(self.fast_max_tokens)
-            .with_stream_label(label);
-        if let Some(thinking) = self.fast_thinking {
-            cfg = cfg.with_thinking(thinking);
-        }
-        if let Some(system) = &self.fast_system {
-            cfg = cfg.with_system(system.clone());
-        }
-        if let Some(limit) = self.fast_max_input_tokens {
-            cfg = cfg.with_max_input_tokens(limit);
-        }
-        if let Some(logger) = &self.logger {
-            logger.log_code_labeled("user", Some(label), &content, None, None);
-        }
-        let response = tokio::select! {
-            _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fast gather repair".into())),
-            result = self.fast_client.messages_streaming(&cfg, &messages) => {
-                result.map_err(|error| AgentError::Other(error.to_string()))?
-            }
-        };
-        record_usage(&self.usage, "fast", &self.fast_model, &response.usage);
-        let text = extract_text(&response);
-        if let Some(logger) = &self.logger {
-            logger.log_code_labeled(
-                "assistant",
-                Some(label),
-                &text,
-                Some(log_usage(&response.usage)),
-                extract_thinking(&response).as_deref(),
-            );
-        }
-        let parsed = parse_code_response(&text);
-        if let Err(errors) = validate_fast_gather_response(&parsed) {
-            return Err(AgentError::Other(format!(
-                "fast gather response remained invalid after repair: {}",
-                errors.join("; ")
-            )));
-        }
+        let contract = CodeResponseContract::default();
+        let schema = contract.schema_json().to_string();
+        let repaired = repair_json_response(JsonRepairCall {
+            client: self.fast_client.clone(),
+            model: self.fast_model.clone(),
+            max_tokens: self.fast_max_tokens,
+            max_input_tokens: self.fast_max_input_tokens,
+            contract: JsonContract {
+                name: label,
+                schema: &schema,
+                instructions: "Preserve the intended analysis and requests. Followups require a known non-empty type, name, and reason.",
+            },
+            rejected_response: invalid,
+            validation_errors: errors,
+            logger: self.logger.clone(),
+            log_kind: RepairLogKind::Code,
+            shutdown: Some(shutdown.clone()),
+        })
+        .await?;
+        record_usage(&self.usage, "fast", &self.fast_model, &repaired.usage);
+        let parsed = contract
+            .accept_repair_with(&repaired.text, fast_gather_semantic_errors)
+            .map_err(|errors| {
+                AgentError::Other(format!(
+                    "fast gather response remained invalid after repair: {}",
+                    errors.join("; ")
+                ))
+            })?;
         Ok(parsed)
     }
 
@@ -893,21 +883,22 @@ impl AgentRunner {
                     t
                 }
             };
-            let mut parsed = parse_code_response(&text);
-            if let Err(errors) = validate_fast_gather_response(&parsed) {
-                kres_core::async_eprintln!(
-                    "[fast round {fast_rounds}] invalid gather response; retrying once: {}",
-                    errors.join("; ")
-                );
-                parsed = self
-                    .repair_fast_gather_response(
+            let parsed = match validate_fast_gather_text(&text) {
+                Ok(parsed) => parsed,
+                Err(errors) => {
+                    kres_core::async_eprintln!(
+                        "[fast round {fast_rounds}] invalid gather response; retrying once: {}",
+                        errors.join("; ")
+                    );
+                    self.repair_fast_gather_response(
                         &text,
                         &errors,
                         "fast gather schema repair",
                         shutdown,
                     )
-                    .await?;
-            }
+                    .await?
+                }
+            };
 
             // §27: honour skill_reads. Read each requested file and
             // graft it into the first skill's `files` map so the next
@@ -1198,7 +1189,7 @@ impl AgentRunner {
             trimmed_prev.len(),
         );
         let synth_role_for_usage = if use_fast { "fast" } else { "slow" };
-        let text = tokio::select! {
+        let mut text = tokio::select! {
             _ = shutdown.cancelled() => {
                 return Err(AgentError::Other(format!("cancelled during {log_phase} call")));
             }
@@ -1225,45 +1216,74 @@ impl AgentRunner {
                 t
             }
         };
-        let mut slow_parsed = parse_code_response(&text);
-        // bugs.md#M3: surface the non-JSON case instead of letting it
-        // masquerade as a valid-but-empty analysis. The strategy
-        // field is also on TaskSummary for callers that want to
-        // react in-band.
-        //
-        // Rescue path: when the slow agent returned pure prose, any
-        // bug claims in that prose would otherwise be lost (findings
-        // stays empty, the merger has nothing to promote — see
-        // slow-code-agent-audit.system.md:37 "a bug that exists only in
-        // prose will be LOST"). Ask the fast agent to translate the
-        // prose into the expected envelope. If the translation also
-        // fails to produce parseable JSON, keep the original
-        // RawText result so the prose at least survives as analysis.
-        if slow_parsed.strategy == ParseStrategy::RawText {
-            tracing::warn!(
-                target: "kres_agents",
-                fast_rounds,
-                "slow agent returned no parseable JSON; attempting fast-agent translation"
-            );
-            match self
-                .translate_slow_raw_text(&slow_parsed.analysis, &ctx.task_brief, shutdown)
-                .await
+        let response_contract =
+            CodeResponseContract::new(ctx.allowed_response_extensions.iter().cloned());
+        let response_schema = response_contract.schema_json().to_string();
+        let tolerant_contract = response_contract.clone().allowing_invalid_findings();
+        let initial_validation = tolerant_contract.validate(&text);
+        let mut slow_parsed = initial_validation
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|_| diagnose_code_response(&text));
+        let envelope_errors = initial_validation.err().unwrap_or_default();
+        if !envelope_errors.is_empty() {
+            if let Ok(repaired) = repair_json_response(JsonRepairCall {
+                client: synth_client.clone(),
+                model: synth_model.clone(),
+                max_tokens: synth_max_tokens,
+                max_input_tokens: synth_max_in,
+                contract: JsonContract {
+                    name: "slow-synthesis",
+                    schema: &response_schema,
+                    instructions: "Preserve analysis, Finding ids, followup requests, output paths, edit paths, and plan step identities. Correct representation and field types only.",
+                },
+                rejected_response: &text,
+                validation_errors: &envelope_errors,
+                logger: self.logger.clone(),
+                log_kind: RepairLogKind::Code,
+                shutdown: Some(shutdown.clone()),
+            })
+            .await
             {
-                Some(translated) => {
-                    kres_core::async_eprintln!(
-                        "[slow] rescued via fast-agent translation: {} finding(s), {} followup(s)",
-                        translated.findings.len(),
-                        translated.followups.len(),
-                    );
-                    slow_parsed = translated;
-                }
-                None => {
-                    tracing::warn!(
-                        target: "kres_agents",
-                        "fast-agent translation failed; prose preserved as analysis with no structured findings"
-                    );
+                record_usage(&self.usage, synth_role_for_usage, &synth_model, &repaired.usage);
+                if let Ok(candidate) = tolerant_contract.accept_repair(&repaired.text) {
+                    text = repaired.text;
+                    slow_parsed = candidate;
+                } else {
+                    tracing::warn!(target: "kres_agents", "slow synthesis JSON repair failed the strict response contract");
                 }
             }
+        }
+        if !slow_parsed.invalid_findings.is_empty() {
+            let outcome = crate::finding_repair::repair_invalid_findings(
+                synth_client.clone(),
+                synth_model.clone(),
+                synth_max_tokens,
+                synth_max_in,
+                std::mem::take(&mut slow_parsed.invalid_findings),
+                crate::finding_repair::FindingRepairRuntime {
+                    logger: self.logger.clone(),
+                    cancel: Some(crate::finding_repair::FindingRepairCancel::Shutdown(
+                        shutdown.clone(),
+                    )),
+                    usage: self.usage.clone(),
+                    role: synth_role_for_usage,
+                },
+            )
+            .await?;
+            slow_parsed.merge_repaired_findings(outcome.findings);
+            if !outcome.unrepaired.is_empty() {
+                return Err(AgentError::Other(
+                    crate::finding_repair::format_unrepaired_findings(&outcome.unrepaired),
+                ));
+            }
+            text = replace_response_findings(&text, &slow_parsed.findings)?;
+        }
+        if let Err(errors) = response_contract.validate(&text) {
+            return Err(AgentError::Other(format!(
+                "slow response remained invalid after JSON repair: {}",
+                errors.join("; ")
+            )));
         }
         kres_core::async_eprintln!(
             "[slow] complete: {} finding(s), {} followup(s)",
@@ -1338,288 +1358,6 @@ impl AgentRunner {
             // trimmed lists already shipped to this step's slow call.
             gathered_symbols: trimmed_symbols,
             gathered_context: trimmed_context,
-        })
-    }
-
-    /// Re-emit a prose-only slow-agent reply as the JSON envelope the
-    /// pipeline expects. Invoked from `run_once_with_ctx` when the
-    /// slow call produced `ParseStrategy::RawText`. The fast agent is
-    /// told to transcribe — not augment — so this should not invent
-    /// findings the prose doesn't already make.
-    ///
-    /// Returns the reparsed response, or `None` when the translation
-    /// itself couldn't be parsed (the caller then keeps the original
-    /// prose-as-analysis result so the content isn't lost entirely).
-    /// Deliberately skips `self.fast_system` — the fast-agent system
-    /// prompt pushes toward the fast-agent schema (ready_for_slow /
-    /// skill_reads), which is the wrong target here. Also skips the
-    /// prompt cache — this path fires on the rare non-JSON turn, so
-    /// the ~4KB translation prompt isn't worth a breakpoint.
-    async fn translate_slow_raw_text(
-        &self,
-        prose: &str,
-        task_brief: &str,
-        shutdown: &Shutdown,
-    ) -> Option<CodeResponse> {
-        let user_content = format!(
-            "The slow agent returned the analysis below as free-form prose \
-             instead of the required JSON envelope. Re-emit the SAME CONTENT \
-             as strict JSON with this shape:\n\
-             {{\"analysis\": \"<prose narrative>\", \"findings\": [<Finding>, ...], \
-             \"followups\": [{{\"type\": \"T\", \"name\": \"N\", \"reason\": \"R\"}}]}}\n\n\
-             Rules:\n\
-             - Do NOT invent new bugs or analysis. Transcribe the prose.\n\
-             - Every actionable bug described in the prose MUST appear as a \
-               Finding record with this schema: id (snake_case slug), title, \
-               severity (low|medium|high), status ('active'), \
-               relevant_symbols (array of {{name, filename, line, definition}}), \
-               relevant_file_sections (array of {{filename, line_start, \
-               line_end, content}}), summary, reproducer_sketch, impact. \
-               Optional: mechanism_detail, fix_sketch, open_questions, \
-               related_finding_ids.\n\
-             - If the prose made a bug claim without enough detail for a \
-               concrete Finding (no file:line, no reproducer), omit it \
-               rather than fabricate fields.\n\
-             - Output JSON only, no fences, no preamble.\n\n\
-             ---\n\
-             Task brief: {task_brief}\n\n\
-             Prose analysis to translate:\n\n{prose}"
-        );
-        let messages = vec![Message {
-            role: "user".into(),
-            content: user_content.clone(),
-            cache: false,
-            cached_prefix: None,
-        }];
-        let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
-            .with_max_tokens(self.fast_max_tokens)
-            .with_stream_label("fast translate raw slow");
-        if let Some(thinking) = self.fast_thinking {
-            cfg = cfg.with_thinking(thinking);
-        }
-        if let Some(n) = self.fast_max_input_tokens {
-            cfg = cfg.with_max_input_tokens(n);
-        }
-        if let Some(lg) = &self.logger {
-            lg.log_code("user", &user_content, None, None);
-        }
-        kres_core::async_eprintln!("[fast translate] structuring raw slow-agent prose");
-        let text = tokio::select! {
-            _ = shutdown.cancelled() => return None,
-            r = self.fast_client.messages_streaming(&cfg, &messages) => {
-                match r {
-                    Ok(resp) => {
-                        record_usage(&self.usage, "fast", &self.fast_model, &resp.usage);
-                        let t = extract_text(&resp);
-                        if let Some(lg) = &self.logger {
-                            let thinking = extract_thinking(&resp);
-                            lg.log_code(
-                                "assistant",
-                                &t,
-                                Some(log_usage(&resp.usage)),
-                                thinking.as_deref(),
-                            );
-                        }
-                        t
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "kres_agents",
-                            "raw-text translation call failed: {e}"
-                        );
-                        return None;
-                    }
-                }
-            }
-        };
-        let reparsed = parse_code_response(&text);
-        if reparsed.strategy == ParseStrategy::RawText {
-            tracing::warn!(
-                target: "kres_agents",
-                "raw-text translation also returned non-JSON"
-            );
-            return None;
-        }
-        Some(reparsed)
-    }
-
-    /// Re-emit a previous step reply as schema-correct JSON WITHOUT
-    /// re-running the gather + synthesis loop. Invoked by the workflow
-    /// runner when a step's reply was received but failed the step's
-    /// declared OUTPUT SCHEMA (prose-only, missing a required typed
-    /// field, or a malformed object). Instead of paying for a whole
-    /// fresh `run_once_with_ctx` (which re-fetches all source), the
-    /// model is shown the original task + OUTPUT SCHEMA, the exact
-    /// validator error, and its own prior reply, and is asked to
-    /// convert that content into the required JSON — not to redo the
-    /// analysis. Unlike [`Self::translate_slow_raw_text`], this targets
-    /// the step's own schema (the `base_prompt` carries the step's
-    /// OUTPUT SCHEMA tail), so workflow-specific fields such as
-    /// `claim_validation`, `verdict`, and `triage_coding` survive.
-    ///
-    /// `use_fast`/`mode` mirror the synthesis routing so the reformat
-    /// uses the same client and system prompt that produced the
-    /// original reply. Returns the reparsed `TaskSummary`, or `None`
-    /// when the reformat call itself failed or still produced no
-    /// parseable JSON (the caller then falls back to a full retry).
-    pub async fn reformat_response_to_schema(
-        &self,
-        base_prompt: &str,
-        prior_response: &str,
-        validator_err: &str,
-        routing: ReformatRouting,
-        shutdown: &Shutdown,
-    ) -> Option<TaskSummary> {
-        let ReformatRouting {
-            use_fast,
-            use_routing_prompt,
-            mode,
-        } = routing;
-        let user_content = format!(
-            "Your previous reply did not satisfy this step's required OUTPUT \
-             SCHEMA. Do NOT redo the analysis and do NOT request more data — \
-             you already gathered everything you need. Re-emit the SAME content \
-             and the SAME decisions as a single valid JSON object that matches \
-             the OUTPUT SCHEMA below, as the LAST top-level JSON object in your \
-             reply.\n\n\
-             Validator error from the previous attempt: {validator_err}\n\n\
-             Preserve every code_output file, code_edit, finding, and typed \
-             field your previous reply intended. If a required field was \
-             missing, fill it from the content you already produced; do not \
-             invent new facts or change your conclusions.\n\n\
-             --- ORIGINAL TASK AND OUTPUT SCHEMA ---\n{base_prompt}\n\n\
-             --- YOUR PREVIOUS REPLY TO REFORMAT ---\n{prior_response}"
-        );
-        let messages = vec![Message {
-            role: "user".into(),
-            content: user_content.clone(),
-            cache: false,
-            cached_prefix: None,
-        }];
-        let (client, model, max_tokens, max_in, thinking) = if use_fast {
-            (
-                &self.fast_client,
-                self.fast_model.clone(),
-                self.fast_max_tokens,
-                self.fast_max_input_tokens,
-                self.fast_thinking,
-            )
-        } else {
-            (
-                &self.slow_client,
-                self.slow_model.clone(),
-                self.slow_max_tokens,
-                self.slow_max_input_tokens,
-                self.slow_thinking,
-            )
-        };
-        let mut cfg = CallConfig::defaults_for(model.clone())
-            .with_max_tokens(max_tokens)
-            .with_stream_label("json-reformat");
-        if let Some(thinking) = thinking {
-            cfg = cfg.with_thinking(thinking);
-        }
-        // Mirror the synthesis system-prompt selection so the reformat
-        // call speaks the same dialect the original reply did. This must
-        // track all three synthesis branches in run_once_with_ctx,
-        // including the routing-agent prompt used by the orchestrator
-        // step — otherwise its reformat retry would run under the
-        // fast-gather prompt (wrong shape for a routing decision).
-        let system_for_call = if use_routing_prompt {
-            self.routing_system.as_ref().or(self.fast_system.as_ref())
-        } else if use_fast {
-            self.fast_system.as_ref()
-        } else {
-            match mode {
-                kres_core::TaskMode::Coding => self
-                    .slow_coding_system
-                    .as_ref()
-                    .or(self.slow_system.as_ref()),
-                kres_core::TaskMode::Generic => self
-                    .slow_generic_system
-                    .as_ref()
-                    .or(self.slow_system.as_ref()),
-                kres_core::TaskMode::Audit => self.slow_system.as_ref(),
-            }
-        };
-        if let Some(s) = system_for_call {
-            cfg = cfg.with_system(s.clone());
-        }
-        if let Some(n) = max_in {
-            cfg = cfg.with_max_input_tokens(n);
-        }
-        let role_for_usage = if use_fast { "fast" } else { "slow" };
-        if let Some(lg) = &self.logger {
-            lg.log_code("user", &user_content, None, None);
-        }
-        kres_core::async_eprintln!("[json-reformat] re-emitting prior reply as schema JSON");
-        let text = tokio::select! {
-            _ = shutdown.cancelled() => return None,
-            r = client.messages_streaming(&cfg, &messages) => {
-                match r {
-                    Ok(resp) => {
-                        record_usage(&self.usage, role_for_usage, &model, &resp.usage);
-                        let t = extract_text(&resp);
-                        if let Some(lg) = &self.logger {
-                            let thinking = extract_thinking(&resp);
-                            lg.log_code(
-                                "assistant",
-                                &t,
-                                Some(log_usage(&resp.usage)),
-                                thinking.as_deref(),
-                            );
-                        }
-                        t
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "kres_agents",
-                            "json-reformat call failed: {e}"
-                        );
-                        return None;
-                    }
-                }
-            }
-        };
-        let parsed = parse_code_response(&text);
-        // A prose-only reformat reply is no better than the input it was
-        // meant to fix: parse_code_response never fails — it falls back
-        // to RawText and stuffs everything into `analysis`. Returning
-        // Some here would wrap that prose as a "successful" reformat and
-        // starve the caller's full-retry fallback (run_once_with_ctx),
-        // contradicting this method's contract. Mirror
-        // translate_slow_raw_text and surface None so the caller re-runs
-        // a full gather+synthesis instead.
-        if parsed.strategy == ParseStrategy::RawText {
-            tracing::warn!(
-                target: "kres_agents",
-                "json-reformat returned non-JSON; falling back to full retry"
-            );
-            return None;
-        }
-        // Mirror run_once_with_ctx's mode-based field routing so the
-        // returned summary maps onto the step outputs identically.
-        let (findings_out, code_output, code_edits) = match mode {
-            kres_core::TaskMode::Audit | kres_core::TaskMode::Generic => {
-                (parsed.findings, Vec::new(), Vec::new())
-            }
-            kres_core::TaskMode::Coding => (Vec::new(), parsed.code_output, parsed.code_edits),
-        };
-        Some(TaskSummary {
-            raw_response: text,
-            analysis: parsed.analysis,
-            findings: findings_out,
-            followups: parsed.followups,
-            fast_rounds: 0,
-            strategy: parsed.strategy,
-            mode,
-            code_output,
-            code_edits,
-            plan: None,
-            // No gather happened on the reformat path; the caller keeps
-            // the gathered data captured from the original run.
-            gathered_symbols: Vec::new(),
-            gathered_context: Vec::new(),
         })
     }
 }
@@ -1715,6 +1453,7 @@ impl AgentRunner {
         if lenses.is_empty() {
             return self.run_once_with_ctx(prompt, ctx, shutdown).await;
         }
+        let lens_schema = CodeResponseContract::default().schema_json().to_string();
         let fanout = self
             .run_lenses_shared_gather_repairing(
                 prompt,
@@ -1724,6 +1463,8 @@ impl AgentRunner {
                 LensRepairPolicy {
                     max_retries: GENERIC_LENS_REPAIR_RETRIES,
                     repair_instruction: "Your previous response for this review lens did not produce usable lens output. Reuse the same gathered source/context and reply with this lens's analysis, findings, or followups.",
+                    contract_name: "review-lens",
+                    schema: &lens_schema,
                 },
                 validate_generic_lens_output,
             )
@@ -1784,6 +1525,7 @@ impl AgentRunner {
             &outs,
             consolidate_rules,
             self.logger.clone(),
+            Some(shutdown.clone()),
         )
         .await?;
         self.append_comparison_entry(
@@ -1840,6 +1582,7 @@ impl AgentRunner {
                     all_lenses: lenses,
                     extra_lens_instruction: None,
                     cache_mode: CacheMode::PrimeThenParallel,
+                    run_keys: None,
                 },
                 ctx,
                 shutdown,
@@ -1851,30 +1594,78 @@ impl AgentRunner {
             // validator/transport message to each retried lens — the
             // generic repair instruction alone does not tell the model
             // why its output was rejected.
-            let mut retry_errors: Vec<(String, String)> = Vec::new();
+            let mut retry_errors: Vec<(String, Option<String>, String)> = Vec::new();
             for failure in &fanout.failures {
-                retry_errors.push((failure.lens_id.clone(), failure.error.clone()));
+                retry_errors.push((
+                    failure.lens_id.clone(),
+                    failure.slow_model.clone(),
+                    failure.error.clone(),
+                ));
             }
             for output in &fanout.outputs {
                 if let Err(e) = validate(output) {
-                    retry_errors.push((output.lens_id.clone(), e));
+                    retry_errors.push((output.lens_id.clone(), output.slow_model.clone(), e));
                 }
             }
             if retry_errors.is_empty() {
                 return Ok(fanout);
             }
-            let retry_lenses: BTreeSet<String> =
-                retry_errors.iter().map(|(id, _)| id.clone()).collect();
+
+            // First repair representation/schema only, using the rejected
+            // response and the caller's exact contract. A successful repair
+            // avoids paying for a complete lens rerun and cannot bypass the
+            // caller-owned validator below.
+            let invalid_outputs: BTreeSet<(String, Option<String>)> = retry_errors
+                .iter()
+                .map(|(lens_id, model, _)| (lens_id.clone(), model.clone()))
+                .collect();
+            for output in fanout.outputs.iter_mut().filter(|output| {
+                invalid_outputs.contains(&lens_run_key(output))
+                    && lens_has_structural_json_error(output)
+            }) {
+                let errors: Vec<String> = retry_errors
+                    .iter()
+                    .filter(|(lens_id, model, _)| {
+                        lens_id == &output.lens_id && model == &output.slow_model
+                    })
+                    .map(|(_, _, error)| error.clone())
+                    .collect();
+                if let Some(repaired) = self
+                    .repair_lens_json(output, &errors, &repair, shutdown)
+                    .await
+                {
+                    *output = repaired;
+                }
+            }
+            retry_errors.retain(|(lens_id, model, _)| {
+                find_lens_output(&fanout.outputs, lens_id, model)
+                    .map_or(true, |output| validate(output).is_err())
+            });
+            if retry_errors.is_empty() && fanout.failures.is_empty() {
+                return Ok(fanout);
+            }
+            let retry_runs: BTreeSet<(String, Option<String>)> = retry_errors
+                .iter()
+                .map(|(id, model, _)| (id.clone(), model.clone()))
+                .collect();
 
             let repair_lenses: Vec<LensSpec> = lenses
                 .iter()
-                .filter(|lens| retry_lenses.contains(&lens.id))
+                .filter(|lens| retry_runs.iter().any(|(id, _)| id == &lens.id))
                 .cloned()
                 .collect();
             if repair_lenses.is_empty() {
                 return Err(AgentError::Other(format!(
                     "shared lens fan-out selected unknown lens id(s) for repair: {}",
-                    retry_lenses.into_iter().collect::<Vec<_>>().join(", ")
+                    retry_runs
+                        .iter()
+                        .map(|(id, model)| format!(
+                            "{}@{}",
+                            id,
+                            model.as_deref().unwrap_or("unknown")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )));
             }
 
@@ -1888,8 +1679,9 @@ impl AgentRunner {
             detailed_repair.push_str(
                 "\n\nValidator error(s) from the previous attempt (find the entry tagged with your lens id):",
             );
-            for (lens_id, err) in &retry_errors {
-                detailed_repair.push_str(&format!("\n- lens '{lens_id}': {err}"));
+            for (lens_id, model, err) in &retry_errors {
+                let model = model.as_deref().unwrap_or("unknown-model");
+                detailed_repair.push_str(&format!("\n- lens '{lens_id}' model '{model}': {err}"));
             }
             let repaired = self
                 .run_prepared_lens_fanout(
@@ -1899,6 +1691,7 @@ impl AgentRunner {
                         all_lenses: lenses,
                         extra_lens_instruction: Some(&detailed_repair),
                         cache_mode: CacheMode::Parallel,
+                        run_keys: Some(&retry_runs),
                     },
                     ctx,
                     shutdown,
@@ -1906,14 +1699,116 @@ impl AgentRunner {
                 .await?;
             fanout
                 .outputs
-                .retain(|output| !retry_lenses.contains(&output.lens_id));
+                .retain(|output| !retry_runs.contains(&lens_run_key(output)));
+            fanout.failures.retain(|failure| {
+                !retry_runs.contains(&(failure.lens_id.clone(), failure.slow_model.clone()))
+            });
+            fanout.outputs.extend(
+                repaired
+                    .outputs
+                    .into_iter()
+                    .filter(|output| retry_runs.contains(&lens_run_key(output))),
+            );
             fanout
                 .failures
-                .retain(|failure| !retry_lenses.contains(&failure.lens_id));
-            fanout.outputs.extend(repaired.outputs);
-            fanout.failures.extend(repaired.failures);
+                .extend(repaired.failures.into_iter().filter(|failure| {
+                    retry_runs.contains(&(failure.lens_id.clone(), failure.slow_model.clone()))
+                }));
         }
         Ok(fanout)
+    }
+
+    async fn repair_lens_json(
+        &self,
+        output: &LensRunOutput,
+        errors: &[String],
+        policy: &LensRepairPolicy<'_>,
+        shutdown: &Shutdown,
+    ) -> Option<LensRunOutput> {
+        let variant = self
+            .effective_slow_variants()
+            .into_iter()
+            .find(|variant| output.slow_model.as_deref() == Some(variant.label.as_str()))?;
+        let contract =
+            CodeResponseContract::new(output.allowed_response_extensions.iter().cloned());
+        if let Ok(mut parsed) = contract
+            .clone()
+            .allowing_invalid_findings()
+            .validate(&output.raw_response)
+        {
+            if !parsed.invalid_findings.is_empty() {
+                let outcome = crate::finding_repair::repair_invalid_findings(
+                    variant.client.clone(),
+                    variant.model.clone(),
+                    variant.max_tokens,
+                    variant.max_input_tokens,
+                    std::mem::take(&mut parsed.invalid_findings),
+                    crate::finding_repair::FindingRepairRuntime {
+                        logger: self.logger.clone(),
+                        cancel: Some(crate::finding_repair::FindingRepairCancel::Shutdown(
+                            shutdown.clone(),
+                        )),
+                        usage: self.usage.clone(),
+                        role: "slow",
+                    },
+                )
+                .await
+                .ok()?;
+                if !outcome.unrepaired.is_empty() {
+                    return None;
+                }
+                parsed.merge_repaired_findings(outcome.findings);
+                let repaired_text =
+                    replace_response_findings(&output.raw_response, &parsed.findings).ok()?;
+                let parsed = contract.validate(&repaired_text).ok()?;
+                return Some(LensRunOutput {
+                    lens_id: output.lens_id.clone(),
+                    lens: output.lens.clone(),
+                    slow_model: output.slow_model.clone(),
+                    parsed,
+                    raw_response: repaired_text,
+                    allowed_response_extensions: output.allowed_response_extensions.clone(),
+                });
+            }
+        }
+        let result = repair_json_response(JsonRepairCall {
+            client: variant.client,
+            model: variant.model.clone(),
+            max_tokens: variant.max_tokens,
+            max_input_tokens: variant.max_input_tokens,
+            contract: JsonContract {
+                name: policy.contract_name,
+                schema: policy.schema,
+                instructions: policy.repair_instruction,
+            },
+            rejected_response: &output.raw_response,
+            validation_errors: errors,
+            logger: self.logger.clone(),
+            log_kind: RepairLogKind::Code,
+            shutdown: Some(shutdown.clone()),
+        })
+        .await
+        .ok()?;
+        record_usage(&self.usage, "slow", &variant.model, &result.usage);
+        let parsed = match contract.accept_repair(&result.text) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                tracing::warn!(
+                    target: "kres_agents",
+                    lens = %output.lens_id,
+                    "JSON repair failed the strict lens response contract"
+                );
+                return None;
+            }
+        };
+        Some(LensRunOutput {
+            lens_id: output.lens_id.clone(),
+            lens: output.lens.clone(),
+            slow_model: output.slow_model.clone(),
+            parsed,
+            raw_response: result.text,
+            allowed_response_extensions: output.allowed_response_extensions.clone(),
+        })
     }
 
     async fn prepare_lens_fanout(
@@ -1987,6 +1882,7 @@ impl AgentRunner {
             all_lenses,
             extra_lens_instruction,
             cache_mode,
+            run_keys,
         } = call;
         // Build per-lens specs once; the same specs feed every slow
         // variant and may be reused across the cache-prime attempt
@@ -2050,7 +1946,15 @@ impl AgentRunner {
         // back to no-cache parallel on seed failure; Parallel skips
         // priming entirely.
         let variant_runs = prepared.slow_variants.iter().cloned().map(|variant| {
-            let lens_specs = lens_specs.clone();
+            let lens_specs = lens_specs
+                .iter()
+                .filter(|spec| {
+                    run_keys.map_or(true, |keys| {
+                        keys.contains(&(spec.lens_id.clone(), Some(variant.label.clone())))
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
             let shared_prefix = prepared.shared_prefix.clone();
             let task_brief = ctx.task_brief.clone();
             let shutdown = shutdown.clone();
@@ -2132,6 +2036,7 @@ impl AgentRunner {
                         slow_model: Some(model_label),
                         raw_response,
                         parsed,
+                        allowed_response_extensions: ctx.allowed_response_extensions.clone(),
                     });
                 }
                 Err((lens_id, model_label, error)) => {
@@ -2275,21 +2180,22 @@ impl AgentRunner {
                     t
                 }
             };
-            let mut parsed = parse_code_response(&text);
-            if let Err(errors) = validate_fast_gather_response(&parsed) {
-                kres_core::async_eprintln!(
-                    "[fast gather round {fast_rounds}] invalid response; retrying once: {}",
-                    errors.join("; ")
-                );
-                parsed = self
-                    .repair_fast_gather_response(
+            let parsed = match validate_fast_gather_text(&text) {
+                Ok(parsed) => parsed,
+                Err(errors) => {
+                    kres_core::async_eprintln!(
+                        "[fast gather round {fast_rounds}] invalid response; retrying once: {}",
+                        errors.join("; ")
+                    );
+                    self.repair_fast_gather_response(
                         &text,
                         &errors,
                         "fast lens gather schema repair",
                         shutdown,
                     )
-                    .await?;
-            }
+                    .await?
+                }
+            };
             if !parsed.skill_reads.is_empty() {
                 apply_skill_reads(&mut live_skills, &parsed.skill_reads);
             }
@@ -2355,6 +2261,20 @@ impl AgentRunner {
     }
 }
 
+fn lens_run_key(output: &LensRunOutput) -> (String, Option<String>) {
+    (output.lens_id.clone(), output.slow_model.clone())
+}
+
+fn find_lens_output<'a>(
+    outputs: &'a [LensRunOutput],
+    lens_id: &str,
+    model: &Option<String>,
+) -> Option<&'a LensRunOutput> {
+    outputs
+        .iter()
+        .find(|output| output.lens_id == lens_id && &output.slow_model == model)
+}
+
 /// Config bundle for the cross-lens consolidator. Holds a Client +
 /// model + optional system prompt so the pipeline caller can
 /// construct it once and reuse across tasks.
@@ -2365,6 +2285,7 @@ pub struct ConsolidatorClient {
     pub system: Option<String>,
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
+    pub usage: Option<Arc<UsageTracker>>,
 }
 
 /// Graft a list of newly-requested skill files into the per-run
@@ -2537,11 +2458,14 @@ fn merge_followups(dst: &mut Vec<Followup>, src: Vec<Followup>) {
 }
 
 fn validate_generic_lens_output(output: &LensRunOutput) -> Result<(), String> {
-    if output.parsed.analysis.trim().is_empty()
-        && output.parsed.findings.is_empty()
-        && output.parsed.followups.is_empty()
+    let model = output.slow_model.as_deref().unwrap_or("unknown-model");
+    let parsed = CodeResponseContract::new(output.allowed_response_extensions.iter().cloned())
+        .validate(&output.raw_response)
+        .map_err(|errors| format!("{} ({model}): {}", output.lens_id, errors.join("; ")))?;
+    if parsed.analysis.trim().is_empty()
+        && parsed.findings.is_empty()
+        && parsed.followups.is_empty()
     {
-        let model = output.slow_model.as_deref().unwrap_or("unknown-model");
         Err(format!(
             "{} ({model}): no analysis, findings, or followups",
             output.lens_id
@@ -2549,6 +2473,25 @@ fn validate_generic_lens_output(output: &LensRunOutput) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn lens_has_structural_json_error(output: &LensRunOutput) -> bool {
+    CodeResponseContract::new(output.allowed_response_extensions.iter().cloned())
+        .validate(&output.raw_response)
+        .is_err()
+}
+
+fn replace_response_findings(
+    text: &str,
+    findings: &[kres_core::findings::Finding],
+) -> Result<String, AgentError> {
+    let mut root: Value = crate::json_repair::parse_strict_json("code-agent", text)
+        .map_err(|errors| AgentError::Other(errors.join("; ")))?;
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| AgentError::Other("response must be one JSON object".into()))?;
+    object.insert("findings".into(), serde_json::to_value(findings)?);
+    serde_json::to_string(&root).map_err(AgentError::from)
 }
 
 /// Cut a string to `n` chars with an ellipsis. Used by the verbose
@@ -2603,21 +2546,89 @@ mod tests {
 
     #[test]
     fn fast_gather_validation_rejects_raw_text() {
-        let response = parse_code_response("please read foo.c");
+        let response = diagnose_code_response("please read foo.c");
         let errors = validate_fast_gather_response(&response).unwrap_err();
         assert!(errors.iter().any(|error| error.contains("JSON object")));
     }
 
     #[test]
+    fn generic_lens_validation_rejects_raw_text_and_bad_shapes() {
+        let raw = LensRunOutput {
+            lens_id: "memory".into(),
+            lens: json!({"id":"memory"}),
+            slow_model: Some("test".into()),
+            raw_response: "prose".into(),
+            parsed: diagnose_code_response("prose"),
+            allowed_response_extensions: BTreeSet::new(),
+        };
+        assert!(validate_generic_lens_output(&raw)
+            .unwrap_err()
+            .contains("invalid"));
+
+        let malformed = LensRunOutput {
+            raw_response: r#"{"analysis":"x","findings":"bad"}"#.into(),
+            parsed: diagnose_code_response(r#"{"analysis":"x","findings":"bad"}"#),
+            ..raw
+        };
+        assert!(validate_generic_lens_output(&malformed)
+            .unwrap_err()
+            .contains("findings"));
+
+        let empty_text = r#"{"analysis":""}"#;
+        let empty = LensRunOutput {
+            raw_response: empty_text.into(),
+            parsed: CodeResponseContract::default()
+                .validate(empty_text)
+                .unwrap(),
+            ..malformed
+        };
+        assert!(validate_generic_lens_output(&empty).is_err());
+        assert!(!lens_has_structural_json_error(&empty));
+    }
+
+    #[test]
+    fn comparison_lens_lookup_is_scoped_by_model() {
+        let outputs = vec![
+            LensRunOutput {
+                lens_id: "bounds".into(),
+                lens: json!({"id":"bounds"}),
+                slow_model: Some("model-a".into()),
+                raw_response: r#"{"analysis":"a"}"#.into(),
+                parsed: diagnose_code_response(r#"{"analysis":"a"}"#),
+                allowed_response_extensions: BTreeSet::new(),
+            },
+            LensRunOutput {
+                lens_id: "bounds".into(),
+                lens: json!({"id":"bounds"}),
+                slow_model: Some("model-b".into()),
+                raw_response: "invalid prose".into(),
+                parsed: diagnose_code_response("invalid prose"),
+                allowed_response_extensions: BTreeSet::new(),
+            },
+        ];
+        let model_a = Some("model-a".to_string());
+        let model_b = Some("model-b".to_string());
+        assert!(validate_generic_lens_output(
+            find_lens_output(&outputs, "bounds", &model_a).unwrap()
+        )
+        .is_ok());
+        assert!(validate_generic_lens_output(
+            find_lens_output(&outputs, "bounds", &model_b).unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
     fn fast_gather_validation_rejects_non_array_and_bad_items() {
-        let non_array = parse_code_response(r#"{"analysis":"x","followups":"read foo"}"#);
+        let non_array = diagnose_code_response(r#"{"analysis":"x","followups":"read foo"}"#);
         assert!(validate_fast_gather_response(&non_array)
             .unwrap_err()
             .iter()
             .any(|error| error.contains("must be an array")));
 
-        let bad_item =
-            parse_code_response(r#"{"analysis":"x","followups":[{"type":"read","reason":"why"}]}"#);
+        let bad_item = diagnose_code_response(
+            r#"{"analysis":"x","followups":[{"type":"read","reason":"why"}]}"#,
+        );
         assert!(validate_fast_gather_response(&bad_item)
             .unwrap_err()
             .iter()
@@ -2625,8 +2636,15 @@ mod tests {
     }
 
     #[test]
+    fn fast_gather_validation_rejects_unknown_fields() {
+        let response = diagnose_code_response(r#"{"analysis":"x","folowups":[]}"#);
+        let errors = validate_fast_gather_response(&response).unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("folowups")));
+    }
+
+    #[test]
     fn fast_gather_validation_rejects_bad_semantics() {
-        let response = parse_code_response(
+        let response = diagnose_code_response(
             r#"{"analysis":"x","followups":[{"type":"invented","name":" ","reason":""}]}"#,
         );
         let errors = validate_fast_gather_response(&response).unwrap_err();
@@ -2641,7 +2659,7 @@ mod tests {
 
     #[test]
     fn fast_gather_validation_accepts_typed_request() {
-        let response = parse_code_response(
+        let response = diagnose_code_response(
             r#"{"analysis":"need source","followups":[{"type":"read","name":"mm/filemap.c:1+80","reason":"map entry points"}]}"#,
         );
         assert!(validate_fast_gather_response(&response).is_ok());
@@ -2649,7 +2667,7 @@ mod tests {
 
     #[test]
     fn fast_gather_validation_accepts_file_survey_request() {
-        let response = parse_code_response(
+        let response = diagnose_code_response(
             r#"{"analysis":"need an outline","followups":[{"type":"survey","name":"mm/filemap.c","reason":"build a targeted review inventory"}]}"#,
         );
         assert!(validate_fast_gather_response(&response).is_ok());
@@ -2662,7 +2680,7 @@ mod tests {
     fn parse_only_skill_reads_triggers_loopback() {
         // The fast agent emits a response with nothing but
         // skill_reads. This should NOT be treated as "ready for slow".
-        let r = parse_code_response(
+        let r = diagnose_code_response(
             r#"{"analysis": "I need to load the kernel skill",
                 "followups": [],
                 "skill_reads": ["/kernel.md"],
@@ -2681,7 +2699,7 @@ mod tests {
     fn parse_empty_triggers_slow_handoff() {
         // No followups, no skill_reads, not ready — the AgentRunner
         // should break out and still run the slow agent.
-        let r = parse_code_response(r#"{"analysis": "no work needed"}"#);
+        let r = diagnose_code_response(r#"{"analysis": "no work needed"}"#);
         let only_skill_reads =
             r.followups.is_empty() && !r.ready_for_slow && !r.skill_reads.is_empty();
         assert!(!only_skill_reads);
@@ -2690,7 +2708,7 @@ mod tests {
 
     #[test]
     fn parse_ready_for_slow_short_circuits() {
-        let r = parse_code_response(
+        let r = diagnose_code_response(
             r#"{"analysis": "ready", "followups": [], "ready_for_slow": true}"#,
         );
         assert!(r.ready_for_slow);
@@ -2702,7 +2720,7 @@ mod tests {
     /// breaks out instead of spinning another round.
     #[test]
     fn question_only_followups_trip_early_exit() {
-        let r = parse_code_response(
+        let r = diagnose_code_response(
             r#"{"analysis": "need a target",
                 "followups": [
                     {"type": "question", "name": "which file?"},
@@ -2716,7 +2734,7 @@ mod tests {
 
     #[test]
     fn mixed_followups_do_not_trip_early_exit() {
-        let r = parse_code_response(
+        let r = diagnose_code_response(
             r#"{"analysis": "need a target",
                 "followups": [
                     {"type": "question", "name": "which file?"},

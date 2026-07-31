@@ -225,8 +225,8 @@ line. Each on its own line. Tags can run past 75 columns
   patches MUST include this trailer in the form:
   `Assisted-by: kres:<model-id>` — name BOTH the tool (`kres`)
   AND the underlying model that wrote the patch, e.g.
-  `Assisted-by: kres:claude-sonnet-4-6` or
-  `Assisted-by: kres:claude-opus-4-7`. A bare
+  `Assisted-by: kres:claude-sonnet-5` or
+  `Assisted-by: kres:claude-opus-4-8`. A bare
   `Assisted-by: kres` without the model is INSUFFICIENT — the
   reviewer needs to know which model produced the change. Use
   the model id you are running under; do not invent one. See

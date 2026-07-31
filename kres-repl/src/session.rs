@@ -115,7 +115,7 @@ impl Default for ReplConfig {
             mcp_config: None,
             persist_path: None,
             exit_on_idle: false,
-            assisted_by: "kres:claude-sonnet-4-6".to_string(),
+            assisted_by: "kres:claude-sonnet-5".to_string(),
         }
     }
 }

@@ -32,10 +32,10 @@ Examples:
 
 | Provider files present | CLI | Result |
 |------------------------|-----|--------|
-| `anthropic-fast.json` offers Sonnet | `--slow sonnet` | Selects the Sonnet alias. |
+| `anthropic.json` offers Sonnet | `--slow sonnet` | Selects the Sonnet alias. |
 | `azure.json` offers `gpt-5.5` | `--slow gpt-5.5` | Selects the unique provider. |
-| `foo.json` and `bar.json` offer Opus | `--slow claude-opus-4-7` | Fails as ambiguous. |
-| `foo.json` and `bar.json` offer Opus | `--slow foo.json:claude-opus-4-7` | Selects `foo.json`. |
+| `foo.json` and `bar.json` offer Opus | `--slow claude-opus-4-8` | Fails as ambiguous. |
+| `foo.json` and `bar.json` offer Opus | `--slow foo.json:claude-opus-4-8` | Selects `foo.json`. |
 
 Related docs:
 

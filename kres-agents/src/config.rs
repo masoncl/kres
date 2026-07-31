@@ -5,9 +5,8 @@
 //! defaults; agent roles only select a model and supply their embedded prompt.
 //!
 //! The `api_key` field carries the literal API key string. Shipped
-//! configs in the repo carry `@FAST_KEY@` / `@SLOW_KEY@` placeholders
-//! that setup.sh rewrites at install time from literal
-//! `--fast-key` / `--slow-key` values.
+//! configs in the repo carry an `@API_KEY@` placeholder that setup.sh
+//! rewrites at install time from the literal `--api-key` value.
 
 use std::{
     collections::BTreeMap,
@@ -37,9 +36,9 @@ pub enum AgentKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
-    /// Literal API key string. setup.sh substitutes @FAST_KEY@ /
-    /// @SLOW_KEY@ placeholders in the shipped configs at install
-    /// time; operators can also edit the file directly.
+    /// Literal API key string. setup.sh substitutes the @API_KEY@
+    /// placeholder in shipped HTTP-provider configs at install time;
+    /// operators can also edit the file directly.
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
@@ -424,7 +423,7 @@ impl AgentConfig {
             Some(k) if valid_secret(k) => Ok(()),
             Some(k) if k.starts_with('@') && k.ends_with('@') => {
                 Err(AgentError::Other(format!(
-                    "agent config {} still contains the placeholder key {:?}; run setup.sh --fast-key/--slow-key to fill it in",
+                    "agent config {} still contains the placeholder key {:?}; run setup.sh --provider <name> --api-key <key> to fill it in",
                     cfg_path.display(),
                     k
                 )))
@@ -903,11 +902,11 @@ mod tests {
     fn placeholder_key_errors() {
         // An unsubstituted setup.sh placeholder must surface as a
         // clear config error rather than silently hitting the API
-        // with a string like "@FAST_KEY@".
-        let p = write_tmp(r#"{"api_key": "@FAST_KEY@"}"#);
+        // with a string like "@API_KEY@".
+        let p = write_tmp(r#"{"api_key": "@API_KEY@"}"#);
         let msg = format!("{}", AgentConfig::load(&p).unwrap_err());
         assert!(
-            msg.contains("placeholder") && msg.contains("@FAST_KEY@"),
+            msg.contains("placeholder") && msg.contains("@API_KEY@"),
             "got: {msg}"
         );
         std::fs::remove_file(&p).ok();

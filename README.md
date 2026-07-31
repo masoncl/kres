@@ -1,35 +1,25 @@
 # kres
 
-Kernel code RESearch agent — an LLM-driven multi-agent REPL for
-reviewing, auditing, and finding bugs in C source trees. The
-Linux kernel is the primary target; any large C codebase with
-source-level tooling works too.
+Kernel code RESearch agent — an LLM-driven multi-agent REPL for reviewing and
+fixing bugs in large source trees. The Linux kernel is the primary target.
 
 ## kres introduction
 
-kres splits the job of reviewing code across a number of cooperating agents:
+kres splits the job of reviewing code across a number of cooperating agents,
+all of which iterate generating additional research todos.  While kres can
+review discrete things such as individual commits or functions, the main focus
+is longer reviews on whole files, where each iteration adds to and prioritizes
+a large TODO list of additional research until our turn limit is exhausted.
 
-- **fast** scopes the work, picks the code to look at, and emits
-  a structured brief for deeper analysis.
-- **main** fetches that code via MCP tools, grep, read, git —
-  treating code navigation as a first-class tool-call surface
-  rather than free-form text manipulation.
-- **slow** runs the deep analysis with a prepared context and
-  previous findings in hand, so the expensive model's tokens go
-  to bug-hunting rather than chasing files.
-- **todo** dedups follow-up questions, reprioritises, and keeps a
-  running list across turns so a single prompt can drive 30+
-  tasks without losing coverage.
-- **merger** folds each task's findings into a cumulative,
-  deduplicated bug list; old findings get `invalidated` when a
-  later one supersedes them.
+Potential findings are documented along the way, which can then get exported and
+validated in separate passes.
 
-The results of every turn are used to reprioritize the todo list, and identify
-additional context needed for the next round.
+kres can also automatically generate fixes for the bugs it finds.  The patch
+generation workflow validates the bug, and iterates on fixes until review
+lenses and compile steps pass.
 
 See [docs/agents.md](docs/agents.md) for the task flow and
-[docs/workflow.md](docs/workflow.md) for the shipped review and fix
-workflows.
+[docs/workflow.md](docs/workflow.md) for the review and fix workflows.
 
 ## Quick start
 
@@ -41,24 +31,36 @@ workflows.
 
 2. **Populate `~/.kres/`** from shipped configs:
 
+   kres is really meant to drive requests through the provider APIs.  This gives
+   us more control over context, caching, and the workflows themselves.  But,
+   if you only have CLI access to claude or codex, kres can simulate API access
+   through the rust-code-agent-sdks crate.  This basically uses a set of
+   claude/codex sessions and sends requests through them:
+
    ```
-   ./setup.sh --fast-key $FAST_API_KEY --slow-key $SLOW_API_KEY
+   ./setup.sh --provider claude
    ```
 
-   Each key arg accepts a literal API key or a path to a key
-   file. `setup.sh --help` lists every option — model picks
-   (`--slow`, `--model`), `--semcode PATH`,
-   `--review-prompts PATH`, `--overwrite`, and more. The shipped
-   defaults use `claude-opus-4-7` for the slow agent and
-   `claude-sonnet-4-6` for the fast / main / todo roles;
-   `~/.kres/settings.json` is the single source of truth for
-   model selection.
+   If you're using API access:
+
+   ```
+   ./setup.sh --provider anthropic --api-key "$ANTHROPIC_API_KEY"
+   ```
+
+   Select exactly one provider: `anthropic`, `openai`, `claude`, or `codex`.
+   Anthropic and OpenAI require a literal `--api-key`; Claude and Codex use
+   their CLI authentication.
+
+   If you have semcode and/or the kernel review prompts installed, `setup.sh`
+   will try to autodetect them, but there are flags to help with that if needed.
+
+   The generated `~/.kres/settings.json` can be edited afterwards.
 
 3. **Run a review** from a kernel tree:
 
    ```
    cd linux
-   kres --results review --prompt 'review: fs/btrfs/ctree.c'
+   kres --results review --prompt 'review: fs/btrfs/ctree.c' --turns 10
    kres --summary-markdown --results review
    # review/summary.md now has your results
    ```
@@ -66,15 +68,10 @@ workflows.
    `--prompt 'review: X'` invokes the embedded review workflow —
    a parallel lensed audit over the target. `--results DIR`
    keeps the run's artifacts under `DIR/` (findings.json,
-   report.md, summary.txt). For workflow prompts, `--turns N`
-   caps workflow step executions; for ordinary REPL task runs, see
-   [docs/turns-and-follow.md](docs/turns-and-follow.md).
+   report.md, summary.txt).  `--turns 10` stops after 10 rounds.
 
-Two optional integrations are worth wiring up while you're
-here: semcode-mcp for whole-program code navigation and the
-kernel `review-prompts` repo for subsystem knowledge. Both are
-configured via `setup.sh` flags — see
-[docs/configuration.md](docs/configuration.md) for details.
+   If you're doing more in-depth reviews of whole files, 50 turns is a good starting point.
+
 
 ## Exporting findings
 
@@ -84,26 +81,88 @@ You can export results into either text or markdown:
   `kres --summary`, and the summary output format.
 
 But these scans can produce a lot of results, and churning through a giant
-text file isn't the easiest way to walk them.  You can also dump them into
-a one-dir-per-finding format:
+text file isn't the easiest way to walk them.  It's much better to use:
 
-- [docs/exporting.md](docs/exporting.md) — `kres --export DIR`:
+```
+kres --export DIR --results <results-dir>
+```
+
+After the export, DIR has each of the findings exploded into a subdirectory
+with metadata and tracking details so you can run validation scripts and generate
+fixes.
+
+- [docs/exporting.md](docs/exporting.md) — `kres --export DIR`
+
+## Validating the exported findings
+
+Since we can't let kres run forever, many of the findings are going to be incomplete
+research.  Some will also be hallucinations or other mistakes from the research
+agents.
+
+After we've exported the findings, we can run the validation workflow:
+
+```
+kres --prompt 'validate: <finding dir> <linux source>'
+```
+
+This needs to be run on each individual finding in the export, and scans can
+create a large number of findings.  There's a helper script `scripts/validate-all.py`.  Example run:
+
+```
+cd ~/src/linux
+# semcode-index isn't required, but it does help
+semcode-index
+
+# do the initial kres scan
+kres --results kres-scan --turns 50 --prompt 'review: fs/btrfs/ctree.c'
+
+# export our results into ~/src/kernel-bugs
+kres --export ~/src/kernel-bugs --results kres-scan
+
+cd ~/src/kernel-bugs
+validate-all.py --workspace ~/src/linux -n 20
+
+# list the bugs that are still active
+./findings-index.py --search status:active
+```
+
+The validate-all.py run will churn through each of the findings and run 20
+parallel kres workers to validate the runs.  If you do future exports into the
+same directory, the validate-all.py script skips anything you've already validated.
+
+It's usually easiest to ask your favorite agent to read findings-index.py and
+suggest which bugs are most important.
+
+## Fixing bugs
+
+Continuing our example, pretend you want to make a patch for `~/src/kernel-bugs/findings/big_bad_mm_bug`
+
+```
+cd ~/src/linux
+# make defconfig, or whatever else needed for the kernel to compile
+kres --results fix --prompt 'fix: ~/src/kernel-bugs/findings/big_bad_mm_bug'
+```
+
+At the end of the fix run, you'll either have details about why the bug wasn't
+worth fixing, a failure message, or (hopefully) commits in ~/src/linux fixing the
+bug.  The corresponding finding directory will also have the patch file exported
+there.
 
 ## Further reading
 
-- [docs/agents.md](docs/agents.md) — fast / main / slow / todo /
-  merger flow and how follow-up tasks drive larger reviews.
-- [docs/workflow.md](docs/workflow.md) — the workflow-backed
-  `/review`, `/triage`, and `/fix` flows.
 - [docs/generating-fixes.md](docs/generating-fixes.md) — safety
   process kres uses before editing, committing, reviewing, and
   publishing generated kernel fixes.
+- [docs/agents.md](docs/agents.md) — fast / slow / todo / etc
+  agent flow and how follow-up tasks drive larger reviews.
+- [docs/workflow.md](docs/workflow.md) — the workflow-backed
+  `/review`, `/validate`, and `/fix` flows.
 - [docs/coding-tasks.md](docs/coding-tasks.md) — reproducer and
   fix generation (`code_output`, `code_edits`, `bash` verify).
 - [docs/turns-and-follow.md](docs/turns-and-follow.md) — when
   kres decides a non-interactive run is done.
 - [docs/action-allowlist.md](docs/action-allowlist.md) — which
-  non-MCP tools the main agent can dispatch and how to change
+  non-MCP tools kres can dispatch and how to change
   that.
 - [docs/configuration.md](docs/configuration.md) — `~/.kres/`
   layout, model selection, system-prompt overrides, semcode MCP

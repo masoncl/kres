@@ -4,7 +4,7 @@
     "slow": "@SLOW_MODEL@",
     "main": "@MODEL@",
     "todo": "@MODEL@",
-    "classifier": "anthropic-fast.json:claude-haiku-4-5"
+    "classifier": "@CLASSIFIER_MODEL@"
   },
   "model_aliases": {
     "sonnet": "@MODEL@",

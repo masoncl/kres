@@ -13,11 +13,10 @@ kres/
 ├── kres-repl/                     TUI/REPL, commands, sessions, workflow integration
 ├── configs/                       shipped runtime defaults
 │   ├── models/
-│   │   ├── anthropic-fast.json
-│   │   ├── anthropic-slow.json
+│   │   ├── anthropic.json
 │   │   ├── claude-codes.json
 │   │   ├── codex-codes.json
-│   │   └── vertex-dummy.json
+│   │   └── openai.json
 │   ├── settings.json
 │   ├── mcp.json
 │   ├── prompts/                   system prompts + report/artifact templates

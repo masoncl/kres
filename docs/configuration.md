@@ -33,15 +33,15 @@ or `<provider>.json:<model-id>` when disambiguation is required:
 ```json
 {
   "models": {
-    "fast": "vertex-dummy.json:claude-sonnet-4-6",
-    "slow": "anthropic-slow.json:claude-opus-4-7",
-    "main": "vertex-dummy.json:claude-sonnet-4-6",
-    "todo": "vertex-dummy.json:claude-sonnet-4-6",
-    "classifier": "anthropic-fast.json:claude-haiku-4-5"
+    "fast": "sonnet",
+    "slow": "opus",
+    "main": "sonnet",
+    "todo": "sonnet",
+    "classifier": "anthropic.json:claude-haiku-4-5"
   },
   "model_aliases": {
-    "sonnet": "vertex-dummy.json:claude-sonnet-5",
-    "opus": "anthropic-slow.json:claude-opus-4-7"
+    "sonnet": "anthropic.json:claude-sonnet-5",
+    "opus": "anthropic.json:claude-opus-4-8"
   }
 }
 ```
@@ -64,12 +64,12 @@ The required `models` object contains per-model limits and thinking defaults:
 {
   "api_key": "...",
   "models": {
-    "claude-sonnet-4-6": {
+    "claude-sonnet-5": {
       "max_tokens": 64000,
       "max_input_tokens": 900000,
       "rate_limit": 800000
     },
-    "claude-opus-4-7": {
+    "claude-opus-4-8": {
       "max_tokens": 128000,
       "max_input_tokens": 900000,
       "rate_limit": 800000,
@@ -83,11 +83,11 @@ Role-specific model settings do not exist. Fast, main, todo, classifier, and
 slow receive the same limits whenever they select the same model; their
 behavior differs through role-specific embedded system prompts. A provider
 file with multiple models must be qualified when passed directly, for example
-`kres test ~/.kres/models/anthropic-slow.json:claude-opus-4-7`.
+`kres test ~/.kres/models/anthropic.json:claude-opus-4-8`.
 
 If multiple provider files contain the same model, an unqualified selector is
 an error listing the candidates. Select it as
-`foo.json:claude-opus-4-7`. Per-run `--fast-model`, `--slow-model`,
+`foo.json:claude-opus-4-8`. Per-run `--fast-model`, `--slow-model`,
 `--main-model`, `--todo-model`, and `--classifier-model` accept the same
 selector syntax. `--slow sonnet` and `--slow opus` use `model_aliases` when
 configured, then fall back to their shipped model ids. Ambiguity still
@@ -99,9 +99,22 @@ context each agent receives, not by model choice. Two different
 models is a cost/latency optimisation, not a correctness
 requirement.
 
-For OpenAI API access, set `provider: "openai"`. `base_url` is
-optional and defaults to `https://api.openai.com/v1`; set it only for a
-compatible proxy:
+## Shipped providers
+
+`setup.sh --provider NAME` installs only the selected provider stub and writes
+matching role selectors to `settings.json`:
+
+| Setup name | Installed config | Authentication | Default roles |
+|------------|------------------|----------------|---------------|
+| `anthropic` | `anthropic.json` | Required `--api-key` | Sonnet 5 fast/main/todo, Haiku classifier, Opus 4.8 slow |
+| `openai` | `openai.json` | Required Azure `--api-key` | GPT-5.5 for every role |
+| `claude` | `claude-codes.json` | Claude CLI login | Sonnet 5 fast/main/todo/classifier, Opus 4.8 slow |
+| `codex` | `codex-codes.json` | Codex CLI login | GPT-5.6-sol for every role |
+
+The OpenAI stub uses the Azure API Management endpoint and API version shipped
+in `configs/models/openai.json`. A custom OpenAI-compatible connection may use
+`provider: "openai"` with `base_url`; without `host`, `base_url` defaults to
+`https://api.openai.com/v1`:
 
 ```json
 {
@@ -116,8 +129,8 @@ compatible proxy:
 }
 ```
 
-For Azure or Azure API Management deployments, use the same `api_key`
-field plus `host`:
+Azure or Azure API Management connections use the same `api_key` field plus
+`host`:
 
 ```json
 {
@@ -187,15 +200,7 @@ apply.
 Each kres call uses a fresh, non-persistent Claude process and therefore starts
 with an empty conversation context. The process runs with tool access denied.
 The shipped example contains both Sonnet and Opus; select one with, for example,
-`claude-codes.json:claude-sonnet-4-6`.
-
-## Anthropic Vertex and custom transports
-
-Use `provider: "vertex-dummy"` for an Anthropic Messages API exposed
-through Vertex `rawPredict` / `streamRawPredict`. This protocol requires
-`base_url`, `project_id`, and `region`; the model is routed in the URL and
-kres emits the Vertex Anthropic API version in the request body. Exact token
-counting is unavailable on this protocol, so kres uses its local estimate.
+`claude-codes.json:claude-sonnet-5`.
 
 Model configs can also define `headers`, a UUID-valued `session_header`, an
 explicit `proxy`, additional `tls.ca_certificates` PEM bundles, and ordered
@@ -204,10 +209,6 @@ may hold a combined certificate/key PEM, or `key` may name a separate key.
 `${NAME}` references in these transport fields expand from the environment.
 Missing certificate candidates are skipped and certificate contents are never
 included in logs or rate-limiter keys.
-
-The shipped `vertex-dummy.json` shows the minimal multi-model Vertex shape
-using intentionally non-functional connection values. Supply a real endpoint
-and authentication transport in the operator-owned configuration.
 
 Provider API credentials use the same JSON field name: `api_key`; transport-
 authenticated providers may omit it.
@@ -342,13 +343,13 @@ into per-subsystem guides. `setup.sh` substitutes
 Point `setup.sh` at your clone:
 
 ```
-./setup.sh --fast-key $FAST_API_KEY --slow-key $SLOW_API_KEY \
+./setup.sh --provider anthropic --api-key "$ANTHROPIC_API_KEY" \
            --review-prompts /path/to/review-prompts
 ```
 
-`setup.sh --fast-key` and `--slow-key` replace the `@FAST_KEY@` and
-`@SLOW_KEY@` placeholders in `~/.kres/models/*.json`. The replacement
-lands in `api_key` fields.
+For `anthropic` and `openai`, `--api-key` replaces the `@API_KEY@`
+placeholder in the selected provider config. `claude` and `codex` reject that
+flag because their local CLIs own authentication.
 
 Without a resolvable path, `setup.sh` leaves the kernel skill
 uninstalled — agents still run, but the slow agent loses the

@@ -2,21 +2,14 @@
 #
 # setup.sh — initialize a kres config directory.
 #
-# Copies model configs, optional MCP config, and skills shipped in this
-# repo into the destination directory (default ~/.kres) and substitutes
-# API-key placeholders in each model file. Existing destination files
+# Copies the selected provider's model config, optional MCP config, and skills
+# shipped in this repo into the destination directory (default ~/.kres) and
+# substitutes the API-key placeholder when required. Existing destination files
 # are left untouched unless --overwrite is passed.
 #
 # Usage:
-#   setup.sh [--dest DIR] [--slow-key KEY] [--fast-key KEY] [--overwrite]
-#
-# --slow-key / --fast-key accept literal key strings. The argument's
-# value is substituted inline for the @SLOW_KEY@ / @FAST_KEY@
-# placeholder in the installed config JSON — no external credential
-# files are read or written.
-#
-# --fast-key feeds the default Sonnet model config.
-# --slow-key feeds the default Opus model config.
+#   setup.sh --provider {anthropic,openai,claude,codex} [--api-key KEY]
+#            [--dest DIR] [--overwrite]
 #
 # Without --overwrite, any destination file that already exists is
 # reported and skipped. The script is idempotent in that mode.
@@ -25,18 +18,17 @@ set -euo pipefail
 
 usage() {
   cat <<USAGE
-Usage: $0 [--dest DIR] [--slow-key KEY] [--fast-key KEY]
+Usage: $0 --provider {anthropic,openai,claude,codex} [--api-key KEY]
           [--slow MODEL] [--model MODEL]
           [--semcode PATH] [--review-prompts PATH] [--overwrite]
 
 Options:
   --dest DIR             Destination directory (default: \$HOME/.kres)
-  --slow-key KEY         Slow-agent API key literal
-  --fast-key KEY         Fast / main / todo agent API key literal
-  --slow MODEL           Model selector used for the slow agent.
-                         Default: anthropic-slow.json:claude-opus-4-7.
-  --model MODEL          Model selector used for fast/main/todo agents.
-                         Default: anthropic-fast.json:claude-sonnet-4-6.
+  --provider NAME        Required provider: anthropic, openai, claude, or codex
+  --api-key KEY          API key literal. Required for anthropic and openai;
+                         rejected for claude and codex, which use CLI auth.
+  --slow MODEL           Override the provider's default slow model selector
+  --model MODEL          Override the provider's default fast/main/todo selector
   --semcode PATH         Path to a semcode-mcp binary. Installs mcp.json
                          pointing at it. If omitted, mcp.json is only
                          installed when semcode-mcp is found on PATH (and
@@ -55,10 +47,10 @@ USAGE
 }
 
 DEST="${HOME}/.kres"
-SLOW_KEY=""
-FAST_KEY=""
-SLOW_MODEL="anthropic-slow.json:claude-opus-4-7"
-MODEL="anthropic-fast.json:claude-sonnet-4-6"
+PROVIDER=""
+API_KEY=""
+SLOW_MODEL=""
+MODEL=""
 # SEMCODE states: unset (auto-detect via PATH), empty-after-flag
 # (explicit skip), or a non-empty string (use as the binary path).
 SEMCODE_ARG=""
@@ -71,10 +63,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dest)                DEST="$2"; shift 2 ;;
     --dest=*)              DEST="${1#*=}"; shift ;;
-    --slow-key)            SLOW_KEY="$2"; shift 2 ;;
-    --slow-key=*)          SLOW_KEY="${1#*=}"; shift ;;
-    --fast-key)            FAST_KEY="$2"; shift 2 ;;
-    --fast-key=*)          FAST_KEY="${1#*=}"; shift ;;
+    --provider)            PROVIDER="$2"; shift 2 ;;
+    --provider=*)          PROVIDER="${1#*=}"; shift ;;
+    --api-key)             API_KEY="$2"; shift 2 ;;
+    --api-key=*)           API_KEY="${1#*=}"; shift ;;
     --slow)                SLOW_MODEL="$2"; shift 2 ;;
     --slow=*)              SLOW_MODEL="${1#*=}"; shift ;;
     --model)               MODEL="$2"; shift 2 ;;
@@ -89,10 +81,65 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "${PROVIDER}" ]]; then
+  echo "error: --provider is required" >&2
+  usage >&2
+  exit 2
+fi
+
+MODEL_CONFIGS=()
+CLASSIFIER_MODEL=""
+case "${PROVIDER}" in
+  anthropic)
+    MODEL_CONFIGS=(anthropic.json)
+    : "${MODEL:=anthropic.json:claude-sonnet-5}"
+    : "${SLOW_MODEL:=anthropic.json:claude-opus-4-8}"
+    CLASSIFIER_MODEL="anthropic.json:claude-haiku-4-5"
+    ;;
+  openai)
+    MODEL_CONFIGS=(openai.json)
+    : "${MODEL:=openai.json:gpt-5.5}"
+    : "${SLOW_MODEL:=openai.json:gpt-5.5}"
+    CLASSIFIER_MODEL="openai.json:gpt-5.5"
+    ;;
+  claude)
+    MODEL_CONFIGS=(claude-codes.json)
+    : "${MODEL:=claude-codes.json:claude-sonnet-5}"
+    : "${SLOW_MODEL:=claude-codes.json:claude-opus-4-8}"
+    CLASSIFIER_MODEL="claude-codes.json:claude-sonnet-5"
+    ;;
+  codex)
+    MODEL_CONFIGS=(codex-codes.json)
+    : "${MODEL:=codex-codes.json:gpt-5.6-sol}"
+    : "${SLOW_MODEL:=codex-codes.json:gpt-5.6-sol}"
+    CLASSIFIER_MODEL="codex-codes.json:gpt-5.6-sol"
+    ;;
+  *)
+    echo "error: unsupported provider '${PROVIDER}'; expected anthropic, openai, claude, or codex" >&2
+    exit 2
+    ;;
+esac
+
+case "${PROVIDER}" in
+  anthropic|openai)
+    if [[ -z "${API_KEY}" ]]; then
+      echo "error: --api-key is required for provider '${PROVIDER}'" >&2
+      exit 2
+    fi
+    ;;
+  claude|codex)
+    if [[ -n "${API_KEY}" ]]; then
+      echo "error: --api-key is not used by provider '${PROVIDER}'" >&2
+      exit 2
+    fi
+    ;;
+esac
+
 # Resolve the repo root from the script's own location so setup.sh
 # works whether invoked from a checkout, an installed tree, or via a
 # symlink on the operator's PATH.
-SRC_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]:-$0}")"
+SRC_DIR="$(cd "$(dirname -- "${SCRIPT_PATH}")" && pwd)"
 CONFIGS_SRC="${SRC_DIR}/configs"
 SKILLS_SRC="${SRC_DIR}/skills"
 
@@ -111,29 +158,13 @@ mkdir -p "${DEST}/workflows"
 
 say() { printf '  %s\n' "$*"; }
 
-# resolve_key KEY — returns the literal API key string that should be
-# substituted for @FAST_KEY@ / @SLOW_KEY@ placeholders. An empty
-# argument returns the empty string, signalling 'leave placeholder in
-# place'.
-resolve_key() {
-  local val="$1"
-  if [[ -z "$val" ]]; then
-    printf ''
-    return 0
-  fi
-  printf '%s' "$val"
-}
-
-SLOW_KEY_VALUE="$(resolve_key "${SLOW_KEY}")"
-FAST_KEY_VALUE="$(resolve_key "${FAST_KEY}")"
-
 # For logging/reporting: obscure the literal key so it doesn't leak
 # to stdout. `set | grep` and `ps` still see the full value, but our
 # own output stays clean.
 redact() {
   local val="$1"
   if [[ -z "$val" ]]; then
-    printf '<placeholder unchanged>'
+    printf '<not supplied>'
   elif [[ "${#val}" -le 8 ]]; then
     printf '***'
   else
@@ -158,8 +189,7 @@ install_file() {
 }
 
 # install_model_config SRC DST — copy a model JSON config, replacing
-# both @FAST_KEY@ and @SLOW_KEY@ placeholders. If a key value is empty,
-# its placeholder is left in place so the operator can edit later.
+# @API_KEY@ with the required provider credential.
 install_model_config() {
   local src="$1" dst="$2"
   if [[ ! -e "$src" ]]; then
@@ -172,15 +202,12 @@ install_model_config() {
   fi
   local tmp
   tmp="$(mktemp "${dst}.tmp.XXXXXX")"
-  KRES_FAST_KEY_VALUE="${FAST_KEY_VALUE}" \
-  KRES_SLOW_KEY_VALUE="${SLOW_KEY_VALUE}" \
+  KRES_API_KEY_VALUE="${API_KEY}" \
   awk \
-    -v fast_ph="@FAST_KEY@" \
-    -v slow_ph="@SLOW_KEY@" \
+    -v key_ph="@API_KEY@" \
     '
     BEGIN {
-      fast_val = ENVIRON["KRES_FAST_KEY_VALUE"]
-      slow_val = ENVIRON["KRES_SLOW_KEY_VALUE"]
+      key_val = ENVIRON["KRES_API_KEY_VALUE"]
     }
     function json_escape(s,    out, i, c) {
       out = ""
@@ -206,21 +233,20 @@ install_model_config() {
       return out line
     }
     {
-      line = subst($0, fast_ph, fast_val)
-      line = subst(line, slow_ph, slow_val)
+      line = subst($0, key_ph, key_val)
       print line
     }
     ' "$src" > "$tmp"
   mv "$tmp" "$dst"
   chmod 0640 "$dst"
-  say "wrote: ${dst} (@FAST_KEY@=$(redact "${FAST_KEY_VALUE}"), @SLOW_KEY@=$(redact "${SLOW_KEY_VALUE}"))"
+  say "wrote: ${dst} (@API_KEY@=$(redact "${API_KEY}"))"
 }
 
 echo "kres setup"
 say "dest:         ${DEST}"
 say "overwrite:    $([[ ${OVERWRITE} -eq 1 ]] && echo yes || echo no)"
-say "slow key:     $(redact "${SLOW_KEY_VALUE}")"
-say "fast key:     $(redact "${FAST_KEY_VALUE}")"
+say "provider:     ${PROVIDER}"
+say "api key:      $(redact "${API_KEY}")"
 say "slow model:   ${SLOW_MODEL}"
 say "model:        ${MODEL}"
 
@@ -257,8 +283,9 @@ echo "system prompts and model configs:"
 # Model configs. kres no longer auto-loads legacy
 # ~/.kres/*-agent.json files; normal startup resolves each role to
 # a provider JSON under ~/.kres/models/ that contains the selected model.
-for src in "${CONFIGS_SRC}/models"/*.json; do
-  install_model_config "$src" "${DEST}/models/$(basename "$src")"
+for config_name in "${MODEL_CONFIGS[@]}"; do
+  src="${CONFIGS_SRC}/models/${config_name}"
+  install_model_config "$src" "${DEST}/models/${config_name}"
 done
 
 # MCP registry: install mcp.json only when we actually have a
@@ -294,8 +321,18 @@ if [[ -n "${SEMCODE_CMD}" ]]; then
     say "keep: ${mcp_dst}"
   else
     mcp_tmp="$(mktemp "${mcp_dst}.tmp.XXXXXX")"
-    awk -v cmd="${SEMCODE_CMD}" '
+    KRES_SEMCODE_CMD="${SEMCODE_CMD}" awk '
       BEGIN { replaced = 0 }
+      function json_escape(s,    out, i, c) {
+        out = ""
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c == "\\") out = out "\\\\"
+          else if (c == "\"") out = out "\\\""
+          else out = out c
+        }
+        return out
+      }
       {
         # Replace the first "command": "…" value with cmd. Preserve
         # anything before and after the match so a future trailing
@@ -303,7 +340,7 @@ if [[ -n "${SEMCODE_CMD}" ]]; then
         if (!replaced && match($0, /"command"[[:space:]]*:[[:space:]]*"[^"]*"/)) {
           prefix = substr($0, 1, RSTART - 1)
           suffix = substr($0, RSTART + RLENGTH)
-          print prefix "\"command\": \"" cmd "\"" suffix
+          print prefix "\"command\": \"" json_escape(ENVIRON["KRES_SEMCODE_CMD"]) "\"" suffix
           replaced = 1
           next
         }
@@ -317,32 +354,46 @@ if [[ -n "${SEMCODE_CMD}" ]]; then
 fi
 
 # Per-user settings — default model ids per agent role. kres reads
-# ~/.kres/settings.json on every start. The shipped file has two
-# placeholder tokens (@SLOW_MODEL@ for the slow role and opus alias,
-# @MODEL@ for fast/main/todo and the sonnet alias); the classifier role is
-# pinned in the shipped file to the Haiku config. We substitute placeholders
-# with --slow / --model values (or the built-in defaults).
+# ~/.kres/settings.json on every start. The shipped file has three
+# placeholder tokens for the selected provider's role defaults. We substitute
+# them with --slow / --model values (or the provider defaults above).
 settings_dst="${DEST}/settings.json"
 if [[ -e "${settings_dst}" ]] && [[ "${OVERWRITE}" -ne 1 ]]; then
   say "keep: ${settings_dst}"
 else
   settings_tmp="$(mktemp "${settings_dst}.tmp.XXXXXX")"
+  KRES_SLOW_MODEL="${SLOW_MODEL}" \
+  KRES_MODEL="${MODEL}" \
+  KRES_CLASSIFIER_MODEL="${CLASSIFIER_MODEL}" \
   awk \
-    -v slow_ph="@SLOW_MODEL@" -v slow_val="${SLOW_MODEL}" \
-    -v reg_ph="@MODEL@" -v reg_val="${MODEL}" \
+    -v slow_ph="@SLOW_MODEL@" \
+    -v reg_ph="@MODEL@" \
+    -v classifier_ph="@CLASSIFIER_MODEL@" \
     '
-    function subst(line, ph, val,    out, i, lp) {
+    function json_escape(s,    out, i, c) {
+      out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else out = out c
+      }
+      return out
+    }
+    function subst(line, ph, val,    out, i, lp, replacement) {
       lp = length(ph)
+      replacement = json_escape(val)
       out = ""
       while ((i = index(line, ph)) > 0) {
-        out  = out substr(line, 1, i - 1) val
+        out  = out substr(line, 1, i - 1) replacement
         line = substr(line, i + lp)
       }
       return out line
     }
     {
-      line = subst($0, slow_ph, slow_val)
-      line = subst(line, reg_ph, reg_val)
+      line = subst($0, slow_ph, ENVIRON["KRES_SLOW_MODEL"])
+      line = subst(line, reg_ph, ENVIRON["KRES_MODEL"])
+      line = subst(line, classifier_ph, ENVIRON["KRES_CLASSIFIER_MODEL"])
       print line
     }
     ' "${CONFIGS_SRC}/settings.json" > "${settings_tmp}"
@@ -446,10 +497,3 @@ else
 fi
 
 echo "done."
-if [[ -z "${FAST_KEY_VALUE}" ]] || [[ -z "${SLOW_KEY_VALUE}" ]]; then
-  echo
-  echo "note: one or both model-config placeholders were not substituted."
-  echo "      edit ${DEST}/models/*.json and replace @FAST_KEY@ / @SLOW_KEY@ with"
-  echo "      your API key strings, or re-run setup.sh with --fast-key /"
-  echo "      --slow-key and literal key values."
-fi

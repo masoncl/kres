@@ -21,6 +21,7 @@ SIGKILL).
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -39,6 +40,19 @@ active_processes: list[subprocess.Popen] = []
 processes_lock = Lock()
 signal_received = False
 SEVERITIES = {"high", "medium", "low"}
+
+
+def configured_fast_model():
+    """Read the fast-role model selector from ~/.kres/settings.json."""
+    settings_path = Path.home() / ".kres" / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read {settings_path}: {exc}") from exc
+    model = settings.get("models", {}).get("fast")
+    if not isinstance(model, str) or not model.strip():
+        raise RuntimeError(f"{settings_path} has no non-empty models.fast setting")
+    return model.strip()
 
 
 def signal_handler(signum, frame):
@@ -260,7 +274,7 @@ def mark_successful_validation_if_needed(bug_dir):
     return validate_state(bug_dir)
 
 
-def validate_one(kres_bin, workspace, bug_dir, timeout):
+def validate_one(kres_bin, slow_model, workspace, bug_dir, timeout):
     """Run kres --prompt 'validate: <bug_dir> <workspace>' with cwd = workspace.
 
     Returns (bug_dir, returncode, combined_output).
@@ -274,7 +288,7 @@ def validate_one(kres_bin, workspace, bug_dir, timeout):
     # the Rust side with exit 101.
     cmd = [
         kres_bin,
-        "--slow", "sonnet",
+        "--slow-model", slow_model,
         "--prompt", f"validate: {bug_dir} {workspace}",
         "--stdio",
         "--one",
@@ -401,6 +415,12 @@ Examples:
     )
     args = parser.parse_args()
 
+    try:
+        slow_model = configured_fast_model()
+    except RuntimeError as exc:
+        print(f"model configuration error: {exc}", file=sys.stderr)
+        return 1
+
     # Validate paths.
     if not args.kres_bin or not os.access(args.kres_bin, os.X_OK):
         target = args.kres_bin or "(none on $PATH)"
@@ -497,6 +517,7 @@ Examples:
                 executor.submit(
                     validate_one,
                     args.kres_bin,
+                    slow_model,
                     workspace,
                     d,
                     args.timeout,

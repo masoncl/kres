@@ -6,14 +6,14 @@
 //! ```json
 //! {
 //!   "models": {
-//!     "fast": "vertex-dummy.json:claude-sonnet-4-6",
+//!     "fast": "anthropic.json:claude-sonnet-5",
 //!     "slow": "anthropic.json:claude-opus-4-8",
-//!     "main": "vertex-dummy.json:claude-sonnet-4-6",
-//!     "todo": "vertex-dummy.json:claude-sonnet-4-6",
+//!     "main": "anthropic.json:claude-sonnet-5",
+//!     "todo": "anthropic.json:claude-sonnet-5",
 //!     "classifier": "anthropic.json:claude-haiku-4-5"
 //!   },
 //!   "model_aliases": {
-//!     "sonnet": "vertex-dummy.json:claude-sonnet-4-6",
+//!     "sonnet": "anthropic.json:claude-sonnet-5",
 //!     "opus": "anthropic.json:claude-opus-4-8"
 //!   },
 //!   "actions": {
@@ -396,15 +396,13 @@ mod tests {
     #[test]
     fn shipped_settings_template_matches_strict_schema() {
         let rendered = include_str!("../../configs/settings.json")
-            .replace("@MODEL@", "claude-sonnet-4-6")
-            .replace("@SLOW_MODEL@", "claude-opus-4-8");
+            .replace("@MODEL@", "claude-sonnet-5")
+            .replace("@SLOW_MODEL@", "claude-opus-4-8")
+            .replace("@CLASSIFIER_MODEL@", "claude-haiku-4-5");
         let settings: Settings = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(settings.models.fast.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(settings.models.fast.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(settings.models.slow.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(
-            settings.resolve_model_selector("sonnet"),
-            "claude-sonnet-4-6"
-        );
+        assert_eq!(settings.resolve_model_selector("sonnet"), "claude-sonnet-5");
         assert_eq!(settings.resolve_model_selector("opus"), "claude-opus-4-8");
     }
 

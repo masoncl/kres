@@ -536,8 +536,8 @@ fn kres_config_dirs() -> Vec<PathBuf> {
 /// known shorthand. Other selectors are model ids or provider:model pairs.
 fn slow_tag_to_model_id(tag: &str) -> Option<&'static str> {
     match tag.to_ascii_lowercase().as_str() {
-        "sonnet" => Some("claude-sonnet-4-6"),
-        "opus" => Some("claude-opus-4-7"),
+        "sonnet" => Some("claude-sonnet-5"),
+        "opus" => Some("claude-opus-4-8"),
         _ => None,
     }
 }
@@ -2626,7 +2626,7 @@ mod tests {
         let models = base.join("models");
         std::fs::create_dir_all(&models).unwrap();
         let provider = models.join("anthropic.json");
-        std::fs::write(&provider, r#"{"models":{"claude-sonnet-4-6":{}}}"#).unwrap();
+        std::fs::write(&provider, r#"{"models":{"claude-sonnet-5":{}}}"#).unwrap();
 
         let (found, model_override) = resolve_slow_selector_in_dirs(
             "sonnet",
@@ -2634,8 +2634,8 @@ mod tests {
             std::slice::from_ref(&base),
         )
         .unwrap();
-        assert_eq!(found, qualified_model_path(&provider, "claude-sonnet-4-6"));
-        assert_eq!(model_override.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(found, qualified_model_path(&provider, "claude-sonnet-5"));
+        assert_eq!(model_override.as_deref(), Some("claude-sonnet-5"));
 
         std::fs::remove_dir_all(base).ok();
     }

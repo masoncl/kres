@@ -2,15 +2,15 @@
   "provider": "claude-codes",
   "claude_path": "claude",
   "models": {
-    "claude-sonnet-4-6": {
-      "max_tokens": 64000,
-      "max_input_tokens": 900000,
-      "thinking": {"type": "adaptive", "effort": "high"}
-    },
-    "claude-opus-4-7": {
+    "claude-sonnet-5": {
       "max_tokens": 128000,
       "max_input_tokens": 900000,
-      "thinking": {"type": "adaptive", "effort": "high"}
+      "thinking": {"type": "adaptive", "effort": "medium"}
+    },
+    "claude-opus-4-8": {
+      "max_tokens": 128000,
+      "max_input_tokens": 900000,
+      "thinking": {"type": "adaptive", "effort": "medium"}
     }
   }
 }

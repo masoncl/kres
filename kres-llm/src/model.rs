@@ -41,7 +41,7 @@ impl Model {
     pub fn from_id(id: impl Into<String>) -> Self {
         let id: String = id.into();
         let max_output_tokens = match id.as_str() {
-            "claude-opus-4-7" | "claude-opus-4-6" => 128_000,
+            "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => 128_000,
             id if is_openai_model(id) => 128_000,
             _ => 64_000,
         };
@@ -271,6 +271,7 @@ mod tests {
 
     #[test]
     fn from_id_known_values() {
+        assert_eq!(Model::from_id("claude-opus-4-8").max_output_tokens, 128_000);
         assert_eq!(Model::from_id("claude-opus-4-7").max_output_tokens, 128_000);
         assert_eq!(Model::from_id("claude-opus-4-6").max_output_tokens, 128_000);
     }

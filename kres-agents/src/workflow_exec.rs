@@ -2596,8 +2596,114 @@ fn eval_builtin(
 ) -> Result<(bool, Option<String>), String> {
     match name {
         "fix_research_status" => Ok(eval_fix_research_status(step, ctx)),
+        "fix_series_assessment" => Ok(eval_fix_series_assessment(step, ctx)),
         "orchestrator_dispatch" => Ok(eval_orchestrator_dispatch(step, ctx)),
         other => Err(format!("unknown builtin eval '{other}'")),
+    }
+}
+
+fn eval_fix_series_assessment(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(complete) = output_bool(outputs, "complete") else {
+        return eval_fail("complete must be a boolean");
+    };
+    let Some(decision) = output_str(outputs, "decision") else {
+        return eval_fail("decision must be a string");
+    };
+    if complete != (decision == "complete") {
+        return eval_fail("complete and decision are inconsistent");
+    }
+
+    let Some(remaining_work) = outputs.get("remaining_work").and_then(Value::as_array) else {
+        return eval_fail("remaining_work must be an array");
+    };
+    if complete && !remaining_work.is_empty() {
+        return eval_fail("a complete assessment cannot have remaining_work");
+    }
+    if decision == "revise_pending_plan" {
+        if remaining_work.is_empty() {
+            return eval_fail("revise_pending_plan requires remaining_work");
+        }
+        if !outputs.get("plan_update").is_some_and(Value::is_object) {
+            return eval_fail("revise_pending_plan requires plan_update");
+        }
+    }
+
+    let Some(tracked) = ctx
+        .workflow_inputs
+        .get("fix_series_state")
+        .and_then(|state| state.get("original_bugs"))
+        .and_then(Value::as_array)
+    else {
+        return eval_fail("fix_series_state.original_bugs must be an array");
+    };
+    let expected = tracked
+        .iter()
+        .filter_map(|item| item.get("id")?.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if expected.len() != tracked.len() {
+        return eval_fail("fix_series_state contains missing or duplicate original bug ids");
+    }
+    let Some(outcomes) = outputs.get("outcomes").and_then(Value::as_array) else {
+        return eval_fail("outcomes must be an array");
+    };
+    let mut actual = std::collections::BTreeSet::new();
+    for (index, outcome) in outcomes.iter().enumerate() {
+        let Some(object) = outcome.as_object() else {
+            return eval_fail(&format!("outcomes[{index}] must be an object"));
+        };
+        if object.len() != 3
+            || !object.contains_key("bug")
+            || !object.contains_key("outcome")
+            || !object.contains_key("evidence")
+        {
+            return eval_fail(&format!(
+                "outcomes[{index}] must contain exactly bug, outcome, and evidence"
+            ));
+        }
+        let Some(bug) = object
+            .get("bug")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            return eval_fail(&format!("outcomes[{index}].bug must be non-empty"));
+        };
+        let Some(disposition) = object.get("outcome").and_then(Value::as_str) else {
+            return eval_fail(&format!("outcomes[{index}].outcome must be a string"));
+        };
+        if !matches!(
+            disposition,
+            "fixed" | "invalidated" | "duplicate" | "unresolved"
+        ) {
+            return eval_fail(&format!(
+                "outcomes[{index}].outcome '{disposition}' is invalid"
+            ));
+        }
+        let Some(_evidence) = object
+            .get("evidence")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return eval_fail(&format!("outcomes[{index}].evidence must be non-empty"));
+        };
+        if complete && !matches!(disposition, "fixed" | "invalidated" | "duplicate") {
+            return eval_fail(&format!(
+                "outcomes[{index}].outcome '{disposition}' is not a completed disposition"
+            ));
+        }
+        if !actual.insert(bug) {
+            return eval_fail(&format!("outcomes contains duplicate bug id '{bug}'"));
+        }
+    }
+    if actual != expected {
+        return eval_fail("outcomes must cover every original bug exactly once");
+    }
+    if complete || decision == "revise_pending_plan" {
+        (true, None)
+    } else {
+        eval_fail(&format!("series assessment decision is '{decision}'"))
     }
 }
 
@@ -3365,6 +3471,99 @@ mod tests {
 
     fn fix_workflow() -> Workflow {
         parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap()
+    }
+
+    fn series_assessment_context(
+        outputs: Value,
+    ) -> (Step, Map<String, Value>, HashMap<String, StepState>) {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "series-assessment")
+            .unwrap();
+        let mut inputs = Map::new();
+        inputs.insert(
+            "fix_series_state".into(),
+            json!({"original_bugs": [
+                {"id": "bug-a", "description": "a"},
+                {"id": "bug-b", "description": "b"}
+            ]}),
+        );
+        let mut steps = HashMap::new();
+        steps.insert(
+            step.id.clone(),
+            StepState {
+                outputs: outputs.as_object().unwrap().clone(),
+                ..StepState::default()
+            },
+        );
+        (step, inputs, steps)
+    }
+
+    #[test]
+    fn series_assessment_requires_exact_evidenced_coverage() {
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": true,
+            "decision": "complete",
+            "remaining_work": [],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "fixed", "evidence": "commit a"},
+                {"bug": "bug-b", "outcome": "invalidated", "evidence": "source:b"}
+            ]
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_fix_series_assessment(&step, &ctx), (true, None));
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": false,
+            "decision": "revise_pending_plan",
+            "remaining_work": ["add bug-c todo"],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "invented", "evidence": "x"},
+                {"bug": "bug-b", "outcome": "unresolved", "evidence": "missing audit"}
+            ],
+            "plan_update": {"expected_revision": 2, "operations": []}
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert!(!eval_fix_series_assessment(&step, &ctx).0);
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": true,
+            "decision": "complete",
+            "remaining_work": [],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "fixed", "evidence": "commit a"}
+            ]
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let (passed, reason) = eval_fix_series_assessment(&step, &ctx);
+        assert!(!passed);
+        assert!(reason.unwrap().contains("cover every original bug"));
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": false,
+            "decision": "revise_pending_plan",
+            "remaining_work": ["add bug-c todo"],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "fixed", "evidence": "commit a"},
+                {"bug": "bug-b", "outcome": "unresolved", "evidence": "missing caller audit"}
+            ],
+            "plan_update": {"expected_revision": 2, "operations": []}
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_fix_series_assessment(&step, &ctx), (true, None));
     }
 
     #[test]
@@ -5215,6 +5414,7 @@ mod tests {
         m.insert("target".into(), json!("/tmp/finding"));
         m.insert("target_kind".into(), json!("finding_dir"));
         m.insert("target_artifact_dir".into(), json!("/tmp/finding"));
+        m.insert("fix_run_mode".into(), json!("standalone"));
         m
     }
 
@@ -5226,6 +5426,7 @@ mod tests {
         );
         m.insert("target_kind".into(), json!("prose"));
         m.insert("target_artifact_dir".into(), json!(""));
+        m.insert("fix_run_mode".into(), json!("standalone"));
         m
     }
 

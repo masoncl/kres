@@ -117,7 +117,22 @@
     "fix_run_mode": {
       "type": "string",
       "required": false,
-      "description": "Machine-provided mode: planning for the initial research/status pass, todo for a per-todo full fix run."
+      "description": "Machine-provided mode: planning for the initial research/status pass, todo for a per-todo full fix run, or final for the series completion gate."
+    },
+    "fix_series_state": {
+      "type": "object",
+      "required": false,
+      "description": "Machine-provided revisioned outer-series state used by the final completion gate."
+    },
+    "fix_plan_revision": {
+      "type": "integer",
+      "required": false,
+      "description": "Machine-provided current outer fix-plan revision for stale-update protection."
+    },
+    "fix_series_commits": {
+      "type": "array<string>",
+      "required": false,
+      "description": "Machine-provided exact commit list for final series publication."
     }
   },
   "skills": [
@@ -141,7 +156,7 @@
     {
       "id": "research",
       "title": "Research the bug",
-      "agent": "fast",
+      "agent": "slow",
       "mode": "audit",
       "actions": [
         "read",
@@ -166,6 +181,7 @@
         "",
         "CURRENT FIX TODO, IF THIS IS A PER-TODO RUN:",
         "{{workflow.current_fix_todo || ''}}",
+        "CURRENT FIX PLAN REVISION: {{workflow.fix_plan_revision || '0'}}",
         "",
         "PRIOR RESEARCH ATTEMPTS FROM THIS RUN (oldest first; empty on first attempt):",
         "{{research.prior_attempts || ''}}",
@@ -178,7 +194,7 @@
         "or commit evidence that ruled the prior shape out). If a prior attempt's blocking",
         "followups were not gathered, finish gathering them before proposing a new shape.",
         "",
-        "Research has two modes:",
+        "Research has two modes with separate authority:",
         "- Planning mode: when CURRENT FIX TODO is empty, determine whether the input contains",
         "  one bug or multiple independently committable bugs. Create fix_plan as an ordered",
         "  array of todos, one per commit. Every todo must have id, title, scope, affected_files,",
@@ -192,7 +208,11 @@
         "  todo depends on an earlier one to compile, be safe, or make semantic sense, encode",
         "  that ordering in depends_on instead of merging them into one todo. For invalid or",
         "  unconfirmed research, fix_plan may be omitted or empty.",
-        "- Per-todo mode: when CURRENT FIX TODO is non-empty, validate only that todo against",
+        "  Also emit bug_inventory with one stable id and description per original distinct bug.",
+        "  Bug identity is independent of commit decomposition: multiple fix_plan todos may",
+        "  address one bug, and one todo may contribute to multiple bugs. When metadata.bugs",
+        "  exists, preserve those exact ids and descriptions in bug_inventory.",
+        "- Per-todo mode: when CURRENT FIX TODO is non-empty, verify only that todo against",
         "  workspace HEAD and return research fields scoped to that todo. Keep fix_plan equal",
         "  to the broader series plan so later steps understand the surrounding series, but do",
         "  not broaden affected_files, affected_symbols, or the fix contract beyond the current",
@@ -202,8 +222,16 @@
         "  fix_contract_proven=false, invalidity_proven=false, and return fix_plan with a",
         "  revised version of the current todo using the same id. Put the corrected scope,",
         "  affected files/symbols, fix_contract, rationale, and depends_on in that typed",
-        "  todo. Rust may replace the current todo and rerun it; do not rely on prose to",
+        "  todo. You are not the series planner in this mode: do not add, remove, reorder,",
+        "  split, or merge other todos unless the evidence requires a typed plan_update. Rust may replace the current todo and rerun it; do not rely on prose to",
         "  carry the correction.",
+        "  When evidence requires changing the remaining graph, emit plan_update with",
+        "  expected_revision equal to CURRENT FIX PLAN REVISION and ordered operations.",
+        "  Supported operations are replace_current(todo), split_current(todos),",
+        "  append_after_current(todos), revise_pending(todo), and remove_pending(id).",
+        "  Completed todos are immutable. Every resulting dependency must still name an",
+        "  earlier todo. Use plan_update only with research_status=unconfirmed; Rust validates",
+        "  and atomically applies the complete update before rerunning from the current index.",
         "",
         "If KIND is finding_dir, read FINDING.md, summary.md, and metadata.yaml from the target",
         "before doing anything else. metadata.yaml.git.sha is the audit's HEAD; the workspace",
@@ -372,6 +400,89 @@
           "type": "array<object>",
           "optional": true,
           "description": "Ordered series plan. Each item is one independent commit todo with id, title, scope, affected_files, affected_symbols, fix_contract, rationale, and depends_on."
+        },
+        "bug_inventory": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "description"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "description": {"type": "string"}
+              }
+            }
+          },
+          "description": "Immutable original bug identities. Required for confirmed planning research; separate from commit-oriented fix_plan todos."
+        },
+        "plan_update": {
+          "type": "object",
+          "optional": true,
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["expected_revision", "operations"],
+            "properties": {
+              "expected_revision": {"type": "integer"},
+              "operations": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["op", "todo"],
+                      "properties": {
+                        "op": {"const": "replace_current"},
+                        "todo": {"type": "object"}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["op", "todos"],
+                      "properties": {
+                        "op": {"const": "split_current"},
+                        "todos": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["op", "todos"],
+                      "properties": {
+                        "op": {"const": "append_after_current"},
+                        "todos": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["op", "todo"],
+                      "properties": {
+                        "op": {"const": "revise_pending"},
+                        "todo": {"type": "object"}
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["op", "id"],
+                      "properties": {
+                        "op": {"const": "remove_pending"},
+                        "id": {"type": "string", "minLength": 1}
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "description": "Revision-checked atomic mutation of current or pending series work. Valid only for unconfirmed per-todo research."
         },
         "research_decision": {
           "type": "object",
@@ -1216,14 +1327,9 @@
       ],
       "lenses": [
         {
-          "id": "lifetime",
+          "id": "memory-lifetime",
           "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
-          "investigate": "Object lifetime: pointer ownership, refcounting, RCU grace periods, free ordering, copied pointers, and shared object lifetime."
-        },
-        {
-          "id": "memory",
-          "skip_if": "orchestrator.next_step == 'write-commit-message' && write-commit-message.code_changes_emitted != true",
-          "investigate": "Memory safety: leaks, use-after-free, double-free, memory corruption, and allocator API misuse."
+          "investigate": "Memory safety and object lifetime: allocation and initialization, pointer ownership, refcounting, RCU grace periods, asynchronous use, cleanup paths, callback ownership, object layout, free ordering, copied pointers, shared object lifetime, leaks, use-after-free, double-free, uninitialized memory, memory corruption, and allocator API misuse. Pure index, range, and arithmetic errors remain owned by the bounds lens."
         },
         {
           "id": "bounds",
@@ -1379,7 +1485,7 @@
         "review"
       ],
       "run_if": "research.research_status == 'confirmed' && ((write-patch.code_changes_emitted == false && write-patch.review_dispute == '') || write-commit-message.commit_message_written == false || review.clean == false || build.result == 'failed')",
-      "agent": "fast",
+      "agent": "slow",
       "mode": "audit",
       "actions": [
         "read",
@@ -1548,6 +1654,125 @@
           "optional": true,
           "description": "Status files updated when research.is_latent is true."
         }
+      }
+    },
+    {
+      "id": "series-assessment",
+      "title": "Assess complete fix series",
+      "agent": "slow",
+      "mode": "audit",
+      "run_if": "workflow.fix_run_mode == 'final'",
+      "actions": [
+        "read",
+        "source",
+        "type",
+        "git",
+        "grep",
+        "callers"
+      ],
+      "prompt": [
+        "You are the authoritative final planner for a completed kres fix series.",
+        "",
+        "ORIGINAL TARGET: {{workflow.target}}",
+        "REVISIONED SERIES STATE:",
+        "{{workflow.fix_series_state}}",
+        "SERIES BASE COMMIT: {{workflow.fix_series_state.base_head}}",
+        "EXACT SERIES COMMITS (oldest first): {{workflow.fix_series_commits}}",
+        "",
+        "Inspect the original finding artifacts when present, the immutable fix_series_state.original_bugs inventory, the complete commit series and current source, and the recorded todo dispositions. Do not judge only HEAD~1. Every original bug component must be fixed by a cited commit/source hunk, invalidated by source or reachable commit evidence, or matched to a proven upstream duplicate. A merely deferred or unexamined component is incomplete. Negative coverage claims require concrete search, source, caller, or history evidence.",
+        "",
+        "Set complete=true only when the complete series satisfies the original target and every planned todo is done. Otherwise set complete=false and return decision=revise_pending_plan when a concrete additional or revised todo can finish the work, unconfirmed when required evidence is still missing, or failure when the produced series is incorrect and cannot safely advance. Put machine routing only in the typed fields.",
+        "",
+        "Return one JSON object with complete, decision, analysis, remaining_work, outcomes, and optional plan_update. remaining_work is an array of concrete missing items with evidence or exact evidence requests. outcomes contains one object per id in fix_series_state.original_bugs with exactly bug, outcome (fixed | invalidated | duplicate | unresolved), and evidence; complete=true is incompatible with unresolved. For revise_pending_plan, plan_update is required: expected_revision must match the supplied state and every operation must be append_after_current with one or more independently committable todos."
+      ],
+      "outputs": {
+        "complete": {
+          "type": "boolean"
+        },
+        "decision": {
+          "type": "enum",
+          "values": [
+            "complete",
+            "revise_pending_plan",
+            "unconfirmed",
+            "failure"
+          ]
+        },
+        "analysis": {
+          "type": "string"
+        },
+        "remaining_work": {
+          "type": "array<string>"
+        },
+        "outcomes": {
+          "type": "array<object>",
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["bug", "outcome", "evidence"],
+              "properties": {
+                "bug": {"type": "string", "minLength": 1},
+                "outcome": {"type": "string", "enum": ["fixed", "invalidated", "duplicate", "unresolved"]},
+                "evidence": {"type": "string", "minLength": 1}
+              }
+            }
+          },
+          "description": "Final per-original-bug outcomes for deterministic finding metadata update."
+        },
+        "plan_update": {
+          "type": "object",
+          "optional": true,
+          "description": "Required with revise_pending_plan. Revision-checked append_after_current operations add follow-up todos after the completed series."
+        }
+      },
+      "eval": {
+        "type": "builtin",
+        "name": "fix_series_assessment",
+        "on_fail": {
+          "action": "exit_failure",
+          "max_attempts": 1,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "final-record-results",
+      "title": "Record final series outcomes",
+      "depends_on": ["series-assessment"],
+      "run_if": "workflow.fix_run_mode == 'final' && series-assessment.complete == true && workflow.target_artifact_dir != ''",
+      "agent": "reaper",
+      "action": {
+        "type": "set-finding-results",
+        "args": {
+          "finding_dir": "{{workflow.target_artifact_dir}}",
+          "from": "series-assessment"
+        }
+      },
+      "outputs": {
+        "files_updated": {"type": "array<string>"},
+        "outcomes_written": {"type": "integer"}
+      }
+    },
+    {
+      "id": "final-publish",
+      "title": "Publish assessed fix series",
+      "depends_on": ["final-record-results"],
+      "run_if": "workflow.fix_run_mode == 'final' && series-assessment.complete == true && workflow.target_artifact_dir != ''",
+      "agent": "reaper",
+      "action": {
+        "type": "publish-fix",
+        "args": {
+          "finding_dir": "{{workflow.target_artifact_dir}}",
+          "commits": "{{workflow.fix_series_commits}}",
+          "status_when_series_is_latent": "confirmed_latent"
+        }
+      },
+      "outputs": {
+        "patch_paths": {"type": "array<string>"},
+        "status": {"type": "string", "optional": true},
+        "files_updated": {"type": "array<string>", "optional": true}
       }
     }
   ],

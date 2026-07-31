@@ -216,9 +216,17 @@ the bug still exists at the current workspace HEAD.
 
 ### Fix Steps
 
+Before the per-todo workflow starts, the outer driver runs `research` in
+planning mode with primary-slow synthesis. Its `fix_plan` becomes revisioned,
+atomically persisted `fix-series.json` state. Planning mode owns decomposition;
+per-todo research verifies the selected item and can change remaining work only
+through a bounded, revision-checked typed update.
+`--resume` reloads this outer state and resumes any matching inner workflow
+snapshot.
+
 1. **research**
 
-   The fast/audit agent pulls affected files, callers, enough source
+   The primary-slow audit agent receives fast-gathered affected files, callers, enough source
    context, and enough local history to decide whether the bug is real
    and how to fix it. It does not own exhaustive `Fixes:` provenance;
    that is a separate workflow step after the patch exists.
@@ -672,9 +680,9 @@ the bug still exists at the current workspace HEAD.
 
    LLM review only. It reviews `git diff HEAD~1`, callee/source context,
    and the commit message. It runs parallel lenses so each reviewer gets
-   its own context window: object-lifetime, memory, bounds, races,
-   general, commit assertions, and an antagonistic kernel-maintainer
-   lens.
+   its own context window: combined memory-safety/object-lifetime,
+   bounds, races, commit assertions, an antagonistic kernel-maintainer
+   lens, and bug coverage.
 
    The one supported shape for `/fix` review is the `review` step in
    `configs/workflows/fix.json` with a non-empty `lenses` array and
@@ -785,7 +793,8 @@ the bug still exists at the current workspace HEAD.
 
 10. **publish**
 
-   Reaper action `publish-fix`, only when `target_artifact_dir` is set
+   Reaper action `publish-fix`, only for standalone/non-series execution when
+   `target_artifact_dir` is set
    and review is clean. It runs `git format-patch -1 --stdout HEAD`,
    writes the current fix's patch into the artifact directory, records
    the patch name under `auto_generated_fixes:` in `metadata.yaml`
@@ -798,6 +807,34 @@ the bug still exists at the current workspace HEAD.
    structured plan says the finding has only one component, publish also
    sets `metadata.yaml`, `FINDING.md`, and the `summary.md` status section
    (when present) to `confirmed_latent`.
+
+11. **series-assessment**
+
+   After every planned todo has completed, a primary-slow final assessment
+   reviews the original finding, revisioned series state, complete commit
+   sequence, and current source. It does not judge only `HEAD~1`. The series is
+   successful only when every planned todo is done and every original bug
+   component is fixed, invalidated with evidence, or matched to a proven
+   upstream duplicate. Deferred or unexamined components fail the gate.
+
+   The typed decision is `complete`, `revise_pending_plan`, `unconfirmed`, or
+   `failure`. A revision decision must carry a stale-checked plan update made
+   only of `append_after_current` operations. Rust validates and persists the
+   new todos, runs them through the normal fix pipeline, and repeats the final
+   assessment. Other non-`complete` decisions fail while preserving structured
+   remaining work in the workflow trace. A builtin validator requires outcomes
+   to cover the authoritative todo IDs exactly once, with a valid disposition
+   and non-empty evidence. Complete decisions also require empty remaining work
+   and prohibit unresolved outcomes.
+
+12. **final-record-results / final-publish**
+
+   Series runs blank `target_artifact_dir` for every per-todo execution, so the
+   ordinary record/publish steps cannot mutate finding success artifacts before
+   the final gate. After `series-assessment.complete=true`, these JSON-defined
+   reaper steps write the assessor's final per-bug outcomes and format the exact
+   persisted commit list, oldest first. Publication is therefore downstream of
+   whole-series completion rather than downstream of each local review.
 
 ### Fix Series
 
@@ -828,6 +865,28 @@ full `fix_series_plan`, the selected `current_fix_todo`, one-based
 `fix_index`, and `fix_run_mode=todo` in workflow inputs. The planning
 pass uses `fix_run_mode=planning`.
 
+The outer snapshot also records the pre-series HEAD, completed commit SHA for
+each todo, and each todo's typed review outcomes. Successful todo commit
+identity is read from the repository's current HEAD, including when an accepted
+review dispute skipped the commit step. Inner snapshot directories
+include todo identity, outer plan revision, and todo revision. Before final
+assessment, Rust verifies that the persisted commits are an exact parent chain
+from the recorded base through current HEAD.
+
+On resume, an absent outer snapshot falls back to the durable planning snapshot
+instead of failing. Before each pending todo starts, Rust verifies workspace
+HEAD against the completed commit prefix. It accepts a direct child only when
+the matching inner snapshot records that commit or an accepted review-dispute
+path, covering the crash window between inner commit persistence and outer-state
+reconciliation.
+
+Planning records an immutable `original_bugs` inventory separately from the
+commit-oriented todo graph. Existing finding `metadata.bugs` is authoritative;
+prose findings receive the planning model's typed `bug_inventory`. Every
+outer-state reconciliation persists `fix-series.json` and rewrites
+`metadata.bugs` from that immutable inventory. Structural revisions, splits,
+removals, final appended work, and resume cannot change original bug identity.
+
 Per-todo research must stay confirmed to reach patch writing. If the bug
 is still proven but the current todo's fix contract is wrong or
 incomplete, research returns `unconfirmed` with
@@ -836,7 +895,17 @@ incomplete, research returns `unconfirmed` with
 `fix_plan` containing a revised version of the current todo with the
 same `id`. Rust validates that replacement todo, updates the in-memory
 series plan, and reruns the same todo. Each todo has a small revision
-budget so a bad contract cannot loop forever. If research returns
+budget so a bad contract cannot loop forever.
+
+When new evidence requires a structural change, per-todo research may instead
+emit a revision-checked `plan_update`. Its `expected_revision` must equal the
+persisted outer revision. The supported atomic operations replace or split the
+current todo, append work immediately after it, revise later pending work, or
+remove later pending work. Completed work is immutable, and Rust validates the
+entire resulting ordered dependency graph before committing the update. A
+stale, partial, empty, or invalid update fails without changing series state.
+
+If research returns
 invalid, unconfirmed without a usable revised todo, or exhausts the
 revision budget, the workflow fails that todo instead of marking the
 whole finding invalid/unconfirmed. For invalid per-todo research with
@@ -852,11 +921,12 @@ fixes in workspace history, but patch-writing is instructed to edit only
 the current todo's scope.
 
 Top-level fix series runs persist planning and every todo/revision in distinct
-`workflow-state` subdirectories. Automatic series-level `--resume` is not yet
-supported because the outer todo list itself is not a workflow snapshot; the
-driver rejects explicit series resume flags rather than pretending that one
-inner step snapshot represents the entire series. A per-todo workflow run can
-still resume normally when `current_fix_todo` is provided explicitly.
+`workflow-state` subdirectories. The outer driver atomically stores the
+revisioned todo graph and statuses in `fix-series.json`. On `--resume`, an
+interrupted outer `InProgress` item becomes `Pending`, then its matching inner
+workflow snapshot resumes so already-settled edits, commits, builds, and review
+steps are not repeated. Completed outer todos are skipped. The final
+`series-assessment` has its own resumable inner snapshot as well.
 
 ### Fix Flow Invariants
 

@@ -2485,6 +2485,12 @@ impl Session {
             .await
     }
 
+    async fn stash_interruptible_prompt(&self, text: &str, operator_submission: bool) {
+        if operator_submission {
+            *self.interrupted_prompt.lock().await = Some(text.to_string());
+        }
+    }
+
     async fn submit_prompt_inner(
         &self,
         text: String,
@@ -2574,10 +2580,13 @@ impl Session {
             }
         }
 
-        // §22: stash the prompt so a ctrl-c during inference leaves
-        // enough state for /continue to re-submit. Cleared after
-        // spawn — the spawned task owns re-execution from here.
-        *self.interrupted_prompt.lock().await = Some(text.clone());
+        // §22: only operator submissions use the interruption stash.
+        // Pipeline work is already represented by a todo carrying its
+        // identity, dependency, and plan-step linkage; resubmitting its bare
+        // prompt through the operator path would lose that state and derive a
+        // new narrow session goal.
+        self.stash_interruptible_prompt(&text, include_recent_context)
+            .await;
         // Track the latest prompt for session.json persistence.
         *self.last_prompt.lock().await = Some(text.clone());
 
@@ -4012,15 +4021,19 @@ impl Session {
 
     /// §46: decide whether the idle loop should auto-launch a
     /// `/continue` on timeout. Conditions (mirroring):
-    /// no active tasks, at least one pending todo, and at least one
-    /// pending item whose deps are satisfied.
+    /// no tracked tasks (including terminal tasks awaiting reaping), at least
+    /// one pending todo, and at least one pending item whose deps are
+    /// satisfied.
     async fn should_auto_continue(&self) -> bool {
         use kres_core::TodoStatus;
         if self.stop_latched.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
-        let running = self.mgr.active_count().await;
-        if running > 0 {
+        // A terminal task remains publishable until the reaper removes it.
+        // Treating active_count()==0 as idle races the reaper: auto-continue
+        // can otherwise redispatch while the terminal result is still waiting
+        // to update findings, todos, and the interruption stash.
+        if !self.mgr.snapshot().await.is_empty() {
             return false;
         }
         let items = self.mgr.todo_snapshot().await;
@@ -5874,6 +5887,60 @@ mod tests {
         // without stdin plumbing, but we can assert construction
         // leaves `agent_runner` unset.
         assert!(s.agent_runner.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_continue_waits_for_terminal_task_to_be_reaped() {
+        let mgr = TaskManager::new();
+        assert!(
+            mgr.seed_todo_if_empty(vec![kres_core::TodoItem::new("next", "review")])
+                .await
+        );
+        let s = Session::new(mgr.clone(), ReplConfig::default()).await;
+        mgr.spawn("finished but unreaped", None, |_| async {
+            Ok(kres_core::task::TaskOutcome {
+                analysis: "done".to_string(),
+                ..Default::default()
+            })
+        })
+        .await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if mgr
+                    .snapshot()
+                    .await
+                    .iter()
+                    .all(|task| task.state.is_terminal())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task should reach a terminal state");
+
+        assert_eq!(mgr.active_count().await, 0);
+        assert!(
+            !s.should_auto_continue().await,
+            "terminal-but-unreaped task must block auto-continue"
+        );
+        assert_eq!(mgr.reap().await.len(), 1);
+        assert!(s.should_auto_continue().await);
+    }
+
+    #[tokio::test]
+    async fn pipeline_submission_does_not_replace_operator_interruption_stash() {
+        let s = Session::new(TaskManager::new(), ReplConfig::default()).await;
+
+        s.stash_interruptible_prompt("operator prompt", true).await;
+        s.stash_interruptible_prompt("pipeline prompt", false).await;
+
+        assert_eq!(
+            s.interrupted_prompt.lock().await.as_deref(),
+            Some("operator prompt")
+        );
     }
 
     #[tokio::test]

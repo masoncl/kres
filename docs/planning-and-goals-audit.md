@@ -19,7 +19,7 @@ pipeline.
 | --- | --- | --- | --- |
 | Generic task pipeline | ordinary `--prompt`, REPL input | task/todo loop | main-model `define_goal` + `define_plan` |
 | Review | `/review TARGET`, `--prompt 'review: TARGET'` | task/todo loop configured by `review.json` | primary-slow `define_goal` + staged `define_plan`; primary-slow todo/goal review |
-| Fix series | `/fix TARGET`, `--prompt 'fix: TARGET'`, workflow runner | JSON workflow executor | static 16-step DAG plus fast-model `research.fix_plan` |
+| Fix series | `/fix TARGET`, `--prompt 'fix: TARGET'`, workflow runner | JSON workflow executor plus outer series driver | static 19-step DAG plus primary-slow `research.fix_plan`, revisioned outer state, and final series assessment |
 | Validation | `/validate DIR [WORKSPACE]`, `--prompt 'validate: ...'`, workflow runner | JSON workflow executor | static two-step DAG |
 | Triage | `/triage DIR`, `--prompt 'triage: DIR'`, workflow runner | JSON workflow executor | static one-step DAG |
 
@@ -56,9 +56,52 @@ expressions form a static executable plan. The workflow executor does not call
 decided deterministically from step state and the workflow's expressions.
 
 Fix has a third, workflow-local layer: `research.fix_plan`. That is an ordered
-array of independently committable fix todos generated at runtime. Rust runs
-the static fix workflow once per todo. It is not a `kres_core::Plan`, is not
-shown by `/plan`, and is not judged by `check_goal`.
+array of independently committable fix todos generated at runtime by the
+primary slow model. Rust runs the static fix workflow once per todo and stores
+the authoritative tracked plan, statuses, per-todo revision counts, and plan
+revision in `fix-series.json`. It is not a `kres_core::Plan` and is not shown by
+`/plan`. After every todo completes, a final primary-slow `series-assessment`
+checks the complete commit sequence against the original target.
+
+Planning and execution verification are mode-scoped responsibilities within
+the shared JSON `research` contract. In planning mode, research owns the series
+decomposition. In per-todo mode, it verifies the selected todo and may submit a
+revision-checked mutation of current or pending work. Completed work is
+immutable, structural revisions are bounded, and stale revisions are rejected.
+Both modes use slow synthesis after normal fast gathering and deterministic
+fetches.
+
+The outer fix-series snapshot is atomic and resumable. An interrupted
+`InProgress` todo resets to `Pending`, while the matching inner workflow
+snapshot resumes its already-settled commit/build/review steps instead of
+restarting the todo against a partially modified tree.
+Snapshot directories include the stable todo identity, outer plan revision,
+and todo revision so a revised or split todo cannot resume an older shape's
+inner workflow state.
+If interruption occurs before outer state exists, resume continues the planning
+snapshot. Before dispatching pending work, the driver validates HEAD against the
+completed prefix, with a narrow allowance for a matching inner snapshot that
+already owns the next commit.
+
+The outer state stores immutable `original_bugs` separately from mutable,
+commit-oriented todos. Existing artifact `metadata.bugs` is authoritative;
+prose targets use the planning model's typed `bug_inventory`. Reconciliation
+rewrites artifact metadata from that immutable inventory, so structural
+revisions cannot erase bug coverage. The outer snapshot records the pre-series Git HEAD,
+every completed todo's commit SHA read from the repository after successful
+execution, and its typed review outcomes. Before final assessment, Rust proves
+that those commits form an exact first-parent chain from the recorded base to
+the current HEAD. Per-todo runs do not publish finding results or patch files.
+After the final assessment passes, JSON-defined reaper steps record the final
+outcomes and publish the exact persisted commit list. A builtin evaluator
+requires final outcomes to cover every authoritative todo exactly once with a
+valid disposition and non-empty evidence before completion or plan revision is
+accepted.
+
+The patch-cycle `orchestrator` also uses the primary slow model. It retains the
+existing typed branch contract and executor reset semantics, but now shares the
+same model quality tier as initial planning and final completion rather than
+delegating correctness routing to the fast model.
 
 ## Task/todo goal lifecycle
 
@@ -584,36 +627,39 @@ and todos.
 
 ## Fix-series workflow
 
-`configs/workflows/fix.json` is a statically authored 16-step graph containing
+`configs/workflows/fix.json` is a statically authored 19-step graph containing
 research, status recording, lore search, patch writing, commit-message writing,
 commit, build, compile triage, review, orchestration, result recording, and
-publication. Its `completion` expressions are the workflow's explicit success
-and failure criteria. It does not use the session goal judge or session plan.
+final assessed publication. Its `completion` expressions are the workflow's
+explicit success and failure criteria. It does not use the session goal judge
+or session plan.
 
 Before running the full graph, `run_fix_series_driver` clones the workflow and
-runs only `research`, `invalidate`, and `unconfirm` as a planning/status pass.
+runs `research`, `invalidate`, and `unconfirm` as a
+planning/status pass.
 When research confirms the finding, `research.fix_plan` must contain one or
 more typed todos with stable ID, title, scope, affected files and symbols, fix
 contract, rationale, and dependencies.
 
-The research step is declared `agent: fast`. In the production AgentRunner
-path it still gets normal fast gathering and deterministic tool execution, but
-its final synthesis also uses the **fast model**. Thus the runtime fix
-decomposition and fix contracts are currently authored by the fast model, not
-the slow model.
+The research step is declared `agent: slow`. It gets normal fast gathering and
+deterministic tool execution, then primary-slow synthesis. Planning mode owns
+the initial decomposition; per-todo mode verifies one item and can propose a
+bounded, revision-checked mutation of current or pending work.
 
 Rust validates the generated plan, rejects duplicate or empty IDs and forward
 dependencies, then executes the complete static workflow once per todo in
-dependency order. Per-todo research may revise the current todo, preserving its
-ID, when the bug remains proven but the proposed fix contract is incomplete.
-Those revisions are again generated by the fast-model research step and are
-bounded to three attempts.
+dependency order. Same-ID and structural plan revisions are bounded. The outer
+state persists the pre-series HEAD, plan revision, todo statuses, completed
+commit SHAs, and review outcomes. Resume uses identity- and revision-qualified
+inner snapshots.
 
 Later decisions are distributed across roles: code/slow writes patches and
-commit messages, slow lenses review, fast consolidation and the fast
+commit messages, slow lenses review, fast consolidation and the primary-slow
 `orchestrator` choose retry routing, and deterministic reaper steps perform
-mutations. These decisions refine or execute the fix plan but do not replace
-the top-level series plan.
+mutations. Per-todo runs defer finding-result and patch publication. A final
+primary-slow assessment receives the exact base, commit list, todo graph, and
+outcomes; only its clean result enables JSON-defined final record/publish
+steps.
 
 ## Validation workflow
 
@@ -647,10 +693,10 @@ exists.
 | Decision | Generic | Review | Fix | Validation | Triage |
 | --- | --- | --- | --- | --- | --- |
 | Define outcome goal | main | primary slow | static JSON completion/prompt | static JSON prompt/eval | static JSON prompt/eval |
-| Build initial plan | main | primary slow, staged dependencies | static DAG; fast creates `fix_plan` | static DAG | static one-step DAG |
-| Source-informed plan revision | first slow call, then todo | named-file scan before initial goal/plan; primary-slow reconciliation after tasks | fast per-todo research | none | none |
-| Decide followup priority | todo | primary slow with deterministic identity/state guards | static DAG + fast orchestrator | static dependency | n/a |
-| Decide completion | main goal judge | primary-slow goal judge plus followup guard | Rust expressions/evals | Rust step/eval state | Rust step/eval state |
+| Build initial plan | main | primary slow, staged dependencies | static DAG; primary slow creates `fix_plan` | static DAG | static one-step DAG |
+| Source-informed plan revision | first slow call, then todo | named-file scan before initial goal/plan; primary-slow reconciliation after tasks | primary-slow research with revision guard | none | none |
+| Decide followup priority | todo | primary slow with deterministic identity/state guards | static DAG + primary-slow orchestrator | static dependency | n/a |
+| Decide completion | main goal judge | primary-slow goal judge plus followup guard | final primary-slow assessment + Rust eval | Rust step/eval state | Rust step/eval state |
 | Deep analysis | slow | parallel slow lenses | mixed by step | slow final pass | slow |
 
 ## Findings and remaining migration risks

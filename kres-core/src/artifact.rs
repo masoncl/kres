@@ -11,9 +11,9 @@ pub struct FindingBug {
 }
 
 /// A per-bug result entry recorded in `metadata.yaml` under `results:`.
-/// `bug` is the stable id from `metadata.bugs[]` or
-/// `research.fix_plan[].id`; for single-bug findings it may be empty.
-/// `outcome` is `fixed | invalidated | deferred | unresolved`.
+/// `bug` is the stable id from `metadata.bugs[]`; legacy single-bug
+/// findings may leave it empty.
+/// `outcome` is `fixed | invalidated | deferred | duplicate | unresolved`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindingResult {
     pub bug: String,
@@ -414,10 +414,48 @@ pub fn set_finding_bugs(finding_dir: &Path, bugs: &[FindingBug]) -> std::io::Res
     Ok(vec![metadata_path])
 }
 
+/// Read the complete top-level `bugs:` inventory from `metadata.yaml`.
+pub fn read_finding_bugs(finding_dir: &Path) -> std::io::Result<Vec<FindingBug>> {
+    let path = finding_dir.join("metadata.yaml");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let body = std::fs::read_to_string(&path)?;
+    let value: serde_yaml::Value = serde_yaml::from_str(&body).map_err(std::io::Error::other)?;
+    let Some(items) = value.get("bugs").and_then(serde_yaml::Value::as_sequence) else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let id = item
+                .get("id")
+                .and_then(serde_yaml::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bugs[{index}].id must be a non-empty string"),
+                    )
+                })?;
+            let description = item
+                .get("description")
+                .and_then(serde_yaml::Value::as_str)
+                .unwrap_or_default();
+            Ok(FindingBug {
+                id: id.to_string(),
+                description: description.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Replace (or insert) the top-level `results:` block in
 /// `metadata.yaml`. Each entry records what happened to one bug from
 /// the finding's `bugs:` list — `outcome` is `fixed | invalidated |
-/// deferred | unresolved` and `evidence` is a short prose pointer
+/// deferred | duplicate | unresolved` and `evidence` is a short prose pointer
 /// (file:line, commit ref, linked todo id, etc.). The block is
 /// written as a full replacement: callers pass the complete current
 /// result set, not a delta.
@@ -1401,6 +1439,26 @@ status: active
         assert!(updated.contains("- id: 'refcount'\n"));
         assert!(updated.contains("id: F1\n"));
         assert!(updated.contains("status: active\n"));
+    }
+
+    #[test]
+    fn read_finding_bugs_round_trips_written_inventory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("metadata.yaml"), "id: F1\nstatus: active\n").unwrap();
+        std::fs::write(dir.join("FINDING.md"), "# F1\n").unwrap();
+        let bugs = vec![
+            FindingBug {
+                id: "original-a".to_string(),
+                description: "first bug".to_string(),
+            },
+            FindingBug {
+                id: "original-b".to_string(),
+                description: "second bug".to_string(),
+            },
+        ];
+        set_finding_bugs(dir, &bugs).unwrap();
+        assert_eq!(read_finding_bugs(dir).unwrap(), bugs);
     }
 
     #[test]

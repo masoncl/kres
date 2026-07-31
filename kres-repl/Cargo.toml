@@ -29,3 +29,4 @@ crossterm = "0.28"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tempfile = "3"

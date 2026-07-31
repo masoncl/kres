@@ -1189,7 +1189,7 @@ impl AgentRunner {
             cfg = cfg.with_thinking(thinking);
         }
         // System prompt selection:
-        // - synthesis_use_routing_prompt (orchestrator step only):
+        // - synthesis_use_routing_prompt (orchestrator step only, independent of client):
         //   use the dedicated routing-agent system prompt. That step
         //   is pure routing over typed inputs and the routing prompt
         //   matches that shape.

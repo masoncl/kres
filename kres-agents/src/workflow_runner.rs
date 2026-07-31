@@ -1230,6 +1230,60 @@ impl LlmDriver {
                     })?;
                 let dir = interpolate(dir, &self.workflow, ctx, Some(&step.id))
                     .map_err(|e| format!("publish-fix dir interpolation: {e}"))?;
+                let commits = action
+                    .args
+                    .as_ref()
+                    .and_then(|a| a.get("commits"))
+                    .map(|value| {
+                        resolve_action_string_array(value, &self.workflow, ctx, Some(&step.id))
+                    })
+                    .transpose()
+                    .map_err(|e| format!("publish-fix commits: {e}"))?;
+                if let Some(commits) = commits {
+                    if commits.is_empty() {
+                        return Err("publish-fix commits must not be empty".to_string());
+                    }
+                    let mut paths = Vec::with_capacity(commits.len());
+                    for (idx, commit) in commits.iter().enumerate() {
+                        paths.push(
+                            run_publish_fix_commit(
+                                &self.workspace,
+                                &dir,
+                                u32::try_from(idx + 1)
+                                    .map_err(|_| "too many fix commits to publish".to_string())?,
+                                commit,
+                            )
+                            .await?,
+                        );
+                    }
+                    let mut out = Map::new();
+                    out.insert(
+                        "patch_paths".into(),
+                        Value::Array(paths.into_iter().map(Value::String).collect()),
+                    );
+                    if fix_series_is_single_latent(ctx) {
+                        if let Some(status) = action
+                            .args
+                            .as_ref()
+                            .and_then(|args| args.get("status_when_series_is_latent"))
+                            .and_then(Value::as_str)
+                        {
+                            let status = interpolate(status, &self.workflow, ctx, Some(&step.id))
+                                .map_err(|e| {
+                                format!("publish-fix series latent status interpolation: {e}")
+                            })?;
+                            let files_updated = run_set_finding_status(&dir, &status, None, None)?;
+                            out.insert("status".into(), Value::String(status));
+                            out.insert(
+                                "files_updated".into(),
+                                Value::Array(
+                                    files_updated.into_iter().map(Value::String).collect(),
+                                ),
+                            );
+                        }
+                    }
+                    return Ok(out);
+                }
                 let fix_index = action
                     .args
                     .as_ref()
@@ -2235,6 +2289,39 @@ pub fn interpolate(
     interpolate_with_lens_binding(src, workflow, ctx, current_step, LensInterpolation::None)
 }
 
+fn resolve_action_string_array(
+    value: &Value,
+    workflow: &Workflow,
+    ctx: &ExecContext<'_>,
+    current_step: Option<&str>,
+) -> Result<Vec<String>> {
+    if value.is_array() {
+        return serde_json::from_value(value.clone())
+            .map_err(|error| anyhow!("must be an array of strings: {error}"));
+    }
+    let template = value
+        .as_str()
+        .ok_or_else(|| anyhow!("must be an array or template string"))?;
+    let trimmed = template.trim();
+    if let Some(expr) = trimmed
+        .strip_prefix("{{")
+        .and_then(|expr| expr.strip_suffix("}}"))
+    {
+        let resolved = resolve_one(
+            expr.trim(),
+            workflow,
+            ctx,
+            current_step,
+            LensInterpolation::None,
+        )?;
+        return serde_json::from_value(resolved)
+            .map_err(|error| anyhow!("template must resolve to an array of strings: {error}"));
+    }
+    let interpolated = interpolate(template, workflow, ctx, current_step)?;
+    serde_json::from_str(&interpolated)
+        .map_err(|error| anyhow!("must be a JSON array of strings: {error}"))
+}
+
 /// Lens-aware interpolation. When `lens` is `Some`, `{{lens.<key>}}`
 /// references resolve against the lens object's fields (any field
 /// declared on the lens map, including the special `id`). Used by
@@ -2679,6 +2766,11 @@ pub fn extract_outputs(text: &str, step: &Step) -> Result<Map<String, Value>> {
 /// require. Other derive entries are passed through unchanged so
 /// the workflow author can extend the set without code changes.
 pub fn derive_inputs(workflow: &Workflow, mut inputs: Map<String, Value>) -> Map<String, Value> {
+    if workflow.id == "fix" {
+        inputs
+            .entry("fix_run_mode".to_string())
+            .or_insert_with(|| Value::String("standalone".to_string()));
+    }
     if let Some(target) = inputs.get("target").and_then(|v| v.as_str()) {
         if let Some(path) = normalized_finding_dir(target) {
             grant_finding_dir_consent(&path);
@@ -2791,6 +2883,22 @@ fn normalized_finding_dir(s: &str) -> Option<PathBuf> {
 
 fn grant_finding_dir_consent(path: &Path) {
     let _ = kres_core::consent::get_or_install().grant_from_mention(path);
+}
+
+fn fix_series_is_single_latent(ctx: &ExecContext<'_>) -> bool {
+    let Some(tracked) = ctx
+        .workflow_inputs
+        .get("fix_series_state")
+        .and_then(|state| state.get("tracked"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    tracked.len() == 1
+        && tracked[0]
+            .get("is_latent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 fn research_invalid_evidence_is_actionable(ctx: &ExecContext<'_>) -> bool {
@@ -3855,24 +3963,48 @@ async fn run_publish_fix(
     finding_dir: &str,
     fix_index: u32,
 ) -> Result<String, String> {
+    run_publish_fix_commit(workspace, finding_dir, fix_index, "HEAD").await
+}
+
+async fn git_rev_parse_commit(workspace: &Path, commit: &str) -> Result<String, String> {
+    let commitish = format!("{commit}^{{commit}}");
+    let output = tokio::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["rev-parse", "--verify", &commitish])
+        .output()
+        .await
+        .map_err(|e| format!("git rev-parse {commit}: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse {commit} exited {}: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+async fn run_publish_fix_commit(
+    workspace: &Path,
+    finding_dir: &str,
+    fix_index: u32,
+    commit: &str,
+) -> Result<String, String> {
     let dir = PathBuf::from(finding_dir);
     if !dir.is_absolute() {
         return Err(format!("finding_dir must be absolute: {finding_dir}"));
     }
     let fix_name = kres_core::auto_generated_fix_name(fix_index);
     let fix_path = dir.join(&fix_name);
-    if let Some(head_sha) = git_rev_parse_head_optional(workspace).await {
-        if kres_core::patch_file_matches_head_named(&dir, &fix_name, &head_sha).unwrap_or(false) {
-            kres_core::ensure_artifact_dir_files(&dir)
-                .map_err(|e| format!("prepare {finding_dir}: {e}"))?;
-            kres_core::clear_invalidation_artifacts(&dir)
-                .map_err(|e| format!("clear invalidation artifacts in {finding_dir}: {e}"))?;
-            return Ok(fix_path.display().to_string());
-        }
+    let commit_sha = git_rev_parse_commit(workspace, commit).await?;
+    if kres_core::patch_file_matches_head_named(&dir, &fix_name, &commit_sha).unwrap_or(false) {
+        kres_core::record_auto_generated_fix_named(&dir, &fix_name)
+            .map_err(|e| format!("record auto-generated fix in {finding_dir}: {e}"))?;
+        return Ok(fix_path.display().to_string());
     }
     let mut cmd = tokio::process::Command::new("git");
     cmd.current_dir(workspace)
-        .args(["format-patch", "-1", "--stdout", "HEAD"])
+        .args(["format-patch", "-1", "--stdout", &commit_sha])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = match tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output()).await {
@@ -5013,18 +5145,16 @@ fn is_mutating_git_followup(command: &str) -> bool {
 /// routing/decision agent; the user message is authoritative;
 /// emit only the JSON it specifies." That fits the orchestrator
 /// step (pure routing over already-typed inputs) and only that
-/// step. Research, lore-search, fixes-tag-search, and
-/// compile-triage are all `agent: fast` too, but they analyze
-/// gathered code or history and need the fast-gather system
-/// prompt at synthesis time — the routing prompt would tell them
-/// "you are not analyzing code," which contradicts their own
-/// user-message prompts.
+/// step. Client selection is independent: the fix orchestrator now
+/// uses the primary slow model while retaining the routing system
+/// contract. Other fast steps analyze gathered code or history and
+/// need the fast-gather system prompt at synthesis time.
 ///
 /// Hardcoded by step id because today the orchestrator is the
 /// only pure-routing step. If more arrive, replace this with a
 /// typed step field (e.g. `synthesis_system: "routing-agent"`).
-fn use_routing_prompt_for_synth(step_id: &str, synthesis_use_fast: bool) -> bool {
-    synthesis_use_fast && step_id == "orchestrator"
+fn use_routing_prompt_for_synth(step_id: &str, _synthesis_use_fast: bool) -> bool {
+    step_id == "orchestrator"
 }
 
 fn agent_runner_with_gated_fetcher(
@@ -5860,6 +5990,31 @@ mod tests {
         };
         let s = interpolate("BUG INPUT: {{workflow.target}}", &wf, &ctx, None).unwrap();
         assert_eq!(s, "BUG INPUT: /tmp/finding");
+    }
+
+    #[test]
+    fn action_string_array_template_preserves_json_array() {
+        let wf = fix_workflow();
+        let mut inputs = Map::new();
+        inputs.insert(
+            "fix_series_commits".into(),
+            json!(["851de20dda1e41352a1328899808c84a9f97f37a"]),
+        );
+        let states = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+
+        let commits = resolve_action_string_array(
+            &json!("{{workflow.fix_series_commits}}"),
+            &wf,
+            &ctx,
+            Some("final-publish"),
+        )
+        .unwrap();
+
+        assert_eq!(commits, vec!["851de20dda1e41352a1328899808c84a9f97f37a"]);
     }
 
     #[test]
@@ -6951,6 +7106,16 @@ mod tests {
             "stale partial invalidation",
         )
         .unwrap();
+        std::fs::write(
+            artifact.path().join("metadata.yaml"),
+            "id: F1\nstatus: active\n",
+        )
+        .unwrap();
+        std::fs::write(
+            artifact.path().join("summary.md"),
+            "[FINDING.md](FINDING.md) | [metadata.yaml](metadata.yaml)\n\nbody\n",
+        )
+        .unwrap();
         let second = run_publish_fix(repo.path(), artifact.path().to_str().unwrap(), 1)
             .await
             .unwrap();
@@ -6965,6 +7130,58 @@ mod tests {
             .path()
             .join(kres_core::PARTIAL_INVALIDATION_NAME)
             .exists());
+        assert!(
+            std::fs::read_to_string(artifact.path().join("metadata.yaml"))
+                .unwrap()
+                .contains("auto_generated_fixes:\n- auto-generated-fix.diff\n")
+        );
+        assert!(std::fs::read_to_string(artifact.path().join("summary.md"))
+            .unwrap()
+            .contains(kres_core::AUTO_GENERATED_FIX_LINK));
+    }
+
+    #[tokio::test]
+    async fn publish_fix_commit_formats_exact_historical_commits() {
+        let repo = init_test_git_repo();
+        let mut commits = Vec::new();
+        for (value, subject) in [("2", "fix: first"), ("3", "fix: second")] {
+            std::fs::write(repo.path().join("a.c"), format!("int x = {value};\n")).unwrap();
+            assert!(std::process::Command::new("git")
+                .args(["add", "a.c"])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+            assert!(std::process::Command::new("git")
+                .args(["commit", "-q", "-m", subject])
+                .current_dir(repo.path())
+                .status()
+                .unwrap()
+                .success());
+            commits.push(git_rev_parse_head_optional(repo.path()).await.unwrap());
+        }
+
+        let artifact = tempfile::tempdir().unwrap();
+        std::fs::write(
+            artifact.path().join("metadata.yaml"),
+            "id: F1\nstatus: active\n",
+        )
+        .unwrap();
+        std::fs::write(artifact.path().join("FINDING.md"), "# F1\n").unwrap();
+        std::fs::write(artifact.path().join("summary.md"), "# F1\n").unwrap();
+
+        for (idx, commit) in commits.iter().enumerate() {
+            let path = run_publish_fix_commit(
+                repo.path(),
+                artifact.path().to_str().unwrap(),
+                u32::try_from(idx + 1).unwrap(),
+                commit,
+            )
+            .await
+            .unwrap();
+            let patch = std::fs::read_to_string(path).unwrap();
+            assert!(patch.starts_with(&format!("From {commit} ")));
+        }
     }
 
     #[tokio::test]
@@ -7882,6 +8099,15 @@ mod tests {
         let derived = derive_inputs(&wf, inputs);
         assert_eq!(derived.get("target_kind"), Some(&json!("prose")));
         assert_eq!(derived.get("target_artifact_dir"), Some(&json!("")));
+    }
+
+    #[test]
+    fn derive_fix_inputs_defaults_run_mode_to_standalone() {
+        let workflow = crate::workflow::lookup_workflow(None, "fix").unwrap();
+        let mut inputs = Map::new();
+        inputs.insert("target".into(), Value::String("fix this".into()));
+        let derived = derive_inputs(&workflow, inputs);
+        assert_eq!(derived.get("fix_run_mode"), Some(&json!("standalone")));
     }
 
     #[test]
@@ -9564,7 +9790,7 @@ mod tests {
         // fix.json declares agent:fast, but the predicate is honest
         // about the precondition) → no routing prompt because the
         // routing prompt is paired with the fast client.
-        assert!(!use_routing_prompt_for_synth("orchestrator", false));
+        assert!(use_routing_prompt_for_synth("orchestrator", false));
 
         // Other fast-tagged workflow steps → no routing prompt.
         for other_step in [

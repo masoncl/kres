@@ -1086,7 +1086,31 @@ mod tests {
         // steps around the LLM-authored patch/provenance/message/review
         // steps, plus the post-review orchestrator that routes the
         // next step when review is not clean.
-        assert_eq!(wf.steps.len(), 16, "fix workflow has 16 steps");
+        assert_eq!(wf.steps.len(), 19, "fix workflow has 19 steps");
+        assert_eq!(
+            wf.steps
+                .iter()
+                .find(|step| step.id == "research")
+                .unwrap()
+                .agent,
+            Some(Agent::Slow),
+            "fix planning and per-todo verification use the primary slow model"
+        );
+        let series_assessment = wf
+            .steps
+            .iter()
+            .find(|step| step.id == "series-assessment")
+            .expect("final assessment step");
+        assert_eq!(
+            series_assessment.run_if.as_deref(),
+            Some("workflow.fix_run_mode == 'final'")
+        );
+        assert!(series_assessment.depends_on.is_empty());
+        assert!(wf
+            .steps
+            .iter()
+            .any(|step| step.id == "final-record-results"));
+        assert!(wf.steps.iter().any(|step| step.id == "final-publish"));
         let research = wf.steps.iter().find(|s| s.id == "research").unwrap();
         let research_eval = research.eval.as_ref().expect("research eval");
         assert_eq!(research_eval.kind, EvalKind::Builtin);
@@ -1273,7 +1297,22 @@ mod tests {
                 ][..]
             )
         );
-        assert_eq!(review.lenses.len(), 7);
+        assert_eq!(review.lenses.len(), 6);
+        assert!(review.lenses.iter().any(|l| {
+            l.id == "memory-lifetime"
+                && l.fields
+                    .get("investigate")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| {
+                        s.contains("Memory safety and object lifetime")
+                            && s.contains("use-after-free")
+                            && s.contains("refcounting")
+                    })
+        }));
+        assert!(!review
+            .lenses
+            .iter()
+            .any(|l| l.id == "lifetime" || l.id == "memory"));
         assert_eq!(review.aggregate, Some(Aggregate::Consolidate));
         assert!(review.consolidate.is_some());
         let review_prompt = review.prompt.as_deref().unwrap_or("");

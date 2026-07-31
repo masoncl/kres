@@ -50,6 +50,9 @@ struct LogEntry<'a> {
     thinking: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     request: Option<&'a RequestMeta>,
+    /// Model identifier reported by the provider for an assistant response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_model: Option<&'a str>,
 }
 
 /// Wire-relevant request config snapshot. Populated on user-side
@@ -157,6 +160,31 @@ impl TurnLogger {
         self.log_code_labeled_with_request(role, label, content, usage, thinking, None);
     }
 
+    /// Log an assistant response with the model identifier returned by the provider.
+    pub fn log_code_labeled_with_model(
+        &self,
+        role: &str,
+        label: Option<&str>,
+        content: &str,
+        usage: Option<LoggedUsage>,
+        thinking: Option<&str>,
+        response_model: Option<&str>,
+    ) {
+        let entry = LogEntry {
+            timestamp: log_timestamp(),
+            role,
+            label,
+            content,
+            usage,
+            thinking,
+            request: None,
+            response_model,
+        };
+        if let Err(e) = self.write(true, &entry) {
+            tracing::warn!(target: "kres_core::log", "code log write failed: {e}");
+        }
+    }
+
     /// Like `log_code_labeled` but also serialises a `request` block
     /// describing the wire-format request config (model, max_tokens,
     /// thinking shape). Use this from call sites that go straight to
@@ -178,6 +206,7 @@ impl TurnLogger {
             usage,
             thinking,
             request,
+            response_model: None,
         };
         if let Err(e) = self.write(true, &entry) {
             tracing::warn!(target: "kres_core::log", "code log write failed: {e}");
@@ -200,6 +229,7 @@ impl TurnLogger {
             usage,
             thinking,
             request: None,
+            response_model: None,
         };
         if let Err(e) = self.write(false, &entry) {
             tracing::warn!(target: "kres_core::log", "main log write failed: {e}");
@@ -288,6 +318,27 @@ mod tests {
         assert!(main.contains("\"timestamp\":"));
         assert!(main.contains("\"role\":\"user\""));
         assert!(!main.contains("\"usage\""));
+    }
+
+    #[test]
+    fn assistant_response_model_is_logged_without_changing_label() {
+        let dir = tempdir().unwrap();
+        let log = TurnLogger::new(dir.path()).unwrap();
+        log.log_code_labeled_with_model(
+            "assistant",
+            Some("phase=slow"),
+            "done",
+            None,
+            None,
+            Some("claude-opus-4-8"),
+        );
+        let path = log.session_dir().join("code.jsonl");
+        drop(log);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["label"], "phase=slow");
+        assert_eq!(value["response_model"], "claude-opus-4-8");
     }
 
     #[test]

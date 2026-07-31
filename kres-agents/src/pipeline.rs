@@ -662,12 +662,13 @@ fn build_lens_call_future(
                     let t = extract_text(&resp);
                     if let Some(lg) = &logger {
                         let th = extract_thinking(&resp);
-                        lg.log_code_labeled(
+                        lg.log_code_labeled_with_model(
                             "assistant",
                             Some(&log_label),
                             &t,
                             Some(log_usage(&resp.usage)),
                             th.as_deref(),
+                            resp.model.as_deref(),
                         );
                     }
                     let parsed = diagnose_code_response(&t);
@@ -946,12 +947,13 @@ impl AgentRunner {
                     if let Some(lg) = &self.logger {
                         let thinking = extract_thinking(&resp);
                         let label = format!("phase=fast-gather task={log_task} round={fast_rounds}");
-                        lg.log_code_labeled(
+                        lg.log_code_labeled_with_model(
                             "assistant",
                             Some(&label),
                             &t,
                             Some(log_usage(&resp.usage)),
                             thinking.as_deref(),
+                            resp.model.as_deref(),
                         );
                     }
                     t
@@ -1297,12 +1299,13 @@ impl AgentRunner {
                 if let Some(lg) = &self.logger {
                     let thinking = extract_thinking(&resp);
                     let label = format!("phase={log_phase} task={log_task}");
-                    lg.log_code_labeled(
+                    lg.log_code_labeled_with_model(
                         "assistant",
                         Some(&label),
                         &t,
                         Some(log_usage(&resp.usage)),
                         thinking.as_deref(),
+                        resp.model.as_deref(),
                     );
                 }
                 t
@@ -2296,12 +2299,13 @@ impl AgentRunner {
                     if let Some(lg) = &self.logger {
                         let th = extract_thinking(&resp);
                         let label = format!("phase=fast-gather-lenses round={fast_rounds}");
-                        lg.log_code_labeled(
+                        lg.log_code_labeled_with_model(
                             "assistant",
                             Some(&label),
                             &t,
                             Some(log_usage(&resp.usage)),
                             th.as_deref(),
+                            resp.model.as_deref(),
                         );
                     }
                     t

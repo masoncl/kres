@@ -275,6 +275,23 @@ pub struct Client {
     /// Submission channel for one long-lived, multiplexed Codex app-server.
     codex_dispatcher:
         Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<CodexCommand>>>>,
+    /// Idle Claude CLI processes, separated by immutable invocation settings.
+    claude_pool: Arc<tokio::sync::Mutex<HashMap<ClaudePoolKey, Vec<IdleClaudeClient>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ClaudePoolKey {
+    model: String,
+    system: Option<String>,
+    thinking: String,
+}
+
+const MAX_IDLE_CLAUDE_CLIENTS_PER_KEY: usize = 8;
+const CLAUDE_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+struct IdleClaudeClient {
+    client: claude_codes::AsyncClient,
+    idle_since: tokio::time::Instant,
 }
 
 struct CodexCommand {
@@ -1015,8 +1032,7 @@ impl Client {
         cfg: &CallConfig,
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
-        use claude_codes::{AsyncClient, ClaudeCliBuilder, ClaudeOutput, PermissionMode};
-        use std::process::Stdio;
+        use claude_codes::ClaudeOutput;
 
         let LlmCredentials::ClaudeCodes {
             api_key,
@@ -1041,39 +1057,48 @@ impl Client {
         }
         prompt.push_str("Respond only to the conversation above.");
 
-        let mut builder = ClaudeCliBuilder::new()
-            .model(&cfg.model.id)
-            .permission_mode(PermissionMode::DontAsk)
-            .settings(r#"{"permissions":{"deny":["*"]}}"#);
-        if let Some(path) = claude_path {
-            builder = builder.command(path);
-        }
-        if let Some(key) = api_key {
-            builder = builder.api_key(key);
-        }
-        if let Some(system) = cfg.system.as_deref() {
-            builder = builder.append_system_prompt(system);
-        }
-        if let crate::model::ThinkingBudget::ExplicitBudget(tokens) = cfg.thinking {
-            builder = builder.max_thinking_tokens(tokens);
-        }
-
-        let mut command = builder
-            .build_command()
-            .map_err(|e| LlmError::Other(format!("claude-codes initialization failed: {e}")))?;
-        command.stderr(Stdio::null());
-        if let Some(url) = base_url {
-            command.env("ANTHROPIC_BASE_URL", url);
-        }
-        let child = command
-            .spawn()
-            .map_err(|e| LlmError::Other(format!("claude-codes spawn failed: {e}")))?;
-        let mut client = AsyncClient::new(child)
-            .map_err(|e| LlmError::Other(format!("claude-codes initialization failed: {e}")))?;
-        let responses = client
-            .query(&prompt)
-            .await
-            .map_err(|e| LlmError::Other(format!("claude-codes query failed: {e}")))?;
+        let pool_key = ClaudePoolKey {
+            model: cfg.model.id.clone(),
+            system: cfg.system.clone(),
+            thinking: format!("{:?}", cfg.thinking),
+        };
+        let pooled = {
+            let mut pool = self.claude_pool.lock().await;
+            pool.get_mut(&pool_key)
+                .and_then(Vec::pop)
+                .map(|idle| idle.client)
+        };
+        let mut reused = false;
+        let mut client = if let Some(mut client) = pooled {
+            if client.is_alive() {
+                reused = true;
+                client
+            } else {
+                self.spawn_claude_codes_client(
+                    cfg,
+                    claude_path.as_ref(),
+                    api_key.as_deref(),
+                    base_url.as_deref(),
+                )?
+            }
+        } else {
+            self.spawn_claude_codes_client(
+                cfg,
+                claude_path.as_ref(),
+                api_key.as_deref(),
+                base_url.as_deref(),
+            )?
+        };
+        let pid = client.pid();
+        let responses = match client.query(&prompt).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                let _ = client.shutdown().await;
+                return Err(LlmError::Other(format!(
+                    "claude-codes query failed: {error}"
+                )));
+            }
+        };
 
         let mut response_text = String::new();
         let mut actual_model = None;
@@ -1122,16 +1147,82 @@ impl Client {
                 _ => {}
             }
         }
-        client
-            .shutdown()
-            .await
-            .map_err(|e| LlmError::Other(format!("claude-codes shutdown failed: {e}")))?;
+        let reported_model = actual_model.clone();
+        tracing::info!(
+            target: "kres_llm::claude_codes",
+            requested_model = %cfg.model.id,
+            reported_model = reported_model.as_deref().unwrap_or("unknown"),
+            pid = pid.unwrap_or_default(),
+            reused,
+            "Claude Code request completed"
+        );
         if let Some(error) = result_error {
+            let _ = client.shutdown().await;
             return Err(LlmError::Other(format!(
                 "claude-codes query failed: {error}"
             )));
         }
-
+        let reset_ok = client
+            .query("/clear")
+            .await
+            .map(|responses| {
+                responses.iter().any(
+                    |response| matches!(response, ClaudeOutput::Result(result) if !result.is_error),
+                )
+            })
+            .unwrap_or(false)
+            && client.is_alive();
+        if reset_ok {
+            let mut pool = self.claude_pool.lock().await;
+            let clients = pool.entry(pool_key.clone()).or_default();
+            if clients.len() < MAX_IDLE_CLAUDE_CLIENTS_PER_KEY {
+                let idle_since = tokio::time::Instant::now();
+                clients.push(IdleClaudeClient { client, idle_since });
+                let pool = Arc::clone(&self.claude_pool);
+                let pid = clients.last().and_then(|idle| idle.client.pid());
+                tokio::spawn(async move {
+                    tokio::time::sleep(CLAUDE_CLIENT_IDLE_TIMEOUT).await;
+                    let expired = {
+                        let mut pool = pool.lock().await;
+                        let clients = pool.get_mut(&pool_key);
+                        let position = clients.as_ref().and_then(|clients| {
+                            clients.iter().position(|idle| {
+                                idle.idle_since == idle_since && idle.client.pid() == pid
+                            })
+                        });
+                        let expired = position.and_then(|position| {
+                            clients.and_then(|clients| {
+                                (idle_since.elapsed() >= CLAUDE_CLIENT_IDLE_TIMEOUT)
+                                    .then(|| clients.swap_remove(position).client)
+                            })
+                        });
+                        if pool.get(&pool_key).is_some_and(Vec::is_empty) {
+                            pool.remove(&pool_key);
+                        }
+                        expired
+                    };
+                    if let Some(client) = expired {
+                        tracing::info!(
+                            target: "kres_llm::claude_codes",
+                            pid = pid.unwrap_or_default(),
+                            "shutting down idle Claude Code process"
+                        );
+                        let _ = client.shutdown().await;
+                    }
+                });
+            } else {
+                drop(pool);
+                let _ = client.shutdown().await;
+            }
+        } else {
+            tracing::warn!(
+                target: "kres_llm::claude_codes",
+                requested_model = %cfg.model.id,
+                pid = pid.unwrap_or_default(),
+                "discarding Claude Code process after failed context reset"
+            );
+            let _ = client.shutdown().await;
+        }
         Ok(MessagesResponse {
             model: actual_model.or_else(|| Some(cfg.model.id.clone())),
             stop_reason,
@@ -1140,6 +1231,48 @@ impl Client {
                 text: response_text,
             }],
         })
+    }
+
+    fn spawn_claude_codes_client(
+        &self,
+        cfg: &CallConfig,
+        claude_path: Option<&std::path::PathBuf>,
+        api_key: Option<&str>,
+        base_url: Option<&str>,
+    ) -> Result<claude_codes::AsyncClient, LlmError> {
+        use claude_codes::{AsyncClient, ClaudeCliBuilder, PermissionMode};
+        use std::process::Stdio;
+
+        let mut builder = ClaudeCliBuilder::new()
+            .model(&cfg.model.id)
+            .permission_mode(PermissionMode::DontAsk)
+            .strict_mcp_config(true)
+            .settings(r#"{"permissions":{"deny":["*"]}}"#);
+        if let Some(path) = claude_path {
+            builder = builder.command(path);
+        }
+        if let Some(key) = api_key {
+            builder = builder.api_key(key);
+        }
+        if let Some(system) = cfg.system.as_deref() {
+            builder = builder.append_system_prompt(system);
+        }
+        if let crate::model::ThinkingBudget::ExplicitBudget(tokens) = cfg.thinking {
+            builder = builder.max_thinking_tokens(tokens);
+        }
+        let mut command = builder
+            .build_command()
+            .map_err(|e| LlmError::Other(format!("claude-codes initialization failed: {e}")))?;
+        command.args(["--bare", "--safe-mode", "--tools", ""]);
+        command.stderr(Stdio::null());
+        if let Some(url) = base_url {
+            command.env("ANTHROPIC_BASE_URL", url);
+        }
+        let child = command
+            .spawn()
+            .map_err(|e| LlmError::Other(format!("claude-codes spawn failed: {e}")))?;
+        AsyncClient::new(child)
+            .map_err(|e| LlmError::Other(format!("claude-codes initialization failed: {e}")))
     }
 
     fn openai_base_url(&self) -> String {
@@ -2045,6 +2178,7 @@ impl ClientBuilder {
             http,
             rate_limiter: self.rate_limiter,
             codex_dispatcher: Arc::new(tokio::sync::Mutex::new(None)),
+            claude_pool: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 }

@@ -29,6 +29,8 @@ DELTA PROTOCOL — read carefully:
 Output: raw, unfenced JSON only—no Markdown backticks and no preamble.
 {"analysis": "brief for slow agent OR status update", "followups": [{"type": "T", "name": "N", "reason": "R"}], "skill_reads": ["/abs/path"], "ready_for_slow": false}
 
+Every followup MUST include a non-empty `reason`. State the precise evidence gap and how the requested result will help prove or disprove the current concern. Do not rely on `analysis` to explain it: downstream agents preserve the reason with the request so they can understand and prioritize the intended evidence.
+
 Set ready_for_slow=true when you have gathered enough context. When true, your 'analysis' field should be a structured brief:
 - Restate the question
 - List what code was gathered and why (reference things in previously_fetched by name)

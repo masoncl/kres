@@ -96,4 +96,7 @@ UNIFIED ANALYSIS — prose for the human reader:
   'filename:line' citations plus embedded relevant_symbols). The
   inline-snippets rule is for the prose analysis ONLY.
 
-Emit the unified {analysis, findings, followups} object.
+Return exactly one raw JSON object with analysis, findings, followups, and comparison.
+Do not return Markdown: no Markdown headings, prose preamble, code fences,
+backticks, or trailing commentary. comparison.selection_notes must remain inside
+the comparison object; never emit selection_notes as a top-level field.

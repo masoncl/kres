@@ -35,10 +35,14 @@ use crate::{
     followup::Followup,
     json_repair::{repair_json_response, JsonContract, JsonRepairCall, RepairLogKind},
     prompt::CodePrompt,
-    response::{diagnose_code_response, CodeResponse, CodeResponseContract, ParseStrategy},
+    response::{
+        diagnose_code_response, log_json_normalization, CodeResponse, CodeResponseContract,
+        ParseStrategy,
+    },
 };
 
 const GENERIC_LENS_REPAIR_RETRIES: usize = 1;
+const JSON_ONLY_OUTPUT_INSTRUCTION: &str = "Return exactly one raw JSON object. Do not return Markdown: no Markdown headings, prose preamble, code fences, backticks, or trailing commentary.";
 const FAST_GATHER_KINDS: &[&str] = &[
     "survey", "source", "type", "callers", "callees", "search", "grep", "read", "file", "find",
     "git", "make", "meson", "cargo", "bash", "lore", "question",
@@ -76,6 +80,10 @@ fn fast_gather_semantic_errors(response: &CodeResponse) -> Vec<String> {
         }
     }
     errors
+}
+
+fn append_json_only_output_instruction(prompt: &str) -> String {
+    format!("{}\n\n{}", prompt.trim_end(), JSON_ONLY_OUTPUT_INSTRUCTION)
 }
 
 fn validate_fast_gather_text(text: &str) -> Result<CodeResponse, Vec<String>> {
@@ -742,7 +750,15 @@ impl AgentRunner {
         shutdown: &Shutdown,
     ) -> Result<CodeResponse, AgentError> {
         let contract = CodeResponseContract::default();
-        let schema = contract.schema_json().to_string();
+        let schema = contract
+            .schema_json_for(&[
+                "analysis",
+                "followups",
+                "skill_reads",
+                "ready_for_slow",
+                "plan",
+            ])
+            .to_string();
         let repaired = repair_json_response(JsonRepairCall {
             client: self.fast_client.clone(),
             model: self.fast_model.clone(),
@@ -791,11 +807,17 @@ impl AgentRunner {
         ctx: &RunContext,
         shutdown: &Shutdown,
     ) -> Result<TaskSummary, AgentError> {
-        let composed = prepend_original_prompt(prompt, &ctx.original_prompt);
+        let composed = append_json_only_output_instruction(&prepend_original_prompt(
+            prompt,
+            &ctx.original_prompt,
+        ));
         let prompt: &str = composed.as_str();
         let gather_composed;
         let gather_prompt = if let Some(gather) = ctx.gather_prompt.as_deref() {
-            gather_composed = prepend_original_prompt(gather, &ctx.original_prompt);
+            gather_composed = append_json_only_output_instruction(&prepend_original_prompt(
+                gather,
+                &ctx.original_prompt,
+            ));
             gather_composed.as_str()
         } else {
             prompt
@@ -968,6 +990,7 @@ impl AgentRunner {
                     repaired
                 }
             };
+            log_json_normalization(self.logger.as_deref(), &parsed, "fast-gather");
 
             // §27: honour skill_reads. Read each requested file and
             // graft it into the first skill's `files` map so the next
@@ -1331,6 +1354,7 @@ impl AgentRunner {
                 synth_max_tokens,
                 synth_max_in,
                 std::mem::take(&mut slow_parsed.invalid_findings),
+                &ctx.previous_findings,
                 crate::finding_repair::FindingRepairRuntime {
                     logger: self.logger.clone(),
                     thinking: synth_thinking,
@@ -1356,6 +1380,7 @@ impl AgentRunner {
                 errors.join("; ")
             )));
         }
+        log_json_normalization(self.logger.as_deref(), &slow_parsed, log_phase);
         kres_core::async_eprintln!(
             "[slow] complete: {} finding(s), {} followup(s)",
             slow_parsed.findings.len(),
@@ -1524,7 +1549,9 @@ impl AgentRunner {
         if lenses.is_empty() {
             return self.run_once_with_ctx(prompt, ctx, shutdown).await;
         }
-        let lens_schema = CodeResponseContract::default().schema_json().to_string();
+        let lens_schema = CodeResponseContract::default()
+            .schema_json_for(&["analysis", "findings", "followups"])
+            .to_string();
         let fanout = self
             .run_lenses_shared_gather_repairing(
                 prompt,
@@ -1679,6 +1706,9 @@ impl AgentRunner {
                 }
             }
             if retry_errors.is_empty() {
+                for output in &fanout.outputs {
+                    log_json_normalization(self.logger.as_deref(), &output.parsed, "slow-lens");
+                }
                 return Ok(fanout);
             }
 
@@ -1702,7 +1732,7 @@ impl AgentRunner {
                     .map(|(_, _, error)| error.clone())
                     .collect();
                 if let Some(repaired) = self
-                    .repair_lens_json(output, &errors, &repair, shutdown)
+                    .repair_lens_json(output, &errors, &repair, &ctx.previous_findings, shutdown)
                     .await
                 {
                     *output = repaired;
@@ -1713,6 +1743,9 @@ impl AgentRunner {
                     .map_or(true, |output| validate(output).is_err())
             });
             if retry_errors.is_empty() && fanout.failures.is_empty() {
+                for output in &fanout.outputs {
+                    log_json_normalization(self.logger.as_deref(), &output.parsed, "slow-lens");
+                }
                 return Ok(fanout);
             }
             let retry_runs: BTreeSet<(String, Option<String>)> = retry_errors
@@ -1786,6 +1819,9 @@ impl AgentRunner {
                     retry_runs.contains(&(failure.lens_id.clone(), failure.slow_model.clone()))
                 }));
         }
+        for output in &fanout.outputs {
+            log_json_normalization(self.logger.as_deref(), &output.parsed, "slow-lens");
+        }
         Ok(fanout)
     }
 
@@ -1794,6 +1830,7 @@ impl AgentRunner {
         output: &LensRunOutput,
         errors: &[String],
         policy: &LensRepairPolicy<'_>,
+        existing_findings: &[Finding],
         shutdown: &Shutdown,
     ) -> Option<LensRunOutput> {
         let variant = self
@@ -1814,6 +1851,7 @@ impl AgentRunner {
                     variant.max_tokens,
                     variant.max_input_tokens,
                     std::mem::take(&mut parsed.invalid_findings),
+                    existing_findings,
                     crate::finding_repair::FindingRepairRuntime {
                         logger: self.logger.clone(),
                         thinking: variant.thinking,
@@ -1890,11 +1928,17 @@ impl AgentRunner {
         ctx: &RunContext,
         shutdown: &Shutdown,
     ) -> Result<PreparedLensFanout, AgentError> {
-        let composed = prepend_original_prompt(prompt, &ctx.original_prompt);
+        let composed = append_json_only_output_instruction(&prepend_original_prompt(
+            prompt,
+            &ctx.original_prompt,
+        ));
         let prompt: &str = composed.as_str();
         let gather_composed;
         let gather_prompt = if let Some(gather) = ctx.gather_prompt.as_deref() {
-            gather_composed = prepend_original_prompt(gather, &ctx.original_prompt);
+            gather_composed = append_json_only_output_instruction(&prepend_original_prompt(
+                gather,
+                &ctx.original_prompt,
+            ));
             gather_composed.as_str()
         } else {
             prompt
@@ -2286,6 +2330,7 @@ impl AgentRunner {
                     repaired
                 }
             };
+            log_json_normalization(self.logger.as_deref(), &parsed, "fast-gather-lenses");
             if !parsed.skill_reads.is_empty() {
                 apply_skill_reads(&mut live_skills, &parsed.skill_reads);
             }
@@ -2576,7 +2621,9 @@ fn replace_response_findings(
     text: &str,
     findings: &[kres_core::findings::Finding],
 ) -> Result<String, AgentError> {
-    let mut root: Value = crate::json_repair::parse_strict_json("code-agent", text)
+    let normalized = crate::response::normalized_code_response_json(text)
+        .map_err(|errors| AgentError::Other(errors.join("; ")))?;
+    let mut root: Value = crate::json_repair::parse_strict_json("code-agent", &normalized)
         .map_err(|errors| AgentError::Other(errors.join("; ")))?;
     let object = root
         .as_object_mut()
@@ -2654,7 +2701,7 @@ mod tests {
         };
         assert!(validate_generic_lens_output(&raw)
             .unwrap_err()
-            .contains("invalid"));
+            .contains("JSON object"));
 
         let malformed = LensRunOutput {
             raw_response: r#"{"analysis":"x","findings":"bad"}"#.into(),
@@ -2823,8 +2870,8 @@ mod tests {
         let r = diagnose_code_response(
             r#"{"analysis": "need a target",
                 "followups": [
-                    {"type": "question", "name": "which file?"},
-                    {"type": "question", "name": "which function?"}
+                    {"type": "question", "name": "which file?", "reason": "the target is ambiguous"},
+                    {"type": "question", "name": "which function?", "reason": "the requested scope is ambiguous"}
                 ],
                 "ready_for_slow": false}"#,
         );
@@ -2837,8 +2884,8 @@ mod tests {
         let r = diagnose_code_response(
             r#"{"analysis": "need a target",
                 "followups": [
-                    {"type": "question", "name": "which file?"},
-                    {"type": "source", "name": "foo"}
+                    {"type": "question", "name": "which file?", "reason": "the target is ambiguous"},
+                    {"type": "source", "name": "foo", "reason": "the implementation is required"}
                 ],
                 "ready_for_slow": false}"#,
         );

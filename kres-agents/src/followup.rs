@@ -16,7 +16,6 @@ pub struct Followup {
     pub kind: String,
     /// What to fetch: a symbol name, a regex, a path, etc.
     pub name: String,
-    #[serde(default)]
     pub reason: String,
     /// Optional scoping path for search/file types.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +91,17 @@ mod tests {
         let f: Followup =
             serde_json::from_str(r#"{"type":"source","name":"foo","reason":"why"}"#).unwrap();
         assert!(!f.nice_to_have);
+    }
+
+    #[test]
+    fn reason_is_required_by_wire_schema() {
+        assert!(serde_json::from_str::<Followup>(r#"{"type":"source","name":"foo"}"#).is_err());
+        let schema = serde_json::to_value(schemars::schema_for!(Followup)).unwrap();
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "reason"));
     }
 
     #[test]

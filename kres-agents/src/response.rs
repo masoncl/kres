@@ -4,10 +4,11 @@
 //! `{"analysis": "...", "followups": [...], "skill_reads": [...],
 //!   "findings": [...], "ready_for_slow": bool}`.
 //!
-//! Acceptance is deliberately strict: the complete model response must be one
-//! JSON object. Serde validates nested DTOs and unknown fields; callers may ask
-//! the model to re-emit a rejected response, but the replacement passes through
-//! this identical boundary.
+//! Acceptance prefers a complete JSON object but also recognizes exactly one
+//! embedded object as deterministic transport normalization. Serde still
+//! validates nested DTOs and unknown fields; callers may ask the model to
+//! re-emit a rejected response, and the replacement passes through this
+//! identical boundary.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,6 +77,13 @@ pub struct CodeResponse {
     pub plan: Option<kres_core::PlanRewrite>,
     /// Which parse strategy won — used for diagnostics.
     pub strategy: ParseStrategy,
+    /// Exact non-whitespace prefix/suffix discarded around one uniquely
+    /// embedded JSON object. Callers persist this under a searchable JSONL
+    /// normalization label; it is never folded into `analysis`.
+    pub discarded_surrounding: Option<String>,
+    /// Number of illegal literal control characters escaped inside JSON
+    /// strings before strict deserialization.
+    pub escaped_control_characters: usize,
     /// Structural problems that the forgiving parser would
     /// otherwise hide (for example a non-array `followups` field or
     /// an invalid item inside that array). Gather callers reject and
@@ -190,6 +198,52 @@ impl CodeResponseContract {
         schema
     }
 
+    /// Project the generated envelope schema to the fields a particular
+    /// inference stage may emit. The accepted response still goes through
+    /// this contract; this only keeps unrelated code/plan schemas out of the
+    /// repair prompt.
+    pub fn schema_json_for(&self, fields: &[&str]) -> Value {
+        let selected = fields.iter().copied().collect::<BTreeSet<_>>();
+        let mut schema = self.schema_json();
+        if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+            properties.retain(|name, _| selected.contains(name.as_str()));
+        }
+        if let Some(object) = schema.as_object_mut() {
+            object.insert(
+                "anyOf".into(),
+                Value::Array(
+                    fields
+                        .iter()
+                        .map(|field| {
+                            let field = *field;
+                            serde_json::json!({
+                                "required": [field],
+                                "properties": {(field): {"not": {"type": "null"}}}
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+            if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+                required.retain(|field| field.as_str().is_some_and(|f| selected.contains(f)));
+            }
+            if let Some(all_of) = object.get_mut("allOf").and_then(Value::as_array_mut) {
+                all_of.retain(|clause| {
+                    clause
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|properties| {
+                            properties
+                                .keys()
+                                .any(|name| selected.contains(name.as_str()))
+                        })
+                });
+            }
+        }
+        prune_unused_schema_defs(&mut schema);
+        schema
+    }
+
     pub fn allowing_invalid_findings(mut self) -> Self {
         self.allow_invalid_findings = true;
         self
@@ -206,8 +260,10 @@ impl CodeResponseContract {
     ) -> Result<CodeResponse, Vec<String>> {
         // Parse the typed envelope first so serde observes duplicate known
         // fields. Parsing into Value first would silently collapse them.
-        let raw: RawResponse = crate::json_repair::parse_strict_json("code-agent", text)?;
-        let root: Value = crate::json_repair::parse_strict_json("code-agent", text)?;
+        let normalized = normalize_code_response_json(text)?;
+        let raw: RawResponse =
+            crate::json_repair::parse_strict_json("code-agent", &normalized.json)?;
+        let root: Value = crate::json_repair::parse_strict_json("code-agent", &normalized.json)?;
         let object = root
             .as_object()
             .ok_or_else(|| vec!["response must be one JSON object".to_string()])?;
@@ -234,7 +290,9 @@ impl CodeResponseContract {
         if !unknown.is_empty() {
             return Err(unknown);
         }
-        let response = finalize_raw_response(raw, text, ParseStrategy::WholeBody);
+        let mut response = finalize_raw_response(raw, text, normalized.strategy);
+        response.discarded_surrounding = normalized.discarded_surrounding;
+        response.escaped_control_characters = normalized.escaped_control_characters;
         let mut errors = response.validation_errors.clone();
         if !self.allow_invalid_findings {
             errors.extend(response.invalid_findings.iter().map(|finding| {
@@ -268,6 +326,56 @@ impl CodeResponseContract {
         semantic: impl FnOnce(&CodeResponse) -> Vec<String>,
     ) -> Result<CodeResponse, Vec<String>> {
         self.validate_with(repaired, semantic)
+    }
+}
+
+fn prune_unused_schema_defs(schema: &mut Value) {
+    let Some(all_defs) = schema.get("$defs").and_then(Value::as_object).cloned() else {
+        return;
+    };
+    let mut needed = BTreeSet::new();
+    collect_schema_refs(schema.get("properties"), &mut needed);
+    collect_schema_refs(schema.get("anyOf"), &mut needed);
+    collect_schema_refs(schema.get("allOf"), &mut needed);
+    let mut pending = needed.iter().cloned().collect::<Vec<_>>();
+    while let Some(name) = pending.pop() {
+        let Some(definition) = all_defs.get(&name) else {
+            continue;
+        };
+        let mut nested = BTreeSet::new();
+        collect_schema_refs(Some(definition), &mut nested);
+        for dependency in nested {
+            if needed.insert(dependency.clone()) {
+                pending.push(dependency);
+            }
+        }
+    }
+    if let Some(defs) = schema.get_mut("$defs").and_then(Value::as_object_mut) {
+        defs.retain(|name, _| needed.contains(name));
+    }
+}
+
+fn collect_schema_refs(value: Option<&Value>, refs: &mut BTreeSet<String>) {
+    let Some(value) = value else { return };
+    match value {
+        Value::Object(object) => {
+            if let Some(name) = object
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+            {
+                refs.insert(name.to_string());
+            }
+            for child in object.values() {
+                collect_schema_refs(Some(child), refs);
+            }
+        }
+        Value::Array(array) => {
+            for child in array {
+                collect_schema_refs(Some(child), refs);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -337,10 +445,40 @@ fn parse_code_response_with_extensions(
     text: &str,
     _allowed_extensions: &BTreeSet<String>,
 ) -> CodeResponse {
-    if let Ok(response) = serde_json::from_str::<RawResponse>(text) {
-        return into_code_response(response, text, ParseStrategy::WholeBody);
+    if let Ok(normalized) = normalize_code_response_json(text) {
+        if let Ok(response) = serde_json::from_str::<RawResponse>(&normalized.json) {
+            let mut parsed = into_code_response(response, text, normalized.strategy);
+            parsed.discarded_surrounding = normalized.discarded_surrounding;
+            parsed.escaped_control_characters = normalized.escaped_control_characters;
+            return parsed;
+        }
     }
     raw_text_response(text, "response must be exactly one JSON object")
+}
+
+pub fn log_json_normalization(
+    logger: Option<&kres_core::log::TurnLogger>,
+    response: &CodeResponse,
+    context: &str,
+) {
+    if response.discarded_surrounding.is_none() && response.escaped_control_characters == 0 {
+        return;
+    }
+    let Some(logger) = logger else { return };
+    let mut content = format!(
+        "context: {context}\nescaped_control_characters: {}",
+        response.escaped_control_characters
+    );
+    if let Some(discarded) = &response.discarded_surrounding {
+        content.push('\n');
+        content.push_str(discarded);
+    }
+    let label = if response.discarded_surrounding.is_some() {
+        "json-normalization discarded-surrounding-prose"
+    } else {
+        "json-normalization escaped-control-characters"
+    };
+    logger.log_code_labeled("normalization", Some(label), &content, None, None);
 }
 
 fn raw_text_response(text: &str, error: &str) -> CodeResponse {
@@ -356,6 +494,8 @@ fn raw_text_response(text: &str, error: &str) -> CodeResponse {
         code_edits: vec![],
         plan: None,
         strategy: ParseStrategy::RawText,
+        discarded_surrounding: None,
+        escaped_control_characters: 0,
         validation_errors: vec![error.to_string()],
         unknown_fields: BTreeMap::new(),
     }
@@ -406,9 +546,189 @@ fn into_code_response(r: RawResponse, _original: &str, strategy: ParseStrategy) 
         code_edits,
         plan,
         strategy,
+        discarded_surrounding: None,
+        escaped_control_characters: 0,
         validation_errors,
         unknown_fields: r.extra,
     }
+}
+
+struct NormalizedCodeJson {
+    json: String,
+    strategy: ParseStrategy,
+    discarded_surrounding: Option<String>,
+    escaped_control_characters: usize,
+}
+
+fn normalize_code_response_json(text: &str) -> Result<NormalizedCodeJson, Vec<String>> {
+    if crate::json_repair::parse_strict_json::<Value>("code-agent", text).is_ok() {
+        let strategy = if crate::json_repair::strip_whole_json_fence(text).is_some() {
+            ParseStrategy::FencedBlock
+        } else {
+            ParseStrategy::WholeBody
+        };
+        let json = crate::json_repair::strip_whole_json_fence(text)
+            .unwrap_or(text)
+            .to_string();
+        return Ok(NormalizedCodeJson {
+            json,
+            strategy,
+            discarded_surrounding: None,
+            escaped_control_characters: 0,
+        });
+    }
+
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        let (escaped, count) = escape_json_string_controls(trimmed);
+        if count > 0
+            && crate::json_repair::parse_strict_json::<Value>("code-agent", &escaped).is_ok()
+        {
+            return Ok(NormalizedCodeJson {
+                json: escaped,
+                strategy: ParseStrategy::WholeBody,
+                discarded_surrounding: None,
+                escaped_control_characters: count,
+            });
+        }
+    }
+
+    let candidates = outermost_json_object_candidates(text);
+    if candidates.len() != 1 {
+        return Err(vec![format!(
+            "code-agent response must contain exactly one JSON object; found {} valid embedded candidates",
+            candidates.len()
+        )]);
+    }
+    let candidate = &candidates[0];
+    let prefix = &text[..candidate.start];
+    let suffix = &text[candidate.end..];
+    let discarded = format!(
+        "JSON_NORMALIZATION_DISCARDED_SURROUNDING\n--- prefix ---\n{}\n--- suffix ---\n{}",
+        prefix, suffix
+    );
+    Ok(NormalizedCodeJson {
+        json: candidate.json.clone(),
+        strategy: ParseStrategy::BraceMatch,
+        discarded_surrounding: Some(discarded),
+        escaped_control_characters: candidate.escaped_control_characters,
+    })
+}
+
+pub(crate) fn normalized_code_response_json(text: &str) -> Result<String, Vec<String>> {
+    normalize_code_response_json(text).map(|normalized| normalized.json)
+}
+
+struct JsonObjectCandidate {
+    start: usize,
+    end: usize,
+    json: String,
+    escaped_control_characters: usize,
+}
+
+fn outermost_json_object_candidates(text: &str) -> Vec<JsonObjectCandidate> {
+    let mut candidates = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text.char_indices() {
+        if start.is_none() {
+            if ch == '{' {
+                start = Some(offset);
+                depth = 1;
+                in_string = false;
+                escaped = false;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate_start = start.take().expect("candidate start exists");
+                    let end = offset + ch.len_utf8();
+                    let raw = &text[candidate_start..end];
+                    let (json, escaped_control_characters) = escape_json_string_controls(raw);
+                    if crate::json_repair::parse_strict_json::<Value>("code-agent", &json)
+                        .ok()
+                        .is_some_and(|value| value.is_object())
+                    {
+                        candidates.push(JsonObjectCandidate {
+                            start: candidate_start,
+                            end,
+                            json,
+                            escaped_control_characters,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    candidates
+}
+
+fn escape_json_string_controls(text: &str) -> (String, usize) {
+    let mut output = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if in_string {
+            if escaped {
+                output.push(ch);
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    output.push(ch);
+                    escaped = true;
+                }
+                '"' => {
+                    output.push(ch);
+                    in_string = false;
+                }
+                '\n' => {
+                    output.push_str("\\n");
+                    count += 1;
+                }
+                '\r' => {
+                    output.push_str("\\r");
+                    count += 1;
+                }
+                '\t' => {
+                    output.push_str("\\t");
+                    count += 1;
+                }
+                control if control <= '\u{001f}' => {
+                    use std::fmt::Write;
+                    let _ = write!(output, "\\u{:04x}", control as u32);
+                    count += 1;
+                }
+                _ => output.push(ch),
+            }
+        } else {
+            output.push(ch);
+            if ch == '"' {
+                in_string = true;
+            }
+        }
+    }
+    (output, count)
 }
 
 fn value_to_plan(v: Value) -> (Option<kres_core::PlanRewrite>, Option<String>) {
@@ -577,8 +897,22 @@ mod strict_contract_tests {
         assert!(contract
             .validate(r#"{"analysis":"ok","followups":[]}"#)
             .is_ok());
-        assert!(contract.validate(r#"prose {"analysis":"ok"}"#).is_err());
-        assert!(contract.validate(r#"{"analysis":"ok"} trailing"#).is_err());
+        let embedded = contract
+            .validate(
+                r#"## Analysis
+Here is the result:
+{"analysis":"ok"}
+Thanks."#,
+            )
+            .unwrap();
+        assert_eq!(embedded.strategy, ParseStrategy::BraceMatch);
+        assert!(embedded
+            .discarded_surrounding
+            .as_deref()
+            .is_some_and(
+                |discarded| discarded.contains("## Analysis") && discarded.contains("Thanks.")
+            ));
+        assert!(contract.validate(r#"{"analysis":"ok"} trailing"#).is_ok());
         assert!(contract
             .validate(r#"{"analysis":"ok"} {"analysis":"other"}"#)
             .is_err());
@@ -587,10 +921,93 @@ mod strict_contract_tests {
             .is_ok());
         assert!(contract
             .validate("prose\n```json\n{\"analysis\":\"ok\"}\n```")
-            .is_err());
+            .is_ok());
         assert!(contract
             .validate(r#"{"result":{"analysis":"ok"}}"#)
             .is_err());
+    }
+
+    #[test]
+    fn embedded_normalization_rejects_multiple_json_objects() {
+        let error = CodeResponseContract::default()
+            .validate(r#"first {"analysis":"one"} second {"analysis":"two"}"#)
+            .unwrap_err();
+        assert!(error
+            .iter()
+            .any(|message| message.contains("2 valid embedded candidates")));
+    }
+
+    #[test]
+    fn embedded_normalization_skips_many_brace_heavy_non_json_blocks() {
+        let mut response = "C examples:\n".to_string();
+        for _ in 0..2_000 {
+            response.push_str("if (condition) { do_work(); }\n");
+        }
+        response.push_str("{\"analysis\":\"ok\",\"followups\":[]}");
+
+        let parsed = CodeResponseContract::default().validate(&response).unwrap();
+        assert_eq!(parsed.analysis, "ok");
+        assert_eq!(parsed.strategy, ParseStrategy::BraceMatch);
+    }
+
+    #[test]
+    fn embedded_normalization_escapes_controls_only_inside_json_strings() {
+        let response = CodeResponseContract::default()
+            .validate("heading\n{\"analysis\":\"first\nsecond\",\"followups\":[]}\nfooter")
+            .unwrap();
+        assert_eq!(response.analysis, "first\nsecond");
+        assert_eq!(response.escaped_control_characters, 1);
+        assert_eq!(response.strategy, ParseStrategy::BraceMatch);
+    }
+
+    #[test]
+    fn discarded_surrounding_is_logged_with_searchable_label() {
+        let response = CodeResponseContract::default()
+            .validate("important preamble\n{\"analysis\":\"ok\"}\nimportant suffix")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let logger = kres_core::log::TurnLogger::new(temp.path()).unwrap();
+        let code_log = logger.session_dir().join("code.jsonl");
+        log_json_normalization(Some(&logger), &response, "test-context");
+        let logged = std::fs::read_to_string(code_log).unwrap();
+
+        assert!(logged.contains("json-normalization discarded-surrounding-prose"));
+        assert!(logged.contains("important preamble"));
+        assert!(logged.contains("important suffix"));
+        assert!(logged.contains("test-context"));
+    }
+
+    #[test]
+    fn control_only_normalization_uses_distinct_log_label() {
+        let response = CodeResponseContract::default()
+            .validate("{\"analysis\":\"first\nsecond\"}")
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let logger = kres_core::log::TurnLogger::new(temp.path()).unwrap();
+        let code_log = logger.session_dir().join("code.jsonl");
+        log_json_normalization(Some(&logger), &response, "test-context");
+        let logged = std::fs::read_to_string(code_log).unwrap();
+
+        assert!(logged.contains("json-normalization escaped-control-characters"));
+        assert!(!logged.contains("discarded-surrounding-prose"));
+    }
+
+    #[test]
+    fn projected_schema_omits_unrelated_fields_and_definitions() {
+        let schema =
+            CodeResponseContract::default().schema_json_for(&["analysis", "findings", "followups"]);
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        assert!(properties.contains_key("analysis"));
+        assert!(properties.contains_key("findings"));
+        assert!(properties.contains_key("followups"));
+        assert!(!properties.contains_key("code_edits"));
+
+        let defs = schema["$defs"].as_object().unwrap();
+        assert!(defs.contains_key("Finding"));
+        assert!(defs.contains_key("Followup"));
+        assert!(!defs.contains_key("CodeEdit"));
+        assert!(!defs.contains_key("PlanRewrite"));
     }
 
     #[test]

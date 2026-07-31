@@ -95,6 +95,11 @@ mod tests {
     fn fast_prompt_requires_contract_tracing_for_review() {
         let body = lookup("fast-code-agent.system.md").unwrap();
         assert!(
+            body.contains("Every followup MUST include a non-empty `reason`")
+                && body.contains("Do not rely on `analysis` to explain it"),
+            "fast prompt must explain the required followup reason field"
+        );
+        assert!(
             body.contains("A commit review is not complete after reading only the edited lines"),
             "fast prompt must not allow edited-lines-only review gathering"
         );

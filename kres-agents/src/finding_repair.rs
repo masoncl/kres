@@ -56,6 +56,7 @@ pub async fn repair_invalid_findings(
     max_tokens: u32,
     max_input_tokens: Option<u32>,
     invalid: Vec<InvalidFinding>,
+    existing_findings: &[Finding],
     runtime: FindingRepairRuntime,
 ) -> Result<FindingRepairOutcome, AgentError> {
     let FindingRepairRuntime {
@@ -81,6 +82,13 @@ pub async fn repair_invalid_findings(
             outcome.unrepaired.push(item);
             continue;
         };
+        if let Some(finding) = hydrate_existing_finding(&item.raw, existing_findings) {
+            outcome.findings.push(RepairedFinding {
+                index: item.index,
+                finding,
+            });
+            continue;
+        }
         let rejected_response = serde_json::json!({"findings": [item.raw.clone()]}).to_string();
         let validation_errors = vec![format!("findings[0]: {}", item.error)];
         let shutdown = match &cancel {
@@ -146,6 +154,24 @@ pub async fn repair_invalid_findings(
     Ok(outcome)
 }
 
+/// Existing-id responses are deltas even though the wire schema describes a
+/// complete Finding. Overlay the supplied fields on the stored record so an
+/// update such as `{id, status, summary}` does not need an LLM call merely to
+/// repeat the unchanged title, severity, and evidence fields.
+fn hydrate_existing_finding(raw: &serde_json::Value, existing: &[Finding]) -> Option<Finding> {
+    let raw_object = raw.as_object()?;
+    let id = raw_object.get("id")?.as_str()?;
+    let prior = existing.iter().find(|finding| finding.id == id)?;
+    let mut hydrated = serde_json::to_value(prior.redacted_for_agent())
+        .ok()?
+        .as_object()
+        .cloned()?;
+    hydrated.extend(raw_object.clone());
+    serde_json::from_value::<Finding>(serde_json::Value::Object(hydrated))
+        .ok()
+        .map(|finding| finding.redacted_for_agent())
+}
+
 fn accept_repaired_finding(expected_id: &str, text: &str) -> Option<Finding> {
     let parsed =
         crate::json_repair::parse_strict_json::<FindingRepairResponse>("finding-repair", text)
@@ -203,6 +229,38 @@ mod tests {
         assert!(accept_repaired_finding("f1", &two).is_none());
     }
 
+    #[test]
+    fn existing_finding_supplies_fields_omitted_from_delta() {
+        let prior: Finding = serde_json::from_value(json!({
+            "id": "f1",
+            "title": "Original title",
+            "severity": "medium",
+            "summary": "Original summary",
+            "impact": "Original impact"
+        }))
+        .unwrap();
+        let hydrated = hydrate_existing_finding(
+            &json!({
+                "id": "f1",
+                "status": "invalidated",
+                "summary": "New evidence disproves the trigger"
+            }),
+            &[prior],
+        )
+        .unwrap();
+
+        assert_eq!(hydrated.title, "Original title");
+        assert_eq!(hydrated.severity, kres_core::findings::Severity::Medium);
+        assert_eq!(hydrated.summary, "New evidence disproves the trigger");
+        assert_eq!(hydrated.impact, "Original impact");
+        assert_eq!(hydrated.status, kres_core::findings::Status::Invalidated);
+    }
+
+    #[test]
+    fn new_finding_cannot_be_hydrated() {
+        assert!(hydrate_existing_finding(&json!({"id": "new", "status": "active"}), &[]).is_none());
+    }
+
     #[tokio::test]
     async fn cancelled_repair_preserves_current_and_remaining_records() {
         let shutdown = kres_core::Shutdown::new();
@@ -225,6 +283,7 @@ mod tests {
             1_000,
             None,
             invalid,
+            &[],
             FindingRepairRuntime {
                 logger: None,
                 thinking: None,

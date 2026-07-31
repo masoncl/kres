@@ -2695,13 +2695,21 @@ pub fn extract_outputs(text: &str, step: &Step) -> Result<Map<String, Value>> {
         // free-form steps without an eval.
         return Ok(Map::new());
     }
-    let Value::Object(map) = crate::json_repair::parse_strict_json::<Value>("workflow-step", text)
-        .map_err(|errors| {
-            anyhow!(
-                "response is not exactly one JSON object: {}",
-                errors.join("; ")
-            )
-        })?
+    let normalized = crate::response::normalized_code_response_json(text).map_err(|errors| {
+        anyhow!(
+            "response does not contain one unambiguous JSON object: {}",
+            errors.join("; ")
+        )
+    })?;
+    let Value::Object(map) =
+        crate::json_repair::parse_strict_json::<Value>("workflow-step", &normalized).map_err(
+            |errors| {
+                anyhow!(
+                    "response is not exactly one JSON object: {}",
+                    errors.join("; ")
+                )
+            },
+        )?
     else {
         return Err(anyhow!("response must be one JSON object"));
     };
@@ -7437,10 +7445,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_outputs_rejects_prose_around_envelope() {
+    fn extract_outputs_accepts_one_object_surrounded_by_prose() {
         let wf = fix_workflow();
         let step = wf.steps.iter().find(|s| s.id == "research").unwrap();
-        assert!(extract_outputs("prose {\"research_status\":\"confirmed\"}", step).is_err());
+        let outputs = extract_outputs("prose {\"research_status\":\"confirmed\"}", step).unwrap();
+        assert_eq!(outputs["research_status"], "confirmed");
     }
 
     #[test]
@@ -7449,7 +7458,7 @@ mod tests {
         let step = wf.steps.iter().find(|s| s.id == "research").unwrap();
         let body = "Here is some text. {\"unrelated\": 1}";
         let err = extract_outputs(body, step).unwrap_err().to_string();
-        assert!(err.contains("not exactly one JSON object"), "got: {err}");
+        assert!(err.contains("none of the declared keys"), "got: {err}");
     }
 
     #[test]

@@ -226,7 +226,7 @@ pub async fn promote_prose_bugs_with_logger(
     let mut parsed = match tolerant_contract.validate(&text) {
         Ok(parsed) => parsed,
         Err(errors) => {
-            let schema = response_contract.schema_json().to_string();
+            let schema = response_contract.schema_json_for(&["findings"]).to_string();
             let repair = crate::json_repair::repair_json_response(
                 crate::json_repair::JsonRepairCall {
                     client: client.clone(),
@@ -277,6 +277,7 @@ pub async fn promote_prose_bugs_with_logger(
             }
         }
     };
+    crate::response::log_json_normalization(logger.as_deref(), &parsed, "promoter");
     // A RawText strategy on the promoter's OWN reply means the
     // dedicated PROMOTE_SYSTEM judge-mode prompt didn't hold — the
     // model emitted free-form prose instead of the required
@@ -293,6 +294,7 @@ pub async fn promote_prose_bugs_with_logger(
             max_tokens,
             max_input_tokens,
             std::mem::take(&mut parsed.invalid_findings),
+            dedup_against,
             crate::finding_repair::FindingRepairRuntime {
                 logger,
                 thinking,

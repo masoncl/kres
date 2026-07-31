@@ -60,11 +60,17 @@ metadata only; it is not sent to the model and does not affect prompt
 caching. Use it to pair interleaved lensed user/assistant records
 instead of relying on adjacent JSONL lines.
 
-All structured agent responses must be exactly one JSON value with no prose,
-embedded JSON string, or transport wrapper. Prompts require raw, unfenced JSON.
-As a deterministic transport normalization, Rust removes one Markdown JSON
-fence only when it wraps the entire trimmed response, then runs the unchanged
-strict contract before considering inference repair. Serde DTOs are the
+All structured agent prompts require exactly one JSON value with no prose,
+embedded JSON string, or transport wrapper. Prompts end with an explicit
+raw-JSON-only instruction and prohibit Markdown headings, preambles, fences,
+backticks, and trailing commentary.
+As deterministic transport normalization, Rust first accepts whole-response
+JSON or one whole Markdown JSON fence. It may then extract exactly one
+outermost syntactically valid JSON object from surrounding prose. Zero or
+multiple candidates are rejected; kres never chooses between objects. Illegal
+literal control characters are escaped only inside that candidate's JSON
+strings. The resulting object then runs through the unchanged strict contract
+before inference repair. Serde DTOs are the
 acceptance boundary; nested DTOs reject unknown fields, and
 `serde_path_to_error` identifies the exact invalid field. `schemars` derives
 the repair schema from the same Rust DTO, so prompts and deserialization do not
@@ -72,11 +78,21 @@ maintain separate representations of the contract. Workflow-defined extension
 fields are allowed only when declared by that step and are subsequently checked
 against the workflow's JSON Schema.
 
-On failure, one repair inference receives the untouched response, generated
-schema, and serde/schema errors. Its replacement is accepted only by
-deserializing it through the identical contract. Rust does not brace-scan,
-unwrap, normalize, or attempt to infer semantic equivalence between malformed
-and repaired prose. If strict repair fails, the caller retries or fails the
+When surrounding text is discarded, `code.jsonl` retains the original
+assistant response and adds a second row with role `normalization`, label
+`json-normalization discarded-surrounding-prose`, the exact discarded prefix
+and suffix, and the number of escaped control characters. This keeps prompt
+drift and substantive out-of-envelope prose searchable.
+Control-character-only normalization uses the separate label
+`json-normalization escaped-control-characters`.
+
+On failure, one repair inference receives the untouched response, a generated
+schema projected to the fields valid for that inference stage, and the
+serde/schema errors. Unreachable code-edit, file-output, plan, or workflow
+fields are omitted from that repair schema. Its replacement is accepted only by
+deserializing it through the identical contract. Beyond the narrow transport
+normalization above, Rust does not infer fields, merge candidate objects, or
+attempt to infer semantic equivalence between malformed and repaired prose. If strict repair fails, the caller retries or fails the
 step. The original response remains in logs.
 
 If representation-only repair still fails, the existing caller-specific retry
@@ -1045,12 +1061,19 @@ so `{file, what, severity}` is not a valid review finding shape. It retains the
 raw rejected object separately for the repair path described below.
 
 Malformed full-Finding attempts are retained with their raw JSON and exact
-serde error rather than silently discarded. After lens consolidation, and
-again after the prose-promotion pass, kres gives the fast formatting agent one
-strict-schema repair attempt. The complete replacement response must pass the
-same derived serde contract. A record that remains invalid is preserved in
+serde error rather than silently discarded. When the id matches an existing
+finding, kres first overlays the supplied JSON fields on that stored record and
+deserializes the result. This deterministically supplies fields omitted from an
+update without changing fields the agent explicitly provided or spending a
+formatting-agent call. New ids and existing-id updates that remain invalid then
+receive one strict-schema repair attempt. The complete replacement response
+must pass the same derived serde contract. A record that remains invalid is preserved in
 `report.md` and `findings.json.task_prose`, and a blocking typed retry followup
 is added; no missing line number or other evidence is fabricated.
+
+Every followup must include non-empty `type`, `name`, and `reason` fields. The
+generated JSON Schema and the post-parse semantic validator enforce the same
+requirement; `reason` is not an optional legacy field.
 
 For commit/range reviews, the target is the semantic change, not only
 the edited lines. The gather pass and each lens must identify changed

@@ -16,7 +16,11 @@ use kres_core::findings::Finding;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{config::CallConfig, request::Message};
 
-use crate::{error::AgentError, followup::Followup, response::CodeResponseContract};
+use crate::{
+    error::AgentError,
+    followup::Followup,
+    response::{log_json_normalization, CodeResponseContract},
+};
 
 pub const CONSOLIDATOR_INSTRUCTIONS: &str = include_str!("prompts/consolidator.txt");
 
@@ -169,7 +173,15 @@ pub async fn consolidate_lenses_with_logger(
     }
     let response_contract =
         CodeResponseContract::new(["comparison".to_string(), "comparison_details".to_string()]);
-    let response_schema = response_contract.schema_json().to_string();
+    let response_schema = response_contract
+        .schema_json_for(&[
+            "analysis",
+            "findings",
+            "followups",
+            "comparison",
+            "comparison_details",
+        ])
+        .to_string();
     // A structurally valid envelope owns malformed Finding entries at the
     // per-record repair boundary. Other envelope failures get exactly one
     // whole-response repair and never fall through to a second repair path.
@@ -223,13 +235,19 @@ pub async fn consolidate_lenses_with_logger(
             repaired_parsed
         }
     };
+    log_json_normalization(logger.as_deref(), &parsed, "lens-consolidator");
     if !parsed.invalid_findings.is_empty() {
+        let existing_findings = lens_outputs
+            .iter()
+            .flat_map(|output| output.findings.iter().cloned())
+            .collect::<Vec<_>>();
         let outcome = crate::finding_repair::repair_invalid_findings(
             client.clone(),
             model.clone(),
             max_tokens,
             max_input_tokens,
             std::mem::take(&mut parsed.invalid_findings),
+            &existing_findings,
             crate::finding_repair::FindingRepairRuntime {
                 logger: logger.clone(),
                 thinking: consolidator.thinking,
@@ -346,7 +364,9 @@ pub fn naive_fallback(lens_outputs: &[LensOutput<'_>]) -> ConsolidatedTask {
 }
 
 fn extract_comparison(text: &str) -> Option<Value> {
-    let value = crate::json_repair::parse_strict_json::<Value>("lens-consolidator", text).ok()?;
+    let normalized = crate::response::normalized_code_response_json(text).ok()?;
+    let value =
+        crate::json_repair::parse_strict_json::<Value>("lens-consolidator", &normalized).ok()?;
     value
         .get("comparison")
         .cloned()
@@ -493,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn comparison_extraction_uses_strict_response() {
+    fn comparison_extraction_uses_normalized_response() {
         let text = r#"{"analysis":"done","comparison":{"winner":"actual"}}"#;
         assert_eq!(extract_comparison(text), Some(json!({"winner":"actual"})));
         let fenced = format!("```json\n{text}\n```");
@@ -501,7 +521,10 @@ mod tests {
             extract_comparison(&fenced),
             Some(json!({"winner":"actual"}))
         );
-        assert!(extract_comparison(&format!("prose\n{fenced}")).is_none());
+        assert_eq!(
+            extract_comparison(&format!("prose\n{fenced}")),
+            Some(json!({"winner":"actual"}))
+        );
     }
 
     #[test]

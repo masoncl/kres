@@ -24,13 +24,15 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Event, Lock
+from threading import Event, RLock
 
 
 # Global state for signal handling.
 shutdown_event = Event()
 active_processes = []
-processes_lock = Lock()
+# Python signal handlers can interrupt the main thread while it is already in
+# cleanup. Use a reentrant lock so a repeated Ctrl-C can safely retry cleanup.
+processes_lock = RLock()
 signal_received = False
 
 
@@ -38,7 +40,9 @@ def signal_handler(signum, frame):
     """Handle Ctrl-C / SIGTERM by killing every active subprocess."""
     global signal_received
     if signal_received:
-        return  # Avoid multiple invocations
+        print("\nInterrupt repeated; retrying process cleanup...", file=sys.stderr)
+        kill_all_processes()
+        return
     signal_received = True
 
     print("\n\nInterrupted! Shutting down processes...", file=sys.stderr)
@@ -146,18 +150,36 @@ def run_one(cmd_template, arg, line_no, timeout):
 
     cmd = expand_template(cmd_template, arg, line_no)
     proc = None
+    stdin_writer = None
     try:
         proc = subprocess.Popen(
             cmd,
             shell=True,
+            # Batch jobs must not share the operator's terminal input. Keep
+            # a private pipe open, rather than using DEVNULL: interactive
+            # programs such as kres may treat stdin EOF as a request to exit.
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            preexec_fn=os.setsid,  # new pgrp → kill_all can take it down cleanly
+            start_new_session=True,  # new pgrp → kill_all can take it down cleanly
         )
+        # communicate() closes proc.stdin before waiting. Retain the writer
+        # separately so readers see an idle pipe, not EOF, until they exit.
+        stdin_writer = proc.stdin
+        proc.stdin = None
 
         with processes_lock:
             active_processes.append(proc)
+            shutdown_after_spawn = shutdown_event.is_set()
+
+        # Close the race where shutdown starts after the initial event check
+        # but before this process is registered in active_processes. Either
+        # the signal handler sees the registered process, or this worker sees
+        # the shutdown event while still holding the same lock.
+        if shutdown_after_spawn:
+            terminate_process_group(proc)
+            return (arg, -1, "", "Shutdown requested during start")
 
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
@@ -175,10 +197,32 @@ def run_one(cmd_template, arg, line_no, timeout):
     except Exception as exc:
         return (arg, -1, "", str(exc))
     finally:
+        if stdin_writer is not None:
+            stdin_writer.close()
         if proc is not None:
             with processes_lock:
                 if proc in active_processes:
                     active_processes.remove(proc)
+
+
+def terminate_process_group(proc, grace=5):
+    """Terminate one subprocess group and reap its shell process."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        proc.wait(timeout=5)
+    except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def main():
@@ -294,6 +338,8 @@ Examples:
             }
             for future in as_completed(futures):
                 if shutdown_event.is_set():
+                    for pending in futures:
+                        pending.cancel()
                     break
 
                 arg, returncode, stdout, stderr = future.result()
@@ -320,7 +366,7 @@ Examples:
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
     finally:
-        if shutdown_event.is_set() and not signal_received:
+        if shutdown_event.is_set():
             kill_all_processes()
 
     print(

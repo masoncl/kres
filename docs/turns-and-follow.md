@@ -16,16 +16,18 @@ analysis, `code_output`, or `code_edits` (`TaskManager::finish_ok` in
 
 - **`--turns 0`** (the default) — no run-count cap. With a configured goal
   agent, kres checks after each eligible non-coding task whether the accumulated
-  analysis satisfies the per-task goal; goal-met drains the todo
-  list and the reaper exits once nothing is pending or active.
+  analysis satisfies the inherited session completion goal parked for that
+  task; goal-met drains the todo list and the reaper exits once nothing is
+  pending or active.
 
   - Add `--follow` to layer a cost cap: if 3 consecutive
     analysis-producing runs fail to grow the findings list, exit
     even with the goal agent still saying "not met".
 
-  Without a configured main agent model file there is no goal agent;
-  kres falls back to "stop when the active batch finishes", and
-  `--follow` switches that fallback to the 3-run stagnation cap.
+  In a generic session, without a configured main agent model file there is no
+  goal agent; kres falls back to "stop when the active batch finishes", and
+  `--follow` switches that fallback to the 3-run stagnation cap. Review uses
+  its primary slow model for goal checks instead.
   See the `turns_limit == 0` branch in `kres-repl/src/session.rs`
   for the full predicate.
 

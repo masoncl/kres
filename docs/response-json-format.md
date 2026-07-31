@@ -10,7 +10,7 @@ requests for additional data.
   "analysis": "string — the code agent's analysis and answer",
   "followups": [
     {
-      "type": "string — source|type|callers|callees|search|file|read|git|question",
+      "type": "string — one of the typed followup kinds listed below",
       "name": "string — symbol name, regex pattern, glob, file:line+count, or question text",
       "reason": "string — why this data is needed",
       "path": "string — optional directory scope for search/file types"
@@ -51,7 +51,10 @@ workflow-declared extension fields.
 | `bash`     | shell command                    | Allowlist-gated workspace command              |
 | `lore`     | query                            | Semcode lore/history search                    |
 
-The optional `path` field scopes searches and file discovery. Optional
+Every followup requires a non-empty `reason` that explains what decision the
+requested evidence will unblock; this lets the fetcher and later agents retain
+the purpose when requests are deduplicated or served from cache. The optional
+`path` field scopes searches and file discovery. Optional
 `nice_to_have: true` marks a non-blocking followup; omitted or false is
 blocking.
 

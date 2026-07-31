@@ -34,14 +34,14 @@ or `<provider>.json:<model-id>` when disambiguation is required:
 {
   "models": {
     "fast": "vertex-dummy.json:claude-sonnet-4-6",
-    "slow": "anthropic.json:claude-opus-4-8",
+    "slow": "anthropic-slow.json:claude-opus-4-7",
     "main": "vertex-dummy.json:claude-sonnet-4-6",
     "todo": "vertex-dummy.json:claude-sonnet-4-6",
-    "classifier": "anthropic.json:claude-haiku-4-5"
+    "classifier": "anthropic-fast.json:claude-haiku-4-5"
   },
   "model_aliases": {
     "sonnet": "vertex-dummy.json:claude-sonnet-5",
-    "opus": "anthropic.json:claude-opus-4-8"
+    "opus": "anthropic-slow.json:claude-opus-4-7"
   }
 }
 ```
@@ -69,7 +69,7 @@ The required `models` object contains per-model limits and thinking defaults:
       "max_input_tokens": 900000,
       "rate_limit": 800000
     },
-    "claude-opus-4-8": {
+    "claude-opus-4-7": {
       "max_tokens": 128000,
       "max_input_tokens": 900000,
       "rate_limit": 800000,
@@ -83,11 +83,11 @@ Role-specific model settings do not exist. Fast, main, todo, classifier, and
 slow receive the same limits whenever they select the same model; their
 behavior differs through role-specific embedded system prompts. A provider
 file with multiple models must be qualified when passed directly, for example
-`kres test ~/.kres/models/anthropic.json:claude-opus-4-8`.
+`kres test ~/.kres/models/anthropic-slow.json:claude-opus-4-7`.
 
 If multiple provider files contain the same model, an unqualified selector is
 an error listing the candidates. Select it as
-`foo.json:claude-opus-4-6`. Per-run `--fast-model`, `--slow-model`,
+`foo.json:claude-opus-4-7`. Per-run `--fast-model`, `--slow-model`,
 `--main-model`, `--todo-model`, and `--classifier-model` accept the same
 selector syntax. `--slow sonnet` and `--slow opus` use `model_aliases` when
 configured, then fall back to their shipped model ids. Ambiguity still
@@ -257,7 +257,7 @@ path per shipped command.
 
 ## semcode MCP integration
 
-The main agent's code navigation is enhanced by semcode
+The deterministic tool service's code navigation is enhanced by semcode
 (<https://github.com/facebookexperimental/semcode>). When a
 `semcode-mcp` binary is on `PATH`, `setup.sh` writes an
 `mcp.json` that launches it as an MCP child:
@@ -270,8 +270,8 @@ The main agent's code navigation is enhanced by semcode
 }
 ```
 
-kres works without semcode — the main agent already answers
-code questions with `read`, `grep`, and `git`. semcode adds a
+kres works without semcode: typed fast-agent requests are served with `read`,
+`grep`, and `git` fallbacks. semcode adds a
 function/type/callchain-aware index so the agent can ask
 whole-program questions directly instead of deriving them from
 raw regex.
@@ -283,6 +283,10 @@ no match, or returns output that cannot be parsed as a symbol, kres
 falls back to local grep/read-style evidence from the workspace. A
 missing semcode result must not be used by itself to conclude that
 source is unavailable, a symbol is absent, or a review is clean.
+Whole-file review treats `file_survey` specially: an unavailable server, tool
+error, or empty text response falls back to a local definition scan. A valid
+structured response containing an empty inventory is currently accepted as an
+empty survey and does not trigger that fallback.
 For broad source fallbacks, kres returns the grep match list without
 adding a special per-file cap and without automatically reading full
 source context around every hit. If the shared tool-output cap truncates
@@ -290,7 +294,7 @@ the list, the truncation marker is visible to the agent. The agent should
 request targeted `read` followups for the specific file:line ranges it
 needs to inspect.
 
-Tools the main agent will call when wired up:
+Supported semcode operations include:
 
 - Symbols: `find_function`, `find_type`, `find_callers`,
   `find_calls`, `find_callchain`, `grep_functions`.
@@ -308,8 +312,8 @@ reaching the fast/slow agents.
 Whole-program questions that read/grep can only approximate —
 "who calls `<function>`", "what does `<type>` look
 like on this branch", "show me every change to this function
-over the last 1000 commits". Without semcode the main agent
-still answers, just via more grep round-trips and more false
+over the last 1000 commits". Without semcode the tool service
+still gathers evidence, just via more grep round-trips and more false
 positives.
 
 ### Install

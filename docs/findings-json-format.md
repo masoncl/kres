@@ -132,9 +132,10 @@ should be JUST enough to prove the bug. Rules of thumb:
   `related_finding_ids`.
 - `status: invalidated` findings stay in the file — they carry
   negative evidence so the slow agent doesn't re-propose them.
-- A finding whose `relevant_symbols` / `relevant_file_sections` are a
-  strict subset of another finding's — and whose `impact` overlaps —
-  must be merged into the broader finding rather than kept separate.
+- Different ids are merged conservatively when they share a source anchor and
+  either explicitly cross-reference each other or have at least 70% overlap in
+  normalized id/title tokens. Findings that merely cite the same function are
+  retained separately when their identities do not overlap enough.
 
 ## Relationship to other files
 
@@ -153,7 +154,7 @@ The four are complementary and independent — writing
 
 Four points where findings flow:
 
-1. **Each slow-agent call emits `findings` natively**, inline with its
+1. **Each audit slow-agent call emits `findings` natively**, inline with its
    `analysis` + `followups`, pulling relevant symbols/file-sections
    from the `symbols` and `context` it received. The slow agent is
    the most expensive call in the pipeline and has the richest

@@ -1,7 +1,9 @@
 # prompt JSON format
 
-The prompt JSON is sent to the code agent as the user message. It
-provides kernel source context and a question for the agent to analyze.
+The prompt JSON is the user message sent to fast and slow code-agent turns. It
+provides source context and a question for the current phase to analyze. Fast
+gather rounds receive newly fetched evidence plus `previously_fetched`; the
+final slow turn receives the accumulated context.
 
 ## Schema
 

@@ -5,7 +5,7 @@ Keep `AGENTS.md` short and point back here instead of duplicating the
 flow details.
 
 For a cross-workflow inventory of goal ownership, planning, plan mutation,
-and completion decisions, see [Planning and Goal-Setting Audit](planning-and-goals-audit.md).
+and completion decisions, see [Planning and Goal Ownership](planning-and-goals-audit.md).
 
 ## Shared Workflow Runner Behavior
 
@@ -17,11 +17,12 @@ itself. The same grant is used by `read`, `edit`, `code_output`, and
 workflow reaper paths; `/clear` or process restart drops the grants.
 
 The workflow runner wires the normal orchestrator into every LLM step.
-That means LLM steps use the fast-gather -> main-fetch -> synthesis loop:
+That means LLM steps use the fast-gather -> deterministic-fetch -> synthesis
+loop:
 
 1. Fast agent requests typed followups such as `read`, `source`,
    `type`, `grep`, `git`, `callers`, or `make`.
-2. The main/service path fetches data and adds it to symbols/context.
+2. The deterministic tool service fetches data and adds it to symbols/context.
 3. The step's declared agent receives the gathered context and emits the final
    response. `agent: fast` uses the fast model for synthesis; `agent: slow` and
    `agent: code` use the slow model.
@@ -988,7 +989,7 @@ separate hardcoded review lens list. `/review <target>` and
 workflow-defined task loop. It uses the optimized lens path:
 
 1. For a named source-file review, bootstrap requests semcode's compact Tree-sitter
-   `file_survey` exactly once, performs no other fetches, and sends that inventory to one
+   `file_survey` exactly once, performs no other semantic fetches, and sends that inventory to one
    non-lensed slow call. The slow call emits a no-reasoning 0-100 bug-likelihood guess
    for every defined function. That ranking is supplied to `define_goal` and
    `define_plan`, so the initial semantic groups are source-informed. It is also cached
@@ -1099,24 +1100,11 @@ consolidator must emit a typed followup for the exact proof needed, the
 todo agent must keep the relevant trace step pending, and the goal judge
 must not declare the review complete.
 
-Required per finding:
-
-- `id`: short stable snake_case slug.
-- `title`: one-line human title.
-- `severity`: `low`, `medium`, or `high`.
-- `status`: normally `active`.
-- `relevant_symbols`: embedded symbol records
-  `{name, filename, line, definition}`.
-- `relevant_file_sections`: embedded source slices when a cited region
-  is not covered by `relevant_symbols`.
-- `summary`: what is wrong and why, with file:line citations.
-- `reproducer_sketch`: the code path, inputs, and state needed to
-  trigger the bug.
-- `impact`: what goes wrong when triggered.
-
-Optional fields include `mechanism_detail`, `fix_sketch`,
-`open_questions`, and `related_finding_ids`. Embedded source bodies
-should be minimal but sufficient to prove the bug.
+The canonical wire and storage fields are owned by
+[findings-json-format.md](findings-json-format.md). Review strengthens that
+storage contract: actionable findings must include status, sufficient embedded
+source anchors, a cited summary, a concrete reproducer path, and impact.
+Embedded source bodies should be minimal but sufficient to prove the bug.
 
 A clean lens should still return JSON with a brief `analysis`, an empty
 `findings` array, and an empty `followups` array, but only when the lens

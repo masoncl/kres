@@ -2,18 +2,14 @@
 
 ## CLI
 
+```text
+kres [OPTIONS] [COMMAND]
 ```
-kres test <model_config.json> [--prompt ...] [--model ...]
-kres turn <model_config.json> -o <output.md> [-i <input.json>] [other flags]
-kres [--fast-agent ...] [--slow NAME ... | --slow-agent ...] [--main-agent ...]
-     [--todo-agent ...] [--mcp-config ...] [--skills DIR]
-     [--results DIR] [--findings PATH] [--report PATH] [--todo PATH]
-     [--prompt PROMPT] [--template PATH] [--turns N]
-     [--follow] [--resume]
-     [--gather-turns N] [--stop-grace-ms MS] [--stdio]
-     [--allow ACTION]... [--assisted-by TEXT]
-     [--summary | --summary-markdown]
-```
+
+The subcommands are `test`, `turn`, `validate-workflow`, and `run-workflow`.
+Without a subcommand, kres starts the analysis REPL or performs the terminal
+operation selected by flags such as `--summary`, `--summary-markdown`,
+`--export`, or `--export-index`.
 
 Pass `kres --help` for the full list with argument-by-argument
 descriptions.
@@ -36,10 +32,10 @@ Examples:
 
 | Provider files present | CLI | Result |
 |------------------------|-----|--------|
-| `anthropic.json` offers Sonnet | `--slow sonnet` | Selects the Sonnet alias. |
+| `anthropic-fast.json` offers Sonnet | `--slow sonnet` | Selects the Sonnet alias. |
 | `azure.json` offers `gpt-5.5` | `--slow gpt-5.5` | Selects the unique provider. |
-| `foo.json` and `bar.json` offer Opus | `--slow claude-opus-4-6` | Fails as ambiguous. |
-| `foo.json` and `bar.json` offer Opus | `--slow foo.json:claude-opus-4-6` | Selects `foo.json`. |
+| `foo.json` and `bar.json` offer Opus | `--slow claude-opus-4-7` | Fails as ambiguous. |
+| `foo.json` and `bar.json` offer Opus | `--slow foo.json:claude-opus-4-7` | Selects `foo.json`. |
 
 Related docs:
 
@@ -71,7 +67,10 @@ Related docs:
 | `/followup`                    | List items deferred by goal-met or `--turns` cap |
 | `/summary [FILE]`              | Render `findings.json` (including stored task prose) to a plain-text summary (default `summary.txt`) |
 | `/summary-markdown [FILE]`     | Same as `/summary`, markdown output (default `summary.md`) |
-| `/review <target>`             | Compose the review template + target, submit |
+| `/review <target>`             | Run the JSON-defined review workflow through the task/todo loop |
+| `/triage <finding-dir>`        | Run the JSON-defined finding triage workflow |
+| `/validate <finding-dir> [source-workspace]` | Validate an exported finding against source |
+| `/fix <target>`                | Run the JSON-defined fix workflow |
 | `/extract …`                   | Copy artifacts out (`--dir`, `--report`, `--todo`, `--findings`) |
 | `/done N`                      | Remove the N'th pending todo |
 | `/report <path>`               | Write findings to markdown |

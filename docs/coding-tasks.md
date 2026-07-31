@@ -33,7 +33,7 @@ in the same batch have landed.
 
 **Bash verification** — the slow agent can emit a `bash` followup
 (`cc -o repro repro.c && ./repro`, `make -C test`, …) to build
-and run what it wrote. The main agent executes from the workspace
+and run what it wrote. The deterministic tool service executes from the workspace
 root and feeds back `[exit N]` + stdout + stderr. `bash` is OFF
 by default; see [action-allowlist.md](action-allowlist.md). A
 typical invocation:

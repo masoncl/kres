@@ -41,7 +41,7 @@ cargo fmt --all --check
 
 ## Pre-commit hook
 
-`.githooks/pre-commit` runs `cargo fmt --check` + `cargo clippy -D
+`.githooks/pre-commit` runs `cargo fmt --all --check` + `cargo clippy -D
 warnings` on every commit. Enable it per-clone with:
 
 ```

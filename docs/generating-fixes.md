@@ -85,7 +85,7 @@ Each todo has its own:
 - commit message;
 - build result;
 - review result;
-- published patch file.
+- persisted commit identity.
 
 The coding agent sees the broader series plan, but it is instructed to
 edit only the current todo. This is the main guard against one generated
@@ -176,8 +176,11 @@ commit message without making it more kernel-reviewable.
 
 ## Publish
 
-After a todo passes build and review, `publish-fix` writes the generated
-patch to the artifact directory when one is available.
+Passing a todo's build and review gates records its commit in the persisted
+series; it does not publish an intermediate patch. After every planned commit
+passes the final series assessment, `publish-fix` writes patches from the exact
+persisted commit list. This avoids publishing an inferred git range that could
+include unrelated commits.
 
 Patch filenames are deterministic:
 
@@ -223,8 +226,9 @@ Check:
 Useful run artifacts:
 
 - `/tmp/kres-fix/report.md`: high-level workflow report;
-- `/tmp/kres-fix/workflow-state/`: persisted planning and per-todo execution
-  snapshots for audit/debugging. Outer fix-series `--resume` is not currently
-  supported;
+- `/tmp/kres-fix/fix-series.json`: outer-series plan, statuses, and exact commit
+  identities used for resume and publication;
+- `/tmp/kres-fix/workflow-state/`: per-todo execution snapshots used by inner
+  workflow resume;
 - `.kres/logs/<session>/code.jsonl`: agent prompts and replies;
 - `.kres/logs/<session>/main.jsonl`: tool-fetch and reaper activity.

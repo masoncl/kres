@@ -4412,6 +4412,7 @@ pub struct BuiltAgents {
 #[derive(Default)]
 pub struct AgentRunnerBuildOptions {
     pub extra_slow_cfgs: Vec<(PathBuf, Option<String>)>,
+    pub compare_slow_models: bool,
     pub skills: Option<serde_json::Value>,
     pub usage: Option<Arc<UsageTracker>>,
     pub gather_turns: u8,
@@ -4429,6 +4430,7 @@ pub async fn build_agent_runner(
 ) -> Result<BuiltAgents> {
     let AgentRunnerBuildOptions {
         extra_slow_cfgs,
+        compare_slow_models,
         skills,
         usage,
         gather_turns,
@@ -4510,6 +4512,7 @@ pub async fn build_agent_runner(
         max_input_tokens: slow_cfg.max_input_tokens,
         thinking: slow_thinking,
         label: slow_model.id.clone(),
+        general_lens_only: false,
     }];
     for (cfg_path, model_override) in extra_slow_cfgs {
         if cfg_path == slow_cfg_path {
@@ -4551,6 +4554,7 @@ pub async fn build_agent_runner(
             max_input_tokens: cfg.max_input_tokens,
             thinking,
             label: model.id.clone(),
+            general_lens_only: !compare_slow_models,
         });
     }
 

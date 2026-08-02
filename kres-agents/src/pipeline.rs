@@ -444,6 +444,12 @@ pub struct SlowAgentVariant {
     pub max_input_tokens: Option<u32>,
     pub thinking: Option<ThinkingBudget>,
     pub label: String,
+    /// Route this variant only to the workflow's general review lens.
+    pub general_lens_only: bool,
+}
+
+fn variant_runs_lens(general_lens_only: bool, lens_id: &str) -> bool {
+    !general_lens_only || lens_id == "general"
 }
 
 /// Inputs to one run that vary per-task. Separated from AgentRunner
@@ -608,6 +614,7 @@ fn build_lens_call_future(
         max_input_tokens,
         thinking,
         label: model_label,
+        general_lens_only: _,
     } = variant;
     let LensCallContext {
         shared_prefix,
@@ -2074,6 +2081,9 @@ impl AgentRunner {
             let lens_specs = lens_specs
                 .iter()
                 .filter(|spec| {
+                    if !variant_runs_lens(variant.general_lens_only, &spec.lens_id) {
+                        return false;
+                    }
                     run_keys.map_or(true, |keys| {
                         keys.contains(&(spec.lens_id.clone(), Some(variant.label.clone())))
                     })
@@ -2177,7 +2187,16 @@ impl AgentRunner {
             outputs,
             failures,
             fast_rounds: prepared.fast_rounds,
-            attempted: lenses.len() * prepared.slow_variants.len(),
+            attempted: prepared
+                .slow_variants
+                .iter()
+                .map(|variant| {
+                    lenses
+                        .iter()
+                        .filter(|lens| variant_runs_lens(variant.general_lens_only, &lens.id))
+                        .count()
+                })
+                .sum(),
             slow_variant_count: prepared.slow_variants.len(),
         })
     }
@@ -2192,6 +2211,7 @@ impl AgentRunner {
                 max_input_tokens: self.slow_max_input_tokens,
                 thinking: self.slow_thinking,
                 label: self.slow_model.id.clone(),
+                general_lens_only: false,
             }]
         } else {
             self.slow_variants.clone()
@@ -2664,6 +2684,14 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secondary_slow_model_runs_only_general_lens() {
+        assert!(variant_runs_lens(false, "memory"));
+        assert!(variant_runs_lens(false, "general"));
+        assert!(!variant_runs_lens(true, "memory"));
+        assert!(variant_runs_lens(true, "general"));
+    }
     use crate::followup::Followup;
 
     #[tokio::test]

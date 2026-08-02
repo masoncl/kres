@@ -144,6 +144,10 @@ struct ReplArgs {
     /// Mutually exclusive with --slow-model.
     #[arg(long, value_delimiter = ',', conflicts_with = "slow_model")]
     slow: Vec<String>,
+    /// Run every review lens with every --slow model and write comparison.json.
+    /// Without this flag, additional slow models run only the general lens.
+    #[arg(long, default_value_t = false)]
+    compare: bool,
     /// Explicit slow-agent config path (overrides --slow).
     #[arg(long)]
     slow_agent: Option<PathBuf>,
@@ -816,8 +820,12 @@ fn apply_workflow_model_overrides(settings: &mut kres_repl::Settings, args: &Run
     );
 }
 
-fn review_comparison_path(results_dir: &Path, slow_model_count: usize) -> Option<PathBuf> {
-    (slow_model_count > 1).then(|| results_dir.join("comparison.json"))
+fn review_comparison_path(
+    results_dir: &Path,
+    slow_model_count: usize,
+    compare: bool,
+) -> Option<PathBuf> {
+    (compare && slow_model_count > 1).then(|| results_dir.join("comparison.json"))
 }
 
 async fn run_repl(args: ReplArgs) -> Result<()> {
@@ -1473,11 +1481,16 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             &settings,
             kres_repl::AgentRunnerBuildOptions {
                 extra_slow_cfgs: slow_agent_specs.iter().skip(1).cloned().collect(),
+                compare_slow_models: args.compare,
                 skills: skills_value,
                 usage: usage.clone(),
                 gather_turns: args.gather_turns,
                 logger: logger.clone(),
-                comparison_path: review_comparison_path(&results_dir, slow_agent_specs.len()),
+                comparison_path: review_comparison_path(
+                    &results_dir,
+                    slow_agent_specs.len(),
+                    args.compare,
+                ),
             },
         )
         .await?;
@@ -2523,12 +2536,21 @@ mod tests {
     #[test]
     fn comparison_artifact_requires_multiple_slow_models() {
         let results = Path::new("results");
-        assert_eq!(review_comparison_path(results, 0), None);
-        assert_eq!(review_comparison_path(results, 1), None);
+        assert_eq!(review_comparison_path(results, 0, true), None);
+        assert_eq!(review_comparison_path(results, 1, true), None);
+        assert_eq!(review_comparison_path(results, 2, false), None);
         assert_eq!(
-            review_comparison_path(results, 2),
+            review_comparison_path(results, 2, true),
             Some(results.join("comparison.json"))
         );
+    }
+
+    #[test]
+    fn comparison_mode_is_explicit() {
+        let normal = Cli::try_parse_from(["kres", "--slow", "opus,gpt"]).unwrap();
+        assert!(!normal.repl.compare);
+        let comparison = Cli::try_parse_from(["kres", "--slow", "opus,gpt", "--compare"]).unwrap();
+        assert!(comparison.repl.compare);
     }
 
     #[test]

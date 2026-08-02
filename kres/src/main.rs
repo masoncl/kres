@@ -799,6 +799,18 @@ fn resolve_slow_selector_in_dirs(
     ))
 }
 
+fn append_configured_secondary_slow(
+    specs: &mut Vec<(PathBuf, Option<String>)>,
+    settings: &kres_repl::Settings,
+    dirs: &[PathBuf],
+) -> Result<()> {
+    let Some(selector) = settings.secondary_slow_model() else {
+        return Ok(());
+    };
+    specs.push(resolve_slow_selector_in_dirs(selector, settings, dirs)?);
+    Ok(())
+}
+
 fn apply_slow_model_override_from_spec(
     settings: &mut kres_repl::Settings,
     spec: &(PathBuf, Option<String>),
@@ -858,27 +870,30 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         settings.model_for(kres_repl::ModelRole::Fast),
     )?;
 
-    let slow_agent_specs: Vec<(PathBuf, Option<String>)> = if let Some(p) = args.slow_agent.clone()
-    {
-        let selector = args
-            .slow_model
-            .as_deref()
-            .or_else(|| settings.model_for(kres_repl::ModelRole::Slow));
-        vec![(
-            resolve_agent_for_model(Some(&p), selector)?.expect("explicit path resolves"),
-            selector.map(ToOwned::to_owned),
-        )]
-    } else if args.slow.is_empty() {
-        resolve_agent_for_model(None, settings.model_for(kres_repl::ModelRole::Slow))?
-            .map(|p| vec![(p, args.slow_model.clone())])
-            .unwrap_or_default()
-    } else {
-        let dirs = kres_config_dirs();
-        args.slow
-            .iter()
-            .map(|selector| resolve_slow_selector_in_dirs(selector, &settings, &dirs))
-            .collect::<Result<Vec<_>>>()?
-    };
+    let mut slow_agent_specs: Vec<(PathBuf, Option<String>)> =
+        if let Some(p) = args.slow_agent.clone() {
+            let selector = args
+                .slow_model
+                .as_deref()
+                .or_else(|| settings.model_for(kres_repl::ModelRole::Slow));
+            vec![(
+                resolve_agent_for_model(Some(&p), selector)?.expect("explicit path resolves"),
+                selector.map(ToOwned::to_owned),
+            )]
+        } else if args.slow.is_empty() {
+            resolve_agent_for_model(None, settings.model_for(kres_repl::ModelRole::Slow))?
+                .map(|p| vec![(p, args.slow_model.clone())])
+                .unwrap_or_default()
+        } else {
+            let dirs = kres_config_dirs();
+            args.slow
+                .iter()
+                .map(|selector| resolve_slow_selector_in_dirs(selector, &settings, &dirs))
+                .collect::<Result<Vec<_>>>()?
+        };
+    if args.slow.is_empty() {
+        append_configured_secondary_slow(&mut slow_agent_specs, &settings, &kres_config_dirs())?;
+    }
     if let Some(spec) = slow_agent_specs.first() {
         apply_slow_model_override_from_spec(&mut settings, spec);
     }
@@ -1831,7 +1846,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         settings.model_for(kres_repl::ModelRole::Classifier),
         config_dirs,
     )?;
-    let slow_agent_specs = if !args.slow.is_empty() {
+    let mut slow_agent_specs = if !args.slow.is_empty() {
         args.slow
             .iter()
             .map(|selector| {
@@ -1847,6 +1862,9 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         .map(|path| vec![(path, args.slow_model.clone())])
         .unwrap_or_default()
     };
+    if args.slow.is_empty() {
+        append_configured_secondary_slow(&mut slow_agent_specs, &settings, config_dirs)?;
+    }
     if let Some(spec) = slow_agent_specs.first() {
         apply_slow_model_override_from_spec(&mut settings, spec);
     }
@@ -2609,6 +2627,37 @@ mod tests {
         assert_eq!(found, qualified_model_path(&provider, "foo"));
         assert_eq!(selected.as_deref(), Some("foo"));
 
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn configured_secondary_slow_resolves_to_an_additional_spec() {
+        let base = std::env::temp_dir().join(format!(
+            "kres-secondary-slow-selector-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models = base.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let provider = models.join("provider.json");
+        std::fs::write(&provider, r#"{"models":{"primary":{},"secondary":{}}}"#).unwrap();
+        let settings: kres_repl::Settings =
+            serde_json::from_str(r#"{"models":{"slow":"primary","slow_secondary":"secondary"}}"#)
+                .unwrap();
+        let mut specs = vec![(
+            qualified_model_path(&provider, "primary"),
+            Some("primary".into()),
+        )];
+
+        append_configured_secondary_slow(&mut specs, &settings, std::slice::from_ref(&base))
+            .unwrap();
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[1].0, qualified_model_path(&provider, "secondary"));
+        assert_eq!(specs[1].1.as_deref(), Some("secondary"));
         std::fs::remove_dir_all(base).ok();
     }
 

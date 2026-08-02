@@ -72,6 +72,31 @@ See [docs/agents.md](docs/agents.md) for the task flow and
 
    If you're doing more in-depth reviews of whole files, 50 turns is a good starting point.
 
+## Combining and comparing multiple models
+
+You can add a second model for reviews. In `~/.kres/settings.json`:
+
+```json
+{
+  "models": {
+    "slow": "opus",
+    "slow_secondary": "gpt"
+  }
+}
+```
+
+The primary slow model runs every active lens. The secondary model runs only
+the `general` lens during `/review`, or the broader `maintainer` lens while
+`/fix` iterates on a patch.
+
+For a one-off run, pass both models with `--slow opus,gpt` (equivalent to
+repeating `--slow`). Any explicit `--slow` selection replaces the configured
+primary and secondary pair. Add `--compare` to run every active lens with
+every selected model and write a model comparison under the results
+directory.
+
+See [docs/configuration.md](docs/configuration.md) for selector and alias
+resolution, and [docs/cli.md](docs/cli.md) for precedence details.
 
 ## Exporting findings
 

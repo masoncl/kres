@@ -22,11 +22,27 @@ agent model.
 `--slow NAME` selects a slow model. `sonnet` and `opus` first resolve through
 `settings.json:model_aliases`, then fall back to the shipped model ids. Other
 values are model ids; when multiple provider
-files offer one model, qualify it as `provider.json:model-id`. It is repeatable
-for `/review` comparison mode, for example `--slow sonnet --slow opus`.
-Review sends every slow-agent lens prompt to all configured slow models,
-tags their outputs by model, and writes the consolidator's per-turn
-comparison to `<results>/comparison.json`.
+files offer one model, qualify it as `provider.json:model-id`.
+
+Model selection has three review modes:
+
+- One slow model: the selected model runs every active lens.
+- Two slow models without `--compare`: the first model runs every active lens;
+  the second adds only the supplemental lens (`general` for `/review`,
+  `maintainer` for `/fix`). Configure this persistently with
+  `models.slow_secondary`, or per run with repeated/comma-separated `--slow`.
+- Multiple slow models with `--compare`: every model runs every active lens.
+  Outputs are tagged by model and the per-turn comparison is written to
+  `<results>/comparison.json`.
+
+For example, both `--slow opus,gpt` and `--slow opus --slow gpt` select Opus as
+the primary and GPT as the supplemental model. Adding `--compare` performs the
+full cross-model lens comparison instead.
+
+Any explicit `--slow` value replaces both `models.slow` and
+`models.slow_secondary` for that run. `--slow-model` remains a single-primary
+override, preserves a configured secondary model, and is mutually exclusive
+with `--slow`.
 
 Examples:
 
@@ -36,6 +52,8 @@ Examples:
 | `azure.json` offers `gpt-5.5` | `--slow gpt-5.5` | Selects the unique provider. |
 | `foo.json` and `bar.json` offer Opus | `--slow claude-opus-4-8` | Fails as ambiguous. |
 | `foo.json` and `bar.json` offer Opus | `--slow foo.json:claude-opus-4-8` | Selects `foo.json`. |
+| Opus primary, GPT supplemental | `--slow opus,gpt` | Runs all lenses with Opus and one supplemental lens with GPT. |
+| Compare Opus and GPT | `--slow opus,gpt --compare` | Runs every active lens with both models. |
 
 Related docs:
 

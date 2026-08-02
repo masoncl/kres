@@ -8,6 +8,7 @@
 //!   "models": {
 //!     "fast": "anthropic.json:claude-sonnet-5",
 //!     "slow": "anthropic.json:claude-opus-4-8",
+//!     "slow_secondary": "openai.json:gpt-5.4",
 //!     "main": "anthropic.json:claude-sonnet-5",
 //!     "todo": "anthropic.json:claude-sonnet-5",
 //!     "classifier": "anthropic.json:claude-haiku-4-5"
@@ -105,6 +106,10 @@ pub struct Models {
     pub fast: Option<String>,
     #[serde(default)]
     pub slow: Option<String>,
+    /// Optional second review model. It runs the supplemental lens only:
+    /// `general` for /review and `maintainer` for /fix.
+    #[serde(default)]
+    pub slow_secondary: Option<String>,
     #[serde(default)]
     pub main: Option<String>,
     #[serde(default)]
@@ -197,6 +202,9 @@ impl Settings {
         }
         if proj.models.slow.is_some() {
             self.models.slow = proj.models.slow;
+        }
+        if proj.models.slow_secondary.is_some() {
+            self.models.slow_secondary = proj.models.slow_secondary;
         }
         if proj.models.main.is_some() {
             self.models.main = proj.models.main;
@@ -324,6 +332,14 @@ impl Settings {
         slot.as_deref().map(|id| self.resolve_model_selector(id))
     }
 
+    /// Optional supplemental review model, with configured aliases expanded.
+    pub fn secondary_slow_model(&self) -> Option<&str> {
+        self.models
+            .slow_secondary
+            .as_deref()
+            .map(|id| self.resolve_model_selector(id))
+    }
+
     /// Override the model id for a single role. `Some(id)` replaces
     /// whatever was loaded from settings.json; `None` is a no-op so
     /// callers can pass CLI `Option<String>` through directly.
@@ -448,6 +464,15 @@ mod tests {
         .unwrap();
         assert_eq!(s.model_for(ModelRole::Slow), Some("provider.json:model-v2"));
         assert_eq!(s.resolve_model_selector("unaliased"), "unaliased");
+    }
+
+    #[test]
+    fn secondary_slow_model_expands_configured_alias() {
+        let s: Settings = serde_json::from_str(
+            r#"{"models":{"slow_secondary":"general"},"model_aliases":{"general":"openai.json:gpt-5.4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(s.secondary_slow_model(), Some("openai.json:gpt-5.4"));
     }
 
     #[test]
@@ -621,6 +646,18 @@ mod tests {
 
         assert_eq!(global.resolve_model_selector("sonnet"), "sonnet-v2");
         assert_eq!(global.resolve_model_selector("opus"), "opus-v1");
+    }
+
+    #[test]
+    fn project_secondary_slow_model_overrides_global() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"models":{"slow_secondary":"secondary-v1"}}"#).unwrap();
+        let project: Settings =
+            serde_json::from_str(r#"{"models":{"slow_secondary":"secondary-v2"}}"#).unwrap();
+
+        global.apply_project_overrides(project);
+
+        assert_eq!(global.secondary_slow_model(), Some("secondary-v2"));
     }
 
     #[test]

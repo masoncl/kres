@@ -17,7 +17,10 @@ remain available for one-off overrides.
 - **slow** (selected by `settings.models.slow` or CLI override) — the
   deep analyser. Gets the gathered symbols, the cumulative
   findings, and the task brief; returns analysis prose plus
-  structured findings.
+  structured findings. Optional `settings.models.slow_secondary` adds a second
+  model for the `general` review lens or fix workflow's `maintainer` lens.
+  Explicit `--slow` selection replaces the configured pair; `--compare`
+  expands every selected model across every active lens.
 - **todo** — for generic sessions, dedups the slow agent's
   followups against the current todo list, reprioritises, and
   may reshape the plan.

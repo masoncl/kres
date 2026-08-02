@@ -35,6 +35,7 @@ or `<provider>.json:<model-id>` when disambiguation is required:
   "models": {
     "fast": "sonnet",
     "slow": "opus",
+    "slow_secondary": "openai.json:gpt-5.4",
     "main": "sonnet",
     "todo": "sonnet",
     "classifier": "anthropic.json:claude-haiku-4-5"
@@ -45,6 +46,12 @@ or `<provider>.json:<model-id>` when disambiguation is required:
   }
 }
 ```
+
+`models.slow_secondary` is optional. When set, the primary `models.slow`
+model runs every review lens and the secondary model adds one supplemental
+pass: `general` for `/review` and `maintainer` for `/fix`. Any explicit
+`--slow` value overrides this configured pair. `--compare` runs every lens
+with every selected slow model instead of using the supplemental-lens split.
 
 `model_aliases` defines operator-owned short names for model selectors. Alias
 values may be either an unqualified model id or a provider-qualified selector.

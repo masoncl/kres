@@ -1017,18 +1017,24 @@ workspace contents and does not imply a revision, base, or diff. Only a target c
 as a git commit/range starts from `git show` or `git diff`; source reviews may request
 targeted history later when a concrete semantic question requires it.
 
-When multiple `--slow` selectors are passed, review runs in comparison
-mode. Each selector resolves to one model (`sonnet` and `opus` consult
-`settings.json:model_aliases` before their built-in fallbacks;
-use `provider.json:model-id` when more than one provider offers the model).
-Each active lens prompt is sent to every configured slow model, so a
-commit review with five active lenses and `--slow sonnet --slow opus`
-performs ten slow calls after the shared gather. Every per-lens
-output sent to the consolidator is
-tagged with `slow_model`; the consolidator compares sibling model
-outputs for quality and depth, keeps the best evidence and Findings
-while deduplicating across models and lenses, and records one entry per
-completed review turn in `<results>/comparison.json`.
+Multiple slow selectors have supplemental semantics by default. The first
+model runs every active lens. Without `--compare`, each additional model runs
+only the workflow's supplemental lens: `general` for `/review` and
+`maintainer` for `/fix`. For five active `/review` lenses, two models therefore
+make six slow calls after the shared gather. The selectors may come from
+`models.slow` plus optional `models.slow_secondary`, or from repeated or
+comma-separated `--slow`; explicit CLI selectors replace the configured pair.
+
+`--compare` opts into the full Cartesian fan-out. Each active lens prompt is
+sent to every selected slow model, so five active lenses and two models make
+ten slow calls. Every per-lens output sent to the consolidator is tagged with
+`slow_model`; the consolidator compares sibling outputs, keeps the best
+evidence and Findings while deduplicating across models and lenses, and records
+one entry per completed review turn in `<results>/comparison.json`.
+
+Every selector uses the normal resolution rules: `sonnet` and `opus` consult
+`settings.json:model_aliases` before their built-in fallbacks, and ambiguous
+model ids must be qualified as `provider.json:model-id`.
 
 ### Review Lenses
 

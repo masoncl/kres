@@ -444,12 +444,22 @@ pub struct SlowAgentVariant {
     pub max_input_tokens: Option<u32>,
     pub thinking: Option<ThinkingBudget>,
     pub label: String,
-    /// Route this variant only to the workflow's general review lens.
-    pub general_lens_only: bool,
+    /// Route this variant only to the workflow's supplemental review lens.
+    pub supplemental_lens_only: bool,
 }
 
-fn variant_runs_lens(general_lens_only: bool, lens_id: &str) -> bool {
-    !general_lens_only || lens_id == "general"
+fn supplemental_lens_id(lenses: &[LensSpec]) -> Option<&str> {
+    ["maintainer", "general"]
+        .into_iter()
+        .find(|id| lenses.iter().any(|lens| lens.id == *id))
+}
+
+fn variant_runs_lens(
+    supplemental_lens_only: bool,
+    lens_id: &str,
+    supplemental_lens: Option<&str>,
+) -> bool {
+    !supplemental_lens_only || supplemental_lens == Some(lens_id)
 }
 
 /// Inputs to one run that vary per-task. Separated from AgentRunner
@@ -614,7 +624,7 @@ fn build_lens_call_future(
         max_input_tokens,
         thinking,
         label: model_label,
-        general_lens_only: _,
+        supplemental_lens_only: _,
     } = variant;
     let LensCallContext {
         shared_prefix,
@@ -2016,6 +2026,7 @@ impl AgentRunner {
             cache_mode,
             run_keys,
         } = call;
+        let supplemental_lens = supplemental_lens_id(all_lenses);
         // Build per-lens specs once; the same specs feed every slow
         // variant and may be reused across the cache-prime attempt
         // and the no-cache fallback.
@@ -2081,7 +2092,11 @@ impl AgentRunner {
             let lens_specs = lens_specs
                 .iter()
                 .filter(|spec| {
-                    if !variant_runs_lens(variant.general_lens_only, &spec.lens_id) {
+                    if !variant_runs_lens(
+                        variant.supplemental_lens_only,
+                        &spec.lens_id,
+                        supplemental_lens,
+                    ) {
                         return false;
                     }
                     run_keys.map_or(true, |keys| {
@@ -2193,7 +2208,13 @@ impl AgentRunner {
                 .map(|variant| {
                     lenses
                         .iter()
-                        .filter(|lens| variant_runs_lens(variant.general_lens_only, &lens.id))
+                        .filter(|lens| {
+                            variant_runs_lens(
+                                variant.supplemental_lens_only,
+                                &lens.id,
+                                supplemental_lens,
+                            )
+                        })
                         .count()
                 })
                 .sum(),
@@ -2211,7 +2232,7 @@ impl AgentRunner {
                 max_input_tokens: self.slow_max_input_tokens,
                 thinking: self.slow_thinking,
                 label: self.slow_model.id.clone(),
-                general_lens_only: false,
+                supplemental_lens_only: false,
             }]
         } else {
             self.slow_variants.clone()
@@ -2686,11 +2707,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secondary_slow_model_runs_only_general_lens() {
-        assert!(variant_runs_lens(false, "memory"));
-        assert!(variant_runs_lens(false, "general"));
-        assert!(!variant_runs_lens(true, "memory"));
-        assert!(variant_runs_lens(true, "general"));
+    fn secondary_slow_model_runs_only_workflow_supplemental_lens() {
+        let review_lenses = vec![
+            LensSpec::new("memory", "memory"),
+            LensSpec::new("general", "general"),
+        ];
+        let fix_lenses = vec![
+            LensSpec::new("general", "general"),
+            LensSpec::new("maintainer", "maintainer"),
+        ];
+
+        assert!(variant_runs_lens(
+            false,
+            "memory",
+            supplemental_lens_id(&review_lenses)
+        ));
+        assert!(!variant_runs_lens(
+            true,
+            "memory",
+            supplemental_lens_id(&review_lenses)
+        ));
+        assert!(variant_runs_lens(
+            true,
+            "general",
+            supplemental_lens_id(&review_lenses)
+        ));
+        assert!(!variant_runs_lens(
+            true,
+            "general",
+            supplemental_lens_id(&fix_lenses)
+        ));
+        assert!(variant_runs_lens(
+            true,
+            "maintainer",
+            supplemental_lens_id(&fix_lenses)
+        ));
     }
     use crate::followup::Followup;
 

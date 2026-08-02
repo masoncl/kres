@@ -74,8 +74,11 @@ struct RunWorkflowArgs {
     kres_dir: Option<PathBuf>,
     /// Slow model selector. Use a model id when unique, or
     /// provider.json:model-id to disambiguate. sonnet/opus are aliases.
-    #[arg(long, conflicts_with = "slow_model")]
-    slow: Option<String>,
+    #[arg(long, value_delimiter = ',', conflicts_with = "slow_model")]
+    slow: Vec<String>,
+    /// Run every workflow review lens with every --slow model.
+    #[arg(long, default_value_t = false)]
+    compare: bool,
     /// Override the fast-agent model id. Beats settings.json.
     #[arg(long, value_name = "ID")]
     fast_model: Option<String>,
@@ -1691,7 +1694,8 @@ fn workflow_short_circuit_from_repl_args(repl: &ReplArgs) -> Option<RunWorkflowA
         input: std::mem::take(&mut input),
         workspace,
         kres_dir: resolved_kres_dir,
-        slow: repl.slow.first().cloned(),
+        slow: repl.slow.clone(),
+        compare: repl.compare,
         fast_model: repl.fast_model.clone(),
         slow_model: repl.slow_model.clone(),
         classifier_model: repl.classifier_model.clone(),
@@ -1827,21 +1831,30 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         settings.model_for(kres_repl::ModelRole::Classifier),
         config_dirs,
     )?;
-    let slow_model_cfg = if let Some(selector) = args.slow.as_deref() {
-        let spec =
-            resolve_slow_selector_in_dirs(selector, &settings, std::slice::from_ref(&kres_dir))?;
-        apply_slow_model_override_from_spec(&mut settings, &spec);
-        let (path, _) = spec;
-        Some(path)
+    let slow_agent_specs = if !args.slow.is_empty() {
+        args.slow
+            .iter()
+            .map(|selector| {
+                resolve_slow_selector_in_dirs(selector, &settings, std::slice::from_ref(&kres_dir))
+            })
+            .collect::<Result<Vec<_>>>()?
     } else {
         resolve_agent_for_model_in_dirs(
             None,
             settings.model_for(kres_repl::ModelRole::Slow),
             config_dirs,
         )?
+        .map(|path| vec![(path, args.slow_model.clone())])
+        .unwrap_or_default()
     };
+    if let Some(spec) = slow_agent_specs.first() {
+        apply_slow_model_override_from_spec(&mut settings, spec);
+    }
     let fast_path = fast_model_cfg.unwrap_or_else(|| kres_dir.join("models/__missing_fast__.json"));
-    let slow_path = slow_model_cfg.unwrap_or_else(|| kres_dir.join("models/__missing_slow__.json"));
+    let slow_path = slow_agent_specs
+        .first()
+        .map(|(path, _)| path.clone())
+        .unwrap_or_else(|| kres_dir.join("models/__missing_slow__.json"));
     let classifier_path = classifier_model_cfg.unwrap_or_else(|| fast_path.clone());
 
     let mut inputs_raw = parse_input_kvs(&args.input)?;
@@ -2028,10 +2041,14 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
             fetcher,
             &settings,
             kres_repl::AgentRunnerBuildOptions {
+                extra_slow_cfgs: slow_agent_specs.iter().skip(1).cloned().collect(),
+                compare_slow_models: args.compare,
                 usage: Some(usage.clone()),
                 gather_turns: 5,
                 logger: logger.clone(),
-                comparison_path: None,
+                comparison_path: args.results.as_ref().and_then(|results| {
+                    review_comparison_path(results, slow_agent_specs.len(), args.compare)
+                }),
                 ..Default::default()
             },
         )
@@ -2298,6 +2315,21 @@ mod tests {
     }
 
     #[test]
+    fn workflow_prompt_short_circuit_preserves_multiple_slow_models() {
+        let c = Cli::try_parse_from([
+            "kres",
+            "--prompt",
+            "fix: /tmp/finding",
+            "--slow",
+            "opus,gpt",
+        ])
+        .unwrap();
+        let args = workflow_short_circuit_from_repl_args(&c.repl).unwrap();
+        assert_eq!(args.slow, vec!["opus", "gpt"]);
+        assert!(!args.compare);
+    }
+
+    #[test]
     fn validate_prompt_short_circuit_sets_source_workspace() {
         let base = std::env::temp_dir().join(format!(
             "kres-validate-prompt-test-{}-{}",
@@ -2413,7 +2445,7 @@ mod tests {
     fn run_workflow_slow_tag_unset_when_not_passed() {
         let c = Cli::try_parse_from(["kres", "run-workflow", "workflow-id:fix"]).unwrap();
         match c.cmd {
-            Some(Command::RunWorkflow(args)) => assert!(args.slow.is_none()),
+            Some(Command::RunWorkflow(args)) => assert!(args.slow.is_empty()),
             other => panic!("expected run-workflow command, got {other:?}"),
         }
     }

@@ -4512,7 +4512,7 @@ pub async fn build_agent_runner(
         max_input_tokens: slow_cfg.max_input_tokens,
         thinking: slow_thinking,
         label: slow_model.id.clone(),
-        general_lens_only: false,
+        supplemental_lens_only: false,
     }];
     for (cfg_path, model_override) in extra_slow_cfgs {
         if cfg_path == slow_cfg_path {
@@ -4554,7 +4554,7 @@ pub async fn build_agent_runner(
             max_input_tokens: cfg.max_input_tokens,
             thinking,
             label: model.id.clone(),
-            general_lens_only: !compare_slow_models,
+            supplemental_lens_only: !compare_slow_models,
         });
     }
 

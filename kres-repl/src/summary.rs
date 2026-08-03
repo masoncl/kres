@@ -39,6 +39,7 @@
 //! template choice and output filename differ between them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -48,6 +49,7 @@ use kres_core::findings::{
 };
 use kres_core::Shutdown;
 use serde_json::json;
+use tokio::task::JoinSet;
 
 use kres_agents::pipeline::AgentRunner;
 use kres_agents::workflow_exec::WorkflowStatus;
@@ -60,6 +62,7 @@ use kres_llm::{
 /// and we need a budget to decide staging. Claude's default 200K
 /// context, minus headroom for the output and protocol overhead.
 const DEFAULT_INPUT_BUDGET: u32 = 180_000;
+const SUMMARY_VALIDATION_CONCURRENCY: usize = 20;
 
 /// Default on-disk override location for the plain-text template.
 /// Empty by default; an operator who wants to shadow the embedded
@@ -118,6 +121,17 @@ pub struct SummaryValidationInputs {
     pub shutdown: Shutdown,
 }
 
+struct SummaryValidationJob {
+    finding: Finding,
+    exported: crate::export::ExportedFinding,
+    workspace: PathBuf,
+    validation_dir: PathBuf,
+    workflow: kres_agents::workflow::Workflow,
+    agent_runner: Arc<AgentRunner>,
+    skills_dir: Option<PathBuf>,
+    shutdown: Shutdown,
+}
+
 pub async fn validate_findings_for_summary(
     inputs: SummaryValidationInputs,
 ) -> Result<Vec<Finding>> {
@@ -147,8 +161,8 @@ pub async fn validate_findings_for_summary(
     .await?;
     let override_dir = dirs::home_dir().map(|home| home.join(".kres/workflows"));
     let workflow = kres_agents::workflow::lookup_workflow(override_dir.as_deref(), "validate")?;
-    let mut validated = Vec::with_capacity(exported.len());
-
+    let batch_shutdown = inputs.shutdown.child();
+    let mut jobs = Vec::with_capacity(exported.len());
     for exported_finding in exported {
         let Some(finding) = by_id.get(&exported_finding.id).cloned() else {
             return Err(anyhow!(
@@ -156,69 +170,142 @@ pub async fn validate_findings_for_summary(
                 exported_finding.id
             ));
         };
-        kres_core::consent::get_or_install().grant_from_mention(&exported_finding.dir);
-        let mut driver = LlmDriver::new(inputs.workspace.clone(), workflow.clone())
-            .with_agent_runner(inputs.agent_runner.clone())
-            .with_shutdown(inputs.shutdown.child());
-        if let Some(skills_dir) = inputs.skills_dir.as_ref() {
-            let (with_skills, warnings) = driver.with_skills_dir(skills_dir)?;
-            for warning in warnings {
-                kres_core::async_eprintln!("summary validation skill: {warning}");
-            }
-            driver = with_skills;
-        }
-        let mut workflow_inputs = serde_json::Map::new();
-        workflow_inputs.insert(
-            "target".into(),
-            serde_json::Value::String(exported_finding.dir.display().to_string()),
-        );
-        workflow_inputs.insert(
-            "source_workspace".into(),
-            serde_json::Value::String(inputs.workspace.display().to_string()),
-        );
-        let state_dir = inputs.validation_dir.join("workflow-state").join(
-            exported_finding
-                .dir
-                .file_name()
-                .unwrap_or_else(|| std::ffi::OsStr::new("finding")),
-        );
-        kres_core::async_eprintln!("summary validation: {}", exported_finding.id);
-        let run = crate::workflow::run_workflow_driver(
-            &workflow,
-            &mut driver,
-            derive_inputs(&workflow, workflow_inputs),
-            crate::workflow::WorkflowRunOptions {
-                iteration_cap: 200,
-                state_dir: Some(state_dir),
-                ..Default::default()
-            },
-        )
-        .await?;
-        if !matches!(
-            run.trace.status,
-            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
-        ) {
-            return Err(anyhow!(
-                "validation failed for {}: {}",
-                exported_finding.id,
-                crate::workflow::workflow_status_label(&run.trace.status)
-            ));
-        }
-        let outputs = &run
-            .trace
-            .final_state
-            .get("validate-reachability")
-            .ok_or_else(|| anyhow!("validation produced no reachability step"))?
-            .outputs;
-        let validated_summary = std::fs::read_to_string(exported_finding.dir.join("summary.md"))
-            .with_context(|| format!("reading validated summary for {}", exported_finding.id))?;
-        validated.push(project_validated_finding(
+        jobs.push(SummaryValidationJob {
             finding,
-            outputs,
-            validated_summary,
-        )?);
+            exported: exported_finding,
+            workspace: inputs.workspace.clone(),
+            validation_dir: inputs.validation_dir.clone(),
+            workflow: workflow.clone(),
+            agent_runner: inputs.agent_runner.clone(),
+            skills_dir: inputs.skills_dir.clone(),
+            shutdown: batch_shutdown.child(),
+        });
     }
+
+    let result = run_bounded_ordered(jobs, SUMMARY_VALIDATION_CONCURRENCY, |job| async move {
+        validate_summary_finding(job).await
+    })
+    .await;
+    if result.is_err() {
+        batch_shutdown.cancel();
+    }
+    result
+}
+
+async fn validate_summary_finding(job: SummaryValidationJob) -> Result<Finding> {
+    kres_core::consent::get_or_install().grant_from_mention(&job.exported.dir);
+    let mut driver = LlmDriver::new(job.workspace.clone(), job.workflow.clone())
+        .with_agent_runner(job.agent_runner)
+        .with_shutdown(job.shutdown);
+    if let Some(skills_dir) = job.skills_dir.as_ref() {
+        let (with_skills, warnings) = driver.with_skills_dir(skills_dir)?;
+        for warning in warnings {
+            kres_core::async_eprintln!("summary validation skill: {warning}");
+        }
+        driver = with_skills;
+    }
+    let mut workflow_inputs = serde_json::Map::new();
+    workflow_inputs.insert(
+        "target".into(),
+        serde_json::Value::String(job.exported.dir.display().to_string()),
+    );
+    workflow_inputs.insert(
+        "source_workspace".into(),
+        serde_json::Value::String(job.workspace.display().to_string()),
+    );
+    let state_dir = job.validation_dir.join("workflow-state").join(
+        job.exported
+            .dir
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("finding")),
+    );
+    kres_core::async_eprintln!("summary validation: start {}", job.exported.id);
+    let run = crate::workflow::run_workflow_driver(
+        &job.workflow,
+        &mut driver,
+        derive_inputs(&job.workflow, workflow_inputs),
+        crate::workflow::WorkflowRunOptions {
+            iteration_cap: 200,
+            state_dir: Some(state_dir),
+            ..Default::default()
+        },
+    )
+    .await?;
+    if !matches!(
+        run.trace.status,
+        WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+    ) {
+        return Err(anyhow!(
+            "validation failed for {}: {}",
+            job.exported.id,
+            crate::workflow::workflow_status_label(&run.trace.status)
+        ));
+    }
+    let outputs = &run
+        .trace
+        .final_state
+        .get("validate-reachability")
+        .ok_or_else(|| anyhow!("validation produced no reachability step"))?
+        .outputs;
+    let validated_summary = std::fs::read_to_string(job.exported.dir.join("summary.md"))
+        .with_context(|| format!("reading validated summary for {}", job.exported.id))?;
+    let validated = project_validated_finding(job.finding, outputs, validated_summary)?;
+    kres_core::async_eprintln!("summary validation: done {}", job.exported.id);
     Ok(validated)
+}
+
+async fn run_bounded_ordered<T, U, F, Fut>(
+    items: Vec<T>,
+    limit: usize,
+    operation: F,
+) -> Result<Vec<U>>
+where
+    T: Send + 'static,
+    U: Send + 'static,
+    F: Fn(T) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<U>> + Send + 'static,
+{
+    if limit == 0 {
+        return Err(anyhow!("bounded operation concurrency must be positive"));
+    }
+
+    let item_count = items.len();
+    let mut pending = items.into_iter().enumerate();
+    let mut running = JoinSet::new();
+    let mut outputs: Vec<Option<U>> = std::iter::repeat_with(|| None).take(item_count).collect();
+
+    for _ in 0..limit {
+        let Some((index, item)) = pending.next() else {
+            break;
+        };
+        let operation = operation.clone();
+        running.spawn(async move { operation(item).await.map(|output| (index, output)) });
+    }
+
+    while let Some(joined) = running.join_next().await {
+        let completed = match joined {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("bounded operation task failed: {error}")),
+        };
+        let (index, output) = match completed {
+            Ok(value) => value,
+            Err(error) => {
+                running.abort_all();
+                return Err(error);
+            }
+        };
+        outputs[index] = Some(output);
+
+        if let Some((next_index, item)) = pending.next() {
+            let operation = operation.clone();
+            running.spawn(async move { operation(item).await.map(|output| (next_index, output)) });
+        }
+    }
+
+    outputs
+        .into_iter()
+        .map(|output| output.ok_or_else(|| anyhow!("bounded operation produced no output")))
+        .collect()
 }
 
 fn apply_validation_outputs(
@@ -1149,6 +1236,7 @@ mod tests {
     use super::*;
     use kres_core::findings::{FindingDetail, RelevantFileSection, RelevantSymbol, TaskProse};
     use kres_llm::model::Effort;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn f(id: &str, sev: Severity, status: Status, details: Vec<(&str, &str)>) -> Finding {
         Finding {
@@ -1240,6 +1328,38 @@ mod tests {
             .clone();
 
         assert!(project_validated_finding(finding, &outputs, "body".into()).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_runner_parallelizes_up_to_limit_and_preserves_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let items: Vec<usize> = (0..45).collect();
+        let outputs = run_bounded_ordered(items.clone(), 20, {
+            let active = active.clone();
+            let peak = peak.clone();
+            move |item| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5 + (item % 5) as u64))
+                        .await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(item * 2)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outputs,
+            items.iter().map(|item| item * 2).collect::<Vec<_>>()
+        );
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= 20);
     }
 
     #[test]

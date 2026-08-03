@@ -1329,7 +1329,9 @@ that reachable component.
 is not itself a workflow and is not invokable through
 `--prompt "summary: ..."`. Before rendering, it exports every canonical
 finding with store-only `details` redacted and invokes the existing `validate`
-JSON workflow for each finding. A failed validation aborts the summary. The
-renderer consumes only validation-produced summaries and structured verdicts,
-then owns batching, template selection, and the final output write for both CLI
-and REPL entry points.
+JSON workflow for each finding. Up to 20 finding validations run concurrently;
+their results are restored to canonical finding order before rendering. A failed
+validation cancels the remaining batch and aborts the summary. The renderer
+consumes only validation-produced summaries and structured verdicts, then owns
+batching, template selection, and the final output write for both CLI and REPL
+entry points.

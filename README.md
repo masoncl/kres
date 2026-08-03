@@ -74,7 +74,8 @@ See [docs/agents.md](docs/agents.md) for the task flow and
 
    Summary generation first runs the validation workflow for every finding,
    with up to 20 findings validating in parallel, then renders only the
-   validated results. Both fast and slow models must be configured; validation
+   validated results. The fast model handles both validation roles by default;
+   pass `--slow NAME` to use a different slow validation model. Validation
    artifacts are kept under
    `review/summary-validation/` in this example.
 

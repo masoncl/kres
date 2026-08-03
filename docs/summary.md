@@ -10,8 +10,10 @@ A plain-text summary is produced explicitly by `/summary` or standalone via
 `kres --summary --results <dir>`. Turn-cap and idle exits do not render one
 automatically. The markdown variant is
 `/summary-markdown` / `kres --summary-markdown --results <dir>`,
-which writes `summary.md`. Both commands require configured fast and slow
-agents because validation runs before rendering. That run:
+which writes `summary.md`. Both commands require a configured fast agent.
+Standalone `--summary` and `--summary-markdown` use the fast model for both
+validation roles by default; `--slow NAME` selects a different slow validation
+model for that run. That run:
 
 - exports every canonical finding under `<results>/summary-validation/` and
   runs the existing `validate` workflow against the active source workspace;

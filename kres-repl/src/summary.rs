@@ -1,20 +1,21 @@
-//! /summary and `kres --summary` — render a plain-text (or markdown)
-//! bug report from `findings.json` ALONE. report.md is no longer
-//! consulted by this module; every fact the summary emits comes from
-//! the findings store.
+//! /summary and `kres --summary` — validate every canonical finding with
+//! the existing `validate` workflow, then render a plain-text (or markdown)
+//! bug report from the validation-produced summaries. report.md is not
+//! consulted.
 //!
 //! Flow:
-//!   1. Open the findings file via `kres_core::FindingsStore` (jsondb)
-//!      and take a `FindingsFile` snapshot.
-//!   2. Filter out `Status::Invalidated` and sort the remaining
+//!   1. Export findings and run the `validate` JSON workflow for each one.
+//!   2. Project each structured verdict and generated summary.md into a
+//!      transient Finding, dropping stale pre-validation narrative.
+//!   3. Filter out `Status::Invalidated` and sort the remaining
 //!      findings by severity, most severe first; within one severity
 //!      keep the store's insertion order.
-//!   3. Bucket the per-task material: for every task id that appears
+//!   4. Bucket the per-task material: for every task id that appears
 //!      in `finding.details[].task` ∪ `task_prose[].task`, collect
 //!      the finding-by-finding analysis snippets and the file-level
 //!      task_prose body. This is the set of "per-task summaries and
 //!      details" the user asked for.
-//!   4. Condense pass: greedy-pack tasks into batches that each fit
+//!   5. Condense pass: greedy-pack tasks into batches that each fit
 //!      the fast-agent input budget, then issue ONE call per batch
 //!      using the embedded `condense-task.system.md` system prompt.
 //!      The output is plain prose — since the final document is one
@@ -24,7 +25,7 @@
 //!      from. A single task that alone exceeds the budget falls
 //!      back to `condense_single_task`, which recursively splits
 //!      per_finding halves and drops task_prose with a breadcrumb.
-//!   5. Render pass: send the sorted findings (with `details`
+//!   6. Render pass: send the sorted findings (with `details`
 //!      stripped via `redact_findings_for_agent`) plus the
 //!      `task_observations` string to the `summary` (or
 //!      `summary-markdown`) slash-command template. Single-shot
@@ -45,9 +46,12 @@ use anyhow::{anyhow, Context, Result};
 use kres_core::findings::{
     redact_findings_for_agent, Finding, FindingsFile, FindingsStore, Severity, Status,
 };
+use kres_core::Shutdown;
 use serde_json::json;
 
-use kres_agents::{AgentConfig, AgentKind};
+use kres_agents::pipeline::AgentRunner;
+use kres_agents::workflow_exec::WorkflowStatus;
+use kres_agents::workflow_runner::{derive_inputs, LlmDriver};
 use kres_llm::{
     client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
 };
@@ -100,14 +104,173 @@ pub struct SummaryInputs {
     pub max_tokens: u32,
     pub max_input_tokens: Option<u32>,
     pub thinking: Option<ThinkingBudget>,
+    /// Validation-produced findings. The renderer never reads stale narrative
+    /// or task prose directly from the canonical findings store.
+    pub validated_findings: Vec<Finding>,
 }
 
-pub struct LoadedSummaryAgent {
-    pub client: Arc<Client>,
-    pub model: Model,
-    pub max_tokens: u32,
-    pub max_input_tokens: Option<u32>,
-    pub thinking: Option<ThinkingBudget>,
+pub struct SummaryValidationInputs {
+    pub findings_path: PathBuf,
+    pub validation_dir: PathBuf,
+    pub workspace: PathBuf,
+    pub agent_runner: Arc<AgentRunner>,
+    pub skills_dir: Option<PathBuf>,
+    pub shutdown: Shutdown,
+}
+
+pub async fn validate_findings_for_summary(
+    inputs: SummaryValidationInputs,
+) -> Result<Vec<Finding>> {
+    let store = FindingsStore::new(inputs.findings_path.clone())
+        .await
+        .with_context(|| format!("opening findings {}", inputs.findings_path.display()))?;
+    let original = store.snapshot().await;
+    let by_id: BTreeMap<String, Finding> = original
+        .into_iter()
+        .map(|finding| (finding.id.clone(), finding))
+        .collect();
+
+    if inputs.validation_dir.exists() {
+        std::fs::remove_dir_all(&inputs.validation_dir).with_context(|| {
+            format!(
+                "clearing summary validation directory {}",
+                inputs.validation_dir.display()
+            )
+        })?;
+    }
+    let exported = crate::export::run_export(crate::export::ExportInputs {
+        findings_path: inputs.findings_path,
+        output_dir: inputs.validation_dir.clone(),
+        workspace: inputs.workspace.clone(),
+        redact_details: true,
+    })
+    .await?;
+    let override_dir = dirs::home_dir().map(|home| home.join(".kres/workflows"));
+    let workflow = kres_agents::workflow::lookup_workflow(override_dir.as_deref(), "validate")?;
+    let mut validated = Vec::with_capacity(exported.len());
+
+    for exported_finding in exported {
+        let Some(finding) = by_id.get(&exported_finding.id).cloned() else {
+            return Err(anyhow!(
+                "exported finding {} is missing from canonical findings",
+                exported_finding.id
+            ));
+        };
+        kres_core::consent::get_or_install().grant_from_mention(&exported_finding.dir);
+        let mut driver = LlmDriver::new(inputs.workspace.clone(), workflow.clone())
+            .with_agent_runner(inputs.agent_runner.clone())
+            .with_shutdown(inputs.shutdown.child());
+        if let Some(skills_dir) = inputs.skills_dir.as_ref() {
+            let (with_skills, warnings) = driver.with_skills_dir(skills_dir)?;
+            for warning in warnings {
+                kres_core::async_eprintln!("summary validation skill: {warning}");
+            }
+            driver = with_skills;
+        }
+        let mut workflow_inputs = serde_json::Map::new();
+        workflow_inputs.insert(
+            "target".into(),
+            serde_json::Value::String(exported_finding.dir.display().to_string()),
+        );
+        workflow_inputs.insert(
+            "source_workspace".into(),
+            serde_json::Value::String(inputs.workspace.display().to_string()),
+        );
+        let state_dir = inputs.validation_dir.join("workflow-state").join(
+            exported_finding
+                .dir
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("finding")),
+        );
+        kres_core::async_eprintln!("summary validation: {}", exported_finding.id);
+        let run = crate::workflow::run_workflow_driver(
+            &workflow,
+            &mut driver,
+            derive_inputs(&workflow, workflow_inputs),
+            crate::workflow::WorkflowRunOptions {
+                iteration_cap: 200,
+                state_dir: Some(state_dir),
+                ..Default::default()
+            },
+        )
+        .await?;
+        if !matches!(
+            run.trace.status,
+            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+        ) {
+            return Err(anyhow!(
+                "validation failed for {}: {}",
+                exported_finding.id,
+                crate::workflow::workflow_status_label(&run.trace.status)
+            ));
+        }
+        let outputs = &run
+            .trace
+            .final_state
+            .get("validate-reachability")
+            .ok_or_else(|| anyhow!("validation produced no reachability step"))?
+            .outputs;
+        let validated_summary = std::fs::read_to_string(exported_finding.dir.join("summary.md"))
+            .with_context(|| format!("reading validated summary for {}", exported_finding.id))?;
+        validated.push(project_validated_finding(
+            finding,
+            outputs,
+            validated_summary,
+        )?);
+    }
+    Ok(validated)
+}
+
+fn apply_validation_outputs(
+    finding: &mut Finding,
+    outputs: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    finding.severity = match outputs.get("severity").and_then(|value| value.as_str()) {
+        Some("high") => Severity::High,
+        Some("medium") => Severity::Medium,
+        Some("low") => Severity::Low,
+        other => return Err(anyhow!("validation returned invalid severity {other:?}")),
+    };
+    finding.status = match outputs.get("verdict").and_then(|value| value.as_str()) {
+        Some("Invalid") => Status::Invalidated,
+        Some("Fixed") => Status::Fixed,
+        Some("Unconfirmed" | "Unknown") => Status::Unconfirmed,
+        Some("Plausible" | "ConfirmedLatent") => Status::Active,
+        other => return Err(anyhow!("validation returned invalid verdict {other:?}")),
+    };
+    if let Some(subject) = outputs
+        .get("triage_coding")
+        .and_then(|value| value.get("summary_subject"))
+        .and_then(|value| value.as_str())
+        .filter(|subject| !subject.trim().is_empty())
+    {
+        finding.title = subject.to_string();
+    }
+    Ok(())
+}
+
+fn project_validated_finding(
+    mut finding: Finding,
+    outputs: &serde_json::Map<String, serde_json::Value>,
+    validated_summary: String,
+) -> Result<Finding> {
+    apply_validation_outputs(&mut finding, outputs)?;
+    finding.summary = validated_summary;
+    finding.relevant_symbols.clear();
+    finding.relevant_file_sections.clear();
+    finding.reproducer_sketch.clear();
+    finding.impact.clear();
+    finding.mechanism_detail = None;
+    finding.fix_sketch = None;
+    finding.open_questions.clear();
+    finding.related_finding_ids.clear();
+    finding.details.clear();
+    finding.introduced_by = None;
+    Ok(finding)
+}
+
+fn is_summary_candidate(finding: &Finding) -> bool {
+    !matches!(finding.status, Status::Invalidated | Status::Fixed)
 }
 
 /// Build the default output path for a summary given an optional
@@ -121,37 +284,6 @@ pub fn default_output_path(results_dir: Option<&Path>, filename: Option<&str>) -
         Some(d) => d.join(name),
         None => PathBuf::from(name),
     }
-}
-
-/// Build a minimal fast-agent LLM client from a fast-code-agent config
-/// file. `kres --summary` uses this so it can issue the summary calls
-/// without spinning up the full AgentRunner. The summariser runs on
-/// the fast agent — per-task condensation and per-batch rendering are
-/// both formatting work that the slow agent would be overkill for.
-pub fn load_fast_for_summary(
-    fast_cfg_path: &Path,
-    settings: &crate::settings::Settings,
-) -> Result<LoadedSummaryAgent> {
-    let fast_cfg = AgentConfig::load_for_role(fast_cfg_path, AgentKind::Fast)
-        .with_context(|| format!("loading fast agent config {}", fast_cfg_path.display()))?;
-    let fast_model = crate::settings::pick_model(
-        fast_cfg.model.as_deref(),
-        crate::settings::ModelRole::Fast,
-        settings,
-    );
-    let client = Arc::new(fast_cfg.client_builder()?.build()?);
-    let max_tokens = fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens);
-    let thinking = fast_cfg
-        .thinking
-        .as_ref()
-        .map(|thinking| thinking.to_budget(max_tokens));
-    Ok(LoadedSummaryAgent {
-        client,
-        model: fast_model,
-        max_tokens,
-        max_input_tokens: fast_cfg.max_input_tokens,
-        thinking,
-    })
 }
 
 fn apply_thinking_override(cfg: CallConfig, thinking: Option<ThinkingBudget>) -> CallConfig {
@@ -209,8 +341,7 @@ struct TaskMaterial {
     prose: String,
 }
 
-/// Render the summary. Reads findings.json, runs the condense + render
-/// passes, writes the output file.
+/// Render already-validated findings and write the output file.
 pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     if !inputs.findings_path.exists() {
         return Err(anyhow!(
@@ -219,15 +350,10 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
         ));
     }
 
-    // 1. Load via jsondb. `FindingsStore::new` opens the same
-    // canonical on-disk schema the pipeline writes; `file_snapshot`
-    // returns a Clone<FindingsFile> that detaches us from the live
-    // lock so the summariser doesn't hold a read guard across the
-    // LLM round-trips.
-    let store = FindingsStore::new(inputs.findings_path.clone())
-        .await
-        .with_context(|| format!("opening findings {}", inputs.findings_path.display()))?;
-    let file: FindingsFile = store.file_snapshot().await;
+    let file = FindingsFile {
+        findings: inputs.validated_findings.clone(),
+        ..Default::default()
+    };
 
     // 2. Filter invalidated + sort by severity (descending), preserve
     // insertion order within a severity band. `Vec::sort_by` is
@@ -236,7 +362,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     let mut active: Vec<Finding> = file
         .findings
         .iter()
-        .filter(|f| f.status != Status::Invalidated)
+        .filter(|finding| is_summary_candidate(finding))
         .cloned()
         .collect();
     active.sort_by_key(|f| std::cmp::Reverse(severity_rank(f.severity)));
@@ -248,11 +374,19 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
         file.task_prose.len(),
     );
 
-    if active.is_empty() && file.task_prose.is_empty() {
-        return Err(anyhow!(
-            "no active findings and no task_prose in {} — nothing to summarise",
-            inputs.findings_path.display()
-        ));
+    if active.is_empty() {
+        if let Some(parent) = inputs.output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+        }
+        std::fs::write(
+            &inputs.output_path,
+            "No findings remained after validation.\n",
+        )
+        .with_context(|| format!("writing summary to {}", inputs.output_path.display()))?;
+        return Ok(());
     }
 
     // 3. Bucket per-task material. Order tasks by first appearance
@@ -1047,6 +1181,68 @@ mod tests {
     }
 
     #[test]
+    fn validation_projection_replaces_stale_narrative_and_status() {
+        let finding = f(
+            "stale",
+            Severity::High,
+            Status::Active,
+            vec![("task", "stale task analysis")],
+        );
+        let mut finding = finding;
+        finding.relevant_symbols.push(RelevantSymbol {
+            name: "stale_symbol".into(),
+            filename: "stale.c".into(),
+            line: 10,
+            definition: "stale definition".into(),
+        });
+        finding.relevant_file_sections.push(RelevantFileSection {
+            filename: "stale.c".into(),
+            line_start: 1,
+            line_end: 20,
+            content: "stale source".into(),
+        });
+        finding.related_finding_ids.push("stale-related".into());
+        finding.introduced_by = Some(kres_core::findings::IntroducedBy {
+            sha: "deadbeefdead".into(),
+            subject: "stale attribution".into(),
+        });
+        let outputs = serde_json::json!({
+            "verdict": "Invalid",
+            "severity": "low",
+            "triage_coding": {"summary_subject": "validated subject"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let projected =
+            project_validated_finding(finding, &outputs, "validated body".into()).unwrap();
+
+        assert_eq!(projected.status, Status::Invalidated);
+        assert_eq!(projected.severity, Severity::Low);
+        assert_eq!(projected.title, "validated subject");
+        assert_eq!(projected.summary, "validated body");
+        assert!(projected.details.is_empty());
+        assert!(projected.relevant_symbols.is_empty());
+        assert!(projected.relevant_file_sections.is_empty());
+        assert!(projected.related_finding_ids.is_empty());
+        assert!(projected.introduced_by.is_none());
+        assert!(projected.reproducer_sketch.is_empty());
+        assert!(projected.impact.is_empty());
+    }
+
+    #[test]
+    fn validation_projection_rejects_unknown_control_values() {
+        let finding = f("bad", Severity::Low, Status::Active, vec![]);
+        let outputs = serde_json::json!({"verdict": "Maybe", "severity": "medium"})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        assert!(project_validated_finding(finding, &outputs, "body".into()).is_err());
+    }
+
+    #[test]
     fn severity_sort_desc_with_stable_within_band() {
         let findings = [
             f("a", Severity::Low, Status::Active, vec![]),
@@ -1063,14 +1259,15 @@ mod tests {
     }
 
     #[test]
-    fn invalidated_findings_filtered_out() {
+    fn invalid_and_fixed_findings_are_filtered_out() {
         let findings = [
             f("live", Severity::Medium, Status::Active, vec![]),
             f("dead", Severity::High, Status::Invalidated, vec![]),
+            f("fixed", Severity::High, Status::Fixed, vec![]),
         ];
         let kept: Vec<&Finding> = findings
             .iter()
-            .filter(|f| f.status != Status::Invalidated)
+            .filter(|finding| is_summary_candidate(finding))
             .collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "live");

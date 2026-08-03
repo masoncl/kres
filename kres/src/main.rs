@@ -299,17 +299,11 @@ struct ReplArgs {
     #[arg(long, default_value_t = false)]
     no_tui: bool,
 
-    /// Render a summary from a prior run's report.md +
-    /// findings.json and exit without starting the REPL. Uses the
-    /// fast agent with the embedded `summary` template as the
-    /// system prompt. Single-shot when the inputs fit
-    /// `max_input_tokens`; on overflow, splits findings into chunks,
-    /// renders one partial summary per chunk, then runs a combine
-    /// pass to merge them. Pairs with --report, --findings, and
-    /// --results (or their defaults) to locate the inputs. The
-    /// output filename is `summary.txt`, placed in the results
-    /// directory when --results was supplied, otherwise in the
-    /// current working directory.
+    /// Validate every finding from a prior run, then render a summary and
+    /// exit without starting the REPL. Requires fast and slow agents. Uses
+    /// the embedded `summary` template after validation; oversized inputs
+    /// are rendered in chunks and combined. Validation artifacts and the
+    /// output live under the results directory.
     #[arg(long, default_value_t = false)]
     summary: bool,
 
@@ -990,7 +984,29 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 ));
             }
         };
-        let summary_agent = kres_repl::summary::load_fast_for_summary(&fast_cfg_path, &settings)?;
+        let slow_cfg_path = slow_agent.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--summary requires a slow agent config for validation (pass --slow or configure settings.models.slow)"
+            )
+        })?;
+        let validation_workspace =
+            std::fs::canonicalize(&args.workspace).unwrap_or_else(|_| args.workspace.clone());
+        let validation_fetcher: Arc<dyn kres_agents::pipeline::DataFetcher> =
+            kres_agents::WorkspaceFetcher::new(validation_workspace.clone());
+        let built = kres_repl::build_agent_runner(
+            &fast_cfg_path,
+            slow_cfg_path,
+            validation_workspace.clone(),
+            validation_fetcher,
+            &settings,
+            kres_repl::AgentRunnerBuildOptions {
+                extra_slow_cfgs: slow_agent_specs.iter().skip(1).cloned().collect(),
+                compare_slow_models: args.compare,
+                gather_turns: args.gather_turns,
+                ..Default::default()
+            },
+        )
+        .await?;
         // `results_dir` is already cwd when --results was absent (see
         // the match at the top of run_repl), so the output lands
         // alongside the inputs either way. `--summary-markdown` flips
@@ -1014,25 +1030,40 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         });
         eprintln!("--summary: findings = {}", findings_path.display());
         eprintln!("--summary: output   = {}", output_path.display());
-        // Race the summary call against SIGINT so ctrl-c actually
-        // aborts the HTTP request instead of hanging until the
-        // streaming response completes. Without this branch the REPL
-        // path installs its own ctrl-c handler but --summary has
-        // none, so SIGINT just sits in the tokio signal queue.
-        let summary_fut = kres_repl::summary::run_summary(kres_repl::summary::SummaryInputs {
-            findings_path,
-            output_path,
-            template_path: args.template.clone(),
-            markdown,
-            original_prompt,
-            client: summary_agent.client,
-            model: summary_agent.model,
-            max_tokens: summary_agent.max_tokens,
-            max_input_tokens: summary_agent.max_input_tokens,
-            thinking: summary_agent.thinking,
-        });
+        let summary_shutdown = kres_core::Shutdown::new();
+        let validation_shutdown = summary_shutdown.clone();
+        let summary_fut = async move {
+            let validated_findings = kres_repl::summary::validate_findings_for_summary(
+                kres_repl::summary::SummaryValidationInputs {
+                    findings_path: findings_path.clone(),
+                    validation_dir: results_dir.join("summary-validation"),
+                    workspace: validation_workspace,
+                    agent_runner: built.agent_runner.clone(),
+                    skills_dir,
+                    shutdown: validation_shutdown,
+                },
+            )
+            .await?;
+            kres_repl::summary::run_summary(kres_repl::summary::SummaryInputs {
+                findings_path,
+                output_path,
+                template_path: args.template.clone(),
+                markdown,
+                original_prompt,
+                client: built.agent_runner.fast_client.clone(),
+                model: built.agent_runner.fast_model.clone(),
+                max_tokens: built.agent_runner.fast_max_tokens,
+                max_input_tokens: built.agent_runner.fast_max_input_tokens,
+                thinking: built.agent_runner.fast_thinking,
+                validated_findings,
+            })
+            .await
+        };
+        // Race validation and rendering against SIGINT so ctrl-c aborts the
+        // in-flight workflow or render request.
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                summary_shutdown.cancel();
                 eprintln!("--summary: ctrl-c received; aborting");
                 std::process::exit(130);
             }
@@ -1066,6 +1097,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             findings_path,
             output_dir: export_dir.clone(),
             workspace: args.workspace.clone(),
+            redact_details: false,
         })
         .await?;
         return Ok(());

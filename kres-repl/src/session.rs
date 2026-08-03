@@ -3503,17 +3503,15 @@ impl Session {
         }
     }
 
-    /// `/summary` — render the run's findings.json into a plain-text
-    /// bug report via the fast agent using the `summary`
-    /// slash-command template. Pass `markdown=true` (via
+    /// `/summary` — validate every finding with the shared validate workflow,
+    /// then render a plain-text bug report via the fast agent using the
+    /// `summary` slash-command template. Pass `markdown=true` (via
     /// `/summary-markdown`) to select the markdown-variant template
     /// and default the output filename to `summary.md` instead of
     /// `summary.txt`.
     ///
-    /// report.md is NOT consulted. The summariser reads findings.json
-    /// via jsondb, runs a per-task condense pass, then renders the
-    /// result through the bug-summary template in batches that fit
-    /// the fast agent's context window.
+    /// report.md is NOT consulted. Validation artifacts are written beneath
+    /// the results directory and only validated narratives reach the renderer.
     async fn cmd_summary(&self, filename: Option<String>, markdown: bool) {
         let Some(orc) = self.agent_runner.as_ref() else {
             async_println(
@@ -3568,6 +3566,28 @@ impl Session {
                     .filter(|s| !s.trim().is_empty())
             }),
         };
+        let validation_dir = output_dir
+            .as_ref()
+            .map(|dir| dir.join("summary-validation"))
+            .unwrap_or_else(|| PathBuf::from("summary-validation"));
+        let validated_findings = match crate::summary::validate_findings_for_summary(
+            crate::summary::SummaryValidationInputs {
+                findings_path: findings_path.clone(),
+                validation_dir,
+                workspace: self.cfg.workspace.clone(),
+                agent_runner: orc.clone(),
+                skills_dir: dirs::home_dir().map(|home| home.join(".kres/skills")),
+                shutdown: self.mgr.root_shutdown().child(),
+            },
+        )
+        .await
+        {
+            Ok(findings) => findings,
+            Err(error) => {
+                async_println(format!("/summary: validation failed: {error:#}"));
+                return;
+            }
+        };
         let inputs = crate::summary::SummaryInputs {
             findings_path,
             output_path: output_path.clone(),
@@ -3584,6 +3604,7 @@ impl Session {
             max_tokens: orc.fast_max_tokens,
             max_input_tokens: orc.fast_max_input_tokens,
             thinking: orc.fast_thinking,
+            validated_findings,
         };
         let label = if markdown {
             "/summary-markdown"
@@ -5077,7 +5098,7 @@ fn print_help() {
     kres_core::async_eprintln!(
         "  /validate <finding-dir> [workspace]  validate a finding against source"
     );
-    kres_core::async_eprintln!("  /summary [FILE]        render report.md+findings.json into a plain-text summary (default summary.txt)");
+    kres_core::async_eprintln!("  /summary [FILE]        validate findings, then render a plain-text summary (default summary.txt)");
     kres_core::async_eprintln!(
         "  /summary-markdown [FILE]  render the markdown variant (default summary.md)"
     );

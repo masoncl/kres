@@ -18,7 +18,8 @@ template.
 
 `summary` and `summary-markdown` are report-rendering commands. Both CLI
 and REPL call `kres-repl/src/summary.rs`; they do not run through
-`--prompt "summary: ..."`. The renderer uses the embedded
+`--prompt "summary: ..."`. That shared path invokes the existing `validate`
+workflow once per finding before rendering. The renderer uses the embedded
 `bug-summary.md` / `bug-summary-markdown.md` templates, with optional
 overrides at `~/.kres/commands/summary.md` and
 `~/.kres/commands/summary-markdown.md`.

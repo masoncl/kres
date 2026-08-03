@@ -86,9 +86,8 @@ pub struct RelevantFileSection {
 /// Per-task narrative detail captured on a Finding. Each entry is
 /// the full analysis prose produced by one task that touched this
 /// finding (either on its introductory add or on a subsequent
-/// update). Consumed by `/summary` so the plain-text summary can
-/// pull richer exposition than the short `summary` /
-/// `reproducer_sketch` / `impact` fields carry.
+/// update). Retained for operator diagnostics and explicit exports; summary
+/// validation redacts it before invoking an agent.
 ///
 /// These entries are NEVER forwarded to another LLM call. Every
 /// site that hands findings to an agent strips the field first —
@@ -150,10 +149,8 @@ pub struct Finding {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related_finding_ids: Vec<String>,
 
-    /// Per-task narrative captured from the task's effective_analysis
-    /// at apply_delta time. Purely for `/summary` generation — NEVER
-    /// forwarded to another LLM. Call [`Finding::redacted_for_agent`]
-    /// before handing findings to any agent.
+    /// Per-task narrative captured from the task's effective_analysis at
+    /// apply_delta time. Store-local and NEVER forwarded to another LLM.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(skip)]
     pub details: Vec<FindingDetail>,
@@ -258,8 +255,7 @@ pub struct FindingsFile {
     #[serde(default)]
     pub turn_n: Option<u32>,
     /// Per-task broader-than-finding narrative (see [`TaskProse`]).
-    /// Append-only for `/summary`'s benefit; NEVER serialised into
-    /// an agent prompt.
+    /// Append-only diagnostic history; NEVER serialised into an agent prompt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub task_prose: Vec<TaskProse>,
 }

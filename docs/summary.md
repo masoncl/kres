@@ -10,20 +10,24 @@ A plain-text summary is produced explicitly by `/summary` or standalone via
 `kres --summary --results <dir>`. Turn-cap and idle exits do not render one
 automatically. The markdown variant is
 `/summary-markdown` / `kres --summary-markdown --results <dir>`,
-which writes `summary.md`. That run:
+which writes `summary.md`. Both commands require configured fast and slow
+agents because validation runs before rendering. That run:
 
-- reads `<results>/prompt.md` (saved on first submit so later summaries know
-  the original question) and `<results>/findings.json`; it does not parse
-  `report.md`. Per-task narrative comes from `findings[].details` and the
-  top-level `task_prose` ledger;
-- uses the fast agent for task condensation, then renders with the embedded
-  `summary` slash-command template as its system prompt (override at
+- exports every canonical finding under `<results>/summary-validation/` and
+  runs the existing `validate` workflow against the active source workspace;
+  any validation failure aborts summary generation;
+- renders only validation-produced narratives and structured verdicts, so
+  stale pre-validation details cannot reintroduce contradicted claims;
+- reads `<results>/prompt.md` for the original question and does not parse
+  `report.md`;
+- uses the fast agent to render with the embedded `summary` slash-command
+  template as its system prompt (override at
   `~/.kres/commands/summary.md`; `--summary-markdown` picks the
   `summary-markdown` variant at
   `~/.kres/commands/summary-markdown.md`);
-- filters invalidated findings, sorts stored severities high to low, groups
-  findings and narrative by task, condenses task batches that fit the fast
-  model's input limit, and runs a final render/combine pass;
+- filters findings validation marked Invalid or Fixed, sorts validated
+  severities high to low, and runs a final render/combine pass; if none remain,
+  writes a deterministic no-findings message;
 - orders sections by `bug-severity` (`high` → `medium` → `low` →
   `latent` → `unknown`), one section per bug headed by
   `Subject:`, `bug-severity:`, `bug-impact:` lines;

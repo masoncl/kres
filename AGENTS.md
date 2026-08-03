@@ -361,7 +361,7 @@ used by the fix workflow after `Assisted-by:`. When omitted, kres derives
 | `/resume [PATH]` | Load a persisted `session.json` (defaults to `<results>/session.json.prev` → live file). Overwrites in-memory state |
 | `/todo --clear` | Clear all todo items |
 | `/cost` | Token usage by agent role and model |
-| `/summary [FILE]` | Fast agent renders the run's report.md + findings.json into a summary via the embedded `summary` slash-command template. Output defaults to `summary.txt` in the results dir. Auto-chunks findings when the prompt exceeds the fast agent's `max_input_tokens` and runs a combine pass to merge the partials |
+| `/summary [FILE]` | Run the existing `validate` workflow for every finding, then have the fast agent render only validated summaries through the embedded `summary` template. Output defaults to `summary.txt`; validation artifacts live under `<results>/summary-validation/`. Auto-chunks oversized render inputs and combines the partials |
 | `/summary-markdown [FILE]` | Same as `/summary` but uses the `summary-markdown` template and defaults the filename to `summary.md` |
 | `/review <target>` | Run the embedded `review` workflow for `<target>` — CLI equivalent of `--prompt 'review: <target>'`. The shipped workflow defines the review prompt contract and lenses; execution uses the REPL task/todo loop so followups become next-turn review todos. This is workflow-only; no markdown prompt fallback exists |
 | `/triage <finding-dir>` | Run the embedded `triage` workflow for a kres-exported finding directory. The workflow includes the golden triage template, preserves followups, and validates that `summary.md` was actually written. This is workflow-only; no alternate prompt path exists |

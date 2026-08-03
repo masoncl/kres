@@ -72,6 +72,11 @@ See [docs/agents.md](docs/agents.md) for the task flow and
 
    If you're doing more in-depth reviews of whole files, 50 turns is a good starting point.
 
+   Summary generation first runs the validation workflow for every finding,
+   then renders only the validated results. Both fast and slow models must be
+   configured; validation artifacts are kept under
+   `review/summary-validation/` in this example.
+
 ## Combining and comparing multiple models
 
 You can add a second model for reviews. In `~/.kres/settings.json`:

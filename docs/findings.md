@@ -89,8 +89,8 @@ bare `"<uuid-simple>"` for operator-typed prompts.
 
 Every `apply_delta` touch attaches a `{task, analysis}` entry to
 the finding's `details`. Same task_id overwrites; different
-task_ids append. This is how `/summary` reaches the per-task
-narrative that would otherwise live only in `report.md`.
+task_ids append. This is store-local diagnostic history. Summary validation
+redacts it before exporting a finding to the validation agents.
 
 **`details` never goes back to an agent.** Agent-bound slices go
 through `kres_core::redact_findings_for_agent` first — applied in

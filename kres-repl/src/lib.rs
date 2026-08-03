@@ -30,7 +30,7 @@ pub mod tui;
 pub mod workflow;
 
 pub use commands::{parse_command, Command};
-pub use export::{run_export, run_export_index, ExportInputs};
+pub use export::{run_export, run_export_index, ExportInputs, ExportedFinding};
 pub use report::{append_task_section, render_findings_markdown, write_findings_to_file};
 pub use session::{build_agent_runner, AgentRunnerBuildOptions, ReplConfig, Session};
 pub use settings::{pick_model, ModelRole, Settings};

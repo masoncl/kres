@@ -51,6 +51,15 @@ pub struct ExportInputs {
     /// each exported finding carries the commit state the analysis
     /// was performed against.
     pub workspace: PathBuf,
+    /// Strip store-only per-task analysis before writing FINDING.md. Summary
+    /// validation enables this so Finding.details never reaches an agent.
+    pub redact_details: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportedFinding {
+    pub id: String,
+    pub dir: PathBuf,
 }
 
 /// Per-run workspace-git snapshot. Empty strings if the workspace
@@ -60,11 +69,12 @@ struct GitHead {
     subject: String,
 }
 
-pub async fn run_export(inputs: ExportInputs) -> Result<()> {
+pub async fn run_export(inputs: ExportInputs) -> Result<Vec<ExportedFinding>> {
     let ExportInputs {
         findings_path,
         output_dir,
         workspace,
+        redact_details,
     } = inputs;
 
     if !findings_path.exists() {
@@ -87,7 +97,10 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
     let store = FindingsStore::new(&findings_path)
         .await
         .with_context(|| format!("loading findings {}", findings_path.display()))?;
-    let findings = store.snapshot().await;
+    let mut findings = store.snapshot().await;
+    if redact_details {
+        redact_store_only_details(&mut findings);
+    }
     let git = probe_git_head(&workspace);
     let template = load_metadata_template();
 
@@ -105,6 +118,7 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
     }
 
     let mut written = 0usize;
+    let mut exported = Vec::with_capacity(findings.len());
     for f in &findings {
         let tag = &id_to_tag[&f.id];
         let finding_dir = findings_root.join(tag);
@@ -112,6 +126,10 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
             .with_context(|| format!("creating {}", finding_dir.display()))?;
         write_metadata_yaml(&finding_dir.join("metadata.yaml"), f, &git, &template)?;
         write_finding_md(&finding_dir.join("FINDING.md"), f, &id_to_tag)?;
+        exported.push(ExportedFinding {
+            id: f.id.clone(),
+            dir: finding_dir,
+        });
         written += 1;
     }
 
@@ -127,7 +145,13 @@ pub async fn run_export(inputs: ExportInputs) -> Result<()> {
     // python3 dependency.
     install_export_readme(&output_dir);
     install_index_script(&output_dir);
-    Ok(())
+    Ok(exported)
+}
+
+fn redact_store_only_details(findings: &mut [Finding]) {
+    for finding in findings {
+        finding.details.clear();
+    }
 }
 
 /// Bundled findings index + search tool. Compiled into the kres
@@ -798,7 +822,7 @@ fn render_detail(out: &mut String, d: &FindingDetail) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kres_core::findings::{IntroducedBy, RelevantFileSection, RelevantSymbol};
+    use kres_core::findings::{FindingDetail, IntroducedBy, RelevantFileSection, RelevantSymbol};
 
     fn finding_sample() -> Finding {
         Finding {
@@ -832,6 +856,19 @@ mod tests {
             introduced_by: None,
             first_seen_at: None,
         }
+    }
+
+    #[test]
+    fn summary_validation_export_redacts_store_only_details() {
+        let mut finding = finding_sample();
+        finding.details.push(FindingDetail {
+            task: "task-a".into(),
+            analysis: "private task narrative".into(),
+        });
+
+        redact_store_only_details(std::slice::from_mut(&mut finding));
+
+        assert!(finding.details.is_empty());
     }
 
     fn git_sample() -> GitHead {

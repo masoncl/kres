@@ -37,7 +37,7 @@ Rationale:
   change. This is persisted observability; session stopping uses its own
   three-run no-new-findings streak when `--follow` is active.
 - `turn_n`: monotonic count of store applies.
-- `task_prose`: broader per-task narratives retained for summary generation.
+- `task_prose`: broader per-task narratives retained for operator diagnostics.
 
 ## Finding record
 
@@ -108,7 +108,7 @@ reproducer requirements described in their contracts.
 | `mechanism_detail` | string | Specifics that pin down HOW the bug becomes exploitable: which struct-field type/offset gets clobbered, which invariant-establishing ordering contract in adjacent code is violated, or what the actual kernel object behind an OOB target is. These are the facts a reproducer or patch author would otherwise re-derive. |
 | `fix_sketch` | string | 1-3 sentences describing a concrete patch the analysis identified, with the file:line anchor for the change. Omit entirely if no fix was analyzed — never fabricate. |
 | `open_questions` | array[string] | Unresolved items that would settle or refine the finding: `[UNVERIFIED]` claims, call sites not yet confirmed, type-query followups, locking-order assumptions, etc. One sentence each. These accumulate across turns; the merger unions them. |
-| `details` | array[object] | Per-task narrative captured at apply_delta time. Each entry `{task, analysis}` pairs a provenance stamp with the task's effective_analysis prose verbatim. **Store-local only** — every site that hands findings to an agent must run them through `kres_core::redact_findings_for_agent` first. Consumed by `/summary` so the plain-text summary can reach the richer exposition that would otherwise only live in report.md. Never emitted by agents; the store populates this field. |
+| `details` | array[object] | Per-task narrative captured at apply_delta time. Each entry `{task, analysis}` pairs a provenance stamp with the task's effective_analysis prose verbatim. **Store-local only** — every site that hands findings to an agent must run them through `kres_core::redact_findings_for_agent` first. Summary validation explicitly redacts it before export. Never emitted by agents; the store populates this field. |
 
 ## Sizing guidance for embedded bodies
 

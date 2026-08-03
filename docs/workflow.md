@@ -1326,6 +1326,10 @@ that reachable component.
 
 `/summary`, `/summary-markdown`, `kres --summary`, and
 `kres --summary-markdown` all call `kres-repl/src/summary.rs`. Summary
-is not a workflow and is not invokable through `--prompt "summary: ..."`.
-The summary renderer owns batching, condensation, template selection,
-and output writes for both CLI and REPL entry points.
+is not itself a workflow and is not invokable through
+`--prompt "summary: ..."`. Before rendering, it exports every canonical
+finding with store-only `details` redacted and invokes the existing `validate`
+JSON workflow for each finding. A failed validation aborts the summary. The
+renderer consumes only validation-produced summaries and structured verdicts,
+then owns batching, template selection, and the final output write for both CLI
+and REPL entry points.

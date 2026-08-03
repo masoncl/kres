@@ -62,7 +62,7 @@ Related docs:
 - [action-allowlist.md](action-allowlist.md) — `--allow ACTION`
   and the dispatcher's non-MCP allowlist.
 - [summary.md](summary.md) — `--summary`,
-  `--summary-markdown`, `--template`.
+  `--summary-markdown`, validation-before-render behavior, and `--template`.
 - [configuration.md](configuration.md) — model-id overrides
   (`--fast-model`, `--slow-model`, `--main-model`,
   `--todo-model`, `--classifier-model`), configurable model aliases, and
@@ -83,7 +83,7 @@ Related docs:
 | `/plan`                        | Show the current plan + per-step status |
 | `/resume [PATH]`               | Load a persisted `session.json` |
 | `/followup`                    | List items deferred by goal-met or `--turns` cap |
-| `/summary [FILE]`              | Render `findings.json` (including stored task prose) to a plain-text summary (default `summary.txt`) |
+| `/summary [FILE]`              | Validate every finding, then render a plain-text summary (default `summary.txt`) |
 | `/summary-markdown [FILE]`     | Same as `/summary`, markdown output (default `summary.md`) |
 | `/review <target>`             | Run the JSON-defined review workflow through the task/todo loop |
 | `/triage <finding-dir>`        | Run the JSON-defined finding triage workflow |

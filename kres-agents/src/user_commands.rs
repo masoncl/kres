@@ -19,8 +19,25 @@
 //! get their own directory (`~/.kres/commands/`) and override
 //! path.
 
-/// Name → body. Keep aligned with the shipped files under
-/// `configs/prompts/`.
+const KERNEL_PROBLEM_DESCRIPTION: &str =
+    include_str!("../../configs/prompts/kernel-problem-description.md");
+const KERNEL_FIX_DESCRIPTION: &str =
+    include_str!("../../configs/prompts/commit-kernel-template.md");
+
+pub fn kernel_problem_prompt(specific: &str) -> String {
+    format!(
+        "{}\n\n{}",
+        KERNEL_PROBLEM_DESCRIPTION.trim_end(),
+        specific.trim_start()
+    )
+}
+
+pub fn kernel_fix_prompt() -> String {
+    kernel_problem_prompt(KERNEL_FIX_DESCRIPTION)
+}
+
+/// Name → command-specific body. Kernel problem-writing rules are prepended
+/// by [`lookup_with_root`] so summaries and fix messages cannot drift.
 const TABLE: &[(&str, &str)] = &[
     (
         "summary",
@@ -36,10 +53,11 @@ const TABLE: &[(&str, &str)] = &[
     ),
 ];
 
-/// Return the body for `name` — disk override wins, then the
-/// embedded default, else None. The disk override path is
-/// `~/.kres/commands/<name>.md`; non-existent and empty files
-/// fall through to the embedded copy.
+/// Return the body for `name` — disk override wins for the command-specific
+/// section, then the embedded default, else None. Kernel commands always have
+/// the shared problem-description rules prepended in Rust. The disk override
+/// path is `~/.kres/commands/<name>.md`; non-existent and empty files fall
+/// through to the embedded command-specific section.
 ///
 /// Names are restricted to `[a-zA-Z0-9_-]+` — a stray `/`, `\`,
 /// or path segment would otherwise resolve to a file outside the
@@ -71,18 +89,27 @@ pub fn lookup_with_root(commands_dir: Option<std::path::PathBuf>, name: &str) ->
     if matches!(name, "fix" | "review" | "triage" | "validate") {
         return None;
     }
-    if let Some(dir) = commands_dir {
+    let disk_body = commands_dir.and_then(|dir| {
         let p = dir.join(format!("{name}.md"));
         if let Ok(s) = std::fs::read_to_string(&p) {
             if !s.trim().is_empty() {
                 return Some(s);
             }
         }
-    }
-    TABLE
-        .iter()
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| (*v).to_string())
+        None
+    });
+    let has_disk_body = disk_body.is_some();
+    let specific = disk_body.or_else(|| {
+        TABLE
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| (*v).to_string())
+    })?;
+    Some(if name == "commit-kernel" && !has_disk_body {
+        kernel_fix_prompt()
+    } else {
+        kernel_problem_prompt(&specific)
+    })
 }
 
 /// A command name is a non-empty run of ASCII alphanumerics, `-`,
@@ -152,31 +179,51 @@ mod tests {
 
     #[test]
     fn commit_kernel_body_contains_template_markers() {
-        // The commit-kernel template encodes the kernel-style
-        // commit-message rules (Rule 0: 72-char wrap; subject ≤70;
-        // imperative mood; -s for sign-off). If include_str! ever
-        // points at the wrong file, those rules silently disappear
-        // and the agent reverts to free-form prose. Anchor on the
-        // distinctive "Rule 0" marker plus the AVOID list header.
         let body = lookup("commit-kernel").unwrap();
-        assert!(
-            body.contains("Rule 0"),
-            "commit-kernel body missing Rule 0 (72-char wrap)"
-        );
-        assert!(
-            body.contains("What to AVOID"),
-            "commit-kernel body missing the AVOID checklist"
-        );
+        let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        for marker in [
+            "When the doc and this template disagree, the doc wins",
+            "Rule 0 — 75-column wrap (the most important one)",
+            "Write a kernel changelog, not an audit report. Recent `mm/` commits favor a short causal explanation",
+            "do not turn the body into an exhaustive proof of every path that was checked",
+            "Call chain with state transition",
+            "Before/after state:",
+            "Optimisation and trade-off claims",
+            "If a backtrace helps document the call chain, distill it",
+            "split it, delete non-essential proof, or quote the decisive code snippet",
+            "Kernel fix description rules",
+            "must not exceed 55 chars",
+            "required when the change repairs a regression introduced by a specific commit",
+            "NEVER add `Cc: stable@vger.kernel.org`",
+            "Assisted-by: kres:<model-id>",
+            "commit -s -F .kres-commit-msg.tmp",
+            "Self-check before emitting",
+        ] {
+            assert!(
+                normalized.contains(marker),
+                "commit prompt missing {marker:?}"
+            );
+        }
+        assert!(body.contains("CPU 0                         CPU 1"));
     }
 
     #[test]
-    fn summary_templates_use_kernel_changelog_shape() {
+    fn summary_templates_share_problem_rules_without_fix_rules() {
         for name in ["summary", "summary-markdown"] {
             let body = lookup_with_root(None, name).unwrap();
-            assert!(body.contains("candidate kernel-style"), "{name}");
-            assert!(body.contains("Fix by"), "{name}");
-            assert!(body.contains("55 characters"), "{name}");
-            assert!(!body.contains("bug-severity:"), "{name}");
+            let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(body.contains("Kernel problem description rules"), "{name}");
+            assert!(!body.contains("Kernel fix description rules"), "{name}");
+            assert!(
+                normalized.contains("Do not propose or describe a fix"),
+                "{name}"
+            );
+            assert!(body.contains("CPU timeline"), "{name}");
+            assert!(
+                normalized.contains("If a backtrace helps document the call chain, distill it"),
+                "{name}"
+            );
+            assert!(!body.contains("Assisted-by:"), "{name}");
         }
     }
 
@@ -191,7 +238,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("summary.md"), "OPERATOR SUMMARY OVERRIDE").unwrap();
         let got = lookup_with_root(Some(dir.clone()), "summary").expect("override should resolve");
-        assert_eq!(got, "OPERATOR SUMMARY OVERRIDE");
+        assert!(got.starts_with(KERNEL_PROBLEM_DESCRIPTION.trim_start()));
+        assert!(got.ends_with("OPERATOR SUMMARY OVERRIDE"));
+        assert!(!got.contains("Plain-text validated finding summary"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -207,7 +256,10 @@ mod tests {
         std::fs::write(dir.join("summary.md"), "   \n\t\n").unwrap();
         let got = lookup_with_root(Some(dir.clone()), "summary")
             .expect("should fall through to embedded");
-        assert!(got.contains("Subject:"), "got {got:?}");
+        assert!(
+            got.contains("Plain-text validated finding summary"),
+            "got {got:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -239,7 +291,8 @@ mod tests {
             "extra text must lead the composed body: {body:?}"
         );
         assert!(
-            body.contains("Rule 0"),
+            body.contains("Kernel problem description rules")
+                && body.contains("Kernel fix description rules"),
             "template body must follow: {body:?}"
         );
     }

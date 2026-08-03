@@ -4133,31 +4133,39 @@ fn materialise_global_include(v: &Value) -> Result<String> {
 /// kres source checkout without routing workflow prompt includes
 /// through slash-command templates.
 fn read_at_path(path: &str) -> Result<String> {
+    if is_commit_kernel_include(path) {
+        return Ok(match std::fs::read_to_string(path) {
+            Ok(fix_rules) if !fix_rules.trim().is_empty() => {
+                crate::user_commands::kernel_problem_prompt(&fix_rules)
+            }
+            _ => crate::user_commands::kernel_fix_prompt(),
+        });
+    }
     if let Ok(s) = std::fs::read_to_string(path) {
         return Ok(s);
     }
     if let Some(body) = embedded_workflow_include(path) {
-        return Ok(body.to_string());
+        return Ok(body);
     }
     Err(anyhow!(
         "include path '{path}' not found on disk and not in embedded workflow include table"
     ))
 }
 
-fn embedded_workflow_include(path: &str) -> Option<&'static str> {
+fn is_commit_kernel_include(path: &str) -> bool {
     let normalized = path.replace('\\', "/");
     let suffix = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
-    if suffix == "configs/prompts/commit-kernel-template.md"
+    suffix == "configs/prompts/commit-kernel-template.md"
         || suffix.ends_with("/configs/prompts/commit-kernel-template.md")
-    {
-        return Some(include_str!(
-            "../../configs/prompts/commit-kernel-template.md"
-        ));
-    }
+}
+
+fn embedded_workflow_include(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let suffix = normalized.strip_prefix("./").unwrap_or(normalized.as_str());
     if suffix == "configs/prompts/triage-template.md"
         || suffix.ends_with("/configs/prompts/triage-template.md")
     {
-        return Some(include_str!("../../configs/prompts/triage-template.md"));
+        return Some(include_str!("../../configs/prompts/triage-template.md").to_string());
     }
     None
 }
@@ -9682,6 +9690,14 @@ mod tests {
         let body = read_at_path("/not/a/checkout/configs/prompts/triage-template.md").unwrap();
         assert!(body.contains("# Subject:"), "{body}");
         assert!(body.contains("triage summary"), "{body}");
+    }
+
+    #[test]
+    fn commit_include_composes_problem_and_fix_rules() {
+        let body = read_at_path("configs/prompts/commit-kernel-template.md").unwrap();
+        assert!(body.contains("Kernel problem description rules"), "{body}");
+        assert!(body.contains("Kernel fix description rules"), "{body}");
+        assert_eq!(body.matches("Kernel problem description rules").count(), 1);
     }
 
     #[test]

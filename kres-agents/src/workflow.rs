@@ -1167,18 +1167,20 @@ mod tests {
         assert!(wf.steps.iter().any(|s| s.id == "unconfirm"));
         assert!(wf.steps.iter().any(|s| s.id == "fixes-tag-search"));
         assert!(wf.steps.iter().any(|s| s.id == "publish"));
-        let commit_template = include_str!("../../configs/prompts/commit-kernel-template.md");
+        let commit_template = format!(
+            "{}\n\n{}",
+            include_str!("../../configs/prompts/kernel-problem-description.md"),
+            include_str!("../../configs/prompts/commit-kernel-template.md")
+        );
         assert!(
-            commit_template.contains("Write a kernel changelog, not an audit report")
-                && commit_template.contains("indented evidence")
-                && commit_template.contains("Prefer call chains and call graphs over prose")
-                && commit_template.contains("Simple ASCII art is allowed")
-                && commit_template.contains("Race timeline")
-                && commit_template.contains("Call chain with state transition")
-                && commit_template.contains("Call graph")
-                && commit_template.contains("Before/after state")
-                && commit_template.contains("Dense proof-memo paragraphs"),
-            "commit template must require readable kernel changelog prose with evidence blocks"
+            commit_template.contains("Kernel problem description rules")
+                && commit_template.contains("indented evidence blocks")
+                && commit_template.contains("call chain, ASCII call graph")
+                && commit_template.contains("CPU timeline")
+                && commit_template.contains("before/after state block")
+                && commit_template.contains("Kernel fix description rules")
+                && commit_template.contains("Fix by <verb> <object>"),
+            "commit prompt must compose shared problem rules with fix rules"
         );
         let fixes = wf
             .steps

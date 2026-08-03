@@ -392,7 +392,10 @@ fn resolve_template(inputs: &SummaryInputs) -> Result<(String, String)> {
     if let Some(ref p) = inputs.template_path {
         let text = std::fs::read_to_string(p)
             .with_context(|| format!("reading template {}", p.display()))?;
-        return Ok((p.display().to_string(), text));
+        return Ok((
+            p.display().to_string(),
+            kres_agents::user_commands::kernel_problem_prompt(&text),
+        ));
     }
     let (disk_default, fallback_label, fallback_name) = if inputs.markdown {
         (
@@ -406,7 +409,12 @@ fn resolve_template(inputs: &SummaryInputs) -> Result<(String, String)> {
     if let Some(p) = disk_default.filter(|p| p.exists()) {
         let text = std::fs::read_to_string(&p)
             .with_context(|| format!("reading template {}", p.display()))?;
-        return Ok((p.display().to_string(), text));
+        if !text.trim().is_empty() {
+            return Ok((
+                p.display().to_string(),
+                kres_agents::user_commands::kernel_problem_prompt(&text),
+            ));
+        }
     }
     let body = kres_agents::user_commands::lookup(fallback_name).ok_or_else(|| {
         anyhow!("embedded `{fallback_name}` template missing from user_commands — build bug")

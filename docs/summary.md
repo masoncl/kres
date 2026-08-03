@@ -30,14 +30,15 @@ model for that run. That run:
 - filters findings validation marked Invalid or Fixed, sorts validated
   severities high to low, and runs a final render/combine pass; if none remain,
   writes a deterministic no-findings message;
-- renders each bug as a candidate kernel commit message using the conventions
-  in `configs/prompts/commit-kernel-template.md`: a subsystem-prefixed,
-  imperative subject followed by a short causal changelog and supported fix;
-  the text variant emits raw commit-message blocks while the Markdown variant
-  uses each proposed subject as a `##` heading;
+- renders each bug with the shared kernel problem-description rules from
+  `configs/prompts/kernel-problem-description.md`: a source-area subject and a
+  short causal changelog without proposing a fix; the text variant emits raw
+  problem-description blocks while the Markdown variant uses each subject as
+  a `##` heading;
 - writes `<results>/summary.txt` (or `summary.md` with
   `--summary-markdown`); falls back to the cwd when `--results`
   was absent.
 
 `--template PATH` overrides the shipped summariser prompt for one
-run without rebuilding.
+run without rebuilding. The shared kernel problem-description rules are still
+prepended to that output-specific override.

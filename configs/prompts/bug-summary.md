@@ -1,74 +1,27 @@
-You are converting validated code-review findings into candidate kernel-style
-commit messages. The user message is JSON containing findings and supporting
-task_observations. Cover every real finding exactly once. Merge findings only
-when they describe the same underlying defect.
+## Plain-text validated finding summary
 
-Follow the conventions in Documentation/process/submitting-patches.rst and the
-shipped commit-kernel template. These are candidate changelogs, not claims that
-a patch has already been written or tested.
+Apply the kernel problem-description rules supplied before this section to
+every validated finding in the user JSON. Cover each real finding exactly
+once and merge entries only when they describe the same underlying defect.
+Treat task_observations as supporting evidence without attributing text to
+tasks.
 
-Output a flat sequence of standalone commit messages in plain ASCII text. Do
-not add a report preamble, severity labels, finding IDs, numbering, markdown,
-or a closing summary. Separate messages with this line and a blank line on
-both sides:
+Emit a flat sequence of plain ASCII problem descriptions. Do not propose
+or describe a fix. Do not emit a Fixes trailer, sign-off, severity
+metadata, finding ID, report preamble, numbering, or closing summary.
 
----
+Each entry has this shape:
 
-Each message has this shape:
+<subsystem>: <concise lowercase problem description, no period>
 
-<subsystem>: <imperative summary, lowercase, no period>
+<problem and mechanism paragraphs>
 
-<problem paragraph>
+Use the source-area prefix established by the validated evidence. The
+subject describes the existing defect rather than an imperative patch
+action and must fit on one 75-column line. Separate entries with a line
+containing `---`, with one blank line on either side.
 
-<optional mechanism or evidence block>
-
-Fix by <supported change>.
-
-Fixes: <sha-12+> ("<full original subject>")
-
-Subject rules:
-
-- Use the prefix established by nearby commits for the affected source. If the
-  inputs do not establish a narrower prefix, use the affected top-level source
-  area; never invent a subsystem name.
-- Describe both the change and why it is needed, in imperative mood.
-- Keep the raw subject at 55 characters or fewer so a generated
-  "Subject: [PATCH] " mail header remains within 72 columns.
-- Do not include "Subject:", "[PATCH]", severity, a trailing period, or a
-  finding ID.
-
-Body rules:
-
-- Write a kernel changelog, not an audit report. Start with the failing path
-  and concrete consequence, explain the causal mechanism, then state the
-  supported correction.
-- Prefer two to four short paragraphs. Use concrete identifiers and the
-  smallest amount of proof needed to make the defect understandable.
-- For races, ordering bugs, state transitions, or multi-function control flow,
-  prefer an indented ASCII timeline, call chain, state block, or source excerpt
-  over a dense paragraph. Never use markdown fences.
-- Cite code as filename:function, never by transient line number.
-- Do not mention review tasks, validation, model output, test counts, authors,
-  or the process used to discover the bug.
-- Do not invent a patch. Derive the "Fix by" paragraph from a supported fix
-  sketch or from the narrow invariant demonstrated by the validated finding.
-  If the inputs do not support a concrete correction, end with a concise
-  statement of the invariant the eventual fix must enforce instead of guessing.
-- Add a Fixes trailer only when the inputs explicitly provide a proven
-  introducing commit and its full subject. Use at least 12 hexadecimal digits.
-  Never infer attribution from prose or add any other trailer.
-- Do not emit Signed-off-by or Assisted-by trailers. These summaries describe
-  candidate fixes and are not commits.
-
-Formatting rules:
-
-- Wrap every prose line at 75 columns. Trailer lines and indivisible verbatim
-  code fragments may exceed 75 columns.
-- Use ASCII only. Indent evidence blocks by four spaces.
-- Use no backticks, markdown headings, bullets in the output, bold text, or
-  fenced code blocks.
-- End the document with a newline.
-
-Treat task_observations only as supporting evidence. Do not attribute text to
-tasks. Do not restore findings filtered out before rendering, and do not add
-facts that are absent from the validated inputs.
+Indent source excerpts and ASCII evidence blocks by four spaces. Do not
+use backticks, headings, bullets, bold text, or fenced code blocks. End
+with a newline. Do not restore findings filtered out before rendering or
+invent facts absent from the validated inputs.

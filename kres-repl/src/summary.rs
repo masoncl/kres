@@ -1112,9 +1112,9 @@ fn partial_note(idx: usize, total: usize) -> String {
     format!(
         "You are rendering partial summary {idx} of {total} for the same research run. \
          Cover only the findings provided in this chunk. A later stage will merge the \
-         partials into a single final summary, so emit the sections in the template's \
-         normal shape and skip any closing or global framing that would duplicate \
-         across partials."
+         partials into a single final summary, so emit the candidate commit messages \
+         in the template's normal shape and skip any closing or global framing that \
+         would duplicate across partials."
     )
 }
 
@@ -1126,9 +1126,8 @@ fn combine_system_prompt(markdown: bool) -> String {
          final output — merge duplicates (the same underlying topic or finding) rather \
          than listing them twice. Preserve the style, tone, structure, and line \
          wrapping the partials already use; do not invent new section headings or \
-         framing. If the partials open with a shared contextual lead-in, keep one copy \
-         at the top. Severity ordering is already baked into the partials — preserve \
-         it; do not re-sort across the merged output. End the output with a blank line."
+         framing. Preserve the existing candidate commit order; do not re-sort across \
+         the merged output. End the output with a newline."
     )
 }
 

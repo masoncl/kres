@@ -170,6 +170,17 @@ mod tests {
     }
 
     #[test]
+    fn summary_templates_use_kernel_changelog_shape() {
+        for name in ["summary", "summary-markdown"] {
+            let body = lookup_with_root(None, name).unwrap();
+            assert!(body.contains("candidate kernel-style"), "{name}");
+            assert!(body.contains("Fix by"), "{name}");
+            assert!(body.contains("55 characters"), "{name}");
+            assert!(!body.contains("bug-severity:"), "{name}");
+        }
+    }
+
+    #[test]
     fn unknown_name_returns_none() {
         assert!(lookup("no-such-command").is_none());
     }

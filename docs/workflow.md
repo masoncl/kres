@@ -1334,7 +1334,11 @@ their results are restored to canonical finding order before rendering. A failed
 validation cancels the remaining batch and aborts the summary. The renderer
 consumes only validation-produced summaries and structured verdicts, then owns
 batching, template selection, and the final output write for both CLI and REPL
-entry points. Standalone `--summary` and `--summary-markdown` use the resolved
-fast model for the workflow's slow role unless `--slow` (or another explicit
-slow-model override) is passed. REPL slash commands retain the session's
-configured fast and slow roles.
+entry points. Both render variants format every surviving finding as a
+kernel-style candidate commit message: subsystem-prefixed imperative subject,
+short causal changelog, and a supported fix statement. The Markdown variant
+uses the proposed subject as a section heading; the text variant emits raw
+commit-message blocks. Standalone `--summary` and `--summary-markdown` use the
+resolved fast model for the workflow's slow role unless `--slow` (or another
+explicit slow-model override) is passed. REPL slash commands retain the
+session's configured fast and slow roles.

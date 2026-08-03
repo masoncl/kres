@@ -747,8 +747,9 @@ snapshot.
    may be call chains, ASCII call graphs, CPU timelines, before/after
    state blocks, short case analyses, numeric examples, or source
    snippets. Call chains and call graphs are preferred over prose for
-   multi-function control flow. Diagrams must use ASCII only. When that
-   is the only defect, review routes back to `write-commit-message`;
+   multi-function control flow. Diagrams must use ASCII only and must
+   never use boxes. When that is the only defect, review routes back to
+   `write-commit-message`;
    when it is mixed with source or behavior defects, review routes back
    to `write-patch`.
 

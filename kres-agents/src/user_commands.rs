@@ -21,13 +21,16 @@
 
 const KERNEL_PROBLEM_DESCRIPTION: &str =
     include_str!("../../configs/prompts/kernel-problem-description.md");
+const COMMIT_LOG_DESCRIPTORS: &str =
+    include_str!("../../configs/prompts/commit-log-descriptors.md");
 const KERNEL_FIX_DESCRIPTION: &str =
     include_str!("../../configs/prompts/commit-kernel-template.md");
 
 pub fn kernel_problem_prompt(specific: &str) -> String {
     format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\n{}",
         KERNEL_PROBLEM_DESCRIPTION.trim_end(),
+        COMMIT_LOG_DESCRIPTORS.trim(),
         specific.trim_start()
     )
 }
@@ -36,8 +39,9 @@ pub fn kernel_fix_prompt() -> String {
     kernel_problem_prompt(KERNEL_FIX_DESCRIPTION)
 }
 
-/// Name → command-specific body. Kernel problem-writing rules are prepended
-/// by [`lookup_with_root`] so summaries and fix messages cannot drift.
+/// Name → command-specific body. Kernel problem-writing rules and the shared
+/// descriptor catalog are prepended by [`lookup_with_root`] so summaries and
+/// fix messages cannot drift.
 const TABLE: &[(&str, &str)] = &[
     (
         "summary",
@@ -55,9 +59,9 @@ const TABLE: &[(&str, &str)] = &[
 
 /// Return the body for `name` — disk override wins for the command-specific
 /// section, then the embedded default, else None. Kernel commands always have
-/// the shared problem-description rules prepended in Rust. The disk override
-/// path is `~/.kres/commands/<name>.md`; non-existent and empty files fall
-/// through to the embedded command-specific section.
+/// the shared problem-description rules and descriptor catalog prepended in
+/// Rust. The disk override path is `~/.kres/commands/<name>.md`; non-existent
+/// and empty files fall through to the embedded command-specific section.
 ///
 /// Names are restricted to `[a-zA-Z0-9_-]+` — a stray `/`, `\`,
 /// or path segment would otherwise resolve to a file outside the
@@ -184,13 +188,18 @@ mod tests {
         for marker in [
             "When the doc and this template disagree, the doc wins",
             "Rule 0 — 75-column wrap (the most important one)",
-            "Write a kernel changelog, not an audit report. Recent `mm/` commits favor a short causal explanation",
+            "Make a non-prose descriptor from the appended \"Non-prose technical description techniques\" catalog the default way to explain the bug",
+            "Prose is supporting material only",
             "do not turn the body into an exhaustive proof of every path that was checked",
-            "Call chain with state transition",
-            "Before/after state:",
+            "Non-prose technical description techniques",
+            "Hard rule: never draw boxes",
+            "Linear call chain",
+            "Before/after state block",
+            "Verbatim source excerpt for a bug",
+            "Pseudocode excerpt for a solution",
             "Optimisation and trade-off claims",
             "If a backtrace helps document the call chain, distill it",
-            "split it, delete non-essential proof, or quote the decisive code snippet",
+            "Prose that restates, summarizes, or walks through a descriptor",
             "Kernel fix description rules",
             "must not exceed 55 chars",
             "required when the change repairs a regression introduced by a specific commit",
@@ -204,7 +213,11 @@ mod tests {
                 "commit prompt missing {marker:?}"
             );
         }
-        assert!(body.contains("CPU 0                         CPU 1"));
+        assert_eq!(
+            body.matches("# Non-prose technical description techniques")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -218,13 +231,69 @@ mod tests {
                 normalized.contains("Do not propose or describe a fix"),
                 "{name}"
             );
-            assert!(body.contains("CPU timeline"), "{name}");
+            assert!(body.contains("Two-column CPU or thread timeline"), "{name}");
             assert!(
                 normalized.contains("If a backtrace helps document the call chain, distill it"),
                 "{name}"
             );
+            assert!(body.contains("Hard rule: never draw boxes"), "{name}");
+            assert!(body.contains("Verbatim source excerpt for a bug"), "{name}");
+            assert!(
+                normalized.contains("Never emit pseudocode in a bug summary"),
+                "{name}"
+            );
+            assert!(body.contains("[ ... ] // omitted: <reason>"), "{name}");
+            assert_eq!(
+                body.matches("# Non-prose technical description techniques")
+                    .count(),
+                1,
+                "{name}"
+            );
             assert!(!body.contains("Assisted-by:"), "{name}");
         }
+    }
+
+    #[test]
+    fn descriptor_catalog_has_no_box_diagrams() {
+        assert!(
+            !COMMIT_LOG_DESCRIPTORS
+                .chars()
+                .any(|c| ('\u{2500}'..='\u{257f}').contains(&c)),
+            "descriptor catalog contains Unicode box-drawing characters"
+        );
+        for line in COMMIT_LOG_DESCRIPTORS.lines() {
+            let trimmed = line.trim();
+            let ascii_border = (trimmed.starts_with('+') && trimmed.ends_with('+'))
+                || (trimmed.starts_with('|') && trimmed.ends_with('|'));
+            assert!(
+                !ascii_border,
+                "descriptor catalog contains a box row: {line}"
+            );
+        }
+        assert!(
+            !COMMIT_LOG_DESCRIPTORS.contains("]["),
+            "descriptor catalog contains adjacent bracketed fields that resemble boxes"
+        );
+    }
+
+    #[test]
+    fn descriptor_catalog_is_applicable_not_mandatory_and_bug_safe() {
+        let normalized = COMMIT_LOG_DESCRIPTORS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(COMMIT_LOG_DESCRIPTORS.contains("whenever it makes"));
+        assert!(COMMIT_LOG_DESCRIPTORS.contains("Do not force a descriptor"));
+        assert!(!COMMIT_LOG_DESCRIPTORS.contains("not mandatory"));
+        assert!(!COMMIT_LOG_DESCRIPTORS.contains("    right:"));
+        assert!(!COMMIT_LOG_DESCRIPTORS.contains("source or pseudocode excerpt"));
+        assert!(COMMIT_LOG_DESCRIPTORS.contains("copy it verbatim"));
+        assert!(normalized.contains("Never replace a single source line"));
+        assert!(normalized.contains("Do not use source-language comment syntax"));
+        assert!(normalized.contains("Never use an omission marker to hide control flow"));
+        assert!(COMMIT_LOG_DESCRIPTORS.contains(
+            "Pseudocode is allowed only when explaining a proposed or implemented solution"
+        ));
     }
 
     #[test]
@@ -239,6 +308,7 @@ mod tests {
         std::fs::write(dir.join("summary.md"), "OPERATOR SUMMARY OVERRIDE").unwrap();
         let got = lookup_with_root(Some(dir.clone()), "summary").expect("override should resolve");
         assert!(got.starts_with(KERNEL_PROBLEM_DESCRIPTION.trim_start()));
+        assert!(got.contains("# Non-prose technical description techniques"));
         assert!(got.ends_with("OPERATOR SUMMARY OVERRIDE"));
         assert!(!got.contains("Plain-text validated finding summary"));
         std::fs::remove_dir_all(&dir).ok();
@@ -292,6 +362,7 @@ mod tests {
         );
         assert!(
             body.contains("Kernel problem description rules")
+                && body.contains("Non-prose technical description techniques")
                 && body.contains("Kernel fix description rules"),
             "template body must follow: {body:?}"
         );

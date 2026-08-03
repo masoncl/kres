@@ -47,21 +47,30 @@ reading past the first line.
 behaviour change append "No functional change intended.">
 ```
 
-End with one short "Fix by ..." paragraph.
+End with one short "Fix by ..." paragraph. This required fix sentence is
+the only prose that does not set up or describe a non-prose descriptor;
+keep it to one sentence.
 
-After the blocks, add one short consequence paragraph and one
-short "Fix by ..." paragraph.
+When a descriptor needs context, use one short sentence to describe why
+it matters, then add the short "Fix by ..." paragraph.
+
+Code used to explain the existing bug must be copied verbatim from source as
+specified by the catalog. Pseudocode is allowed only to explain the solution;
+label it `pseudocode` and do not present it as source. A standalone
+`[ ... ] // omitted: <reason>` marker may replace at least two consecutive
+lines of unrelated code in a verbatim excerpt. Never omit one line; every
+retained source line must remain exact.
 
 Choose the right body shape for the change:
 
-- **Bug fix**: symptom → root cause → "Reject/Fix/Drop/Release
-  <object> and return <result>." Include user-visible impact in
-  the symptom paragraph (crash, leak, lockup, regression).
+- **Bug fix**: use the catalog to show symptom and root cause, then
+  "Reject/Fix/Drop/Release <object> and return <result>." Include
+  user-visible impact in the setup sentence or descriptor.
 - **Regression**: `commit <sha-12+> ("<subject>") did X; should
   have done Y.` then "Let's move ..." or "Restore ..." as the
   verb. Pair with a `Fixes:` tag.
-- **Enumerated breakage**: problem paragraph, numbered list of
-  distinct failure modes (each item one sentence), single
+- **Enumerated breakage**: minimal setup, numbered list of distinct
+  failure modes (each item one sentence), single
   closing "Fix by ..." paragraph. Reserved for changes that
   genuinely fix multiple distinct issues; the default is one
   failure per commit (submitting-patches.rst:81-83).

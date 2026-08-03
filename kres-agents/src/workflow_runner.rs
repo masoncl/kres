@@ -9696,8 +9696,18 @@ mod tests {
     fn commit_include_composes_problem_and_fix_rules() {
         let body = read_at_path("configs/prompts/commit-kernel-template.md").unwrap();
         assert!(body.contains("Kernel problem description rules"), "{body}");
+        assert!(
+            body.contains("Non-prose technical description techniques"),
+            "{body}"
+        );
+        assert!(body.contains("Hard rule: never draw boxes"), "{body}");
         assert!(body.contains("Kernel fix description rules"), "{body}");
         assert_eq!(body.matches("Kernel problem description rules").count(), 1);
+        assert_eq!(
+            body.matches("# Non-prose technical description techniques")
+                .count(),
+            1
+        );
     }
 
     #[test]

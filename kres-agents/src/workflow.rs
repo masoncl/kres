@@ -1167,20 +1167,19 @@ mod tests {
         assert!(wf.steps.iter().any(|s| s.id == "unconfirm"));
         assert!(wf.steps.iter().any(|s| s.id == "fixes-tag-search"));
         assert!(wf.steps.iter().any(|s| s.id == "publish"));
-        let commit_template = format!(
-            "{}\n\n{}",
-            include_str!("../../configs/prompts/kernel-problem-description.md"),
-            include_str!("../../configs/prompts/commit-kernel-template.md")
-        );
+        let commit_template = crate::user_commands::kernel_fix_prompt();
         assert!(
             commit_template.contains("Kernel problem description rules")
-                && commit_template.contains("indented evidence blocks")
-                && commit_template.contains("call chain, ASCII call graph")
-                && commit_template.contains("CPU timeline")
-                && commit_template.contains("before/after state block")
+                && commit_template.contains("Non-prose technical description techniques")
+                && commit_template.contains("Hard rule: never draw boxes")
+                && commit_template.contains("Linear call chain")
+                && commit_template.contains("Two-column CPU or thread timeline")
+                && commit_template.contains("Before/after state block")
+                && commit_template.contains("Verbatim source excerpt for a bug")
+                && commit_template.contains("Pseudocode excerpt for a solution")
                 && commit_template.contains("Kernel fix description rules")
                 && commit_template.contains("Fix by <verb> <object>"),
-            "commit prompt must compose shared problem rules with fix rules"
+            "commit prompt must compose problem rules, descriptors, and fix rules"
         );
         let fixes = wf
             .steps
@@ -1278,8 +1277,14 @@ mod tests {
         assert!(
             commit_prompt.contains("human-readable kernel changelog")
                 && commit_prompt.contains("dense proof memo")
-                && commit_prompt.contains("focused indented evidence blocks")
-                && commit_prompt.contains("Prefer call chains and ASCII call graphs")
+                && commit_prompt.contains("non-prose descriptor catalog")
+                && commit_prompt.contains("Prose is supporting material only")
+                && commit_prompt.contains("required one-sentence fix paragraph")
+                && commit_prompt.contains("MUST be verbatim source")
+                && commit_prompt.contains("[ ... ] // omitted: <reason>")
+                && commit_prompt.contains("never omit one line")
+                && commit_prompt.contains("Every retained source line must remain exact")
+                && commit_prompt.contains("Pseudocode is allowed only for the solution")
                 && commit_prompt.contains("Do not inventory every caller"),
             "write-commit-message prompt must reject wall-of-text commit messages"
         );

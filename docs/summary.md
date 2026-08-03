@@ -31,14 +31,17 @@ model for that run. That run:
   severities high to low, and runs a final render/combine pass; if none remain,
   writes a deterministic no-findings message;
 - renders each bug with the shared kernel problem-description rules from
-  `configs/prompts/kernel-problem-description.md`: a source-area subject and a
-  short causal changelog without proposing a fix; the text variant emits raw
-  problem-description blocks while the Markdown variant uses each subject as
-  a `##` heading;
+  `configs/prompts/kernel-problem-description.md` and the descriptor catalog
+  from `configs/prompts/commit-log-descriptors.md`: a source-area subject,
+  non-prose descriptors wherever possible, and only minimal supporting prose,
+  without proposing a fix; code used as bug evidence is copied verbatim with
+  filename:function context and pseudocode is forbidden; the text variant
+  emits raw problem-description blocks while the Markdown variant uses each
+  subject as a `##` heading;
 - writes `<results>/summary.txt` (or `summary.md` with
   `--summary-markdown`); falls back to the cwd when `--results`
   was absent.
 
 `--template PATH` overrides the shipped summariser prompt for one
-run without rebuilding. The shared kernel problem-description rules are still
-prepended to that output-specific override.
+run without rebuilding. The shared kernel problem-description rules and
+descriptor catalog are still prepended to that output-specific override.

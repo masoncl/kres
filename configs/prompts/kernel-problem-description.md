@@ -19,89 +19,63 @@ Subject line, body paragraphs, and list items: all wrap at 75.
 
 ## Body
 
-Write a kernel changelog, not an audit report. Recent commits
-favor a short causal explanation that a maintainer can read quickly:
-what goes wrong, the relevant mechanism, and what the patch changes.
+Write a kernel changelog, not an audit report. Make a non-prose
+descriptor from the appended "Non-prose technical description
+techniques" catalog the default way to explain the bug. Whenever a
+timeline, call chain, call graph, state block, layout, calculation,
+excerpt, or other catalog form can carry the facts, use it instead of
+paragraphs.
+
+Prose is supporting material only. Use the shortest possible prose only
+to set up a descriptor or describe why it matters. Do not translate a
+descriptor back into sentences, narrate each of its entries, or add a
+paragraph that repeats the same causal steps. One short sentence is
+enough when the descriptor needs context. Omit prose entirely when a
+subject and descriptor make the problem clear.
+
 Use concrete identifiers, but do not turn the body into an exhaustive
 proof of every path that was checked.
 
 ```
-<Problem paragraph: observed bad behaviour, invariant violated, or
-reason the change is worth making. Wrap at 75. Include user-visible
-impact: crash signature, latency spike, lockup pattern, refcount
-leak, dmesg excerpt — whatever helps a stable-tree maintainer
-deciding whether to backport.>
+<Optional one-sentence setup: observed bad behaviour, invariant
+violated, or reason the change is worth making. Include user-visible
+impact when relevant.>
 
-<Optional mechanism paragraph. Cite prior commits as
-`commit <sha-12+> ("<full subject>")` — at least 12 hex chars.
-Cite code as filename:function. Never cite source line numbers.>
+<The smallest applicable non-prose descriptors carrying the mechanism
+and evidence. Omit this block when no catalog form improves on one
+short sentence. Cite code as filename:function, never with line
+numbers.>
+
+<Optional one-sentence description of why the descriptor matters. Cite
+prior commits as `commit <sha-12+> ("<full subject>")`.>
 ```
 
 Preferred shape:
 
-- 2-4 short prose paragraphs, normally 1-4 wrapped lines each.
-- Start with the failing path and consequence in plain language.
-- If the bug depends on ordering, callbacks, nested calls, state
-  transitions, or two CPUs racing, use indented evidence blocks instead
-  of dense prose. Prefer call chains and call graphs over prose for
-  multi-function control flow. Choose the structure that makes each
-  causal step clearest: a call chain, ASCII call graph, CPU timeline,
-  before/after state block, short case analysis, numeric example, or a
-  source snippet when the decisive fact is the local branch or
-  expression itself. Keep each evidence block focused, normally 4-14
-  lines. Multiple evidence blocks are fine when they replace paragraphs
-  of compact prose and each block carries a different part of the bug.
-- Simple ASCII art is allowed in indented evidence blocks. Use only
-  ASCII characters such as `|`, `-`, `+`, `<`, `>`, and `->`; do not
-  use Unicode arrows, box drawing, or other non-ASCII diagram glyphs.
+- Start with a descriptor unless one short setup sentence is necessary.
+- Select the smallest catalog technique that exposes the causal
+  relationship. Combine techniques only when each carries different
+  information.
+- Keep each descriptor focused, normally 4-14 lines.
+- Put identifiers, state transitions, ordering, branches, values, and
+  calculations in the descriptor rather than spelling them out in
+  prose.
+- When code explains the bug, use a verbatim contiguous source excerpt.
+  Precede it with filename:function and include enough enclosing control
+  flow to locate the branch. Never paraphrase source, substitute generic
+  operations, or attach invented comments to retained source lines. You
+  may replace two or more unrelated consecutive lines with a standalone
+  `[ ... ] // omitted: <reason>` marker. Never omit a single source line,
+  use source-language comment syntax for an omission, or omit control
+  flow or state changes relevant to the bug. Output-format capitalization
+  rules never apply to quoted source.
+- Pseudocode is allowed only for explaining a solution. Label it
+  `pseudocode`; never use it as evidence of the existing bug.
+- Use prose only to set up a descriptor or describe why it matters.
+  Keep each prose paragraph to one sentence whenever possible and never
+  more than three wrapped lines.
 - Keep scope/proof paragraphs narrow: say only what matters to explain
   why the patch is needed and why this fix is valid.
-
-Evidence block examples to follow:
-
-Race timeline:
-
-    CPU 0                         CPU 1
-    -----                         -----
-    show_state()
-    obj = container->obj;         mutex_lock(&container->lock);
-                                  replace_object(container, NULL);
-                                  free_object(obj);
-                                  mutex_unlock(&container->lock);
-    use_object(obj);              /* obj is freed */
-
-Call chain with state transition:
-
-    handle_event()
-      mark_object_unavailable()
-      split_object()
-        remap_entries()
-          inspect_unused_entry()
-            read_object_data()    /* reads unavailable state again */
-
-Call graph:
-
-    fault path
-      handle_fault()
-        lookup_cached_object()
-          batch_install_entries()
-            uses stale index
-
-    teardown path
-      replace_object()
-        clears slot
-        frees old object
-
-Before/after state:
-
-    before: slot points at old owner
-            callers take old_owner->lock and mutate the object
-    clear:  slot becomes NULL before the object is moved
-    after:  callers fall back to new_owner->lock while the object is
-            still linked under old_owner->lock
-
-Use evidence blocks to carry the mechanics, then keep prose short.
-Do not restate every line of a block in prose.
 
 ## Optimisation and trade-off claims
 
@@ -117,25 +91,18 @@ analysis is a reviewer red flag.
 If a backtrace helps document the call chain, distill it
 (submitting-patches.rst:770-790). Strip timestamps, module lists,
 register dumps, stack dumps. Keep the function chain and the line
-that actually identifies the failure. Indent the distilled
-backtrace by four spaces; do not use markdown fences. Example
-shape:
-
-    unchecked MSR access error: WRMSR to 0xd51 ...
-    at rIP: 0xffffffffae059994 (native_write_msr+0x4/0x20)
-    Call Trace:
-    mba_wrmsr
-    update_domains
-    rdtgroup_mkdir
+that actually identifies the failure. Use the distilled-backtrace
+form in the appended descriptor catalog. Indent it by four spaces;
+do not use markdown fences.
 
 ## What to AVOID
 
-- Bullet lists used as a substitute for prose. The kernel body is
-  prose paragraphs; lists are reserved for the enumerated-breakage
-  shape.
+- Free-form bullet lists. Use a specific descriptor technique instead;
+  reserve numbered lists for genuinely distinct failure modes.
 - Dense proof-memo paragraphs. If a paragraph reads like a review
-  transcript, split it, delete non-essential proof, or quote the
-  decisive code snippet.
+  transcript, replace it with a descriptor or delete non-essential
+  proof.
+- Prose that restates, summarizes, or walks through a descriptor.
 - Exhaustive inventories of callers, exports, fallback paths, or
   negative cases unless each item is needed to understand the bug or
   justify the fix.

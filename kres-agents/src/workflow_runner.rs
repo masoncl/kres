@@ -1710,10 +1710,24 @@ impl Driver for LlmDriver {
             }
             staged.insert(path, body.to_string());
         }
+        // Gather commands can mutate the workspace without emitting staged files.
+        let invalidate_gathered = !staged.is_empty()
+            || effective_actions(step, &self.workflow)
+                .iter()
+                .any(|action| {
+                    matches!(
+                        action,
+                        crate::workflow::ActionType::Make
+                            | crate::workflow::ActionType::Meson
+                            | crate::workflow::ActionType::Bash
+                    )
+                });
         commit_staged_files(&self.workspace, staged)
             .map_err(|error| format!("step '{}' code changes commit: {error}", step.id))?;
-        if let Ok(mut cache) = self.gathered_cache.lock() {
-            cache.clear();
+        if invalidate_gathered {
+            if let Ok(mut cache) = self.gathered_cache.lock() {
+                cache.clear();
+            }
         }
         if let Ok(mut pending) = self.pending_changes.lock() {
             pending.remove(&(step.id.clone(), attempt));
@@ -8981,6 +8995,71 @@ mod tests {
             cached.is_empty(),
             "accepted edits must invalidate source cache"
         );
+    }
+
+    #[tokio::test]
+    async fn llm_driver_preserves_gathered_context_after_read_only_step() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workflow = fix_workflow();
+        let mut step = workflow.steps.first().unwrap().clone();
+        step.actions = Some(vec![crate::workflow::ActionType::Read]);
+        let driver = LlmDriver::new(workspace.path().to_path_buf(), workflow);
+        let gathered = vec![json!({"name": "finding_metadata"})];
+        driver.store_gathered(&step.id, gathered.clone(), Vec::new());
+
+        let ctx = ExecContext {
+            workflow_inputs: &Map::new(),
+            steps: &HashMap::new(),
+        };
+        let effects = driver.attempt_effects(&step, 1, &ctx).await.unwrap();
+        assert_eq!(effects, Value::Array(Vec::new()));
+        driver
+            .apply_attempt_effects(&step, 1, &effects, &ctx)
+            .await
+            .unwrap();
+
+        let (cached, _) = driver.seed_gather_from_deps(std::slice::from_ref(&step.id));
+        assert_eq!(
+            cached, gathered,
+            "read-only steps must preserve gathered context"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_driver_invalidates_gathered_context_after_mutation_capable_followups() {
+        for action in [
+            crate::workflow::ActionType::Make,
+            crate::workflow::ActionType::Meson,
+            crate::workflow::ActionType::Bash,
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let workflow = fix_workflow();
+            let mut step = workflow.steps.first().unwrap().clone();
+            step.actions = Some(vec![action]);
+            let driver = LlmDriver::new(workspace.path().to_path_buf(), workflow);
+            driver.store_gathered(
+                &step.id,
+                vec![json!({"name": "possibly_stale_source"})],
+                Vec::new(),
+            );
+
+            let ctx = ExecContext {
+                workflow_inputs: &Map::new(),
+                steps: &HashMap::new(),
+            };
+            let effects = driver.attempt_effects(&step, 1, &ctx).await.unwrap();
+            assert_eq!(effects, Value::Array(Vec::new()));
+            driver
+                .apply_attempt_effects(&step, 1, &effects, &ctx)
+                .await
+                .unwrap();
+
+            let (cached, _) = driver.seed_gather_from_deps(std::slice::from_ref(&step.id));
+            assert!(
+                cached.is_empty(),
+                "{action:?} followups must invalidate gathered context"
+            );
+        }
     }
 
     #[test]

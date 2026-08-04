@@ -287,14 +287,25 @@ pub struct LlmDriver {
     >,
 }
 
-fn append_skill_block(block: &mut String, label: &str, body: &str) {
+fn append_skill_block(block: &mut String, label: &str, skill: &crate::Skill) {
     block.push_str(&format!("\n--- SKILL: {label} ---\n"));
-    block.push_str(body.trim_end());
+    block.push_str(skill.content.trim_end());
     block.push('\n');
+    for (path, content) in &skill.files {
+        block.push_str(&format!(
+            "\n--- PRELOADED FILE REFERENCED BY SKILL: {path} ---\n"
+        ));
+        block.push_str(content.trim_end());
+        block.push('\n');
+    }
 }
 
 fn skill_key(name: &str) -> String {
     name.strip_suffix(".md").unwrap_or(name).to_string()
+}
+
+fn runner_skills_cover_workflow(workflow_skills: &[String], runner_skills: Option<&Value>) -> bool {
+    workflow_skills == ["auto"] && runner_skills.is_some()
 }
 
 impl LlmDriver {
@@ -385,12 +396,24 @@ impl LlmDriver {
         (symbols, context)
     }
 
-    /// Record the symbols/context a step gathered so dependent steps
-    /// can seed from it. No-op for an empty gather.
-    fn store_gathered(&self, step_id: &str, symbols: Vec<Value>, context: Vec<Value>) {
-        if symbols.is_empty() && context.is_empty() {
-            return;
+    fn seed_gather_for_step(&self, step: &Step, ctx: &ExecContext<'_>) -> GatheredData {
+        let mut gather_sources = step.depends_on.clone();
+        let reuse_own = ctx
+            .steps
+            .get(&step.id)
+            .is_some_and(|state| state.reuse_gathered_context);
+        if reuse_own {
+            gather_sources.push(step.id.clone());
+        } else if let Ok(mut cache) = self.gathered_cache.lock() {
+            cache.remove(&step.id);
         }
+        self.seed_gather_from_deps(&gather_sources)
+    }
+
+    /// Record the symbols/context a step gathered so dependent steps
+    /// can seed from it. Empty gathers replace prior entries because
+    /// the same driver and step ids may be reused across workflow runs.
+    fn store_gathered(&self, step_id: &str, symbols: Vec<Value>, context: Vec<Value>) {
         if let Ok(mut cache) = self.gathered_cache.lock() {
             cache.insert(step_id.to_string(), (symbols, context));
         }
@@ -475,13 +498,7 @@ impl LlmDriver {
                 skills
                     .auto_loaded()
                     .into_iter()
-                    .map(|skill| {
-                        (
-                            format!("{}.md", skill.name),
-                            skill.name.clone(),
-                            skill.content.clone(),
-                        )
-                    })
+                    .map(|skill| (format!("{}.md", skill.name), skill.clone()))
                     .collect::<Vec<_>>(),
             )
         } else {
@@ -490,20 +507,20 @@ impl LlmDriver {
         for name in &self.workflow.skills {
             if name == "auto" {
                 if let Some(auto_skills) = auto_skills.as_ref() {
-                    for (label, key, body) in auto_skills {
-                        if !loaded.insert(key.clone()) {
+                    for (label, skill) in auto_skills {
+                        if !loaded.insert(skill.name.clone()) {
                             continue;
                         }
-                        append_skill_block(&mut block, label, body);
+                        append_skill_block(&mut block, label, skill);
                     }
                 }
                 continue;
             }
             let p = skills_dir.join(name);
-            match std::fs::read_to_string(&p) {
-                Ok(body) => {
+            match crate::Skill::from_path(&p) {
+                Ok(skill) => {
                     if loaded.insert(skill_key(name)) {
-                        append_skill_block(&mut block, name, &body);
+                        append_skill_block(&mut block, name, &skill);
                     }
                 }
                 Err(e) => {
@@ -758,16 +775,16 @@ impl LlmDriver {
             Some(l) => format!("\nlens: {}", l.id),
             None => String::new(),
         };
-        // Avoid double-including skills. The AgentRunner path
-        // serializes its own `skills` field into the CodePrompt
-        // envelope, so when an AgentRunner is wired and has skills
-        // set, the text prelude would duplicate them.
-        let skip_prelude = self
-            .agent_runner
-            .as_ref()
-            .map(|o| o.skills.is_some())
-            .unwrap_or(false);
-        let skills_prelude = if self.skills_block.is_empty() || skip_prelude {
+        // The session runner's skills are equivalent only for a workflow
+        // that requests exactly the workspace-selected automatic skills.
+        // Named workflow skills must keep their local prelude.
+        let runner_supplies_exact_auto_skills = runner_skills_cover_workflow(
+            &self.workflow.skills,
+            self.agent_runner
+                .as_ref()
+                .and_then(|runner| runner.skills.as_ref()),
+        );
+        let skills_prelude = if self.skills_block.is_empty() || runner_supplies_exact_auto_skills {
             String::new()
         } else {
             format!("--- SKILLS ---{}\n", self.skills_block)
@@ -832,10 +849,11 @@ impl LlmDriver {
         {
             let mut last_parse_err: Option<String> = None;
             let mut last_apply_err: Option<String> = None;
-            // #4: seed this step's gather from the source its
-            // dependencies already fetched, so e.g. validate-reachability
-            // does not re-pull what validate-claims gathered.
-            let (seed_symbols, seed_context) = self.seed_gather_from_deps(&step.depends_on);
+            // Seed from dependencies and, on an eval retry, from this
+            // step's prior gather. The retry should add missing evidence
+            // named in prior_attempts without discarding evidence already
+            // fetched by the successful prior synthesis.
+            let (seed_symbols, seed_context) = self.seed_gather_for_step(step, ctx);
             // Preserve validated gather results across full synthesis retries
             // so a successful attempt can seed dependent steps.
             let mut captured_gathered: Option<(Vec<Value>, Vec<Value>)> = None;
@@ -1572,6 +1590,15 @@ impl LlmDriver {
 
 #[async_trait]
 impl Driver for LlmDriver {
+    fn begin_run(&self) {
+        if let Ok(mut cache) = self.gathered_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut pending) = self.pending_changes.lock() {
+            pending.clear();
+        }
+    }
+
     async fn run(
         &self,
         step: &Step,
@@ -1685,6 +1712,9 @@ impl Driver for LlmDriver {
         }
         commit_staged_files(&self.workspace, staged)
             .map_err(|error| format!("step '{}' code changes commit: {error}", step.id))?;
+        if let Ok(mut cache) = self.gathered_cache.lock() {
+            cache.clear();
+        }
         if let Ok(mut pending) = self.pending_changes.lock() {
             pending.remove(&(step.id.clone(), attempt));
         }
@@ -1847,12 +1877,13 @@ impl Driver for LlmDriver {
             .map_err(|e| format!("consolidate payload encode: {e}"))?;
 
         let schema_tail = build_output_schema_tail(step);
-        let skip_skills_prelude = self
-            .agent_runner
-            .as_ref()
-            .map(|o| o.skills.is_some())
-            .unwrap_or(false);
-        let skills_prelude = if self.skills_block.is_empty() || skip_skills_prelude {
+        let runner_supplies_exact_auto_skills = runner_skills_cover_workflow(
+            &self.workflow.skills,
+            self.agent_runner
+                .as_ref()
+                .and_then(|runner| runner.skills.as_ref()),
+        );
+        let skills_prelude = if self.skills_block.is_empty() || runner_supplies_exact_auto_skills {
             String::new()
         } else {
             format!("--- SKILLS ---{}\n\n", self.skills_block)
@@ -6343,10 +6374,63 @@ mod tests {
         let (s2, c2) = driver.seed_gather_from_deps(&["missing".to_string()]);
         assert!(s2.is_empty() && c2.is_empty());
 
-        // Storing an empty gather is a no-op (nothing to seed later).
+        // Storing an empty gather replaces any older entry.
         driver.store_gathered("c", vec![], vec![]);
         let (s3, _) = driver.seed_gather_from_deps(&["c".to_string()]);
         assert!(s3.is_empty());
+
+        <LlmDriver as crate::workflow_exec::Driver>::begin_run(&driver);
+        let (cleared, _) = driver.seed_gather_from_deps(&["a".to_string()]);
+        assert!(cleared.is_empty(), "workflow boundary must clear cache");
+    }
+
+    #[test]
+    fn eval_retry_seeds_its_own_prior_gather_only_after_first_attempt() {
+        let wf = crate::workflow::parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "retry-seed-test",
+                "steps": [{"id": "assessment", "agent": "slow", "prompt": "p"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let step = wf.steps[0].clone();
+        let driver = LlmDriver::new(std::path::PathBuf::from("."), wf);
+        driver.store_gathered(
+            "assessment",
+            vec![json!({"name": "prior_symbol"})],
+            vec![json!({"ctx": "prior_context"})],
+        );
+        let inputs = Map::new();
+        let mut states = std::collections::HashMap::from([(
+            "assessment".to_string(),
+            StepState {
+                id: "assessment".to_string(),
+                ..StepState::default()
+            },
+        )]);
+        let fresh_ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+
+        let first = driver.seed_gather_for_step(&step, &fresh_ctx);
+        assert!(first.0.is_empty() && first.1.is_empty());
+
+        driver.store_gathered(
+            "assessment",
+            vec![json!({"name": "prior_symbol"})],
+            vec![json!({"ctx": "prior_context"})],
+        );
+        states.get_mut("assessment").unwrap().reuse_gathered_context = true;
+        let retry_ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        let retry = driver.seed_gather_for_step(&step, &retry_ctx);
+        assert_eq!(retry.0, vec![json!({"name": "prior_symbol"})]);
+        assert_eq!(retry.1, vec![json!({"ctx": "prior_context"})]);
     }
 
     #[test]
@@ -8840,6 +8924,22 @@ mod tests {
             .unwrap();
         let driver = LlmDriver::new(workspace.path().to_path_buf(), workflow.clone());
         let target = workspace.path().join("result.txt");
+        let stale = std::collections::BTreeMap::from([(target.clone(), "stale".into())]);
+        driver.stage_attempt(step, 1, stale).unwrap();
+        <LlmDriver as crate::workflow_exec::Driver>::begin_run(&driver);
+        let cleared = driver
+            .attempt_effects(
+                step,
+                1,
+                &ExecContext {
+                    workflow_inputs: &Map::new(),
+                    steps: &HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared, Value::Array(Vec::new()));
+
         let staged = std::collections::BTreeMap::from([(target.clone(), "rejected".into())]);
         driver.stage_attempt(step, 1, staged).unwrap();
         driver.discard_attempt(step, 1).await;
@@ -8847,6 +8947,11 @@ mod tests {
 
         let staged = std::collections::BTreeMap::from([(target.clone(), "accepted".into())]);
         driver.stage_attempt(step, 2, staged).unwrap();
+        driver.store_gathered(
+            &step.id,
+            vec![json!({"name": "pre_edit_source"})],
+            Vec::new(),
+        );
         let effects = driver
             .attempt_effects(
                 step,
@@ -8871,6 +8976,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(target).unwrap(), "accepted");
+        let (cached, _) = driver.seed_gather_from_deps(std::slice::from_ref(&step.id));
+        assert!(
+            cached.is_empty(),
+            "accepted edits must invalidate source cache"
+        );
     }
 
     #[test]
@@ -9111,7 +9221,16 @@ mod tests {
     #[test]
     fn with_skills_dir_loads_files_and_warns_on_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("kernel.md"), "kernel skill body").unwrap();
+        let guidance = tmp.path().join("technical-patterns.md");
+        std::fs::write(&guidance, "mandatory external guidance").unwrap();
+        std::fs::write(
+            tmp.path().join("kernel.md"),
+            format!(
+                "kernel skill body\nAlways read `{}` before assessing.",
+                guidance.display()
+            ),
+        )
+        .unwrap();
         let wf_json = serde_json::json!({
             "$schema_version": 1,
             "id": "skills-test",
@@ -9123,6 +9242,13 @@ mod tests {
         let (driver, warnings) = driver.with_skills_dir(tmp.path()).unwrap();
         assert!(driver.skills_block.contains("kernel skill body"));
         assert!(driver.skills_block.contains("--- SKILL: kernel.md ---"));
+        assert!(driver
+            .skills_block
+            .contains("--- PRELOADED FILE REFERENCED BY SKILL:"));
+        assert!(driver
+            .skills_block
+            .contains(&guidance.display().to_string()));
+        assert!(driver.skills_block.contains("mandatory external guidance"));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("missing.md"));
     }
@@ -9157,6 +9283,25 @@ mod tests {
         assert!(driver.skills_block.contains("--- SKILL: systemd.md ---"));
         assert!(!driver.skills_block.contains("kernel skill body"));
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn session_skills_only_cover_exact_auto_workflow_selection() {
+        let runner_skills = json!({});
+
+        assert!(runner_skills_cover_workflow(
+            &["auto".to_string()],
+            Some(&runner_skills)
+        ));
+        assert!(!runner_skills_cover_workflow(
+            &["kernel.md".to_string()],
+            Some(&runner_skills)
+        ));
+        assert!(!runner_skills_cover_workflow(
+            &["auto".to_string(), "extra.md".to_string()],
+            Some(&runner_skills)
+        ));
+        assert!(!runner_skills_cover_workflow(&["auto".to_string()], None));
     }
 
     #[tokio::test]

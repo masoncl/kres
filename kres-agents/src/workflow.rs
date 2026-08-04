@@ -1106,6 +1106,13 @@ mod tests {
             Some("workflow.fix_run_mode == 'final'")
         );
         assert!(series_assessment.depends_on.is_empty());
+        let assessment_prompt = series_assessment.prompt.as_deref().unwrap();
+        assert!(assessment_prompt.contains("fix_series_original_artifacts"));
+        assert!(assessment_prompt.contains("series-assessment.prior_attempts"));
+        assert!(assessment_prompt.contains("exhaustive final-tree grep/search"));
+        let assessment_eval = series_assessment.eval.as_ref().expect("assessment eval");
+        assert_eq!(assessment_eval.on_fail.action, OnFailAction::Repeat);
+        assert_eq!(assessment_eval.on_fail.max_attempts, Some(3));
         assert!(wf
             .steps
             .iter()

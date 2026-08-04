@@ -828,9 +828,11 @@ snapshot.
 
 11. **series-assessment**
 
-   After every planned todo has completed, a primary-slow final assessment
-   reviews the original finding, revisioned series state, complete commit
-   sequence, and current source. It does not judge only `HEAD~1`. The series is
+   During planning, the runner snapshots mandatory `metadata.yaml` and
+   `FINDING.md` plus optional `summary.md` into the persisted fix-series state.
+   Each opened artifact must resolve inside the finding directory. The
+   primary-slow final assessment reviews that immutable snapshot with the revisioned series state, complete
+   commit sequence, and current source. It does not judge only `HEAD~1`. The series is
    successful only when every planned todo is done and every original bug
    component is fixed, invalidated with evidence, or matched to a proven
    upstream duplicate. Deferred or unexamined components fail the gate.
@@ -839,8 +841,14 @@ snapshot.
    `failure`. A revision decision must carry a stale-checked plan update made
    only of `append_after_current` operations. Rust validates and persists the
    new todos, runs them through the normal fix pipeline, and repeats the final
-   assessment. Other non-`complete` decisions fail while preserving structured
-   remaining work in the workflow trace. A builtin validator requires outcomes
+   assessment. An `unconfirmed` result gets up to three total attempts,
+   preserving typed prior outputs and gathered source only across its immediate
+   repeat so the next gather pass can satisfy exact evidence requests. A typed
+   `failure` decision terminates immediately. Eval and driver-error exhaustion
+   use the same required terminal-snapshot path, so resume cannot grant another
+   attempt. Resume refreshes the snapshot's workflow inputs from the current
+   outer-series state. Accepted source edits invalidate gathered source before
+   dependent steps run. A builtin validator requires outcomes
    to cover the authoritative todo IDs exactly once, with a valid disposition
    and non-empty evidence. Complete decisions also require empty remaining work
    and prohibit unresolved outcomes.

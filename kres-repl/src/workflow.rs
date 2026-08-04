@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -111,6 +112,108 @@ fn absolute_path(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
+}
+
+fn load_fix_series_original_artifacts(inputs: &Map<String, Value>) -> Result<String, String> {
+    if inputs.get("target_kind").and_then(Value::as_str) != Some("finding_dir") {
+        return Ok(String::new());
+    }
+    let Some(dir) = inputs
+        .get("target_artifact_dir")
+        .and_then(Value::as_str)
+        .filter(|dir| !dir.trim().is_empty())
+    else {
+        return Err("finding-dir assessment is missing target_artifact_dir".to_string());
+    };
+    let dir = Path::new(dir);
+    let canonical_dir = std::fs::canonicalize(dir).map_err(|err| {
+        format!(
+            "could not resolve finding directory {}: {err}",
+            dir.display()
+        )
+    })?;
+    let mut artifacts = String::new();
+    for (name, required) in [
+        ("metadata.yaml", true),
+        ("FINDING.md", true),
+        ("summary.md", false),
+    ] {
+        let path = dir.join(name);
+        match std::fs::File::open(&path) {
+            Ok(mut file) => {
+                let resolved = opened_file_path(&file, &path)?;
+                if !resolved.starts_with(&canonical_dir) {
+                    return Err(format!(
+                        "original fix artifact {} resolves outside finding directory {}",
+                        path.display(),
+                        canonical_dir.display()
+                    ));
+                }
+                let mut body = String::new();
+                file.read_to_string(&mut body).map_err(|err| {
+                    format!(
+                        "could not read original fix artifact {}: {err}",
+                        path.display()
+                    )
+                })?;
+                artifacts.push_str(&format!("--- ORIGINAL ARTIFACT: {name} ---\n"));
+                artifacts.push_str(body.trim_end());
+                artifacts.push_str("\n\n");
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {}
+            Err(err) => {
+                return Err(format!(
+                    "could not preload original fix artifact {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(artifacts)
+}
+
+#[cfg(target_os = "linux")]
+fn opened_file_path(file: &std::fs::File, original: &Path) -> Result<PathBuf, String> {
+    use std::os::fd::AsRawFd;
+
+    std::fs::canonicalize(format!("/proc/self/fd/{}", file.as_raw_fd())).map_err(|err| {
+        format!(
+            "could not resolve opened original fix artifact {}: {err}",
+            original.display()
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn opened_file_path(file: &std::fs::File, original: &Path) -> Result<PathBuf, String> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+
+    let mut path = [0 as libc::c_char; libc::PATH_MAX as usize];
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) };
+    if result == -1 {
+        return Err(format!(
+            "could not resolve opened original fix artifact {}: {}",
+            original.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let resolved = unsafe { CStr::from_ptr(path.as_ptr()) };
+    let resolved = PathBuf::from(resolved.to_string_lossy().into_owned());
+    std::fs::canonicalize(&resolved).map_err(|err| {
+        format!(
+            "could not resolve opened original fix artifact {}: {err}",
+            original.display()
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened_file_path(_file: &std::fs::File, original: &Path) -> Result<PathBuf, String> {
+    Err(format!(
+        "secure opened-file resolution is unsupported on this platform for {}",
+        original.display()
+    ))
 }
 
 pub fn workflow_prompt_invocation(raw: &str) -> Option<(&str, &str)> {
@@ -346,6 +449,8 @@ struct FixSeriesState {
     final_revisions: usize,
     base_head: String,
     original_bugs: Vec<FixSeriesBug>,
+    #[serde(default)]
+    original_artifacts: String,
     tracked: Vec<TrackedFixTodo>,
     todo_revisions: Vec<usize>,
 }
@@ -958,7 +1063,23 @@ async fn run_fix_series_driver(
     let outer_state_exists = results_dir.is_some_and(|dir| FixSeriesState::path(dir).exists());
     let mut series_state = if resume && outer_state_exists {
         match FixSeriesState::load(results_dir.expect("state directory checked above"), target) {
-            Ok(state) => state,
+            Ok(mut state) => {
+                if state.original_artifacts.is_empty()
+                    && inputs.get("target_kind").and_then(Value::as_str) == Some("finding_dir")
+                {
+                    match load_fix_series_original_artifacts(&inputs) {
+                        Ok(artifacts) => state.original_artifacts = artifacts,
+                        Err(e) => {
+                            return Trace {
+                                events,
+                                status: WorkflowStatus::Failure(e),
+                                final_state,
+                            };
+                        }
+                    }
+                }
+                state
+            }
             Err(e) => {
                 return Trace {
                     events,
@@ -1026,6 +1147,14 @@ async fn run_fix_series_driver(
                 return trace;
             }
         };
+        let original_artifacts = match load_fix_series_original_artifacts(&inputs) {
+            Ok(artifacts) => artifacts,
+            Err(e) => {
+                let mut trace = planning_trace;
+                trace.status = WorkflowStatus::Failure(e);
+                return trace;
+            }
+        };
         async_println(format!(
             "[fix series] research confirmed; {} fix todo(s) planned",
             plan.len()
@@ -1058,6 +1187,7 @@ async fn run_fix_series_driver(
             final_revisions: 0,
             base_head,
             original_bugs,
+            original_artifacts,
             todo_revisions: vec![0; plan.len()],
             tracked: plan
                 .into_iter()
@@ -1384,6 +1514,10 @@ async fn run_fix_series_driver(
             "fix_series_commits".into(),
             Value::Array(series_commits.into_iter().map(Value::String).collect()),
         );
+        assessment_inputs.insert(
+            "fix_series_original_artifacts".into(),
+            Value::String(series_state.original_artifacts.clone()),
+        );
         let assessment_trace = run_with_optional_resume(
             &assessment_workflow,
             driver,
@@ -1433,6 +1567,18 @@ async fn run_fix_series_driver(
                 }
             }
         }
+        if series_assessment_is_terminal_failure(
+            &assessment_trace.status,
+            assessment_decision.as_deref(),
+        ) {
+            events.extend(assessment_trace.events);
+            final_state = assessment_trace.final_state;
+            status = WorkflowStatus::Failure(
+                "series assessment determined that the produced series cannot safely advance"
+                    .to_string(),
+            );
+            break 'series;
+        }
         events.extend(assessment_trace.events);
         final_state = assessment_trace.final_state;
         status = assessment_trace.status;
@@ -1444,6 +1590,13 @@ async fn run_fix_series_driver(
         status,
         final_state,
     }
+}
+
+fn series_assessment_is_terminal_failure(status: &WorkflowStatus, decision: Option<&str>) -> bool {
+    matches!(
+        status,
+        WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+    ) && decision == Some("failure")
 }
 
 async fn run_with_optional_observer(
@@ -1487,7 +1640,8 @@ async fn run_with_optional_resume(
 ) -> Trace {
     if resume {
         if let Some(dir) = snapshot_dir.as_ref() {
-            if let Some(snapshot) = WorkflowSnapshot::load(dir, &workflow.id) {
+            if let Some(mut snapshot) = WorkflowSnapshot::load(dir, &workflow.id) {
+                refresh_snapshot_inputs(&mut snapshot, &inputs);
                 return run_resume(workflow, driver, snapshot, Some(dir.clone()), iteration_cap)
                     .await;
             }
@@ -1502,6 +1656,10 @@ async fn run_with_optional_resume(
         snapshot_dir,
     )
     .await
+}
+
+fn refresh_snapshot_inputs(snapshot: &mut WorkflowSnapshot, inputs: &Map<String, Value>) {
+    snapshot.inputs.extend(inputs.clone());
 }
 
 fn fix_series_plan_value(tracked: &[TrackedFixTodo]) -> Value {
@@ -1790,6 +1948,133 @@ mod tests {
     }
 
     #[test]
+    fn final_assessment_preloads_original_finding_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("metadata.yaml"), "id: finding-one\n").unwrap();
+        std::fs::write(tmp.path().join("FINDING.md"), "# Exact original claim\n").unwrap();
+        std::fs::write(tmp.path().join("summary.md"), "Original summary evidence\n").unwrap();
+        let inputs = Map::from_iter([
+            (
+                "target_artifact_dir".to_string(),
+                json!(tmp.path().display().to_string()),
+            ),
+            ("target_kind".to_string(), json!("finding_dir")),
+        ]);
+
+        let artifacts = load_fix_series_original_artifacts(&inputs).unwrap();
+
+        assert!(artifacts.contains("--- ORIGINAL ARTIFACT: metadata.yaml ---"));
+        assert!(artifacts.contains("id: finding-one"));
+        assert!(artifacts.contains("--- ORIGINAL ARTIFACT: FINDING.md ---"));
+        assert!(artifacts.contains("# Exact original claim"));
+        assert!(artifacts.contains("--- ORIGINAL ARTIFACT: summary.md ---"));
+        assert!(artifacts.contains("Original summary evidence"));
+    }
+
+    #[test]
+    fn final_assessment_does_not_treat_prose_results_as_original_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("summary.md"), "stale generated output\n").unwrap();
+        let inputs = Map::from_iter([
+            (
+                "target_artifact_dir".to_string(),
+                json!(tmp.path().display().to_string()),
+            ),
+            ("target_kind".to_string(), json!("prose")),
+        ]);
+
+        assert!(load_fix_series_original_artifacts(&inputs)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn final_assessment_requires_mandatory_finding_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("metadata.yaml"), "id: finding-one\n").unwrap();
+        let inputs = Map::from_iter([
+            (
+                "target_artifact_dir".to_string(),
+                json!(tmp.path().display().to_string()),
+            ),
+            ("target_kind".to_string(), json!("finding_dir")),
+        ]);
+
+        let err = load_fix_series_original_artifacts(&inputs).unwrap_err();
+        assert!(err.contains("FINDING.md"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_assessment_rejects_artifact_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "unconsented secret\n").unwrap();
+        std::fs::write(tmp.path().join("metadata.yaml"), "id: finding-one\n").unwrap();
+        symlink(outside.path(), tmp.path().join("FINDING.md")).unwrap();
+        let inputs = Map::from_iter([
+            (
+                "target_artifact_dir".to_string(),
+                json!(tmp.path().display().to_string()),
+            ),
+            ("target_kind".to_string(), json!("finding_dir")),
+        ]);
+
+        let err = load_fix_series_original_artifacts(&inputs).unwrap_err();
+        assert!(
+            err.contains("resolves outside finding directory"),
+            "got: {err}"
+        );
+        assert!(!err.contains("unconsented secret"));
+    }
+
+    #[test]
+    fn resume_refreshes_machine_supplied_workflow_inputs() {
+        let mut snapshot = WorkflowSnapshot {
+            schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+            workflow_id: "fix".to_string(),
+            inputs: Map::from_iter([
+                ("target".to_string(), json!("same target")),
+                ("fix_series_original_artifacts".to_string(), json!("stale")),
+            ]),
+            steps: Vec::new(),
+            events_count: 0,
+        };
+        let fresh = Map::from_iter([
+            ("target".to_string(), json!("same target")),
+            (
+                "fix_series_original_artifacts".to_string(),
+                json!("fresh artifacts"),
+            ),
+        ]);
+
+        refresh_snapshot_inputs(&mut snapshot, &fresh);
+
+        assert_eq!(
+            snapshot.inputs.get("fix_series_original_artifacts"),
+            Some(&json!("fresh artifacts"))
+        );
+    }
+
+    #[test]
+    fn typed_series_failure_is_terminal_after_successful_validation() {
+        assert!(series_assessment_is_terminal_failure(
+            &WorkflowStatus::Success,
+            Some("failure")
+        ));
+        assert!(!series_assessment_is_terminal_failure(
+            &WorkflowStatus::Success,
+            Some("unconfirmed")
+        ));
+        assert!(!series_assessment_is_terminal_failure(
+            &WorkflowStatus::Failure("invalid outputs".to_string()),
+            Some("failure")
+        ));
+    }
+
+    #[test]
     fn target_input_key_uses_single_required_input() {
         let mut inputs = Map::new();
         inputs.insert("path".to_string(), json!({"required": true}));
@@ -1975,6 +2260,7 @@ mod tests {
                 id: "bug".to_string(),
                 description: "bug".to_string(),
             }],
+            original_artifacts: "immutable original finding\n".to_string(),
             tracked: vec![TrackedFixTodo {
                 todo: series_todo("first", Vec::new()),
                 status: FixTodoStatus::InProgress,
@@ -1989,11 +2275,20 @@ mod tests {
         let loaded = FixSeriesState::load(&dir, "finding").unwrap();
         assert_eq!(loaded.plan_revision, 2);
         assert_eq!(loaded.base_head, "base");
+        assert_eq!(loaded.original_artifacts, "immutable original finding\n");
         assert_eq!(loaded.todo_revisions, vec![1]);
         assert_eq!(loaded.tracked[0].status, FixTodoStatus::Pending);
         assert!(FixSeriesState::load(&dir, "other finding")
             .unwrap_err()
             .contains("target"));
+
+        let path = FixSeriesState::path(&dir);
+        let mut legacy: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("original_artifacts");
+        std::fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+        let legacy = FixSeriesState::load(&dir, "finding").unwrap();
+        assert!(legacy.original_artifacts.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2010,6 +2305,7 @@ mod tests {
                 id: "bug".to_string(),
                 description: "bug".to_string(),
             }],
+            original_artifacts: String::new(),
             tracked: vec![
                 TrackedFixTodo {
                     todo: series_todo("done", Vec::new()),
@@ -2110,6 +2406,7 @@ mod tests {
                 id: "original".to_string(),
                 description: "original bug".to_string(),
             }],
+            original_artifacts: String::new(),
             tracked: vec![TrackedFixTodo {
                 todo: series_todo("split-commit", Vec::new()),
                 status: FixTodoStatus::Pending,
@@ -2175,6 +2472,7 @@ mod tests {
                 id: "bug".to_string(),
                 description: "bug".to_string(),
             }],
+            original_artifacts: String::new(),
             tracked: vec![
                 TrackedFixTodo {
                     todo: series_todo("first", Vec::new()),
@@ -2236,6 +2534,7 @@ mod tests {
                 id: "bug".to_string(),
                 description: "bug".to_string(),
             }],
+            original_artifacts: String::new(),
             tracked: vec![TrackedFixTodo {
                 todo: series_todo("done", Vec::new()),
                 status: FixTodoStatus::Done,

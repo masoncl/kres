@@ -133,6 +133,11 @@
       "type": "array<string>",
       "required": false,
       "description": "Machine-provided exact commit list for final series publication."
+    },
+    "fix_series_original_artifacts": {
+      "type": "string",
+      "required": false,
+      "description": "Machine-preloaded original finding artifacts for the final series assessment."
     }
   },
   "skills": [
@@ -1679,8 +1684,14 @@
         "{{workflow.fix_series_state}}",
         "SERIES BASE COMMIT: {{workflow.fix_series_state.base_head}}",
         "EXACT SERIES COMMITS (oldest first): {{workflow.fix_series_commits}}",
+        "ORIGINAL FINDING ARTIFACTS (machine-preloaded; do not request them again):",
+        "{{workflow.fix_series_original_artifacts || 'none'}}",
+        "PRIOR ASSESSMENT ATTEMPTS:",
+        "{{series-assessment.prior_attempts || 'none'}}",
         "",
-        "Inspect the original finding artifacts when present, the immutable fix_series_state.original_bugs inventory, the complete commit series and current source, and the recorded todo dispositions. Do not judge only HEAD~1. Every original bug component must be fixed by a cited commit/source hunk, invalidated by source or reachable commit evidence, or matched to a proven upstream duplicate. A merely deferred or unexamined component is incomplete. Negative coverage claims require concrete search, source, caller, or history evidence.",
+        "Inspect the machine-preloaded original finding artifacts when present, the immutable fix_series_state.original_bugs inventory, the complete commit series and current source, and the recorded todo dispositions. Do not judge only HEAD~1. Every original bug component must be fixed by a cited commit/source hunk, invalidated by source or reachable commit evidence, or matched to a proven upstream duplicate. A merely deferred or unexamined component is incomplete. Negative coverage claims require concrete search, source, caller, or history evidence.",
+        "",
+        "The fast gather phase must not set ready_for_slow until it has resolved every evidence request in PRIOR ASSESSMENT ATTEMPTS and gathered the evidence needed for this assessment. Trace each changed semantic contract through unchanged readers, writers, callers, callees, callbacks, setup sites, and shared helpers as applicable. Use exhaustive final-tree grep/search and caller evidence before making negative coverage claims. Read changed functions from the current worktree with read; source/semcode results may be stale or incomplete. A failed or empty source request requires local grep/read fallback and is not evidence of absence. If mandatory evidence remains unavailable, keep gathering rather than declaring the context complete.",
         "",
         "Set complete=true only when the complete series satisfies the original target and every planned todo is done. Otherwise set complete=false and return decision=revise_pending_plan when a concrete additional or revised todo can finish the work, unconfirmed when required evidence is still missing, or failure when the produced series is incorrect and cannot safely advance. Put machine routing only in the typed fields.",
         "",
@@ -1732,8 +1743,8 @@
         "type": "builtin",
         "name": "fix_series_assessment",
         "on_fail": {
-          "action": "exit_failure",
-          "max_attempts": 1,
+          "action": "repeat",
+          "max_attempts": 3,
           "on_exhausted": "exit_failure"
         }
       }

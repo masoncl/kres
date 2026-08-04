@@ -101,6 +101,13 @@ pub struct StepState {
     /// either commit to that shape or justify a change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prior_attempts: Vec<Map<String, Value>>,
+    /// True only while `on_fail: repeat` is re-running the same
+    /// semantic attempt against an unchanged workspace. Drivers may
+    /// reuse this step's gathered source in that case. Branch and
+    /// rerun-chain re-entry explicitly clear it because intervening
+    /// steps may have changed the source tree.
+    #[serde(default)]
+    pub reuse_gathered_context: bool,
 }
 
 /// Walk a dotted path through a JSON value. Stops at the first
@@ -271,7 +278,7 @@ pub struct WorkflowSnapshot {
 impl WorkflowSnapshot {
     /// Current snapshot schema version. Bump when the on-disk shape
     /// changes in a way that would crash old loaders.
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
 
     /// Latest persisted snapshot for the given workflow id. Returns
     /// None when the file is missing OR carries a `schema_version`
@@ -340,6 +347,9 @@ pub enum StepStatus {
     DoneWithFailure,
     /// `branch_to` jumped away from this step before it settled.
     BranchedAway,
+    /// The step terminally failed or exhausted its retry budget.
+    /// Persisted so resume cannot silently grant another attempt.
+    TerminalFailure,
 }
 
 pub enum LensFanOutConsolidate {
@@ -393,6 +403,11 @@ impl From<&str> for DriverError {
 
 #[async_trait]
 pub trait Driver: Sync {
+    /// Begin one workflow executor invocation. Drivers with ephemeral
+    /// per-run caches should clear them here so reused driver instances
+    /// cannot leak state across workflows, fix todos, or plan revisions.
+    fn begin_run(&self) {}
+
     /// Run one step instance. `lens` is `Some` for one of N parallel
     /// calls when the step has a `lenses` fan-out; `None` for plain
     /// steps. The driver should bind `{{lens.<field>}}` from the
@@ -1337,6 +1352,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
     snapshot_dir: Option<std::path::PathBuf>,
     observer: Option<EventObserver>,
 ) -> Trace {
+    driver.begin_run();
     let mut state: HashMap<String, StepState> = workflow
         .steps
         .iter()
@@ -1422,6 +1438,33 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             .save(dir)
             .map_err(|error| format!("persist workflow effect boundary: {error}"))
         };
+    let finish_failure = |state: HashMap<String, StepState>,
+                          mut events: Vec<TraceEvent>,
+                          message: String| {
+        let persistence_error = snapshot_save_required(&state, events.len()).err();
+        let status = if let Some(error) = persistence_error {
+            if let Some(dir) = snapshot_dir.as_ref() {
+                let _ = std::fs::remove_file(dir.join(format!("workflow-{}.json", workflow.id)));
+            }
+            WorkflowStatus::Failure(format!(
+                "{message}; terminal state could not be persisted: {error}"
+            ))
+        } else {
+            WorkflowStatus::Failure(message)
+        };
+        record(
+            &mut events,
+            &observer,
+            TraceEvent::Terminated {
+                status: status.clone(),
+            },
+        );
+        Trace {
+            events,
+            status,
+            final_state: state,
+        }
+    };
 
     // Initial snapshot — useful when --resume picks up a workflow
     // that hasn't dispatched any step yet.
@@ -1445,6 +1488,17 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         // captures every status transition before the next step
         // dispatches.
         snapshot_save(&state, events.len());
+
+        if let Some(failed) = state
+            .values()
+            .find(|step| step.status == StepStatus::TerminalFailure)
+        {
+            status = WorkflowStatus::Failure(format!(
+                "step '{}' previously reached terminal failure",
+                failed.id
+            ));
+            break;
+        }
 
         // Accepted effects are recovered before any new model work. The
         // payload came from the snapshot, so this path neither increments the
@@ -1616,6 +1670,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     );
                     let st = state.get_mut(&step.id).unwrap();
                     st.status = StepStatus::Skipped;
+                    st.reuse_gathered_context = false;
                     if step.preserve_outputs_on_skip {
                         if st.outputs.is_empty() && !st.preserved_outputs_on_skip.is_empty() {
                             st.outputs = std::mem::take(&mut st.preserved_outputs_on_skip);
@@ -1649,6 +1704,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     );
                     let st = state.get_mut(&step.id).unwrap();
                     st.status = StepStatus::Skipped;
+                    st.reuse_gathered_context = false;
                     if step.preserve_outputs_on_skip {
                         if st.outputs.is_empty() && !st.preserved_outputs_on_skip.is_empty() {
                             st.outputs = std::mem::take(&mut st.preserved_outputs_on_skip);
@@ -1758,22 +1814,11 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     ) {
                         continue;
                     }
-                    status = WorkflowStatus::Failure(format!(
-                        "step '{}' driver error on attempt {attempt}: {e}",
-                        step.id
-                    ));
-                    record(
-                        &mut events,
-                        &observer,
-                        TraceEvent::Terminated {
-                            status: status.clone(),
-                        },
-                    );
-                    return Trace {
+                    return finish_failure(
+                        state,
                         events,
-                        status,
-                        final_state: state,
-                    };
+                        format!("step '{}' driver error on attempt {attempt}: {e}", step.id),
+                    );
                 }
             }
         } else {
@@ -1865,23 +1910,14 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                             snapshot_save(&state, events.len());
                             continue;
                         }
-                        status = WorkflowStatus::Failure(format!(
-                            "step '{}' shared lens fan-out attempt {attempt} driver error: {e}",
-                            step.id
-                        ));
-                        record(
-                            &mut events,
-                            &observer,
-                            TraceEvent::Terminated {
-                                status: status.clone(),
-                            },
-                        );
-                        snapshot_save(&state, events.len());
-                        return Trace {
+                        return finish_failure(
+                            state,
                             events,
-                            status,
-                            final_state: state,
-                        };
+                            format!(
+                                "step '{}' shared lens fan-out attempt {attempt} driver error: {e}",
+                                step.id
+                            ),
+                        );
                     }
                 }
             }
@@ -1987,26 +2023,14 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                         snapshot_save(&state, events.len());
                         continue;
                     }
-                    status = WorkflowStatus::Failure(format!(
-                        "step '{}' lens '{lens_id}' attempt {attempt} driver error: {e}",
-                        step.id
-                    ));
-                    record(
-                        &mut events,
-                        &observer,
-                        TraceEvent::Terminated {
-                            status: status.clone(),
-                        },
-                    );
-                    // Fix #10: persist partial per-lens outputs before
-                    // terminating so resume can pick up from the
-                    // failing lens without re-running the OK ones.
-                    snapshot_save(&state, events.len());
-                    return Trace {
+                    return finish_failure(
+                        state,
                         events,
-                        status,
-                        final_state: state,
-                    };
+                        format!(
+                            "step '{}' lens '{lens_id}' attempt {attempt} driver error: {e}",
+                            step.id
+                        ),
+                    );
                 }
                 let strategy = step.aggregate.unwrap_or_default();
                 let aggregated = match strategy {
@@ -2048,22 +2072,14 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                                     snapshot_save(&state, events.len());
                                     continue;
                                 }
-                                status = WorkflowStatus::Failure(format!(
-                                    "step '{}' consolidate (attempt {attempt}) failed: {e}",
-                                    step.id
-                                ));
-                                record(
-                                    &mut events,
-                                    &observer,
-                                    TraceEvent::Terminated {
-                                        status: status.clone(),
-                                    },
-                                );
-                                return Trace {
+                                return finish_failure(
+                                    state,
                                     events,
-                                    status,
-                                    final_state: state,
-                                };
+                                    format!(
+                                        "step '{}' consolidate (attempt {attempt}) failed: {e}",
+                                        step.id
+                                    ),
+                                );
                             }
                         }
                     }
@@ -2253,6 +2269,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             };
             {
                 let accepted = state.get_mut(&step.id).unwrap();
+                accepted.reuse_gathered_context = false;
                 accepted.status = StepStatus::EffectsPending;
                 accepted.pending_effects = Some(effects);
             }
@@ -2305,14 +2322,19 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             );
             match on_exhausted {
                 OnExhausted::ExitFailure => {
-                    status = WorkflowStatus::Failure(format!(
-                        "step '{}' exhausted after {attempt} attempts",
-                        step.id
-                    ));
-                    break;
+                    let exhausted = state.get_mut(&step.id).unwrap();
+                    exhausted.reuse_gathered_context = false;
+                    exhausted.status = StepStatus::TerminalFailure;
+                    return finish_failure(
+                        state,
+                        events,
+                        format!("step '{}' exhausted after {attempt} attempts", step.id),
+                    );
                 }
                 OnExhausted::Continue => {
-                    state.get_mut(&step.id).unwrap().status = StepStatus::DoneWithFailure;
+                    let exhausted = state.get_mut(&step.id).unwrap();
+                    exhausted.reuse_gathered_context = false;
+                    exhausted.status = StepStatus::DoneWithFailure;
                     continue;
                 }
                 OnExhausted::BranchTo => {
@@ -2370,6 +2392,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 // is always meaningful.
                 let snapshot = std::mem::take(&mut st.outputs);
                 st.prior_attempts.push(snapshot);
+                st.reuse_gathered_context = true;
                 st.status = StepStatus::Pending;
             }
             OnFailAction::RerunChain => {
@@ -2388,7 +2411,9 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     }
                 }
                 // Make sure the current step itself is reschedulable.
-                state.get_mut(&step.id).unwrap().status = StepStatus::Pending;
+                let current = state.get_mut(&step.id).unwrap();
+                current.reuse_gathered_context = false;
+                current.status = StepStatus::Pending;
             }
             OnFailAction::BranchTo => {
                 let target = match resolve_branch_target(&eval.on_fail, &state, &step.id) {
@@ -2433,6 +2458,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     // Settle the source as Done so the picker passes
                     // over it and runs the target next.
                     if let Some(st) = state.get_mut(&step.id) {
+                        st.reuse_gathered_context = false;
                         st.status = StepStatus::Done;
                     }
                 } else {
@@ -2440,14 +2466,19 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 }
             }
             OnFailAction::Continue => {
-                state.get_mut(&step.id).unwrap().status = StepStatus::DoneWithFailure;
+                let failed = state.get_mut(&step.id).unwrap();
+                failed.reuse_gathered_context = false;
+                failed.status = StepStatus::DoneWithFailure;
             }
             OnFailAction::ExitFailure => {
-                status = WorkflowStatus::Failure(format!(
-                    "step '{}' on_fail.action = exit_failure",
-                    step.id
-                ));
-                break;
+                let failed = state.get_mut(&step.id).unwrap();
+                failed.reuse_gathered_context = false;
+                failed.status = StepStatus::TerminalFailure;
+                return finish_failure(
+                    state,
+                    events,
+                    format!("step '{}' on_fail.action = exit_failure", step.id),
+                );
             }
         }
     }
@@ -2479,6 +2510,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
 fn reset_for_reentry(state: &mut HashMap<String, StepState>, id: &str) {
     if let Some(st) = state.get_mut(id) {
         st.status = StepStatus::Pending;
+        st.reuse_gathered_context = false;
         // The step's previous outputs encoded a real attempt at this
         // step's job; whatever drove the reset (branch_to from a
         // downstream eval, on_exhausted branch_to, or rerun_chain)
@@ -2496,6 +2528,7 @@ fn reset_for_reentry(state: &mut HashMap<String, StepState>, id: &str) {
 fn reset_for_reentry_preserve_outputs(state: &mut HashMap<String, StepState>, id: &str) {
     if let Some(st) = state.get_mut(id) {
         st.status = StepStatus::Pending;
+        st.reuse_gathered_context = false;
         st.preserved_outputs_on_skip.clear();
     }
 }
@@ -2567,15 +2600,22 @@ fn retry_driver_error(
     detail: &str,
 ) -> bool {
     let Some(eval) = &step.eval else {
+        if let Some(st) = state.get_mut(&step.id) {
+            st.reuse_gathered_context = false;
+            st.status = StepStatus::Pending;
+        }
         return false;
     };
     let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
-    if attempt >= max {
-        return false;
-    }
     let st = state.get_mut(&step.id).unwrap();
     st.eval_failures += 1;
-    st.status = StepStatus::Pending;
+    st.reuse_gathered_context = false;
+    let exhausted = attempt >= max;
+    st.status = if exhausted {
+        StepStatus::TerminalFailure
+    } else {
+        StepStatus::Pending
+    };
     record(
         events,
         observer,
@@ -2586,7 +2626,18 @@ fn retry_driver_error(
             eval_failures: st.eval_failures,
         },
     );
-    true
+    if exhausted {
+        record(
+            events,
+            observer,
+            TraceEvent::Exhausted {
+                id: step.id.clone(),
+                on_exhausted: "ExitFailure".to_string(),
+                attempts: attempt,
+            },
+        );
+    }
+    !exhausted
 }
 
 fn eval_builtin(
@@ -2700,7 +2751,7 @@ fn eval_fix_series_assessment(step: &Step, ctx: &ExecContext<'_>) -> (bool, Opti
     if actual != expected {
         return eval_fail("outcomes must cover every original bug exactly once");
     }
-    if complete || decision == "revise_pending_plan" {
+    if complete || matches!(decision, "revise_pending_plan" | "failure") {
         (true, None)
     } else {
         eval_fail(&format!("series assessment decision is '{decision}'"))
@@ -2952,6 +3003,7 @@ fn reset_dependents_preserving(
                 StepStatus::Done | StepStatus::Skipped | StepStatus::DoneWithFailure
             ) {
                 st.status = StepStatus::Pending;
+                st.reuse_gathered_context = false;
                 let preserve_for_skip = workflow
                     .steps
                     .iter()
@@ -3532,6 +3584,21 @@ mod tests {
             steps: &steps,
         };
         assert!(!eval_fix_series_assessment(&step, &ctx).0);
+
+        let (step, inputs, steps) = series_assessment_context(json!({
+            "complete": false,
+            "decision": "failure",
+            "remaining_work": ["the produced series is unsafe"],
+            "outcomes": [
+                {"bug": "bug-a", "outcome": "unresolved", "evidence": "bad patch"},
+                {"bug": "bug-b", "outcome": "fixed", "evidence": "commit b"}
+            ]
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_fix_series_assessment(&step, &ctx), (true, None));
 
         let (step, inputs, steps) = series_assessment_context(json!({
             "complete": true,
@@ -4923,20 +4990,25 @@ mod tests {
     #[test]
     fn snapshot_load_rejects_unknown_schema_version() {
         let tmp = tempfile::tempdir().unwrap();
-        let body = serde_json::json!({
-            "schema_version": 99,
-            "workflow_id": "x",
-            "inputs": {},
-            "steps": [],
-            "events_count": 0,
-        });
-        std::fs::write(
-            tmp.path().join("workflow-x.json"),
-            serde_json::to_string(&body).unwrap(),
-        )
-        .unwrap();
-        let loaded = WorkflowSnapshot::load(tmp.path(), "x");
-        assert!(loaded.is_none(), "expected None for future schema_version");
+        for version in [2, 99] {
+            let body = serde_json::json!({
+                "schema_version": version,
+                "workflow_id": "x",
+                "inputs": {},
+                "steps": [],
+                "events_count": 0,
+            });
+            std::fs::write(
+                tmp.path().join("workflow-x.json"),
+                serde_json::to_string(&body).unwrap(),
+            )
+            .unwrap();
+            let loaded = WorkflowSnapshot::load(tmp.path(), "x");
+            assert!(
+                loaded.is_none(),
+                "expected None for schema_version {version}"
+            );
+        }
     }
 
     #[test]
@@ -4952,6 +5024,107 @@ mod tests {
         snap.save(tmp.path()).unwrap();
         let loaded = WorkflowSnapshot::load(tmp.path(), "x").expect("current version loads");
         assert_eq!(loaded.workflow_id, "x");
+    }
+
+    struct RetryContextDriver {
+        seen_reuse: std::sync::Mutex<Vec<bool>>,
+        pass_on_attempt: u32,
+    }
+
+    #[async_trait]
+    impl Driver for RetryContextDriver {
+        async fn run(
+            &self,
+            step: &Step,
+            attempt: u32,
+            ctx: &ExecContext<'_>,
+            _lens: Option<&Lens>,
+        ) -> Result<Map<String, Value>, DriverError> {
+            let reuse = ctx
+                .steps
+                .get(&step.id)
+                .is_some_and(|state| state.reuse_gathered_context);
+            self.seen_reuse.lock().unwrap().push(reuse);
+            Ok(Map::from_iter([(
+                "ok".to_string(),
+                Value::Bool(attempt >= self.pass_on_attempt),
+            )]))
+        }
+    }
+
+    fn retry_context_workflow(max_attempts: u32) -> Workflow {
+        parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "retry-context",
+                "steps": [{
+                    "id": "check",
+                    "agent": "slow",
+                    "prompt": "check",
+                    "outputs": {"ok": {"type": "boolean"}},
+                    "eval": {
+                        "type": "field_check",
+                        "expr": "ok == true",
+                        "on_fail": {
+                            "action": "repeat",
+                            "max_attempts": max_attempts,
+                            "on_exhausted": "exit_failure"
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn repeat_action_explicitly_enables_same_step_gather_reuse() {
+        let workflow = retry_context_workflow(2);
+        let mut driver = RetryContextDriver {
+            seen_reuse: std::sync::Mutex::new(Vec::new()),
+            pass_on_attempt: 2,
+        };
+
+        let trace = run(&workflow, &mut driver, Map::new()).await;
+
+        assert_eq!(trace.status, WorkflowStatus::Success);
+        assert_eq!(*driver.seen_reuse.lock().unwrap(), vec![false, true]);
+        assert!(!trace.final_state["check"].reuse_gathered_context);
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_reopen_terminally_exhausted_step() {
+        let workflow = retry_context_workflow(1);
+        let snapshots = tempfile::tempdir().unwrap();
+        let mut first = RetryContextDriver {
+            seen_reuse: std::sync::Mutex::new(Vec::new()),
+            pass_on_attempt: 2,
+        };
+        let first_trace = run_with_persistence(
+            &workflow,
+            &mut first,
+            Map::new(),
+            20,
+            snapshots.path().to_path_buf(),
+        )
+        .await;
+        assert!(matches!(first_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(
+            first_trace.final_state["check"].status,
+            StepStatus::TerminalFailure
+        );
+
+        let snapshot = WorkflowSnapshot::load(snapshots.path(), &workflow.id).unwrap();
+        let mut resumed = RetryContextDriver {
+            seen_reuse: std::sync::Mutex::new(Vec::new()),
+            pass_on_attempt: 1,
+        };
+        let resumed_trace = run_resume(&workflow, &mut resumed, snapshot, None, 20).await;
+
+        assert!(matches!(resumed_trace.status, WorkflowStatus::Failure(_)));
+        assert!(resumed.seen_reuse.lock().unwrap().is_empty());
+        assert_eq!(resumed_trace.final_state["check"].attempt, 1);
     }
 
     /// Fix #10: when a lensed step is killed mid-fan-out, the
@@ -5790,6 +5963,88 @@ mod tests {
                 ..
             } if id == "research" && action.contains("driver error")
         )));
+    }
+
+    #[tokio::test]
+    async fn exhausted_driver_error_is_terminal_across_resume() {
+        struct FailingDriver {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+            fail: bool,
+        }
+
+        #[async_trait]
+        impl Driver for FailingDriver {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                *self.calls.lock().unwrap() += 1;
+                if self.fail {
+                    Err("injected driver failure".into())
+                } else {
+                    Ok(Map::from_iter([("ok".to_string(), Value::Bool(true))]))
+                }
+            }
+        }
+
+        let workflow = parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "driver-exhaustion",
+                "steps": [{
+                    "id": "check",
+                    "agent": "slow",
+                    "prompt": "check",
+                    "outputs": {"ok": {"type": "boolean"}},
+                    "eval": {
+                        "type": "field_check",
+                        "expr": "ok == true",
+                        "on_fail": {
+                            "action": "repeat",
+                            "max_attempts": 2,
+                            "on_exhausted": "exit_failure"
+                        }
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let snapshots = tempfile::tempdir().unwrap();
+        let first_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut first = FailingDriver {
+            calls: first_calls.clone(),
+            fail: true,
+        };
+        let first_trace = run_with_persistence(
+            &workflow,
+            &mut first,
+            Map::new(),
+            20,
+            snapshots.path().to_path_buf(),
+        )
+        .await;
+        assert!(matches!(first_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(*first_calls.lock().unwrap(), 2);
+        assert_eq!(
+            first_trace.final_state["check"].status,
+            StepStatus::TerminalFailure
+        );
+
+        let snapshot = WorkflowSnapshot::load(snapshots.path(), &workflow.id).unwrap();
+        let resumed_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let mut resumed = FailingDriver {
+            calls: resumed_calls.clone(),
+            fail: false,
+        };
+        let resumed_trace = run_resume(&workflow, &mut resumed, snapshot, None, 20).await;
+
+        assert!(matches!(resumed_trace.status, WorkflowStatus::Failure(_)));
+        assert_eq!(*resumed_calls.lock().unwrap(), 0);
+        assert_eq!(resumed_trace.final_state["check"].attempt, 2);
     }
 
     /// When the driver overrides `lens_fan_out_consolidate` and

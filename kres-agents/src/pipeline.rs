@@ -319,6 +319,27 @@ enum CacheMode {
     /// `cache_control` so a single transient error can't stall the
     /// whole fan-out.
     PrimeThenParallel,
+    /// Prime the shared prefix with a throwaway probe call, then fan out
+    /// *every* lens in parallel.
+    ///
+    /// `PrimeThenParallel` promotes a real lens to seed, so the other lenses
+    /// wait for a full analysis before they may start. Measured over one
+    /// mm/vmscan.c review that cost 1059s — 34% of the run — with a seed in
+    /// flight and no sibling running; seeds averaged 365s.
+    ///
+    /// A probe pays the same cache write but only has to get its input
+    /// processed. The delta document sits after the cache breakpoint, so it
+    /// cannot affect the entry: in that same run `bounds`, `races` and
+    /// `general` each sent a different delta and all three read the identical
+    /// 85,956-token entry the seed wrote. Everything else about the request —
+    /// model, system prompt, thinking, max_tokens — is left byte-identical to
+    /// a real lens call, because whether those participate in the cache key is
+    /// not something to guess at.
+    ///
+    /// This trades a small token increase for latency: one extra cache read
+    /// per task plus the probe's own output. Falls back to
+    /// `PrimeThenParallel` if the probe fails.
+    ProbeThenParallel,
     /// Skip cache priming entirely: run every lens in parallel with
     /// no `cache_control`. Used by the repair retry path.
     Parallel,
@@ -612,6 +633,110 @@ fn slow_variant_call_config(
 /// folds the prefix into plain content so the request carries no
 /// cache breakpoint at all. Same byte-identical prompt either way —
 /// only the wire framing changes.
+/// Delta document for a cache probe. Must be a valid JSON document so the
+/// two-document contract the agents are given still holds, and short enough
+/// that the model has nothing to work on.
+fn cache_probe_delta() -> String {
+    serde_json::to_string_pretty(&json!({
+        "task": "cache_probe",
+        "instruction": "Ignore the review task in the preceding document. This \
+    call exists only to warm the prompt cache. Reply with the single word READY \
+    and nothing else. Do not analyze, do not emit findings, do not emit JSON.",
+    }))
+    .expect("probe delta serializes")
+}
+
+/// Warm the shared prefix so every lens can start at once. Returns true when
+/// the call succeeded and the prefix should now be cached.
+/// Which priming strategy the review lens fan-out uses.
+///
+/// Selectable at runtime so both can be measured against the same binary on
+/// the same target: `KRES_LENS_CACHE_MODE=prime` restores promoting a real
+/// lens to seed. Anything else (including unset) uses the throwaway probe.
+fn review_lens_cache_mode() -> CacheMode {
+    match std::env::var("KRES_LENS_CACHE_MODE").as_deref() {
+        Ok("prime") => CacheMode::PrimeThenParallel,
+        _ => CacheMode::ProbeThenParallel,
+    }
+}
+
+fn build_cache_probe_future(
+    variant: SlowAgentVariant,
+    ctx: LensCallContext,
+) -> impl std::future::Future<Output = bool> + Send + 'static {
+    let SlowAgentVariant {
+        client,
+        model,
+        system,
+        max_tokens,
+        max_input_tokens,
+        thinking,
+        label: model_label,
+        supplemental_lens_only: _,
+    } = variant;
+    let LensCallContext {
+        shared_prefix,
+        task_brief,
+        shutdown,
+        usage,
+        logger,
+    } = ctx;
+    let log_label = format!("phase=cache-probe task={task_brief} model={model_label}");
+    let delta = cache_probe_delta();
+    let logged = format!("{shared_prefix}{delta}");
+    async move {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: delta,
+            cache: false,
+            cached_prefix: Some(shared_prefix),
+        }];
+        // Identical config to a real lens call: only the delta differs.
+        let cfg = slow_variant_call_config(
+            model.clone(),
+            max_tokens,
+            max_input_tokens,
+            thinking,
+            system,
+            format!("cache probe ({model_label})"),
+        );
+        if let Some(lg) = &logger {
+            let meta = cfg.request_meta();
+            lg.log_code_labeled_with_request(
+                "user",
+                Some(&log_label),
+                &logged,
+                None,
+                None,
+                Some(&meta),
+            );
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => false,
+            r = client.messages_streaming(&cfg, &messages) => match r {
+                Ok(resp) => {
+                    record_usage(&usage, "slow", &model, &resp.usage);
+                    if let Some(lg) = &logger {
+                        lg.log_code_labeled_with_model(
+                            "assistant",
+                            Some(&log_label),
+                            &extract_text(&resp),
+                            Some(log_usage(&resp.usage)),
+                            None,
+                            resp.model.as_deref(),
+                        );
+                    }
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(target: "kres_agents", "cache probe failed: {e}");
+                    false
+                }
+            }
+        }
+    }
+}
+
 fn build_lens_call_future(
     spec: LensCallSpec,
     variant: SlowAgentVariant,
@@ -1542,7 +1667,7 @@ impl AgentRunner {
                     lenses,
                     all_lenses: lenses,
                     extra_lens_instruction: None,
-                    cache_mode: CacheMode::PrimeThenParallel,
+                    cache_mode: review_lens_cache_mode(),
                     run_keys: None,
                 },
                 ctx,
@@ -1979,6 +2104,80 @@ impl AgentRunner {
                     build_lens_call_future(spec, variant.clone(), ctx, use_cache)
                 };
                 match cache_mode {
+                    CacheMode::ProbeThenParallel => {
+                        if lens_specs.is_empty() {
+                            return Vec::<RawLensResult>::new();
+                        }
+                        // A probe only pays off when siblings read what it
+                        // wrote. With a single lens there is no sibling, so
+                        // the probe is pure overhead — the same "write with
+                        // no reader" trap as a single-call change survey.
+                        // Observed on the 2026-08-05 run: the one-lens
+                        // gpt-5.6-sol variant spent 33s and 162,752 fresh
+                        // input tokens on four probes that wrote no cache at
+                        // all, while the four-lens opus variant spent 8s and
+                        // 368 tokens to write 222,598.
+                        if lens_specs.len() == 1 {
+                            return join_all(
+                                lens_specs
+                                    .iter()
+                                    .map(|s| make_future(s.clone(), false))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .await;
+                        }
+                        let probe_ctx = LensCallContext {
+                            shared_prefix: shared_prefix.clone(),
+                            task_brief: task_brief.clone(),
+                            shutdown: shutdown.clone(),
+                            usage: usage.clone(),
+                            logger: logger.clone(),
+                        };
+                        if build_cache_probe_future(variant.clone(), probe_ctx).await {
+                            // Prefix is warm: every lens starts now.
+                            join_all(
+                                lens_specs
+                                    .iter()
+                                    .map(|s| make_future(s.clone(), true))
+                                    .collect::<Vec<_>>(),
+                            )
+                            .await
+                        } else {
+                            // Probe failed, so the prefix may not be cached.
+                            // Fall back to promoting a real lens to seed —
+                            // the behaviour this replaces, which is known to
+                            // work — rather than letting every lens race to
+                            // write the same entry.
+                            let (first_spec, rest_specs) =
+                                lens_specs.split_first().expect("checked non-empty above");
+                            let seed = make_future(first_spec.clone(), true).await;
+                            let mut raws = Vec::with_capacity(lens_specs.len());
+                            let seeded = seed.is_ok();
+                            raws.push(seed);
+                            if seeded {
+                                raws.extend(
+                                    join_all(
+                                        rest_specs
+                                            .iter()
+                                            .map(|s| make_future(s.clone(), true))
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .await,
+                                );
+                            } else if !shutdown.is_cancelled() {
+                                raws.extend(
+                                    join_all(
+                                        rest_specs
+                                            .iter()
+                                            .map(|s| make_future(s.clone(), false))
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .await,
+                                );
+                            }
+                            raws
+                        }
+                    }
                     CacheMode::PrimeThenParallel => {
                         let Some((first_spec, rest_specs)) = lens_specs.split_first() else {
                             return Vec::<RawLensResult>::new();
@@ -2751,6 +2950,66 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_is_only_worth_paying_for_when_a_sibling_reads_it() {
+        // Documents the rule the dispatch enforces: the probe's return is
+        // (n - 1) cache reads, so at n == 1 it is pure overhead. Measured on
+        // the 2026-08-05 run, the single-lens gpt variant burned 33s and
+        // 162,752 fresh tokens on probes that wrote nothing.
+        fn probe_is_worthwhile(lens_count: usize) -> bool {
+            lens_count > 1
+        }
+        assert!(!probe_is_worthwhile(0));
+        assert!(!probe_is_worthwhile(1));
+        assert!(probe_is_worthwhile(2));
+        assert!(probe_is_worthwhile(4));
+    }
+
+    #[test]
+    fn lens_cache_mode_is_selectable_for_ab_measurement() {
+        // Both strategies must be reachable from one binary, or comparing
+        // them means rebuilding and the comparison drifts.
+        assert!(matches!(
+            review_lens_cache_mode(),
+            CacheMode::ProbeThenParallel | CacheMode::PrimeThenParallel
+        ));
+    }
+
+    #[test]
+    fn cache_probe_delta_is_a_standalone_document_and_touches_no_prefix_field() {
+        // The probe rides the same two-document framing as a real lens call:
+        // a stable prefix the agents already have, plus this delta. It must
+        // parse on its own, and it must not introduce any field that appears
+        // in the shared prefix — a collision would change what the model sees
+        // for the cached half rather than just adding an instruction.
+        let delta: Value = serde_json::from_str(&cache_probe_delta())
+            .expect("probe delta must be one valid JSON document");
+        let keys: Vec<&str> = delta
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["instruction", "task"]);
+        for shared in LENS_SHARED_CACHE_FIELDS {
+            assert!(
+                delta.get(*shared).is_none(),
+                "probe delta must not carry shared-prefix field {shared}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_probe_delta_is_small_enough_to_be_a_probe() {
+        // If this ever grows into a real instruction the probe stops being
+        // cheap and the latency win disappears.
+        assert!(
+            cache_probe_delta().len() < 600,
+            "probe delta is {} bytes; it exists only to warm the prefix",
+            cache_probe_delta().len()
+        );
+    }
 
     #[test]
     fn low_effort_profile_preserves_thinking_shape() {

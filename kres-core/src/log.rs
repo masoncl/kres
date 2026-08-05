@@ -762,6 +762,45 @@ mod tests {
     }
 
     #[test]
+    fn an_assistant_record_can_be_paired_with_its_request_by_label() {
+        // Usage lives on the assistant record and the phase lives on the
+        // label. An unlabelled assistant record is unattributable: consolidate
+        // and promote logged their requests as `phase=consolidate` /
+        // `phase=promote` but their responses with no label at all, so a
+        // by-stage accounting folded 825.6k of fresh input into whichever
+        // bucket it used for unlabelled records.
+        let dir = tempdir().unwrap();
+        let log = TurnLogger::new(dir.path()).unwrap();
+        log.log_code_labeled("user", Some("phase=consolidate"), "{}", None, None);
+        log.log_code_labeled(
+            "assistant",
+            Some("phase=consolidate"),
+            "done",
+            Some(LoggedUsage {
+                input: 10,
+                output: 2,
+                cache_creation: 0,
+                cache_read: 0,
+            }),
+            None,
+        );
+        let path = log.session_dir().join("code.jsonl");
+        drop(log);
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let with_usage: Vec<_> = rows.iter().filter(|r| r.get("usage").is_some()).collect();
+        assert_eq!(with_usage.len(), 1);
+        assert_eq!(
+            with_usage[0]["label"], "phase=consolidate",
+            "every record carrying usage must name its phase"
+        );
+    }
+
+    #[test]
     fn accounting_covers_both_documents_of_a_split_prompt() {
         // A prompt is sent as a stable document plus a per-call delta,
         // concatenated. If accounting parsed only the first value, every

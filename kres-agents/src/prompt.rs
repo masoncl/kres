@@ -180,25 +180,61 @@ impl<'a> CodePrompt<'a> {
         serde_json::Map<String, Value>,
         serde_json::Map<String, Value>,
     )> {
-        use serde_json::{Map, Value};
-        let full = serde_json::to_value(self)?;
-        let Value::Object(map) = full else {
-            return Ok((Map::new(), Map::new()));
-        };
-        let mut static_map: Map<String, Value> = Map::new();
-        let mut volatile_map: Map<String, Value> = Map::new();
-        // serde_json without `preserve_order` sorts keys, so both documents
-        // are deterministic for a given field set — which is what the cache
-        // needs.
-        for (k, v) in map {
-            if static_keys.contains(&k.as_str()) {
-                static_map.insert(k, v);
-            } else {
-                volatile_map.insert(k, v);
-            }
-        }
-        Ok((static_map, volatile_map))
+        Ok(partition_object(serde_json::to_value(self)?, static_keys))
     }
+}
+
+/// Split any request object into a stable document and a per-call delta, with
+/// the same contract `CodePrompt::to_split_documents` gives agent prompts:
+/// two independently valid JSON documents whose union is the original object
+/// and which are concatenated on the wire.
+///
+/// Goal and todo calls use this. They re-send a large byte-stable head — the
+/// task instructions and the current plan — on every reap, alongside an
+/// accumulator that genuinely grows. Measured over one mm/vmscan.c review:
+/// 22 of 24 calls carried a 12.4KB `plan` drawn from only 9 distinct
+/// payloads, and none of it was cacheable because the whole request was one
+/// block.
+pub fn split_request_documents(
+    request: &Value,
+    stable_keys: &[&str],
+) -> serde_json::Result<SplitPrompt> {
+    let (stable_map, delta_map) = partition_object(request.clone(), stable_keys);
+    if stable_map.is_empty() {
+        return Ok(SplitPrompt {
+            stable: String::new(),
+            delta: serde_json::to_string_pretty(request)?,
+        });
+    }
+    Ok(SplitPrompt {
+        stable: stable_document(stable_map)?,
+        delta: delta_document(delta_map)?,
+    })
+}
+
+/// serde_json without `preserve_order` sorts keys, so both halves are
+/// deterministic for a given field set — which is what the cache needs.
+fn partition_object(
+    value: Value,
+    stable_keys: &[&str],
+) -> (
+    serde_json::Map<String, Value>,
+    serde_json::Map<String, Value>,
+) {
+    use serde_json::Map;
+    let Value::Object(map) = value else {
+        return (Map::new(), Map::new());
+    };
+    let mut stable: Map<String, Value> = Map::new();
+    let mut delta: Map<String, Value> = Map::new();
+    for (k, v) in map {
+        if stable_keys.contains(&k.as_str()) {
+            stable.insert(k, v);
+        } else {
+            delta.insert(k, v);
+        }
+    }
+    (stable, delta)
 }
 
 /// A prompt rendered as two concatenable JSON documents.
@@ -408,6 +444,60 @@ mod tests {
             delta,
         });
         assert_eq!(combined["lens_instruction"], "Apply the memory lens");
+    }
+
+    #[test]
+    fn request_split_keeps_a_growing_accumulator_out_of_the_cached_head() {
+        // Shape of a real check_goal request: a head that repeats on every
+        // reap (instructions + plan) and an `analysis` accumulator that grows.
+        // The head must be byte-identical across calls so it can cache-hit;
+        // the accumulator must stay in the per-call half or the head changes
+        // every time and the cache never hits.
+        let stable = ["task", "instructions", "goal", "original_prompt", "plan"];
+        let call = |analysis: &str| {
+            json!({
+                "task": "check_goal",
+                "instructions": "judge the goal",
+                "goal": "audit the file",
+                "original_prompt": "review mm/vmscan.c",
+                "plan": {"steps": ["a", "b"]},
+                "analysis": analysis,
+            })
+        };
+
+        let first = split_request_documents(&call("task 1"), &stable).unwrap();
+        let second = split_request_documents(&call("task 1 --- task 2"), &stable).unwrap();
+
+        assert_eq!(first.stable, second.stable, "head must not move");
+        assert!(first.stable.contains("\"plan\""));
+        assert!(!first.stable.contains("analysis"));
+        assert!(second.delta.contains("task 2"));
+
+        // And nothing is lost: the two halves still carry every field.
+        let docs: Vec<Value> = serde_json::Deserializer::from_str(&second.rendered())
+            .into_iter::<Value>()
+            .collect::<Result<_, _>>()
+            .expect("both halves parse");
+        let mut keys = std::collections::BTreeSet::new();
+        for d in docs {
+            for k in d.as_object().unwrap().keys() {
+                assert!(keys.insert(k.clone()), "field {k} in both documents");
+            }
+        }
+        assert_eq!(
+            keys,
+            [
+                "analysis",
+                "goal",
+                "instructions",
+                "original_prompt",
+                "plan",
+                "task"
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+        );
     }
 
     #[test]

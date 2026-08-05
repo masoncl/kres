@@ -285,3 +285,5 @@ GENERAL JUDGING RULES:
   abstract requests like "more analysis".
 
 - Keep replies short. One sentence of reason is plenty.
+
+INPUT FRAMING: your input arrives as one or two consecutive JSON objects, not always a single one. When there are two, the first holds the fields that repeat across calls and the second holds this call's own fields; every field appears in exactly one of them. Read the union of their fields as one input, and never conclude a field is absent because it is missing from the first object.

@@ -298,6 +298,11 @@ pub async fn define_goal(
 /// every file one by one") against the derived `goal` string that
 /// may have compressed or generalised that intent during
 /// define_goal.
+/// Fields of a `check_goal` request that repeat across reaps. `analysis` is
+/// the accumulator and stays in the per-call half.
+const CHECK_GOAL_STABLE_FIELDS: &[&str] =
+    &["task", "instructions", "goal", "original_prompt", "plan"];
+
 fn build_check_goal_request(
     original_prompt: &str,
     goal: &str,
@@ -355,10 +360,6 @@ pub async fn check_goal(
     shutdown: Option<kres_core::Shutdown>,
 ) -> GoalCheck {
     let request = build_check_goal_request(original_prompt, goal, analysis, plan);
-    let body = match serde_json::to_string_pretty(&request) {
-        Ok(s) => s,
-        Err(_) => return failed_goal_check("could not serialize goal-check request"),
-    };
     let mut cfg = CallConfig::defaults_for(gc.model.clone())
         .with_max_tokens(gc.max_tokens)
         .with_stream_label("check_goal");
@@ -371,13 +372,21 @@ pub async fn check_goal(
     if let Some(thinking) = gc.thinking {
         cfg = cfg.with_thinking(thinking);
     }
-    // check_goal is one-shot per completed task — no reader for a
-    // tail cache. Skip the +25% write tax.
+    // The volatile half is one-shot per completed task, so it gets no cache
+    // marker and pays no write tax. The head is a different story: task,
+    // instructions, goal, original_prompt and plan repeat on every reap, and
+    // over one mm/vmscan.c review that was 16KB re-sent fresh eight times
+    // while the plan took only a handful of distinct values. Cache the head.
+    let split = match crate::prompt::split_request_documents(&request, CHECK_GOAL_STABLE_FIELDS) {
+        Ok(split) => split,
+        Err(_) => return failed_goal_check("could not split goal-check request"),
+    };
+    let body = split.rendered();
     let messages = vec![Message {
         role: "user".into(),
-        content: body.clone(),
+        content: split.delta,
         cache: false,
-        cached_prefix: None,
+        cached_prefix: (!split.stable.is_empty()).then_some(split.stable),
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();

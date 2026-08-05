@@ -159,8 +159,12 @@ pub async fn consolidate_lenses_with_logger(
                 thinking.push_str(t);
             }
         }
-        lg.log_code(
+        // Same label as the user record above. Without it the response is
+        // unattributable: a by-stage token accounting silently folded every
+        // consolidate and promote call into the goal/todo bucket.
+        lg.log_code_labeled(
             "assistant",
+            Some("phase=consolidate"),
             &text,
             Some(LoggedUsage {
                 input: resp.usage.input_tokens,

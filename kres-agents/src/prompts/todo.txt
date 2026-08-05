@@ -58,3 +58,5 @@ HARD CONSTRAINTS:
   contain an item whose name + type match, keep one.
 - Keep output compact. No preamble ("Now I have all the data..."),
   no closing remarks, no markdown code fences — just the JSON object.
+
+INPUT FRAMING: your input arrives as one or two consecutive JSON objects, not always a single one. When there are two, the first holds the fields that repeat across calls and the second holds this call's own fields; every field appears in exactly one of them. Read the union of their fields as one input, and never conclude a field is absent because it is missing from the first object.

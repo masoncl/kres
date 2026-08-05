@@ -1037,9 +1037,22 @@ async fn stage_render(
             index + 1,
             finding_batches.len(),
         );
-        let prompt_json =
-            build_render_prompt(original_prompt, batch, task_observations, Some(&note))?;
-        let messages = vec![user_message(&prompt_json)];
+        let request = render_prompt_value(original_prompt, batch, task_observations, Some(&note));
+        // One partition has no sibling to read the entry, and a cache write
+        // bills above plain input — the same trap the single-call change
+        // survey fell into. Only mark the head when it will be reused.
+        let messages = if finding_batches.len() > 1 {
+            let split =
+                kres_agents::prompt::split_request_documents(&request, RENDER_STABLE_FIELDS)?;
+            vec![Message {
+                role: "user".into(),
+                content: split.delta,
+                cache: false,
+                cached_prefix: (!split.stable.is_empty()).then_some(split.stable),
+            }]
+        } else {
+            vec![user_message(&serde_json::to_string(&request)?)]
+        };
         let label = format!(
             "summary render finding partition {}/{}",
             index + 1,
@@ -1425,20 +1438,41 @@ fn build_batch_condense_prompt(batch: &[(String, TaskMaterial)]) -> Result<Strin
     }))?)
 }
 
+fn render_prompt_value<T: serde::Serialize>(
+    original_prompt: &str,
+    findings: &[T],
+    task_observations: &str,
+    note: Option<&str>,
+) -> serde_json::Value {
+    json!({
+        "task": "summary",
+        "original_prompt": original_prompt,
+        "findings": findings,
+        "task_observations": task_observations,
+        "note": note.unwrap_or(""),
+    })
+}
+
 fn build_render_prompt<T: serde::Serialize>(
     original_prompt: &str,
     findings: &[T],
     task_observations: &str,
     note: Option<&str>,
 ) -> Result<String> {
-    Ok(serde_json::to_string(&json!({
-        "task": "summary",
-        "original_prompt": original_prompt,
-        "findings": findings,
-        "task_observations": task_observations,
-        "note": note.unwrap_or(""),
-    }))?)
+    Ok(serde_json::to_string(&render_prompt_value(
+        original_prompt,
+        findings,
+        task_observations,
+        note,
+    ))?)
 }
+
+/// Fields every render partition repeats verbatim. The complete condensed
+/// task observations accompany each partition on purpose — separating them
+/// from the findings would make the model infer relationships from state it
+/// does not have — so with more than one partition they are worth caching
+/// rather than re-sending.
+const RENDER_STABLE_FIELDS: &[&str] = &["task", "original_prompt", "task_observations"];
 
 fn combine_system_prompt(markdown: bool) -> String {
     let flavour = if markdown { "markdown" } else { "plain text" };

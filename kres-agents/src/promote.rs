@@ -214,8 +214,10 @@ pub async fn promote_prose_bugs_with_logger(
 
     let text = extract_text(&resp);
     if let Some(lg) = &logger {
-        lg.log_code(
+        // Same label as the user record above; see the note in consolidate.rs.
+        lg.log_code_labeled(
             "assistant",
+            Some("phase=promote"),
             &text,
             Some(LoggedUsage {
                 input: resp.usage.input_tokens,

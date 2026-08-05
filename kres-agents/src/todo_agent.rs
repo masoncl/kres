@@ -119,6 +119,11 @@ pub async fn update_todo_via_agent(
 
 /// Same as `update_todo_via_agent` but also logs the user+assistant
 /// turns to the provided TurnLogger's `main.jsonl`
+/// Fields of an `update_todo` request that repeat across reaps. The todo list
+/// itself and the newly emitted followups are the per-call half.
+const UPDATE_TODO_STABLE_FIELDS: &[&str] =
+    &["task", "instructions", "plan", "lenses", "completed_query"];
+
 pub async fn update_todo_via_agent_with_logger(
     tc: &TodoClient,
     inputs: TodoAgentInputs<'_>,
@@ -177,7 +182,9 @@ pub async fn update_todo_via_agent_with_logger(
         "instructions".into(),
         json!(build_instructions(!lens_payload.is_empty(), has_plan)),
     );
-    let request_text = serde_json::to_string_pretty(&Value::Object(request))?;
+    let split =
+        crate::prompt::split_request_documents(&Value::Object(request), UPDATE_TODO_STABLE_FIELDS)?;
+    let request_text = split.rendered();
 
     // --- Send inference ------------------------------------------------
     let mut cfg = CallConfig::defaults_for(tc.model.clone())
@@ -192,13 +199,15 @@ pub async fn update_todo_via_agent_with_logger(
     if let Some(thinking) = tc.thinking {
         cfg = cfg.with_thinking(thinking);
     }
-    // Each todo-update call is one-shot (one inference per reap);
-    // the tail cache would never be read. Skip the +25% write tax.
+    // The per-call half is one-shot (one inference per reap) so it gets no
+    // cache marker and pays no write tax. The head repeats on every reap —
+    // over one mm/vmscan.c review that was 21KB of instructions plus plan
+    // re-sent fresh fourteen times, from only nine distinct plan payloads.
     let messages = vec![Message {
         role: "user".into(),
-        content: request_text.clone(),
+        content: split.delta.clone(),
         cache: false,
-        cached_prefix: None,
+        cached_prefix: (!split.stable.is_empty()).then(|| split.stable.clone()),
     }];
     if let Some(lg) = &logger {
         let request = cfg.request_meta();

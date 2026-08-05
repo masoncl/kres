@@ -32,7 +32,6 @@ use crate::{
     fetcher::WorkspaceFetcher,
     followup::Followup,
     pipeline::{DataFetcher, FetchResult},
-    tools::{truncate_output, TOOL_OUTPUT_CAP_MCP},
 };
 
 /// Optional per-server hints for which MCP method handles which
@@ -74,12 +73,10 @@ fn lore_call_args(query: &str, since: &str) -> Value {
     json!({"body_patterns": [query], "since_date": since})
 }
 
-/// Keep semcode's compact survey object structured in the gathered context.
-/// If a future result exceeds the shared MCP output cap, preserve the visible
-/// truncation marker as text rather than pretending the partial JSON is valid.
+/// Keep semcode's complete compact survey object structured in the gathered
+/// context. No local size policy may turn valid JSON into a partial string.
 fn structured_survey_result(text: &str) -> Value {
-    let capped = truncate_output(text, TOOL_OUTPUT_CAP_MCP);
-    serde_json::from_str(&capped).unwrap_or(Value::String(capped))
+    serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
 }
 
 pub struct McpFetcher {
@@ -144,26 +141,28 @@ impl DataFetcher for McpFetcher {
                         .await
                     {
                         Ok(text) => {
-                            crate::symbol::append_context(
-                                &mut out.context,
-                                json!({
-                                    "source": format!("mcp:source:{}", fu.name),
-                                    "content": text,
-                                    "note": "raw semcode source output; agents must choose the relevant result when semcode returns multiple candidates",
-                                }),
-                            );
-                            // Parse the semcode output into a
-                            // structured symbol when possible; if the
-                            // parse fails (server returned an error
-                            // blob or unexpected shape) keep the raw
-                            // text as a context entry so the slow
-                            // agent can still read it.
-                            if let Some(sym) = crate::symbol::parse_semcode_symbol(
+                            let evidence = crate::symbol::canonical_semcode_evidence(
                                 &text,
                                 self.methods.find_function,
-                            ) {
+                            );
+                            if evidence.preserve_raw {
+                                crate::symbol::append_context(
+                                    &mut out.context,
+                                    json!({
+                                        "source": format!("mcp:source:{}", fu.name),
+                                        "content": text,
+                                        "note": "raw semcode source output preserved because it is ambiguous or unparseable",
+                                    }),
+                                );
+                            }
+                            if let Some(sym) = evidence.symbol {
+                                let sym = crate::symbol::with_retrieval_source(
+                                    sym,
+                                    format!("mcp:source:{}", fu.name),
+                                );
                                 crate::symbol::append_symbol(&mut out.symbols, sym);
-                            } else {
+                            }
+                            if evidence.needs_local_fallback {
                                 passthrough.push(fu.clone());
                             }
                         }
@@ -188,19 +187,28 @@ impl DataFetcher for McpFetcher {
                         .await
                     {
                         Ok(text) => {
-                            crate::symbol::append_context(
-                                &mut out.context,
-                                json!({
-                                    "source": format!("mcp:type:{}", fu.name),
-                                    "content": text,
-                                    "note": "raw semcode type output; agents must choose the relevant result when semcode returns multiple candidates",
-                                }),
+                            let evidence = crate::symbol::canonical_semcode_evidence(
+                                &text,
+                                self.methods.find_type,
                             );
-                            if let Some(sym) =
-                                crate::symbol::parse_semcode_symbol(&text, self.methods.find_type)
-                            {
+                            if evidence.preserve_raw {
+                                crate::symbol::append_context(
+                                    &mut out.context,
+                                    json!({
+                                        "source": format!("mcp:type:{}", fu.name),
+                                        "content": text,
+                                        "note": "raw semcode type output preserved because it is ambiguous or unparseable",
+                                    }),
+                                );
+                            }
+                            if let Some(sym) = evidence.symbol {
+                                let sym = crate::symbol::with_retrieval_source(
+                                    sym,
+                                    format!("mcp:type:{}", fu.name),
+                                );
                                 crate::symbol::append_symbol(&mut out.symbols, sym);
-                            } else {
+                            }
+                            if evidence.needs_local_fallback {
                                 passthrough.push(Followup {
                                     kind: "type".into(),
                                     name: fu.name.clone(),
@@ -320,7 +328,7 @@ impl McpFetcher {
         }
     }
 
-    /// Call an MCP tool and return the raw (already-capped) text —
+    /// Call an MCP tool and return the complete raw text —
     /// used by the `source` path so the caller can parse it into a
     /// semcode symbol. Returns Err(error_text) on failure so the
     /// caller can decide whether to fall back.
@@ -334,7 +342,7 @@ impl McpFetcher {
         let mut guard = self.client.lock().await;
         let server = guard.server_name().to_string();
         match guard.call_tool(tool, &args).await {
-            Ok(text) => Ok(truncate_output(&text, TOOL_OUTPUT_CAP_MCP)),
+            Ok(text) => Ok(text),
             Err(e) => {
                 tracing::warn!(
                     target: "kres_agents",
@@ -367,7 +375,7 @@ impl McpFetcher {
         match guard.call_tool(tool, &args).await {
             Ok(text) => Ok(json!({
                 "source": format!("mcp:{}:{}", label, name),
-                "result": truncate_output(&text, TOOL_OUTPUT_CAP_MCP),
+                "result": text,
             })),
             Err(e) => {
                 let msg = e.to_string();
@@ -407,7 +415,7 @@ impl McpFetcher {
             Ok(text) => Ok(json!({
                 "source": format!("mcp:lore:{}", query),
                 "since": since,
-                "result": truncate_output(&text, TOOL_OUTPUT_CAP_MCP),
+                "result": text,
             })),
             Err(e) => {
                 let msg = e.to_string();

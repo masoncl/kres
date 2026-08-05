@@ -23,10 +23,13 @@ use kres_core::cost::UsageTracker;
 use kres_core::findings::Finding;
 use kres_core::lens::LensSpec;
 use kres_core::log::{LoggedUsage, TurnLogger};
-use kres_core::shrink::{shrink_findings_to_budget, shrink_json_list_to_budget};
 use kres_core::shutdown::Shutdown;
 use kres_llm::{
-    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+    client::Client,
+    config::CallConfig,
+    model::{Effort, ThinkingBudget},
+    request::{mark_last_n_user_cached, Message},
+    Model,
 };
 
 use crate::{
@@ -42,11 +45,22 @@ use crate::{
 };
 
 const GENERIC_LENS_REPAIR_RETRIES: usize = 1;
+const LOW_EFFORT_EXPLICIT_THINKING_TOKENS: u32 = 1_024;
 const JSON_ONLY_OUTPUT_INSTRUCTION: &str = "Return exactly one raw JSON object. Do not return Markdown: no Markdown headings, prose preamble, code fences, backticks, or trailing commentary.";
 const FAST_GATHER_KINDS: &[&str] = &[
     "survey", "source", "type", "callers", "callees", "search", "grep", "read", "file", "find",
     "git", "make", "meson", "cargo", "bash", "lore", "question",
 ];
+
+fn lower_thinking_effort(thinking: ThinkingBudget, max_tokens: u32) -> ThinkingBudget {
+    match thinking {
+        ThinkingBudget::Disabled => ThinkingBudget::Disabled,
+        ThinkingBudget::ExplicitBudget(_) => {
+            ThinkingBudget::enabled_clamped(LOW_EFFORT_EXPLICIT_THINKING_TOKENS, max_tokens)
+        }
+        ThinkingBudget::Adaptive(_) => ThinkingBudget::Adaptive(Effort::Low),
+    }
+}
 
 fn fast_gather_semantic_errors(response: &CodeResponse) -> Vec<String> {
     let mut errors = Vec::new();
@@ -167,27 +181,21 @@ fn validate_fast_gather_response(response: &CodeResponse) -> Result<(), Vec<Stri
 /// gather rounds still use this prefix cache because they can make
 /// multiple round trips before slow handoff.
 ///
-/// Everything other than `skills` goes in the volatile tail —
-/// including `plan_rewrite_allowed`, which is `Option<bool>` with
-/// `skip_serializing_if=None`. Having it in the prefix meant the
-/// prefix JSON key set varied (slow-first-call had it, fast calls
-/// didn't). `to_cached_split_json` round-trips through
-/// `serde_json::Value` whose Map sorts keys alphabetically, so
-/// `plan_rewrite_allowed` sorted before `skills` — two prefix
-/// shapes on the wire that shared only 5 bytes. Session
-/// `c5843f10-…` confirmed: i=2 (fast) and i=4 (slow) had a common
-/// prefix of 5 chars, cache_read=0.
-///
-/// For fast-agent gather rounds the tail still cache-hits on round
-/// 2+ via the `Message::cache` flag. Non-lensed slow-agent calls do
-/// not use this cache at all; review lenses use the separate
-/// `LENS_SHARED_CACHE_FIELDS` prefix below.
-const CACHED_PREFIX_FIELDS: &[&str] = &["skills"];
+/// Stable task scope is cached independently of the evidence delta. Gather is
+/// a multi-turn conversation: each source/context record is appended once,
+/// and the two newest user cache breakpoints let the next round reuse the
+/// prior task/evidence prefix without rebroadcasting it in a new message.
+/// `plan_rewrite_allowed` deliberately remains volatile because it is present
+/// only on selected synthesis calls.
+// Gather sends one `skills` payload; the common/task split happens only at
+// synthesis, so `common_skills` deliberately does not appear here.
+const CACHED_PREFIX_FIELDS: &[&str] = &["question", "previous_findings", "skills", "plan"];
 const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
     "question",
     "symbols",
     "context",
     "previous_findings",
+    "common_skills",
     "skills",
     "plan",
 ];
@@ -241,6 +249,7 @@ pub struct LensRunFailure {
     pub lens_id: String,
     pub slow_model: Option<String>,
     pub error: String,
+    pub over_input_limit: Option<(u64, u64)>,
 }
 
 impl LensRunFailure {
@@ -271,15 +280,16 @@ struct PreparedLensFanout {
     prompt: String,
     shared_prefix: String,
     slow_variants: Vec<SlowAgentVariant>,
-    trimmed_symbols: Vec<Value>,
-    trimmed_context: Vec<Value>,
-    trimmed_prev: Vec<Finding>,
-    live_skills: Option<Value>,
+    symbols: Vec<Value>,
+    context: Vec<Value>,
+    previous_findings: Vec<Finding>,
+    common_skills: Option<Value>,
+    task_skills: Option<Value>,
     fast_rounds: u8,
 }
 
 type RawLensSuccess = (String, Value, String, String, CodeResponse);
-type RawLensFailure = (String, String, String);
+type RawLensFailure = (String, String, String, Option<(u64, u64)>);
 type RawLensResult = Result<RawLensSuccess, RawLensFailure>;
 
 #[derive(Clone)]
@@ -474,7 +484,12 @@ pub struct RunContext {
     /// Findings from prior turns; attached to the slow-agent prompt
     /// via CodePrompt::with_previous_findings.
     pub previous_findings: Vec<Finding>,
-    /// Short human label for logs.
+    /// Plan step executed by this task. Included in the compact plan
+    /// projection so agents do not have to infer the active row from prose.
+    pub active_plan_step_id: Option<String>,
+    /// Complete task scope for downstream inference calls such as the lens
+    /// consolidator and prose-finding promoter. Log renderers may abbreviate
+    /// it for display, but request construction must not.
     pub task_brief: String,
     /// Top-level prompt that originally spawned the current task
     /// chain. Prepended to every fast/slow/main user turn so a
@@ -511,13 +526,6 @@ pub struct RunContext {
     /// plan in its response; subsequent pipeline-driven tasks keep
     /// this false so plan churn stays bounded.
     pub allow_plan_rewrite: bool,
-    /// When true, the slow agent's LLM call asks the client to
-    /// surface `LlmError::OverInputLimit` instead of internally
-    /// shrinking the user-message text on a 429-with-over-limit.
-    /// Lets the caller perform structured shrinking (e.g. prune a
-    /// workflow step's prior_attempts) and re-issue the run. Other
-    /// callers leave this false and keep the existing auto-shrink.
-    pub surface_over_input_limit: bool,
     /// Route the synthesis call (the one after the fast-gather loop)
     /// to the fast client instead of the slow client. Used by
     /// workflow steps declared `agent: fast` in fix.json so a
@@ -672,7 +680,7 @@ fn build_lens_call_future(
             );
         }
         tokio::select! {
-            _ = shutdown.cancelled() => Err((lens_id, model_label, "cancelled".to_string())),
+            _ = shutdown.cancelled() => Err((lens_id, model_label, "cancelled".to_string(), None)),
             r = client.messages_streaming(&cfg, &messages) => match r {
                 Ok(resp) => {
                     record_usage(&usage, "slow", &model, &resp.usage);
@@ -693,7 +701,13 @@ fn build_lens_call_future(
                 }
                 Err(e) => {
                     tracing::warn!(target: "kres_agents", "lens call failed: {e}");
-                    Err((lens_id, model_label, e.to_string()))
+                    let over_input_limit = match &e {
+                        kres_llm::LlmError::OverInputLimit { actual, limit } => {
+                            Some((*actual, *limit))
+                        }
+                        _ => None,
+                    };
+                    Err((lens_id, model_label, e.to_string(), over_input_limit))
                 }
             }
         }
@@ -807,6 +821,130 @@ impl AgentRunner {
         Ok(parsed)
     }
 
+    /// Run one raw prompt through the primary slow model without a fast gather
+    /// round. Bootstrap analyses use this when Rust has already assembled all
+    /// input and must send it intact.
+    pub async fn run_primary_slow_inference(
+        &self,
+        system: &str,
+        prompt: &str,
+        task_label: &str,
+        shutdown: &Shutdown,
+    ) -> Result<String, AgentError> {
+        self.run_primary_slow_inference_profiled(system, None, prompt, task_label, false, shutdown)
+            .await
+    }
+
+    /// Run a low-reasoning primary-slow call over `stable_prefix + prompt_tail`.
+    /// Change surveys use this for cheap parallel classification while
+    /// retaining the configured slow model.
+    ///
+    /// `cache_prefix` must be true only when several calls share the same
+    /// prefix bytes. A cache write is billed above ordinary input, so marking
+    /// a prefix that nothing else will read is a straight loss — the observed
+    /// case was a single-call change survey paying 144k of cache creation for
+    /// zero reads. When false the two halves are concatenated into one plain
+    /// message; the model sees identical text either way.
+    pub async fn run_primary_slow_inference_low_effort(
+        &self,
+        system: &str,
+        stable_prefix: &str,
+        prompt_tail: &str,
+        cache_prefix: bool,
+        task_label: &str,
+        shutdown: &Shutdown,
+    ) -> Result<String, AgentError> {
+        let joined;
+        let (cached_prefix, tail) = if cache_prefix {
+            (Some(stable_prefix), prompt_tail)
+        } else {
+            joined = format!("{stable_prefix}{prompt_tail}");
+            (None, joined.as_str())
+        };
+        self.run_primary_slow_inference_profiled(
+            system,
+            cached_prefix,
+            tail,
+            task_label,
+            true,
+            shutdown,
+        )
+        .await
+    }
+
+    async fn run_primary_slow_inference_profiled(
+        &self,
+        system: &str,
+        cached_prefix: Option<&str>,
+        prompt_tail: &str,
+        task_label: &str,
+        low_effort: bool,
+        shutdown: &Shutdown,
+    ) -> Result<String, AgentError> {
+        let messages = vec![Message {
+            role: "user".into(),
+            content: prompt_tail.to_string(),
+            cache: cached_prefix.is_some(),
+            cached_prefix: cached_prefix.map(str::to_string),
+        }];
+        let mut cfg = CallConfig::defaults_for(self.slow_model.clone())
+            .with_max_tokens(self.slow_max_tokens)
+            .with_stream_label(format!("slow ({task_label})"))
+            .with_system(system.to_string());
+        let configured_thinking = self.slow_thinking.unwrap_or(cfg.thinking);
+        if low_effort {
+            let max_tokens = cfg.max_tokens;
+            cfg = cfg
+                .with_thinking(lower_thinking_effort(configured_thinking, max_tokens))
+                .with_text_verbosity("low");
+        } else {
+            cfg = cfg.with_thinking(configured_thinking);
+        }
+        if let Some(limit) = self.slow_max_input_tokens {
+            cfg = cfg.with_max_input_tokens(limit);
+        }
+        if let Some(logger) = &self.logger {
+            let label = format!("phase=slow task={task_label}");
+            let meta = cfg.request_meta();
+            let logged_prompt = cached_prefix
+                .map(|prefix| format!("{prefix}{prompt_tail}"))
+                .unwrap_or_else(|| prompt_tail.to_string());
+            logger.log_code_labeled_with_request(
+                "user",
+                Some(&label),
+                &logged_prompt,
+                None,
+                None,
+                Some(&meta),
+            );
+        }
+        let response = tokio::select! {
+            _ = shutdown.cancelled() => {
+                return Err(AgentError::Other(format!(
+                    "cancelled during slow {task_label} call"
+                )));
+            }
+            response = self.slow_client.messages_streaming(&cfg, &messages) => {
+                response.map_err(AgentError::from)?
+            }
+        };
+        record_usage(&self.usage, "slow", &self.slow_model, &response.usage);
+        let text = extract_text(&response);
+        if let Some(logger) = &self.logger {
+            let label = format!("phase=slow task={task_label}");
+            let thinking = extract_thinking(&response);
+            logger.log_code_labeled_with_model(
+                "assistant",
+                Some(&label),
+                &text,
+                Some(log_usage(&response.usage)),
+                thinking.as_deref(),
+                response.model.as_deref(),
+            );
+        }
+        Ok(text)
+    }
+
     /// Convenience wrapper with an empty RunContext.
     pub async fn run_once(
         &self,
@@ -845,313 +983,20 @@ impl AgentRunner {
         } else {
             ctx.task_brief.clone()
         };
-        // Per-run skills clone — mutated mid-loop by `skill_reads`
-        // responses so the fast agent can pull in extra files
-        // mid-gather (§27,).
-        let mut live_skills: Option<Value> = if ctx.disable_skill_reads {
-            None
-        } else {
-            self.skills.clone()
-        };
-        // Seed from an earlier workflow step's gathered data (#4) so a
-        // dependent step does not re-fetch source the prior step
-        // already pulled. With prev_n_* starting at 0, round 0 ships
-        // these to the fast agent as fresh `symbols`/`context` rather
-        // than as a names-only manifest, so the agent sees the bodies
-        // and won't re-request them.
-        let mut symbols: Vec<Value> = ctx.seed_symbols.clone();
-        let mut context: Vec<Value> = ctx.seed_context.clone();
-        let mut prev_n_syms: usize = 0;
-        let mut prev_n_ctx: usize = 0;
-        let mut fast_rounds: u8 = 0;
-        let mut fetched_keys: HashSet<String> = HashSet::new();
-
-        for round in 0..self.max_fast_rounds {
-            if shutdown.is_cancelled() {
-                return Err(AgentError::Other(format!(
-                    "shutdown cancelled during fast round {round}"
-                )));
-            }
-            fast_rounds = round + 1;
-
-            let new_syms = if symbols.len() > prev_n_syms {
-                &symbols[prev_n_syms..]
-            } else {
-                &[]
-            };
-            let new_ctx = if context.len() > prev_n_ctx {
-                &context[prev_n_ctx..]
-            } else {
-                &[]
-            };
-            // §7 / §28: on round 2+, ship the identity-only
-            // `previously_fetched` manifest so the fast agent sees
-            // "you already have these" without paying for full-body
-            // retransmission.
-            let pf_manifest = if prev_n_syms > 0 || prev_n_ctx > 0 {
-                Some(crate::symbol::previously_fetched_manifest(
-                    &symbols[..prev_n_syms],
-                    &context[..prev_n_ctx],
-                ))
-            } else {
-                None
-            };
-            let mut cp = CodePrompt::new(gather_prompt)
-                .with_symbols(new_syms)
-                .with_context(new_ctx);
-            if let Some(ref pf) = pf_manifest {
-                cp = cp.with_previously_fetched(pf);
-            }
-            if let Some(sk) = &live_skills {
-                cp = cp.with_skills(sk);
-            }
-            if let Some(ref p) = ctx.plan {
-                cp = cp.with_plan(p);
-            }
-            // §cache: split the envelope into a stable prefix
-            // (question + skills + previous_findings + parallel_lenses
-            // + plan) and a per-round volatile tail (symbols + context
-            // + previously_fetched). The prefix cache-hits across
-            // rounds; the tail does not.
-            let (prefix, suffix) = cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
-            prev_n_syms = symbols.len();
-            prev_n_ctx = context.len();
-
-            let logged_content = format!("{prefix}{suffix}");
-            let messages = vec![Message {
-                role: "user".into(),
-                content: suffix.clone(),
-                cache: true,
-                cached_prefix: if prefix.is_empty() {
-                    None
-                } else {
-                    Some(prefix.clone())
-                },
-            }];
-            let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
-                .with_max_tokens(self.fast_max_tokens)
-                .with_stream_label(format!("fast round {fast_rounds}"));
-            if let Some(thinking) = self.fast_thinking {
-                cfg = cfg.with_thinking(thinking);
-            }
-            if let Some(s) = &self.fast_system {
-                cfg = cfg.with_system(s.clone());
-            }
-            if let Some(n) = self.fast_max_input_tokens {
-                cfg = cfg.with_max_input_tokens(n);
-            }
-
-            if let Some(lg) = &self.logger {
-                let label = format!("phase=fast-gather task={log_task} round={fast_rounds}");
-                lg.log_code_labeled("user", Some(&label), &logged_content, None, None);
-            }
-            if !new_syms.is_empty() || !new_ctx.is_empty() {
-                kres_core::async_eprintln!(
-                    "[fast round {fast_rounds}/{}] gathered +{} symbol(s), +{} context item(s)",
-                    self.max_fast_rounds,
-                    new_syms.len(),
-                    new_ctx.len(),
-                );
-            }
-            let text = tokio::select! {
-                _ = shutdown.cancelled() => {
-                    return Err(AgentError::Other("cancelled during fast call".into()));
-                }
-                r = self.fast_client.messages_streaming(&cfg, &messages) => {
-                    let resp = r.map_err(|e| AgentError::Other(e.to_string()))?;
-                    record_usage(&self.usage, "fast", &self.fast_model, &resp.usage);
-                    let t = extract_text(&resp);
-                    if let Some(lg) = &self.logger {
-                        let thinking = extract_thinking(&resp);
-                        let label = format!("phase=fast-gather task={log_task} round={fast_rounds}");
-                        lg.log_code_labeled_with_model(
-                            "assistant",
-                            Some(&label),
-                            &t,
-                            Some(log_usage(&resp.usage)),
-                            thinking.as_deref(),
-                            resp.model.as_deref(),
-                        );
-                    }
-                    t
-                }
-            };
-            let parsed = match validate_fast_gather_text_for_run(
-                &text,
-                ctx.disable_skill_reads,
-                ctx.allowed_gather_kinds.as_ref(),
-            ) {
-                Ok(parsed) => parsed,
-                Err(errors) => {
-                    kres_core::async_eprintln!(
-                        "[fast round {fast_rounds}] invalid gather response; retrying once: {}",
-                        errors.join("; ")
-                    );
-                    let repaired = self
-                        .repair_fast_gather_response(
-                            &text,
-                            &errors,
-                            "fast gather schema repair",
-                            shutdown,
-                        )
-                        .await?;
-                    let policy_errors = fast_gather_run_policy_errors(
-                        &repaired,
-                        ctx.disable_skill_reads,
-                        ctx.allowed_gather_kinds.as_ref(),
-                    );
-                    if !policy_errors.is_empty() {
-                        return Err(AgentError::Other(format!(
-                            "fast gather response still violated run policy after repair: {}",
-                            policy_errors.join("; ")
-                        )));
-                    }
-                    repaired
-                }
-            };
-            log_json_normalization(self.logger.as_deref(), &parsed, "fast-gather");
-
-            // §27: honour skill_reads. Read each requested file and
-            // graft it into the first skill's `files` map so the next
-            // fast round sees the new content. Matches.
-            if !parsed.skill_reads.is_empty() {
-                kres_core::async_eprintln!(
-                    "[fast round {}] skill_reads: {}",
-                    fast_rounds,
-                    parsed.skill_reads.join(", ")
-                );
-                apply_skill_reads(&mut live_skills, &parsed.skill_reads);
-            }
-
-            // bugs.md#Phase1 fix: if this round produced ONLY
-            // skill_reads (no followups, not ready) we must loop
-            // back, not jump to slow.
-            let only_skill_reads = parsed.followups.is_empty()
-                && !parsed.ready_for_slow
-                && !parsed.skill_reads.is_empty();
-            if parsed.ready_for_slow {
-                kres_core::async_eprintln!("[fast round {fast_rounds}] ready for slow analysis");
-                break;
-            }
-            if parsed.followups.is_empty() && !only_skill_reads {
-                kres_core::async_eprintln!(
-                    "[fast round {}] no more fetches; proceeding to slow analysis",
-                    fast_rounds
-                );
-                break;
-            }
-            if only_skill_reads {
-                continue;
-            }
-
-            // If every followup is a type:question (clarification
-            // for the operator), the main agent can't fetch data
-            // for it — looping would just re-ask the same question.
-            // Break out to the slow agent, which can surface the
-            // question to the operator via its own followups.
-            if !parsed.followups.is_empty() && parsed.followups.iter().all(|f| f.kind == "question")
-            {
-                kres_core::async_eprintln!(
-                    "[fast round {}] only type:question followups — breaking to slow",
-                    fast_rounds
-                );
-                break;
-            }
-
-            // Dedup followups against previously-fetched keys.
-            // The fast agent is stateless — it can see the
-            // previously_fetched manifest (names only) but not the
-            // content from earlier rounds.  When it needs that
-            // content to decide it's ready, it re-requests the same
-            // data.  Detect this and break to the slow agent, which
-            // receives ALL accumulated data.
-            let novel: Vec<_> = parsed
-                .followups
-                .iter()
-                .filter(|fu| !fetched_keys.contains(&fu.cache_key()))
-                .cloned()
-                .collect();
-            let n_dupes = parsed.followups.len() - novel.len();
-            if n_dupes > 0 && novel.is_empty() {
-                kres_core::async_eprintln!(
-                    "[fast round {}] all {} followup(s) are re-requests — breaking to slow",
-                    fast_rounds,
-                    parsed.followups.len(),
-                );
-                break;
-            }
-            if n_dupes > 0 {
-                kres_core::async_eprintln!(
-                    "[fast round {}] deduped {} re-request(s), {} novel followup(s) remain",
-                    fast_rounds,
-                    n_dupes,
-                    novel.len(),
-                );
-            }
-
-            // Summarise the followups so operators can see what the
-            // fast agent asked the main agent to fetch on their
-            // behalf.
-            let fu_summary: Vec<String> = novel
-                .iter()
-                .take(8)
-                .map(|fu| format!("{}:{}", fu.kind, truncate(&fu.name, 40)))
-                .collect();
-            let tail = if novel.len() > 8 {
-                format!(", +{} more", novel.len() - 8)
-            } else {
-                String::new()
-            };
-            kres_core::async_eprintln!(
-                "[fast round {}] {} followup(s): {}{tail}",
-                fast_rounds,
-                novel.len(),
-                fu_summary.join(", "),
-            );
-
-            for fu in &novel {
-                fetched_keys.insert(fu.cache_key());
-            }
-
-            // Execute validated typed requests directly through the
-            // deterministic data layer.
-            let fetched = tokio::select! {
-                _ = shutdown.cancelled() => {
-                    return Err(AgentError::Other("cancelled during fetch".into()));
-                }
-                f = self.fetcher.fetch(&novel, ctx.plan.as_ref()) => f?,
-            };
-            let got_syms = fetched.symbols.len();
-            let got_ctx = fetched.context.len();
-            let got_chars: usize = fetched
-                .symbols
-                .iter()
-                .chain(fetched.context.iter())
-                .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-                .sum();
-            kres_core::async_eprintln!(
-                "[fast round {}] fetch returned {} symbol(s), {} context item(s) ({}k chars)",
-                fast_rounds,
-                got_syms,
-                got_ctx,
-                got_chars / 1000,
-            );
-            symbols.extend(fetched.symbols);
-            context.extend(fetched.context);
-        }
+        let (symbols, context, fast_rounds, live_skills, task_skill_paths) =
+            self.gather(gather_prompt, ctx, shutdown).await?;
 
         // Slow agent call.
         // Redact `details` before ANY budget / shipping step — the
         // per-task narrative stored on Finding.details is for
         // /summary only and must never reach an agent prompt.
-        // bugs.md#L5: budget previous_findings to ~1M chars before
-        // shipping. Symbols and context are also trimmed — a single
-        // fetcher response can blow the per-slot budget even with a
-        // short gather loop (e.g. a multi-MB type definition).
-        let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
-        let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
-        let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
-        let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
+        // Canonicalization removes exact duplicate representations, but it is
+        // deliberately lossless: inference construction must never discard
+        // source, tool output, findings, or prompt text to satisfy a local
+        // request-size policy. Provider-specific framing happens below the
+        // prompt layer without changing the visible content.
+        let (symbols, context) = crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
+        let previous_findings = kres_core::redact_findings_for_agent(&ctx.previous_findings);
         // Non-lensed slow calls are one-shot. Do not split off a
         // cached prefix here: there is no parallel fan-out to amortize
         // the cache write, and repeated workflow correction passes
@@ -1159,19 +1004,21 @@ impl AgentRunner {
         // Review paths that actually benefit from a shared context
         // prefix go through run_with_lenses below.
         let mut slow_cp = CodePrompt::new(prompt)
-            .with_symbols(&trimmed_symbols)
-            .with_context(&trimmed_context)
-            .with_previous_findings(&trimmed_prev);
-        // Pass `live_skills` (post-skill_reads, §27), NOT
-        // `self.skills` — if the fast agent pulled additional
-        // files into the skill's `files` map mid-loop, the slow
-        // agent needs those files too. Using `self.skills` would
-        // hand the slow agent a stale, smaller skill payload.
-        if let Some(sk) = &live_skills {
+            .with_symbols(&symbols)
+            .with_context(&context)
+            .with_previous_findings(&previous_findings);
+        // Split post-gather skills against the runner's stable base. This
+        // preserves every selected file while keeping common bytes distinct
+        // from per-task additions.
+        let synthesis_skills = split_skills_for_synthesis(live_skills.as_ref(), &task_skill_paths);
+        if let Some(sk) = &synthesis_skills.common {
+            slow_cp = slow_cp.with_common_skills(sk);
+        }
+        if let Some(sk) = &synthesis_skills.task {
             slow_cp = slow_cp.with_skills(sk);
         }
         if let Some(ref p) = ctx.plan {
-            slow_cp = slow_cp.with_plan(p);
+            slow_cp = slow_cp.with_plan(p, ctx.active_plan_step_id.as_deref());
         }
         if ctx.allow_plan_rewrite {
             slow_cp = slow_cp.with_plan_rewrite_allowed(true);
@@ -1273,9 +1120,6 @@ impl AgentRunner {
         if let Some(n) = synth_max_in {
             cfg = cfg.with_max_input_tokens(n);
         }
-        if ctx.surface_over_input_limit {
-            cfg = cfg.with_surface_over_input_limit(true);
-        }
         // Log label reflects which model actually ran the synthesis
         // so trace consumers (and grep'ing operators) can see whether
         // a fast-routed step actually used Sonnet. log_phase is set
@@ -1295,22 +1139,19 @@ impl AgentRunner {
         }
         kres_core::async_eprintln!(
             "[{log_phase}] analyzing with {} symbol(s), {} context item(s), {} previous finding(s)",
-            trimmed_symbols.len(),
-            trimmed_context.len(),
-            trimmed_prev.len(),
+            symbols.len(),
+            context.len(),
+            previous_findings.len(),
         );
         let synth_role_for_usage = if use_fast { "fast" } else { "slow" };
-        let mut text = tokio::select! {
+        let synthesis = tokio::select! {
             _ = shutdown.cancelled() => {
                 return Err(AgentError::Other(format!("cancelled during {log_phase} call")));
             }
-            r = synth_client.messages_streaming(&cfg, &messages) => {
-                let resp = r.map_err(|e| match e {
-                    kres_llm::LlmError::OverInputLimit { actual, limit } => {
-                        AgentError::OverInputLimit { actual, limit }
-                    }
-                    other => AgentError::Other(other.to_string()),
-                })?;
+            r = synth_client.messages_streaming(&cfg, &messages) => r,
+        };
+        let mut text = match synthesis {
+            Ok(resp) => {
                 record_usage(&self.usage, synth_role_for_usage, &synth_model, &resp.usage);
                 let t = extract_text(&resp);
                 if let Some(lg) = &self.logger {
@@ -1327,6 +1168,10 @@ impl AgentRunner {
                 }
                 t
             }
+            Err(kres_llm::LlmError::OverInputLimit { actual, limit }) => {
+                return Err(AgentError::OverInputLimit { actual, limit });
+            }
+            Err(other) => return Err(AgentError::Other(other.to_string())),
         };
         let response_contract =
             CodeResponseContract::new(ctx.allowed_response_extensions.iter().cloned());
@@ -1467,13 +1312,11 @@ impl AgentRunner {
             code_output,
             code_edits,
             plan: slow_plan,
-            // Hand the budget-trimmed gather back (not the raw
-            // accumulator) so the workflow runner can seed a dependent
-            // step (#4) without a giant blob blowing the dependent
-            // step's round-0 fast input limit. These are the same
-            // trimmed lists already shipped to this step's slow call.
-            gathered_symbols: trimmed_symbols,
-            gathered_context: trimmed_context,
+            // Return the same complete canonical evidence set that the slow
+            // call received. Dependent steps may deduplicate it by stable
+            // evidence identity, but must not inherit a size-trimmed subset.
+            gathered_symbols: symbols,
+            gathered_context: context,
         })
     }
 }
@@ -1708,6 +1551,13 @@ impl AgentRunner {
             .await?;
 
         for retry in 0..repair.max_retries {
+            if let Some((actual, limit)) = fanout
+                .failures
+                .iter()
+                .find_map(|failure| failure.over_input_limit)
+            {
+                return Err(AgentError::OverInputLimit { actual, limit });
+            }
             // Collect per-lens errors so we can surface the specific
             // validator/transport message to each retried lens — the
             // generic repair instruction alone does not tell the model
@@ -1842,6 +1692,13 @@ impl AgentRunner {
         for output in &fanout.outputs {
             log_json_normalization(self.logger.as_deref(), &output.parsed, "slow-lens");
         }
+        if let Some((actual, limit)) = fanout
+            .failures
+            .iter()
+            .find_map(|failure| failure.over_input_limit)
+        {
+            return Err(AgentError::OverInputLimit { actual, limit });
+        }
         Ok(fanout)
     }
 
@@ -1965,14 +1822,8 @@ impl AgentRunner {
         };
         // Gather once via fast+main (same loop as run_once, up to the
         // point where we'd call the slow agent).
-        let (symbols, context, fast_rounds, live_skills) = self
-            .gather(
-                gather_prompt,
-                ctx.plan.as_ref(),
-                ctx.disable_skill_reads,
-                shutdown,
-            )
-            .await?;
+        let (symbols, context, fast_rounds, live_skills, task_skill_paths) =
+            self.gather(gather_prompt, ctx, shutdown).await?;
 
         // All review lenses share the same gathered source/context.
         // `run_prepared_lens_fanout` runs the first lens sequentially
@@ -1984,30 +1835,35 @@ impl AgentRunner {
         // just stages the shared-prefix bytes; all dispatch logic
         // lives downstream.
         let slow_variants = self.effective_slow_variants();
-        let redacted_prev = kres_core::redact_findings_for_agent(&ctx.previous_findings);
-        let trimmed_prev = shrink_findings_to_budget(&redacted_prev, 1_000_000);
-        let trimmed_symbols = shrink_json_list_to_budget(&symbols, 1_000_000);
-        let trimmed_context = shrink_json_list_to_budget(&context, 1_000_000);
+        let (symbols, context) = crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
+        let previous_findings = kres_core::redact_findings_for_agent(&ctx.previous_findings);
         let mut shared_cp = CodePrompt::new(prompt)
-            .with_symbols(&trimmed_symbols)
-            .with_context(&trimmed_context)
-            .with_previous_findings(&trimmed_prev);
-        if let Some(sk) = &live_skills {
+            .with_symbols(&symbols)
+            .with_context(&context)
+            .with_previous_findings(&previous_findings);
+        let synthesis_skills = split_skills_for_synthesis(live_skills.as_ref(), &task_skill_paths);
+        if let Some(sk) = &synthesis_skills.common {
+            shared_cp = shared_cp.with_common_skills(sk);
+        }
+        if let Some(sk) = &synthesis_skills.task {
             shared_cp = shared_cp.with_skills(sk);
         }
         if let Some(ref p) = ctx.plan {
-            shared_cp = shared_cp.with_plan(p);
+            shared_cp = shared_cp.with_plan(p, ctx.active_plan_step_id.as_deref());
         }
-        let (shared_prefix, _) = shared_cp.to_cached_split_json(LENS_SHARED_CACHE_FIELDS)?;
+        let shared_prefix = shared_cp
+            .to_split_documents(LENS_SHARED_CACHE_FIELDS)?
+            .stable;
 
         Ok(PreparedLensFanout {
             prompt: prompt.to_string(),
             shared_prefix,
             slow_variants,
-            trimmed_symbols,
-            trimmed_context,
-            trimmed_prev,
-            live_skills,
+            symbols,
+            context,
+            previous_findings,
+            common_skills: synthesis_skills.common,
+            task_skills: synthesis_skills.task,
             fast_rounds,
         })
     }
@@ -2058,23 +1914,24 @@ impl AgentRunner {
                 lens_extra.push_str(&format!("\n(why: {})", lens.reason));
             }
             let mut lens_cp = CodePrompt::new(&prepared.prompt)
-                .with_symbols(&prepared.trimmed_symbols)
-                .with_context(&prepared.trimmed_context)
-                .with_previous_findings(&prepared.trimmed_prev)
+                .with_symbols(&prepared.symbols)
+                .with_context(&prepared.context)
+                .with_previous_findings(&prepared.previous_findings)
                 .with_parallel_lenses(&parallel_lenses)
                 .with_lens_instruction(&lens_extra);
-            // §cache: include skills in the lens prompt — same
-            // rationale as the single slow call above. Use the
-            // post-gather `live_skills` so any skill files the fast
-            // agent pulled in mid-gather reach the lens slow agents
-            // too.
-            if let Some(sk) = &prepared.live_skills {
+            // Put byte-stable skill material first, followed by guides loaded
+            // during this task. Both halves are verbatim and together equal
+            // the post-gather synthesis skill set.
+            if let Some(sk) = &prepared.common_skills {
+                lens_cp = lens_cp.with_common_skills(sk);
+            }
+            if let Some(sk) = &prepared.task_skills {
                 lens_cp = lens_cp.with_skills(sk);
             }
             if let Some(ref p) = ctx.plan {
-                lens_cp = lens_cp.with_plan(p);
+                lens_cp = lens_cp.with_plan(p, ctx.active_plan_step_id.as_deref());
             }
-            let lens_suffix = lens_cp.to_cached_tail_json(LENS_SHARED_CACHE_FIELDS)?;
+            let lens_suffix = lens_cp.to_delta_document(LENS_SHARED_CACHE_FIELDS)?;
             lens_specs.push(LensCallSpec {
                 lens_id: lens.id.clone(),
                 lens_value: lens_identity(lens),
@@ -2189,11 +2046,12 @@ impl AgentRunner {
                         allowed_response_extensions: ctx.allowed_response_extensions.clone(),
                     });
                 }
-                Err((lens_id, model_label, error)) => {
+                Err((lens_id, model_label, error, over_input_limit)) => {
                     failures.push(LensRunFailure {
                         lens_id,
                         slow_model: Some(model_label),
                         error,
+                        over_input_limit,
                     });
                 }
             }
@@ -2245,25 +2103,27 @@ impl AgentRunner {
     pub async fn gather(
         &self,
         prompt: &str,
-        plan: Option<&kres_core::Plan>,
-        disable_skill_reads: bool,
+        ctx: &RunContext,
         shutdown: &Shutdown,
-    ) -> Result<(Vec<Value>, Vec<Value>, u8, Option<Value>), AgentError> {
-        let mut symbols: Vec<Value> = Vec::new();
-        let mut context: Vec<Value> = Vec::new();
-        let mut prev_n_syms: usize = 0;
-        let mut prev_n_ctx: usize = 0;
+    ) -> Result<(Vec<Value>, Vec<Value>, u8, Option<Value>, BTreeSet<String>), AgentError> {
+        let (mut symbols, mut context) =
+            crate::symbol::canonicalize_prompt_evidence(&ctx.seed_symbols, &ctx.seed_context);
         let mut fast_rounds: u8 = 0;
         let mut fetched_keys: HashSet<String> = HashSet::new();
-        // §27 parity: honour mid-loop `skill_reads` in the lens
-        // gather path just like `run_once_with_ctx` does. Without
-        // this, a skill file the fast agent requests mid-gather
-        // never lands in the lens slow-agent payload.
-        let mut live_skills: Option<Value> = if disable_skill_reads {
+        // Honour mid-loop `skill_reads` in the one shared gather path. The
+        // returned live payload feeds either single synthesis or lens fan-out.
+        let mut live_skills: Option<Value> = if ctx.disable_skill_reads {
             None
         } else {
             self.skills.clone()
         };
+        let mut round_symbols = symbols.clone();
+        let mut round_context = context.clone();
+        let mut round_skills = live_skills.clone();
+        // Paths this task's `skill_reads` grafted into the live payload.
+        // Drives both the per-round delta and the synthesis common/task split.
+        let mut task_skill_paths: BTreeSet<String> = BTreeSet::new();
+        let mut history: Vec<Message> = Vec::new();
         for round in 0..self.max_fast_rounds {
             if shutdown.is_cancelled() {
                 return Err(AgentError::Other(format!(
@@ -2271,53 +2131,69 @@ impl AgentRunner {
                 )));
             }
             fast_rounds = round + 1;
-            let new_syms = if symbols.len() > prev_n_syms {
-                &symbols[prev_n_syms..]
+            let round_question = if round == 0 {
+                prompt
             } else {
-                &[]
+                "Continue the same task using the newly gathered evidence in this message. Earlier task scope, evidence, and decisions remain in the conversation history."
             };
-            let new_ctx = if context.len() > prev_n_ctx {
-                &context[prev_n_ctx..]
-            } else {
-                &[]
-            };
-            let pf_manifest = if prev_n_syms > 0 || prev_n_ctx > 0 {
-                Some(crate::symbol::previously_fetched_manifest(
-                    &symbols[..prev_n_syms],
-                    &context[..prev_n_ctx],
-                ))
-            } else {
-                None
-            };
-            let mut cp = CodePrompt::new(prompt)
-                .with_symbols(new_syms)
-                .with_context(new_ctx);
-            if let Some(ref pf) = pf_manifest {
-                cp = cp.with_previously_fetched(pf);
+            let mut cp = CodePrompt::new(round_question)
+                .with_symbols(&round_symbols)
+                .with_context(&round_context);
+            // Prior findings ride the round-0 cached prefix. Later rounds
+            // retain them through conversation history.
+            let fast_previous_findings =
+                (round == 0).then(|| kres_core::redact_findings_for_agent(&ctx.previous_findings));
+            if let Some(findings) = fast_previous_findings.as_ref() {
+                cp = cp.with_previous_findings(findings);
             }
-            if let Some(sk) = &live_skills {
+            if let Some(sk) = &round_skills {
                 cp = cp.with_skills(sk);
             }
-            if let Some(p) = plan {
-                cp = cp.with_plan(p);
+            if round == 0 {
+                if let Some(p) = ctx.plan.as_ref() {
+                    cp = cp.with_plan(p, ctx.active_plan_step_id.as_deref());
+                }
             }
-            let (gp_prefix, gp_suffix) = cp.to_cached_split_json(CACHED_PREFIX_FIELDS)?;
-            prev_n_syms = symbols.len();
-            prev_n_ctx = context.len();
-            let logged_content = format!("{gp_prefix}{gp_suffix}");
-            let messages = vec![Message {
+            // Only the first user turn needs a separately cached stable
+            // task-scope block. Later turns are evidence deltas and each gets
+            // one cache marker. With the cached system prompt this stays
+            // within Anthropic's four-block protocol maximum while preserving
+            // the exact conversation text.
+            let split = if round == 0 {
+                cp.to_split_documents(CACHED_PREFIX_FIELDS)?
+            } else {
+                crate::prompt::SplitPrompt {
+                    stable: String::new(),
+                    delta: cp.to_json_string()?,
+                }
+            };
+            let logged_content = split.rendered();
+            history.push(Message {
                 role: "user".into(),
-                content: gp_suffix,
+                content: split.delta,
                 cache: true,
-                cached_prefix: if gp_prefix.is_empty() {
+                cached_prefix: if split.stable.is_empty() {
                     None
                 } else {
-                    Some(gp_prefix)
+                    Some(split.stable)
                 },
-            }];
+            });
+            mark_last_n_user_cached(&mut history, 2);
+            let logged_request = serde_json::to_string(&serde_json::json!({
+                "messages": history.iter().map(|message| {
+                    serde_json::json!({
+                        "role": message.role,
+                        "content": format!(
+                            "{}{}",
+                            message.cached_prefix.as_deref().unwrap_or(""),
+                            message.content
+                        ),
+                    })
+                }).collect::<Vec<_>>(),
+            }))?;
             let mut cfg = CallConfig::defaults_for(self.fast_model.clone())
                 .with_max_tokens(self.fast_max_tokens)
-                .with_stream_label("fast (lens gather)");
+                .with_stream_label("fast gather");
             if let Some(thinking) = self.fast_thinking {
                 cfg = cfg.with_thinking(thinking);
             }
@@ -2328,18 +2204,34 @@ impl AgentRunner {
                 cfg = cfg.with_max_input_tokens(n);
             }
             if let Some(lg) = &self.logger {
-                let label = format!("phase=fast-gather-lenses round={fast_rounds}");
-                lg.log_code_labeled("user", Some(&label), &logged_content, None, None);
+                let task = if ctx.task_brief.is_empty() {
+                    "task"
+                } else {
+                    &ctx.task_brief
+                };
+                let label = format!("phase=fast-gather task={task} round={fast_rounds}");
+                let meta = cfg.request_meta();
+                lg.log_code_user_request_content(
+                    Some(&label),
+                    &logged_content,
+                    &logged_request,
+                    Some(&meta),
+                );
             }
             let text = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fast call".into())),
-                r = self.fast_client.messages_streaming(&cfg, &messages) => {
-                    let resp = r.map_err(|e| AgentError::Other(e.to_string()))?;
+                r = self.fast_client.messages_streaming(&cfg, &history) => {
+                    let resp = r.map_err(AgentError::from)?;
                     record_usage(&self.usage, "fast", &self.fast_model, &resp.usage);
                     let t = extract_text(&resp);
                     if let Some(lg) = &self.logger {
                         let th = extract_thinking(&resp);
-                        let label = format!("phase=fast-gather-lenses round={fast_rounds}");
+                        let task = if ctx.task_brief.is_empty() {
+                            "task"
+                        } else {
+                            &ctx.task_brief
+                        };
+                        let label = format!("phase=fast-gather task={task} round={fast_rounds}");
                         lg.log_code_labeled_with_model(
                             "assistant",
                             Some(&label),
@@ -2352,7 +2244,11 @@ impl AgentRunner {
                     t
                 }
             };
-            let parsed = match validate_fast_gather_text_for_run(&text, disable_skill_reads, None) {
+            let parsed = match validate_fast_gather_text_for_run(
+                &text,
+                ctx.disable_skill_reads,
+                ctx.allowed_gather_kinds.as_ref(),
+            ) {
                 Ok(parsed) => parsed,
                 Err(errors) => {
                     kres_core::async_eprintln!(
@@ -2363,21 +2259,49 @@ impl AgentRunner {
                         .repair_fast_gather_response(
                             &text,
                             &errors,
-                            "fast lens gather schema repair",
+                            "fast gather schema repair",
                             shutdown,
                         )
                         .await?;
-                    if disable_skill_reads && !repaired.skill_reads.is_empty() {
-                        return Err(AgentError::Other(
-                            "fast lens gather response still requested skill_reads after repair, but skill reads are disabled for this run".into(),
-                        ));
+                    let policy_errors = fast_gather_run_policy_errors(
+                        &repaired,
+                        ctx.disable_skill_reads,
+                        ctx.allowed_gather_kinds.as_ref(),
+                    );
+                    if !policy_errors.is_empty() {
+                        return Err(AgentError::Other(format!(
+                            "fast gather response still violated run policy after repair: {}",
+                            policy_errors.join("; ")
+                        )));
                     }
                     repaired
                 }
             };
-            log_json_normalization(self.logger.as_deref(), &parsed, "fast-gather-lenses");
+            log_json_normalization(self.logger.as_deref(), &parsed, "fast-gather");
+            history.push(Message::plain(
+                "assistant",
+                serde_json::to_string(&json!({
+                    "analysis": &parsed.analysis,
+                    "followups": &parsed.followups,
+                    "skill_reads": &parsed.skill_reads,
+                    "ready_for_slow": parsed.ready_for_slow,
+                    "plan": &parsed.plan,
+                }))?,
+            ));
+            round_symbols.clear();
+            round_context.clear();
+            round_skills = None;
             if !parsed.skill_reads.is_empty() {
-                apply_skill_reads(&mut live_skills, &parsed.skill_reads);
+                let grafted: BTreeSet<String> =
+                    apply_skill_reads(&mut live_skills, &parsed.skill_reads)
+                        .into_iter()
+                        .collect();
+                task_skill_paths.extend(grafted.iter().cloned());
+                // Send only the files this round added; earlier ones remain in
+                // conversation history.
+                if let Some(live) = live_skills.as_ref() {
+                    round_skills = nonempty_object(project_skills(live, &grafted, true));
+                }
             }
             let only_skill_reads = parsed.followups.is_empty()
                 && !parsed.ready_for_slow
@@ -2432,12 +2356,23 @@ impl AgentRunner {
             }
             let fetched = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fetch".into())),
-                f = self.fetcher.fetch(&novel, plan) => f?,
+                f = self.fetcher.fetch(&novel, ctx.plan.as_ref()) => f?,
             };
-            symbols.extend(fetched.symbols);
-            context.extend(fetched.context);
+            let (fetched_symbols, fetched_context) =
+                crate::symbol::canonicalize_prompt_evidence(&fetched.symbols, &fetched.context);
+            for symbol in fetched_symbols {
+                if crate::symbol::append_prompt_evidence(&mut symbols, symbol.clone()) {
+                    round_symbols.push(symbol);
+                }
+            }
+            for item in fetched_context {
+                if crate::symbol::append_prompt_evidence(&mut context, item.clone()) {
+                    round_context.push(item);
+                }
+            }
         }
-        Ok((symbols, context, fast_rounds, live_skills))
+        let (symbols, context) = crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
+        Ok((symbols, context, fast_rounds, live_skills, task_skill_paths))
     }
 }
 
@@ -2474,15 +2409,18 @@ pub struct ConsolidatorClient {
 ///reads happen against the fast-agent's
 /// filesystem, and the file contents land in the FIRST skill's
 /// `files` map (most skills are singletons in practice).
-pub fn apply_skill_reads(skills: &mut Option<Value>, reads: &[String]) {
+/// Returns the paths actually grafted into the payload, in request order.
+/// A failed read still counts: its `[skill_read failed: ...]` marker is new
+/// bytes this task and belongs in the task-specific half of the split.
+pub fn apply_skill_reads(skills: &mut Option<Value>, reads: &[String]) -> Vec<String> {
     if reads.is_empty() {
-        return;
+        return Vec::new();
     }
     // Ensure there's a skills object to mutate.
     let obj = skills.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
     let map = match obj.as_object_mut() {
         Some(m) => m,
-        None => return,
+        None => return Vec::new(),
     };
     if map.is_empty() {
         // Create a synthetic "runtime" skill so the loop has
@@ -2507,10 +2445,12 @@ pub fn apply_skill_reads(skills: &mut Option<Value>, reads: &[String]) {
             files_entry.as_object_mut().unwrap()
         }
     };
+    let mut grafted = Vec::new();
     for path in reads {
         if path.is_empty() {
             continue;
         }
+        grafted.push(path.clone());
         match std::fs::read_to_string(path) {
             Ok(content) => {
                 files_map.insert(path.clone(), Value::String(content));
@@ -2552,6 +2492,86 @@ pub fn apply_skill_reads(skills: &mut Option<Value>, reads: &[String]) {
             }
         }
     }
+    grafted
+}
+
+#[derive(Default)]
+struct SynthesisSkills {
+    common: Option<Value>,
+    task: Option<Value>,
+}
+
+/// Split the live skill payload into the part that was present before this
+/// task ran and the files this task's `skill_reads` grafted in.
+///
+/// `apply_skill_reads` is the only mutator of the payload, so the set of paths
+/// it reported is an exact description of the difference — no tree diffing
+/// needed, and no risk of a structural comparison disagreeing with what was
+/// actually loaded. The union of the two halves is the live payload verbatim;
+/// this is a cache-layout split, not a reduction. `common` is byte-stable
+/// across tasks that share a base payload, so it can lead the cached prefix.
+fn split_skills_for_synthesis(
+    live: Option<&Value>,
+    task_paths: &BTreeSet<String>,
+) -> SynthesisSkills {
+    let Some(live) = live else {
+        return SynthesisSkills::default();
+    };
+    SynthesisSkills {
+        common: nonempty_object(project_skills(live, task_paths, false)),
+        task: nonempty_object(project_skills(live, task_paths, true)),
+    }
+}
+
+/// Project the skill payload onto `paths`. With `only_listed`, keep just those
+/// files (the task-selected half, which needs no scaffold — the common half
+/// already carries it). Otherwise keep everything except those files.
+fn project_skills(live: &Value, paths: &BTreeSet<String>, only_listed: bool) -> Value {
+    let mut projected = serde_json::Map::new();
+    let Some(skills) = live.as_object() else {
+        return Value::Object(projected);
+    };
+    for (skill_name, skill) in skills {
+        let Some(fields) = skill.as_object() else {
+            if !only_listed {
+                projected.insert(skill_name.clone(), skill.clone());
+            }
+            continue;
+        };
+        let mut kept = serde_json::Map::new();
+        for (field, value) in fields {
+            if field == "files" {
+                let mut files = serde_json::Map::new();
+                if let Some(live_files) = value.as_object() {
+                    for (path, body) in live_files {
+                        if paths.contains(path) == only_listed {
+                            files.insert(path.clone(), body.clone());
+                        }
+                    }
+                }
+                // The common half must reproduce the base payload byte for
+                // byte, including an empty `files` map, or a task that loads
+                // no guides and one that loads several emit different common
+                // bytes and lose the cross-task cache hit.
+                if !files.is_empty() || !only_listed {
+                    kept.insert(field.clone(), Value::Object(files));
+                }
+            } else if !only_listed {
+                kept.insert(field.clone(), value.clone());
+            }
+        }
+        if !kept.is_empty() {
+            projected.insert(skill_name.clone(), Value::Object(kept));
+        }
+    }
+    Value::Object(projected)
+}
+
+fn nonempty_object(value: Value) -> Option<Value> {
+    value
+        .as_object()
+        .is_some_and(|object| !object.is_empty())
+        .then_some(value)
 }
 
 /// When the agent emits a skill_read for a path that doesn't exist,
@@ -2705,6 +2725,22 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn low_effort_profile_preserves_thinking_shape() {
+        assert_eq!(
+            lower_thinking_effort(ThinkingBudget::Adaptive(Effort::XHigh), 128_000),
+            ThinkingBudget::Adaptive(Effort::Low)
+        );
+        assert_eq!(
+            lower_thinking_effort(ThinkingBudget::ExplicitBudget(32_000), 128_000),
+            ThinkingBudget::ExplicitBudget(1_024)
+        );
+        assert_eq!(
+            lower_thinking_effort(ThinkingBudget::Disabled, 128_000),
+            ThinkingBudget::Disabled
+        );
+    }
 
     #[test]
     fn secondary_slow_model_runs_only_workflow_supplemental_lens() {
@@ -2975,6 +3011,95 @@ mod tests {
         assert!(!r.followups.iter().all(|f| f.kind == "question"));
     }
 
+    #[test]
+    fn prompt_evidence_is_never_removed_for_size() {
+        let symbols = vec![
+            json!({"name": "old", "definition": "x".repeat(80)}),
+            json!({
+                "name": "new",
+                "definition": "small"
+            }),
+        ];
+        let context = vec![
+            json!({"source": "old", "content": "y".repeat(80)}),
+            json!({
+                "source": "new",
+                "content": "small"
+            }),
+        ];
+
+        let (preserved_symbols, preserved_context) =
+            crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
+
+        assert_eq!(preserved_symbols.len(), symbols.len());
+        assert_eq!(preserved_context.len(), context.len());
+        assert_eq!(preserved_symbols[0]["definition"], symbols[0]["definition"]);
+        assert_eq!(preserved_symbols[1]["definition"], symbols[1]["definition"]);
+        assert_eq!(preserved_context[0]["content"], context[0]["content"]);
+        assert_eq!(preserved_context[1]["content"], context[1]["content"]);
+    }
+
+    #[test]
+    fn every_prior_finding_reaches_the_prompt_with_its_source_intact() {
+        fn finding(id: &str) -> Finding {
+            Finding {
+                id: id.into(),
+                title: id.into(),
+                severity: kres_core::Severity::Medium,
+                status: kres_core::Status::Active,
+                relevant_symbols: Vec::new(),
+                relevant_file_sections: Vec::new(),
+                summary: "summary".into(),
+                reproducer_sketch: "reproducer".into(),
+                impact: "impact".into(),
+                mechanism_detail: None,
+                fix_sketch: None,
+                open_questions: Vec::new(),
+                first_seen_task: None,
+                last_updated_task: None,
+                first_seen_at: None,
+                related_finding_ids: Vec::new(),
+                details: Vec::new(),
+                reactivate: false,
+                introduced_by: None,
+            }
+        }
+
+        // A finding anchored somewhere the task never mentions is still sent
+        // in full: cross-file contract review depends on seeing its source.
+        let mut anchored_elsewhere = finding("elsewhere");
+        anchored_elsewhere
+            .relevant_symbols
+            .push(kres_core::findings::RelevantSymbol {
+                name: "other_fn".into(),
+                filename: "other.c".into(),
+                line: 20,
+                definition: "y".repeat(1_100_000),
+            });
+        let mut anchored_here = finding("here");
+        anchored_here
+            .relevant_symbols
+            .push(kres_core::findings::RelevantSymbol {
+                name: "target_fn".into(),
+                filename: "target.c".into(),
+                line: 10,
+                definition: "x".repeat(1_100_000),
+            });
+
+        let input = vec![anchored_elsewhere, anchored_here];
+        let shipped = kres_core::redact_findings_for_agent(&input);
+
+        assert_eq!(shipped.len(), 2);
+        for finding in &shipped {
+            assert_eq!(
+                finding.relevant_symbols[0].definition.len(),
+                1_100_000,
+                "finding {} lost its source body",
+                finding.id
+            );
+        }
+    }
+
     /// `apply_skill_reads` must graft the requested file into the
     /// first skill's `files` map so a subsequent gather round (and
     /// the lens slow agents that read `live_skills`) see it.
@@ -3002,6 +3127,135 @@ mod tests {
         assert_eq!(body, "hello skill body");
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn synthesis_skills_split_stable_common_from_task_selected_guides() {
+        let live = json!({
+            "kernel": {
+                "content": "stable scaffold",
+                "files": {
+                    "/prompts/technical-patterns.md": "stable patterns",
+                    "/prompts/subsystem/subsystem.md": "routing index",
+                    "/prompts/subsystem/mm-reclaim.md": "selected guide"
+                }
+            }
+        });
+        let task_paths = BTreeSet::from(["/prompts/subsystem/mm-reclaim.md".to_string()]);
+
+        let split = split_skills_for_synthesis(Some(&live), &task_paths);
+        let common = split.common.unwrap();
+        let task = split.task.unwrap();
+
+        // Common half keeps the scaffold and everything loaded at startup,
+        // including the routing index — it is byte-stable, so it cache-hits
+        // rather than needing to be dropped.
+        assert_eq!(common["kernel"]["content"], "stable scaffold");
+        assert_eq!(
+            common["kernel"]["files"]["/prompts/technical-patterns.md"],
+            "stable patterns"
+        );
+        assert_eq!(
+            common["kernel"]["files"]["/prompts/subsystem/subsystem.md"],
+            "routing index"
+        );
+        assert!(common["kernel"]["files"]
+            .get("/prompts/subsystem/mm-reclaim.md")
+            .is_none());
+
+        // Task half carries only what this task loaded, with no scaffold.
+        assert_eq!(
+            task["kernel"]["files"]["/prompts/subsystem/mm-reclaim.md"],
+            "selected guide"
+        );
+        assert_eq!(task["kernel"]["files"].as_object().unwrap().len(), 1);
+        assert!(task["kernel"].get("content").is_none());
+    }
+
+    #[test]
+    fn synthesis_skill_halves_reunite_into_the_live_payload() {
+        // The split is a cache-layout decision. Every byte the fast agent had
+        // after gathering must still reach synthesis across the two halves.
+        let live = json!({
+            "kernel": {
+                "content": "scaffold",
+                "files": {
+                    "/a.md": "base",
+                    "/b.md": "loaded this task",
+                    "/c.md": "[skill_read failed: not found]"
+                }
+            },
+            "other": {"content": "second skill", "files": {}}
+        });
+        let task_paths = BTreeSet::from(["/b.md".to_string(), "/c.md".to_string()]);
+
+        let split = split_skills_for_synthesis(Some(&live), &task_paths);
+
+        let mut union = split.common.unwrap();
+        let task = split.task.unwrap();
+        for (skill, fields) in task.as_object().unwrap() {
+            let files = fields["files"].as_object().unwrap();
+            let target = union[skill]["files"].as_object_mut().unwrap();
+            for (path, body) in files {
+                target.insert(path.clone(), body.clone());
+            }
+        }
+        assert_eq!(union, live);
+    }
+
+    #[test]
+    fn a_failed_skill_read_stays_in_the_task_half() {
+        // A failure marker is new bytes this task produced; it belongs with
+        // the task-selected files, not the byte-stable common prefix.
+        let live = json!({
+            "kernel": {
+                "content": "scaffold",
+                "files": {"/missing.md": "[skill_read failed: not found]"}
+            }
+        });
+        let task_paths = BTreeSet::from(["/missing.md".to_string()]);
+
+        let split = split_skills_for_synthesis(Some(&live), &task_paths);
+
+        assert_eq!(
+            split.task.unwrap()["kernel"]["files"]["/missing.md"],
+            "[skill_read failed: not found]"
+        );
+        // Common reproduces the base payload exactly: scaffold plus an empty
+        // files map, which is what a task loading nothing would also emit.
+        let common = split.common.unwrap();
+        assert_eq!(common["kernel"]["content"], "scaffold");
+        assert_eq!(
+            common["kernel"]["files"].as_object().unwrap().len(),
+            0,
+            "the failure marker must not leak into the stable prefix"
+        );
+    }
+
+    #[test]
+    fn gather_cache_markers_leave_room_for_cached_system_prompt() {
+        fn marker_count(value: &Value) -> usize {
+            match value {
+                Value::Array(values) => values.iter().map(marker_count).sum(),
+                Value::Object(values) => {
+                    usize::from(values.contains_key("cache_control"))
+                        + values.values().map(marker_count).sum::<usize>()
+                }
+                _ => 0,
+            }
+        }
+
+        let mut history = vec![
+            Message::plain("user", "evidence").with_cached_prefix("stable task scope"),
+            Message::plain("assistant", "decision"),
+            Message::cached("user", "new evidence delta"),
+        ];
+        history[0].cache = true;
+        mark_last_n_user_cached(&mut history, 2);
+
+        let serialized = serde_json::to_value(&history).unwrap();
+        assert_eq!(marker_count(&serialized), 3);
+        assert!(marker_count(&serialized) < 4);
     }
 
     /// Regression for the FIX-flow vfs.md miss: agent emitted

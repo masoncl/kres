@@ -8,11 +8,8 @@ pub enum LlmError {
     #[error("API returned status {status}: {body}")]
     ApiStatus { status: u16, body: String },
 
-    /// Provider reported (or kres preemptively detected) that the
-    /// input exceeds the model's per-request token limit. Returned
-    /// only when the caller set `CallConfig::surface_over_input_limit`;
-    /// otherwise the client internally shrinks the last user
-    /// message and retries.
+    /// Provider reported that the input exceeds the model's per-request token
+    /// capability. The original request is left byte-for-byte intact.
     #[error("input over limit: actual={actual} limit={limit}")]
     OverInputLimit { actual: u64, limit: u64 },
 

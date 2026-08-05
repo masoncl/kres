@@ -21,10 +21,8 @@ pub struct CallConfig {
     /// reuse the same system. Matches for all four
     /// agents.
     pub system_cached: bool,
-    /// Soft input-token ceiling. When a 429 arrives AND the exact
-    /// payload size from `count_tokens` exceeds this, the retry path
-    /// shrinks the last user turn. `None` means "never shrink; just
-    /// wait and retry". Maps to config.
+    /// Provider/model input capability used to distinguish a size rejection
+    /// from an ordinary rate limit. Kres never edits a request to fit it.
     pub max_input_tokens: Option<u32>,
     /// Display label for the active-streams registry (e.g. "fast
     /// round 2", "slow lens memory"). When Some, `messages_streaming`
@@ -32,13 +30,6 @@ pub struct CallConfig {
     /// updates its token counters from `message_start` /
     /// `message_delta` events. None = silent call.
     pub stream_label: Option<String>,
-    /// When true, the non-streaming `messages` retry path returns
-    /// `LlmError::OverInputLimit` instead of internally shrinking
-    /// the last user message text on a 429-with-over-limit. Lets
-    /// the caller perform structured shrinking (e.g. prune the
-    /// workflow step's `prior_attempts`) and re-issue the call.
-    /// Default false preserves the existing auto-shrink behavior.
-    pub surface_over_input_limit: bool,
 }
 
 impl CallConfig {
@@ -57,13 +48,7 @@ impl CallConfig {
             system_cached: true,
             max_input_tokens: None,
             stream_label: None,
-            surface_over_input_limit: false,
         }
-    }
-
-    pub fn with_surface_over_input_limit(mut self, surface: bool) -> Self {
-        self.surface_over_input_limit = surface;
-        self
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
@@ -129,6 +114,18 @@ impl CallConfig {
         kres_core::RequestMeta {
             model: self.model.id.clone(),
             max_tokens: self.max_tokens,
+            system_chars: self.system.as_ref().map_or(0, String::len),
+            system_fingerprint: self.system.as_ref().map(|system| {
+                format!(
+                    "{:016x}",
+                    system
+                        .as_bytes()
+                        .iter()
+                        .fold(0xcbf29ce484222325u64, |hash, byte| {
+                            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+                        })
+                )
+            }),
             thinking,
             effort,
             budget_tokens,
@@ -163,6 +160,7 @@ mod tests {
     fn request_meta_carries_xhigh_effort() {
         let cfg = CallConfig::defaults_for(Model::opus_4_7())
             .with_max_tokens(64_000)
+            .with_system("stable system prompt")
             .with_thinking(ThinkingBudget::Adaptive(crate::model::Effort::XHigh));
         let meta = cfg.request_meta();
         assert_eq!(meta.model, "claude-opus-4-7");
@@ -170,6 +168,8 @@ mod tests {
         assert_eq!(meta.thinking.as_deref(), Some("adaptive"));
         assert_eq!(meta.effort.as_deref(), Some("xhigh"));
         assert!(meta.budget_tokens.is_none());
+        assert_eq!(meta.system_chars, "stable system prompt".len());
+        assert!(meta.system_fingerprint.is_some());
     }
 
     #[test]

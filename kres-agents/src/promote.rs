@@ -146,12 +146,9 @@ pub async fn promote_prose_bugs_with_logger(
         return Ok(PromoteOutcome::default());
     }
 
-    // Cap task_brief like the consolidator does so a long operator
-    // prompt doesn't dominate the context window.
-    let brief_capped: String = task_brief.chars().take(300).collect();
     let request = PromoteRequest {
         task: "promote_prose_bugs",
-        task_brief: &brief_capped,
+        task_brief,
         existing_findings: prose_relevant_existing,
         analysis,
         instructions: PROMOTE_INSTRUCTIONS,
@@ -179,7 +176,15 @@ pub async fn promote_prose_bugs_with_logger(
         cached_prefix: None,
     }];
     if let Some(lg) = &logger {
-        lg.log_code("user", &messages[0].content, None, None);
+        let request = cfg.request_meta();
+        lg.log_code_labeled_with_request(
+            "user",
+            Some("phase=promote"),
+            &messages[0].content,
+            None,
+            None,
+            Some(&request),
+        );
     }
     let resp = match cancel.clone() {
         Some(notify) => tokio::select! {
@@ -195,7 +200,7 @@ pub async fn promote_prose_bugs_with_logger(
         },
         None => client.messages_streaming(&cfg, &messages).await,
     }
-    .map_err(|e| AgentError::Other(e.to_string()))?;
+    .map_err(AgentError::from)?;
     if let Some(usage) = &usage {
         usage.record(
             "promote",

@@ -283,14 +283,21 @@ pub async fn repair_json_response(
     };
     let body = serde_json::to_string(&request)?;
     let label = format!("json-repair contract={}", call.contract.name);
-    log_turn(&call.logger, call.log_kind, "user", &label, &body, None);
-
     let cfg = repair_call_config(
         call.model,
         call.max_tokens,
         call.max_input_tokens,
         call.thinking,
         label.clone(),
+    );
+    log_turn(
+        &call.logger,
+        call.log_kind,
+        "user",
+        &label,
+        &body,
+        None,
+        Some(&cfg.request_meta()),
     );
     let messages = vec![Message {
         role: "user".into(),
@@ -306,7 +313,7 @@ pub async fn repair_json_response(
     } else {
         call.client.messages_streaming(&cfg, &messages).await
     }
-    .map_err(|error| AgentError::Other(error.to_string()))?;
+    .map_err(AgentError::from)?;
     let text = response
         .content
         .iter()
@@ -328,6 +335,7 @@ pub async fn repair_json_response(
         &label,
         &text,
         Some(usage),
+        None,
     );
     Ok(JsonRepairResult {
         text,
@@ -342,11 +350,14 @@ fn log_turn(
     label: &str,
     text: &str,
     usage: Option<LoggedUsage>,
+    request: Option<&kres_core::RequestMeta>,
 ) {
     let Some(logger) = logger else { return };
     match kind {
-        RepairLogKind::Code => logger.log_code_labeled(role, Some(label), text, usage, None),
-        RepairLogKind::Main => logger.log_main(role, text, usage, None),
+        RepairLogKind::Code => {
+            logger.log_code_labeled_with_request(role, Some(label), text, usage, None, request)
+        }
+        RepairLogKind::Main => logger.log_main_with_request(role, text, usage, None, request),
     }
 }
 

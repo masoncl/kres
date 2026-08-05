@@ -681,6 +681,11 @@ impl TaskManager {
         g.context_cache.get(&key.to_string()).cloned()
     }
 
+    pub async fn remove_cached_context(&self, key: &str) -> Option<serde_json::Value> {
+        let mut g = self.caches.lock().await;
+        g.context_cache.remove(&key.to_string())
+    }
+
     pub async fn cached_symbol_names(&self) -> Vec<String> {
         let g = self.caches.lock().await;
         g.symbol_cache.keys()
@@ -1293,6 +1298,10 @@ impl<K: Eq + std::hash::Hash + Clone, V> LruCache<K, V> {
         let val = self.map.get_mut(k)?;
         val.1 = tick;
         Some(&val.0)
+    }
+
+    pub fn remove(&mut self, k: &K) -> Option<V> {
+        self.map.remove(k).map(|(value, _)| value)
     }
 
     pub fn keys(&self) -> Vec<K> {

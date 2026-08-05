@@ -92,11 +92,11 @@ the finding's `details`. Same task_id overwrites; different
 task_ids append. This is store-local diagnostic history. Summary validation
 redacts it before exporting a finding to the validation agents.
 
-**`details` never goes back to an agent.** Agent-bound slices go
-through `kres_core::redact_findings_for_agent` first — applied in
-the slow-agent `previous_findings` path and in the promoter's
-inputs. An incoming delta that tries to populate `details` itself
-is stripped at add-time.
+**`details` never goes back to an agent.** Relevant agent-bound findings go
+through `kres_core::redact_findings_for_agent`; unrelated findings are reduced
+to source-body-free manifests that retain every semantic conclusion, open
+question, relationship, attribution, and source anchor. An incoming delta that tries to populate
+`details` itself is stripped at add-time.
 
 ## Storage
 

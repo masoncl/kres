@@ -2,8 +2,37 @@
 
 The prompt JSON is the user message sent to fast and slow code-agent turns. It
 provides source context and a question for the current phase to analyze. Fast
-gather rounds receive newly fetched evidence plus `previously_fetched`; the
-final slow turn receives the accumulated context.
+gather uses one conversation: its first turn carries seed evidence and later
+turns append only new records. The final slow turn receives the complete
+canonical accumulated evidence.
+
+## Wire framing: one or two documents
+
+The schema below describes the logical prompt. On the wire it is sent as one or
+two consecutive JSON documents in separate cacheable text blocks:
+
+- a **stable** document with the fields that do not change across related calls
+  — the gather conversation's first turn, or every lens in one fan-out;
+- a **delta** document with the fields specific to this call.
+
+Every field lands in exactly one document, and the union is the logical prompt
+above. An empty delta is `{}`. The stable document ends with a newline, so the
+pair reads as two whitespace-separated JSON values.
+
+The split exists so the stable bytes can be cached once and reused: all lenses
+over one task cache-read identical evidence, and gather round 2 reuses round
+1's task scope. `CodePrompt::to_split_documents` produces both halves;
+`to_delta_document` produces just the delta for a caller that already holds the
+stable bytes. When a prompt has no stable field the stable document is empty
+and the caller sends the whole prompt as one block.
+
+Each half is a complete JSON document that parses on its own. An earlier
+version instead spliced one object across the block boundary — chopping the
+closing brace off the first half and the opening brace off the second — which
+made neither half independently parseable and required an `_empty_tail`
+sentinel key to keep an empty second half syntactically legal. Log tooling must
+therefore read a payload as a *stream* of JSON values, not a single one; see
+`turn_documents` in `kres-core/src/log.rs`.
 
 ## Schema
 
@@ -27,10 +56,10 @@ final slow turn receives the accumulated context.
       "content": "string — raw content"
     }
   ],
-  "previously_fetched": {},
   "previous_findings": [],
   "parallel_lenses": [],
   "lens_instruction": "string",
+  "common_skills": {},
   "skills": {},
   "plan": {},
   "plan_rewrite_allowed": true
@@ -52,11 +81,11 @@ final slow turn receives the accumulated context.
 | `symbols` | array  | Array of symbol objects providing source code context. |
 | `context` | array  | Array of general context objects from tool results.    |
 | `skills`  | object | Dict of skill name → {content, files} for domain knowledge. |
-| `previously_fetched` | object | Manifest of evidence already gathered for this task. |
-| `previous_findings` | array | Current findings, redacted to remove store-owned narrative/provenance fields. |
+| `common_skills` | object | Byte-stable skill scaffold/common files; combine with task-selected `skills`. |
+| `previous_findings` | array | Every current session finding, in full, redacted only to remove store-owned narrative/provenance fields. Sent once in the shared cached prefix so parallel lenses cache-read the same bytes. |
 | `parallel_lenses` | value | Workflow-defined lens metadata for lensed slow calls. |
 | `lens_instruction` | string | Instruction for the current lens. |
-| `plan` | object | Current session plan, forwarded to fast and slow turns. |
+| `plan` | object | Compact session plan with goal, mode, explicit `active_step_id`, and steps. |
 | `plan_rewrite_allowed` | boolean | Permits the first eligible non-review slow turn to return a replacement step list. |
 
 ## Symbol object

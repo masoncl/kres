@@ -32,10 +32,24 @@ Every round-trip is logged to `.kres/logs/<session-uuid>/`.
 
 ## Building up a larger review
 
-A named-file `--prompt 'review: path/to/file.c'` first runs one file survey
-and one non-lensed slow ranking call. The primary slow model then authors a
-bounded semantic plan whose linked todos enter the normal task loop. Review
-followups are reconciled by dedicated goal/todo clients backed by that primary
+A named-file `--prompt 'review: path/to/file.c'` first uses rename-aware `gix`
+history to build one target-file diff from immediately before the oldest relevant
+change in the six-month window to the current working-tree file, including dirty edits.
+One low-effort slow-agent call assesses that net diff; if the combined diff and
+target source are large, the diff is partitioned at hunk or line boundaries. Each
+diff chunk retains complete current-source context when possible; independently large
+source scopes are crossed with every diff chunk rather than paired by ordinal. The
+low-effort calls run in parallel, and another low-effort inference reconciles
+fixes and contradictions across all partial reports. The completed assessment is atomically checkpointed
+beside `session.json`. It then runs one
+file survey and one non-lensed slow ranking call. When semcode cannot
+produce a structured survey, typed slow fallback calls inventory lossless source partitions while
+preserving the local grep evidence. Rust uses the file-survey inventory to reject incomplete
+or invented function coverage; missing authoritative functions force a corrective
+assessment instead of receiving fabricated zero ratings. The combined function ratings,
+interaction-filtered external research questions, and final file risk inform a
+semantic plan authored by the primary slow model. Its linked todos enter the
+normal task loop. Review followups are reconciled by dedicated goal/todo clients backed by that primary
 slow model; generic sessions continue to use the configured main/todo roles.
 To work through pending items interactively:
 

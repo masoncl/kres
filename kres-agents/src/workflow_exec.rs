@@ -132,113 +132,11 @@ pub fn walk_dotted_path<S: AsRef<str>>(start: Value, rest: &[S]) -> Result<Value
 impl StepState {
     /// Render `prior_attempts` as a `serde_json::Value` for use by
     /// the interpolation engines (`{{<step>.prior_attempts}}`).
-    /// Returns the full unpruned payload; callers that need to fit
-    /// into a budget (e.g. after a provider rejection for
-    /// over-input-limit) should call
-    /// [`Self::prior_attempts_value_pruned`] explicitly.
+    /// Returns every recorded field from every attempt. Workflow history is
+    /// never shortened to fit a request.
     pub fn prior_attempts_value(&self) -> Value {
         serde_json::to_value(&self.prior_attempts)
             .expect("Vec<Map<String, Value>> serialize is infallible")
-    }
-
-    /// One-step destructive prune of `prior_attempts`, used by the
-    /// rejection-driven shrink path. Returns `true` if the prune
-    /// changed state, `false` if nothing more can be pruned.
-    ///
-    /// Three tiers, applied in order until any one of them removes
-    /// data:
-    /// 1. Drop `code_edits` and `code_output` from the oldest entry
-    ///    that still has either (the verbatim hunk payload — by far
-    ///    the largest fields).
-    /// 2. Reduce the oldest non-analysis-only entry to its
-    ///    `analysis` field only.
-    /// 3. Drop the oldest entry outright.
-    ///
-    /// The shrink loop calls this repeatedly while the provider
-    /// keeps returning `LlmError::OverInputLimit`.
-    pub fn prune_one_prior_attempt(&mut self) -> bool {
-        for entry in self.prior_attempts.iter_mut() {
-            let a = entry.remove("code_edits").is_some();
-            let b = entry.remove("code_output").is_some();
-            if a || b {
-                return true;
-            }
-        }
-        for entry in self.prior_attempts.iter_mut() {
-            let only_analysis = entry.len() == 1 && entry.contains_key("analysis");
-            if only_analysis {
-                continue;
-            }
-            let analysis = entry.remove("analysis");
-            entry.clear();
-            if let Some(a) = analysis {
-                entry.insert("analysis".into(), a);
-            }
-            return true;
-        }
-        if !self.prior_attempts.is_empty() {
-            self.prior_attempts.remove(0);
-            return true;
-        }
-        false
-    }
-
-    /// Render `prior_attempts` into a `Value::Array`, stripping
-    /// heavy payload fields from oldest entries first until the
-    /// serialized representation fits inside `max_bytes`. Two
-    /// tiers, applied oldest-first:
-    ///
-    /// 1. Drop `code_edits` and `code_output` (the verbatim hunk
-    ///    payload — by far the largest fields).
-    /// 2. Reduce the entry to `analysis` only, dropping every
-    ///    other metadata field.
-    ///
-    /// If both tiers exhaust without fitting, the partially-pruned
-    /// array is returned as-is. Used by the rejection-driven
-    /// shrink path (see the workflow runner's `OverInputLimit`
-    /// handler) — not invoked from the default
-    /// [`Self::prior_attempts_value`] render.
-    pub fn prior_attempts_value_pruned(&self, max_bytes: usize) -> Value {
-        let mut entries: Vec<Value> = self
-            .prior_attempts
-            .iter()
-            .map(|m| serde_json::to_value(m).unwrap_or_else(|_| Value::Object(Map::new())))
-            .collect();
-
-        let fits = |entries: &[Value]| -> bool {
-            serde_json::to_string(&Value::Array(entries.to_vec()))
-                .map(|s| s.len() <= max_bytes)
-                .unwrap_or(true)
-        };
-
-        if fits(&entries) {
-            return Value::Array(entries);
-        }
-
-        for i in 0..entries.len() {
-            if let Value::Object(m) = &mut entries[i] {
-                m.remove("code_edits");
-                m.remove("code_output");
-            }
-            if fits(&entries) {
-                return Value::Array(entries);
-            }
-        }
-
-        for i in 0..entries.len() {
-            if let Value::Object(m) = &mut entries[i] {
-                let analysis = m.remove("analysis");
-                m.clear();
-                if let Some(a) = analysis {
-                    m.insert("analysis".into(), a);
-                }
-            }
-            if fits(&entries) {
-                return Value::Array(entries);
-            }
-        }
-
-        Value::Array(entries)
     }
 
     /// Single lookup for a `{{<step>.<name>}}` or bare `{{<name>}}`
@@ -368,14 +266,12 @@ pub enum LensFanOutConsolidate {
 /// driver has decided the step cannot be retried within this run.
 /// Typed error from [`Driver::run`]. Lets the exec loop tell apart
 /// "provider rejected the input as over the per-request token
-/// limit" (which the loop responds to by pruning the step's
-/// `prior_attempts` and reissuing) from every other failure (which
-/// goes through the usual `retry_driver_error` budget).
+/// limit" from every other failure. The executor never responds by deleting
+/// model input.
 #[derive(Debug, thiserror::Error)]
 pub enum DriverError {
     /// Provider returned an over-input-limit rejection. The exec
-    /// loop catches this and calls
-    /// [`StepState::prune_one_prior_attempt`] before retrying.
+    /// loop preserves the complete request and reports the failure.
     #[error("OverInputLimit step={step} actual={actual} limit={limit}")]
     OverInputLimit {
         step: String,
@@ -1770,36 +1666,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         };
 
         let outputs = if step.lenses.is_empty() {
-            // Plain step: one driver call, with `prior_attempts`
-            // prune-and-retry when the provider rejects the input
-            // as over the token limit. The driver returns
-            // `DriverError::OverInputLimit` for that signal; every
-            // other failure flows through the standard
-            // `retry_driver_error` budget below.
-            let driver_result = loop {
-                let driver_ctx_iter = ExecContext {
-                    workflow_inputs: &inputs,
-                    steps: &state,
-                };
-                let r = driver.run(step, attempt, &driver_ctx_iter, None).await;
-                match &r {
-                    Err(err @ DriverError::OverInputLimit { .. }) => {
-                        let pruned = state
-                            .get_mut(&step.id)
-                            .map(|st| st.prune_one_prior_attempt())
-                            .unwrap_or(false);
-                        if pruned {
-                            kres_core::async_eprintln!(
-                                "[over-limit] {err} — pruned one prior_attempts tier for step '{}'; retrying",
-                                step.id
-                            );
-                            continue;
-                        }
-                        break r;
-                    }
-                    _ => break r,
-                }
-            };
+            let driver_result = driver.run(step, attempt, &driver_ctx, None).await;
             match driver_result {
                 Ok(o) => o,
                 Err(e) => {
@@ -3634,10 +3501,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_one_prior_attempt_walks_three_tiers_in_order() {
-        // Tier 1: code_edits/code_output from oldest entry that has
-        // either. Tier 2: reduce oldest non-analysis-only entry to
-        // analysis-only. Tier 3: drop the oldest entry outright.
+    fn prior_attempts_value_preserves_every_field() {
         let mut st = StepState::default();
         for i in 0..2 {
             let mut entry = Map::new();
@@ -3649,132 +3513,15 @@ mod tests {
             );
             st.prior_attempts.push(entry);
         }
-
-        // Tier 1, oldest-first: oldest entry loses code_edits.
-        assert!(st.prune_one_prior_attempt());
-        assert!(!st.prior_attempts[0].contains_key("code_edits"));
-        assert!(st.prior_attempts[1].contains_key("code_edits"));
-
-        // Tier 1 again: second entry loses code_edits.
-        assert!(st.prune_one_prior_attempt());
-        assert!(!st.prior_attempts[1].contains_key("code_edits"));
-
-        // Tier 2: oldest entry now reduces to analysis-only.
-        assert!(st.prune_one_prior_attempt());
-        assert_eq!(st.prior_attempts[0].len(), 1);
-        assert!(st.prior_attempts[0].contains_key("analysis"));
-
-        // Tier 2 again: second entry reduces to analysis-only.
-        assert!(st.prune_one_prior_attempt());
-        assert_eq!(st.prior_attempts[1].len(), 1);
-
-        // Tier 3: drop the oldest entry.
-        assert!(st.prune_one_prior_attempt());
-        assert_eq!(st.prior_attempts.len(), 1);
-
-        // Tier 3 again: drop the last entry.
-        assert!(st.prune_one_prior_attempt());
-        assert!(st.prior_attempts.is_empty());
-
-        // Nothing left.
-        assert!(!st.prune_one_prior_attempt());
-    }
-
-    #[test]
-    fn prior_attempts_value_pruned_keeps_payload_under_budget() {
-        // Two small entries with code_edits should sit well under the
-        // 50 KB cap; no pruning needed.
-        let mut st = StepState::default();
-        for i in 0..2 {
-            let mut entry = Map::new();
-            entry.insert("analysis".into(), Value::String(format!("attempt {i}")));
-            entry.insert(
-                "code_edits".into(),
-                json!([{"file_path": "a.c", "old_string": "x", "new_string": "y"}]),
-            );
-            st.prior_attempts.push(entry);
-        }
-        // Generous budget so two small entries with code_edits fit
-        // without pruning.
-        let v = st.prior_attempts_value_pruned(50_000);
+        let expected = serde_json::to_value(&st.prior_attempts).unwrap();
+        let v = st.prior_attempts_value();
+        assert_eq!(v, expected);
         let arr = v.as_array().expect("array");
         assert_eq!(arr.len(), 2);
         for entry in arr {
             assert!(entry.get("code_edits").is_some(), "code_edits preserved");
             assert!(entry.get("analysis").is_some(), "analysis preserved");
         }
-    }
-
-    #[test]
-    fn prior_attempts_value_pruned_strips_oldest_code_edits_first() {
-        // Three entries, each carrying enough code_edits payload that
-        // the array exceeds a tight budget. With the budget set to
-        // roughly two entries' worth, the oldest entry should lose
-        // its code_edits/code_output and keep analysis; newer entries
-        // retain the full payload.
-        let big_blob = "x".repeat(1_000);
-        let mut st = StepState::default();
-        for i in 0..3 {
-            let mut entry = Map::new();
-            entry.insert("analysis".into(), Value::String(format!("attempt {i}")));
-            entry.insert(
-                "code_edits".into(),
-                json!([{
-                    "file_path": "kernel/bpf/helpers.c",
-                    "old_string": big_blob.clone(),
-                    "new_string": big_blob.clone(),
-                }]),
-            );
-            st.prior_attempts.push(entry);
-        }
-        let v = st.prior_attempts_value_pruned(2_500);
-        let arr = v.as_array().expect("array");
-        assert_eq!(arr.len(), 3, "no entries dropped");
-        assert!(
-            arr[0].get("code_edits").is_none(),
-            "oldest entry's code_edits stripped: {arr:?}"
-        );
-        assert_eq!(
-            arr[0].get("analysis").and_then(Value::as_str),
-            Some("attempt 0"),
-            "oldest entry's analysis preserved"
-        );
-        assert!(
-            arr[2].get("code_edits").is_some(),
-            "newest entry keeps code_edits"
-        );
-    }
-
-    #[test]
-    fn prior_attempts_value_pruned_reduces_to_analysis_only_under_severe_pressure() {
-        // Force a very tight budget so even stripping every entry's
-        // code_edits is not enough — the tier-2 reducer must drop
-        // everything except analysis from oldest entries first.
-        let big_blob = "y".repeat(200);
-        let mut st = StepState::default();
-        for i in 0..3 {
-            let mut entry = Map::new();
-            entry.insert("analysis".into(), Value::String(format!("attempt {i}")));
-            entry.insert("changed_files".into(), json!(["a.c", "b.c", "c.c"]));
-            entry.insert("review_dispute".into(), Value::String(big_blob.clone()));
-            entry.insert(
-                "code_edits".into(),
-                json!([{"file_path": "a.c", "old_string": big_blob.clone(), "new_string": big_blob.clone()}]),
-            );
-            st.prior_attempts.push(entry);
-        }
-        // Budget that fits roughly one analysis-only entry plus the
-        // newest full entry.
-        let v = st.prior_attempts_value_pruned(800);
-        let arr = v.as_array().expect("array");
-        assert_eq!(arr.len(), 3, "no entries dropped");
-        // Oldest entry must be analysis-only.
-        let m0 = arr[0].as_object().expect("object");
-        assert_eq!(m0.len(), 1, "oldest entry has only analysis: {m0:?}");
-        assert_eq!(
-            m0.get("analysis").and_then(Value::as_str),
-            Some("attempt 0")
-        );
     }
 
     #[test]
@@ -7467,12 +7214,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn over_input_limit_prunes_prior_attempts_and_retries() {
-        // The exec loop must catch `DriverError::OverInputLimit` and
-        // drive prune_one_prior_attempt on the step's state before
-        // reissuing the driver call. Once the prior_attempts have
-        // been pruned enough that the driver returns Ok, the step
-        // settles successfully.
+    async fn over_input_limit_never_mutates_prior_attempts() {
         let wf_json = json!({
             "$schema_version": 1,
             "id": "over-limit-wf",
@@ -7485,11 +7227,11 @@ mod tests {
         });
         let wf = parse_workflow(&wf_json.to_string()).unwrap();
 
-        struct OverLimitThenOk {
+        struct AlwaysOverLimit {
             calls: std::sync::Arc<std::sync::Mutex<u32>>,
         }
         #[async_trait]
-        impl Driver for OverLimitThenOk {
+        impl Driver for AlwaysOverLimit {
             async fn run(
                 &self,
                 step: &Step,
@@ -7499,24 +7241,18 @@ mod tests {
             ) -> Result<Map<String, Value>, DriverError> {
                 let mut c = self.calls.lock().unwrap();
                 *c += 1;
-                if *c <= 2 {
-                    return Err(DriverError::OverInputLimit {
-                        step: step.id.clone(),
-                        actual: 1000,
-                        limit: 500,
-                    });
-                }
-                Ok(serde_json::from_value(json!({"analysis": "ok"})).unwrap())
+                Err(DriverError::OverInputLimit {
+                    step: step.id.clone(),
+                    actual: 1000,
+                    limit: 500,
+                })
             }
         }
         let calls = std::sync::Arc::new(std::sync::Mutex::new(0u32));
-        let mut driver = OverLimitThenOk {
+        let mut driver = AlwaysOverLimit {
             calls: calls.clone(),
         };
 
-        // Seed two prior_attempts entries each with code_edits, so
-        // two OverInputLimit prunes can strip code_edits oldest-first
-        // and leave the data behind for assertions.
         let seed_with_code_edits = |id: &str| {
             let mut m = Map::new();
             m.insert("analysis".into(), Value::String(format!("attempt {id}")));
@@ -7540,23 +7276,18 @@ mod tests {
         };
         let trace = crate::workflow_exec::run_resume(&wf, &mut driver, snapshot, None, 50).await;
 
-        assert!(matches!(
-            trace.status,
-            WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
-        ));
+        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
         let final_calls = *calls.lock().unwrap();
         assert_eq!(
-            final_calls, 3,
-            "driver.run called 3 times: 2 OverInputLimit + 1 Ok"
+            final_calls, 1,
+            "a byte-identical retry cannot make progress"
         );
         let st = trace.final_state.get("writer").expect("step state");
         assert_eq!(st.prior_attempts.len(), 2, "no entries dropped");
-        // Two tier-1 prunes oldest-first: both entries lose
-        // code_edits, analysis remains.
         for (i, entry) in st.prior_attempts.iter().enumerate() {
             assert!(
-                !entry.contains_key("code_edits"),
-                "entry {i} should have had code_edits pruned: {entry:?}"
+                entry.contains_key("code_edits"),
+                "entry {i} must keep code_edits: {entry:?}"
             );
             assert!(
                 entry.contains_key("analysis"),

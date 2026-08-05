@@ -10,7 +10,7 @@
 //!   - optional session-wide lenses
 //!
 //! The module packages that into a JSON request (with
-//! `analysis_citations`, REPRIORITIZE + DEDUP + COVERAGE instructions)
+//! REPRIORITIZE + DEDUP + COVERAGE instructions)
 //! and sends it through a dedicated todo-agent inference. The response
 //! is parsed back into a new todo list with:
 //!   - done items the agent dropped preserved (coverage signal)
@@ -151,15 +151,10 @@ pub async fn update_todo_via_agent_with_logger(
         })
         .collect();
 
-    // Cap analysis_summary at 15k chars.
-    let analysis_capped: String = analysis_summary.chars().take(15_000).collect();
-    let citations = extract_citations(analysis_summary);
-
     let mut request = serde_json::Map::new();
     request.insert("task".into(), json!("update_todo"));
     request.insert("completed_query".into(), json!(completed_query));
-    request.insert("analysis_summary".into(), json!(analysis_capped));
-    request.insert("analysis_citations".into(), json!(citations));
+    request.insert("analysis_summary".into(), json!(analysis_summary));
     request.insert("new_followups".into(), json!(new_followups));
     request.insert("current_todo".into(), json!(current_payload));
     if !lens_payload.is_empty() {
@@ -206,7 +201,8 @@ pub async fn update_todo_via_agent_with_logger(
         cached_prefix: None,
     }];
     if let Some(lg) = &logger {
-        lg.log_main("user", &request_text, None, None);
+        let request = cfg.request_meta();
+        lg.log_main_with_request("user", &request_text, None, None, Some(&request));
     }
     let resp_result = if let Some(shutdown) = shutdown.clone() {
         tokio::select! {
@@ -631,98 +627,6 @@ fn assign_ids(list: &mut [TodoItem]) {
     }
 }
 
-/// Extract `path:line[-line]` citations from analysis text. Returns a
-/// sorted-deduped list, capped at 200 entries.
-pub fn extract_citations(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut out = std::collections::BTreeSet::new();
-    // Same regex as : file extension gate + line-or-range capture.
-    // Rust's regex crate supports lookbehind-free constructs; use a
-    // hand-coded scan to avoid pulling in a new dependency.
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Scan for a candidate that ends in one of the allowed file
-        // extensions then `:digits[-digits]`. Walk forward char by
-        // char looking for a `.` followed by an extension token.
-        if bytes[i] == b'.' {
-            // match the extension at bytes[i..]
-            for ext in &[
-                ".c", ".h", ".bpf.c", ".go", ".py", ".rs", ".S", ".s", ".md", ".sh",
-            ] {
-                let e = ext.as_bytes();
-                if i + e.len() <= bytes.len() && &bytes[i..i + e.len()] == e {
-                    let mut end_ext = i + e.len();
-                    // Must be followed by `:digits`
-                    if end_ext < bytes.len() && bytes[end_ext] == b':' {
-                        let digits_start = end_ext + 1;
-                        let mut j = digits_start;
-                        while j < bytes.len() && bytes[j].is_ascii_digit() {
-                            j += 1;
-                        }
-                        if j == digits_start {
-                            continue;
-                        }
-                        let mut range_end = j;
-                        if j < bytes.len() && bytes[j] == b'-' {
-                            let mut k = j + 1;
-                            while k < bytes.len() && bytes[k].is_ascii_digit() {
-                                k += 1;
-                            }
-                            if k > j + 1 {
-                                range_end = k;
-                            }
-                        }
-                        // Walk backwards to find the start of the path
-                        // (allow `[\w./+-]*`).
-                        let mut p = i;
-                        while p > 0 {
-                            let c = bytes[p - 1] as char;
-                            if c.is_ascii_alphanumeric()
-                                || c == '.'
-                                || c == '/'
-                                || c == '_'
-                                || c == '+'
-                                || c == '-'
-                            {
-                                p -= 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        let cite = std::str::from_utf8(&bytes[p..range_end])
-                            .ok()
-                            .map(|s| s.to_string());
-                        if let Some(c) = cite {
-                            // Reject bare trailing ".ext" with no path
-                            // (accidentally match "hit .c:123"). The
-                            // regex prefix `[\w./][\w./+-]*` lets
-                            // any of word/./ start the path — so empty
-                            // before `.ext` is OK as long as `.ext`
-                            // itself sits after `[\w./]` — skip if p == i
-                            // (zero-length path component) and the
-                            // char before is whitespace (a false
-                            // match). Simpler: require path length
-                            // >= ext length + 2 (at least `x.c` form).
-                            if c.len() >= e.len() + 2 {
-                                out.insert(c);
-                            }
-                        }
-                        end_ext = range_end;
-                        i = end_ext;
-                        break;
-                    }
-                    let _ = end_ext;
-                }
-            }
-        }
-        i += 1;
-    }
-    out.into_iter().take(200).collect()
-}
-
 /// DEDUP_STOP_TOKENS — common words we don't want skewing the token
 /// overlap when deduping todo items.
 const DEDUP_STOP_TOKENS: &[&str] = &[
@@ -1055,8 +959,8 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          files and symbols match, it is a duplicate.\n\
          3. For each pending item in current_todo, apply the same \
          check. If the new followup overlaps, DROP it.\n\
-         4. The 'analysis_citations' list tells you exactly which \
-         file:line pairs the most recent analysis touched; use it to \
+         4. Read the complete 'analysis_summary' to identify which \
+         file:line pairs the most recent analysis touched; use them to \
          decide which done-item coverage to update.\n\
          5. Only followups that introduce genuinely new files, \
          symbols, or analysis angles survive.\n\
@@ -1211,25 +1115,6 @@ mod tests {
             let item = parsed.iter().find(|item| item.id == id).unwrap();
             assert_eq!(item.status, TodoStatus::InProgress);
         }
-    }
-
-    #[test]
-    fn extract_citations_finds_c_h_rs() {
-        let text = "See mm/slab.c:123 and include/foo.h:45-60 for the trap. Also src/a.rs:9.";
-        let c = extract_citations(text);
-        assert!(c.contains(&"mm/slab.c:123".to_string()));
-        assert!(c.contains(&"include/foo.h:45-60".to_string()));
-        assert!(c.contains(&"src/a.rs:9".to_string()));
-    }
-
-    #[test]
-    fn extract_citations_caps_at_200() {
-        let mut text = String::new();
-        for i in 0..300 {
-            text.push_str(&format!("path{i}/a.c:{i} "));
-        }
-        let c = extract_citations(&text);
-        assert!(c.len() <= 200);
     }
 
     #[test]

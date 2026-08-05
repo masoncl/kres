@@ -253,15 +253,45 @@ fn run_index_script(dir: &Path) {
     let Some(script_path) = install_index_script(dir) else {
         return;
     };
-    let status = std::process::Command::new(&script_path)
-        .arg("--generate")
-        .current_dir(dir)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        Ok(s) => eprintln!("--export: {} exited with {}", script_path.display(), s),
-        Err(e) => eprintln!("--export: failed to run {} ({e})", script_path.display()),
+    // Exec'ing a file that was just written can fail with ETXTBSY when any
+    // process still holds it open for writing; a forked child inherits the
+    // writer's descriptors until it execs. Observed as
+    // "Text file busy (os error 26)" when several exports run concurrently.
+    // The condition is transient by definition, so retry briefly rather than
+    // reporting a spurious export failure.
+    const ETXTBSY_RETRIES: u32 = 5;
+    for attempt in 0..=ETXTBSY_RETRIES {
+        let status = std::process::Command::new(&script_path)
+            .arg("--generate")
+            .current_dir(dir)
+            .status();
+        match status {
+            Ok(s) if s.success() => return,
+            Ok(s) => {
+                eprintln!("--export: {} exited with {}", script_path.display(), s);
+                return;
+            }
+            Err(e) if is_text_file_busy(&e) && attempt < ETXTBSY_RETRIES => {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    20 * u64::from(attempt + 1),
+                ));
+            }
+            Err(e) => {
+                eprintln!("--export: failed to run {} ({e})", script_path.display());
+                return;
+            }
+        }
     }
+}
+
+#[cfg(unix)]
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(unix))]
+fn is_text_file_busy(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Disk override wins when it exists and is non-empty; else the

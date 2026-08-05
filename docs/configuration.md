@@ -292,13 +292,29 @@ falls back to local grep/read-style evidence from the workspace. A
 missing semcode result must not be used by itself to conclude that
 source is unavailable, a symbol is absent, or a review is clean.
 Whole-file review treats `file_survey` specially: an unavailable server, tool
-error, or empty text response falls back to a local definition scan. A valid
-structured response containing an empty inventory is currently accepted as an
-empty survey and does not trigger that fallback.
+error, or empty text response falls back to a local definition scan, followed by
+a typed slow-agent inventory over that preserved evidence and the complete source.
+An empty structured inventory takes the same fallback path instead of being
+treated as evidence that the file defines no functions. Before this structural scan,
+`gix` follows target renames and generates one target-file diff from immediately
+before the oldest relevant change in the last six months to the current working-tree
+file, including dirty edits. One
+low-effort inference assesses the final net change, so changes fixed later in the
+window do not retain obsolete risk. The completed assessment is atomically checkpointed
+in `change-survey.json` beside `session.json`. Only an
+explicit `--resume` run reuses matching entries; a fresh run overwrites a stale
+checkpoint, and `/clear` removes both the checkpoint and any temporary write.
+If the combined target-file diff and current source are large, the diff is partitioned
+at hunk/line boundaries. Each diff chunk retains complete target-source context when
+possible; independently large source scopes are crossed with the diff chunks instead
+of being paired by ordinal position. The calls run in parallel, and
+a low-effort inference reconciles the partial reports before checkpointing the
+assessment. The later structural inventory triggers a corrective inference pass for
+absent authoritative functions and rejects invented names; Rust does not merge ratings by
+blindly taking a maximum.
 For broad source fallbacks, kres returns the grep match list without
 adding a special per-file cap and without automatically reading full
-source context around every hit. If the shared tool-output cap truncates
-the list, the truncation marker is visible to the agent. The agent should
+source context around every hit. The complete match list is returned. The agent should
 request targeted `read` followups for the specific file:line ranges it
 needs to inspect.
 

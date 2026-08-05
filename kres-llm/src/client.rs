@@ -29,6 +29,11 @@ const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_OPENAI_API_VERSION: &str = "2025-04-01-preview";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
+// codex-codes' JSON-RPC schema rejects an individual UserInput::Text string at
+// 1,048,576 characters. This is transport framing, not a kres request limit:
+// split one logical user message into ordered text items and preserve every
+// byte. The model receives all items in the same turn.
+const CODEX_CODES_TEXT_ITEM_BYTES: usize = 1_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LlmCredentials {
@@ -348,8 +353,8 @@ impl Client {
     /// token count. Returns `None` on any failure — callers should
     /// fall back to the chars/4 cheap estimate.
     ///
-    /// Used on a 429 to decide whether the payload needs shrinking
-    /// before retrying (§10 in todo.md).
+    /// Used on a 429 to distinguish a provider/model capability rejection
+    /// from ordinary shared rate limiting. It never changes the request.
     pub async fn count_tokens_exact(&self, cfg: &CallConfig, messages: &[Message]) -> Option<u64> {
         if self.credentials.provider() != Provider::Anthropic {
             return None;
@@ -395,9 +400,10 @@ impl Client {
     /// a 1M-tpm ceiling (observed in session
     /// bf0a7119-459b-519a-b7f4-a092fd9e6611, 8 retries were not).
     ///
-    /// Shrink rule: shrink only when `count_tokens` exceeds
-    /// `max_input_tokens` (a size problem). 429s for workspace-level
-    /// budget exhaustion are handled by waiting and retrying.
+    /// Kres never shrinks a request. When the provider confirms that a request
+    /// exceeds its configured model capability, surface the error so the
+    /// semantic caller can partition the work losslessly. 429s for shared
+    /// workspace budget exhaustion are handled by waiting and retrying.
     ///
     /// Every 429 logs unconditionally to stderr (operator-visible) so
     /// the pacing story is never hidden behind tracing filters.
@@ -416,7 +422,7 @@ impl Client {
             return self.openai_messages(cfg, messages).await;
         }
         const MAX_RETRIES: u32 = 20;
-        let mut working_messages: Vec<Message> = messages.to_vec();
+        let working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
         for attempt in 0..=MAX_RETRIES {
             let body = self.messages_body(cfg, &working_messages, false);
@@ -454,8 +460,8 @@ impl Client {
                     consecutive_429s += 1;
                     let base_wait = retry_after.unwrap_or_else(|| backoff_duration(attempt));
                     let wait = extended_wait(base_wait, consecutive_429s);
-                    // Count the payload exactly so we only shrink for
-                    // a real size problem. `count_tokens` may itself
+                    // Count the payload exactly so we only report a real size
+                    // problem. `count_tokens` may itself
                     // 429; None means "unknown", so wait and retry.
                     let exact = self.count_tokens_exact(cfg, &working_messages).await;
                     let limit = cfg.max_input_tokens;
@@ -464,34 +470,15 @@ impl Client {
                         _ => false,
                     };
                     kres_core::async_eprintln!(
-                        "[rate-limit] 429 attempt={}/{} consecutive={} exact_tokens={:?} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
+                        "[rate-limit] 429 attempt={}/{} consecutive={} exact_tokens={:?} max_input_tokens={:?} retry_after={:?} wait={:?} over_limit={} reason={}",
                         attempt, MAX_RETRIES, consecutive_429s, exact, limit, retry_after, wait, over_limit,
                         if over_limit { "over-limit" } else { "wait" },
                     );
                     if over_limit {
-                        // Caller opted into structured shrinking
-                        // (e.g. prune the workflow step's
-                        // `prior_attempts`): surface the condition
-                        // and let them re-issue. No internal shrink,
-                        // no wait — the caller decides next steps.
-                        if cfg.surface_over_input_limit {
-                            return Err(LlmError::OverInputLimit {
-                                actual: exact.unwrap_or(0),
-                                limit: limit.unwrap_or(0) as u64,
-                            });
-                        }
-                        let target_tokens = (limit.unwrap() as u64 * 9) / 10;
-                        let target_chars = (target_tokens as usize).saturating_mul(4);
-                        if let Some((before, after)) =
-                            shrink_last_user_message_for_retry(&mut working_messages, target_chars)
-                        {
-                            kres_core::async_eprintln!(
-                                "[rate-limit] shrink applied before={}c after={}c target_tokens={} reason=over-limit",
-                                before,
-                                after,
-                                target_tokens,
-                            );
-                        }
+                        return Err(LlmError::OverInputLimit {
+                            actual: exact.unwrap_or(0),
+                            limit: limit.unwrap_or(0) as u64,
+                        });
                     }
                     tokio::time::sleep(wait).await;
                     continue;
@@ -506,6 +493,9 @@ impl Client {
                 );
                 tokio::time::sleep(wait).await;
                 continue;
+            }
+            if let Some(error) = input_limit_error(cfg, &working_messages, status, &body_text) {
+                return Err(error);
             }
             return Err(LlmError::ApiStatus {
                 status: status.as_u16(),
@@ -617,6 +607,9 @@ impl Client {
                 });
                 continue;
             }
+            if let Some(error) = input_limit_error(cfg, messages, status, &body_text) {
+                return Err(error);
+            }
             return Err(LlmError::ApiStatus {
                 status: status.as_u16(),
                 body: body_text,
@@ -625,7 +618,7 @@ impl Client {
         Err(last_err.unwrap_or_else(|| LlmError::Other("stream exhausted retries".into())))
     }
 
-    /// Streaming `messages` call with the full retry+shrink semantics
+    /// Streaming `messages` call with full lossless retry semantics
     /// of [`Client::messages`], returning an assembled
     /// [`MessagesResponse`]. Callers get a drop-in replacement for
     /// the non-streaming method while the wire protocol runs as SSE,
@@ -648,7 +641,7 @@ impl Client {
             return self.openai_messages(cfg, messages).await;
         }
         const MAX_RETRIES: u32 = 20;
-        let mut working_messages: Vec<Message> = messages.to_vec();
+        let working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
         // When the caller tagged this call with a stream_label,
         // register it in the active-streams registry so the REPL
@@ -728,34 +721,15 @@ impl Client {
                         _ => false,
                     };
                     kres_core::async_eprintln!(
-                        "[rate-limit] 429 (stream) attempt={}/{} consecutive={} exact_tokens={:?} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
+                        "[rate-limit] 429 (stream) attempt={}/{} consecutive={} exact_tokens={:?} max_input_tokens={:?} retry_after={:?} wait={:?} over_limit={} reason={}",
                         attempt, MAX_RETRIES, consecutive_429s, exact, limit, retry_after, wait, over_limit,
                         if over_limit { "over-limit" } else { "wait" },
                     );
                     if over_limit {
-                        // Caller opted into structured shrinking
-                        // (see CallConfig::surface_over_input_limit):
-                        // surface the condition and let them prune
-                        // (e.g. a workflow step's prior_attempts)
-                        // before reissuing.
-                        if cfg.surface_over_input_limit {
-                            return Err(LlmError::OverInputLimit {
-                                actual: exact.unwrap_or(0),
-                                limit: limit.unwrap_or(0) as u64,
-                            });
-                        }
-                        let target_tokens = (limit.unwrap() as u64 * 9) / 10;
-                        let target_chars = (target_tokens as usize).saturating_mul(4);
-                        if let Some((before, after)) =
-                            shrink_last_user_message_for_retry(&mut working_messages, target_chars)
-                        {
-                            kres_core::async_eprintln!(
-                                "[rate-limit] shrink applied before={}c after={}c target_tokens={} reason=over-limit",
-                                before,
-                                after,
-                                target_tokens,
-                            );
-                        }
+                        return Err(LlmError::OverInputLimit {
+                            actual: exact.unwrap_or(0),
+                            limit: limit.unwrap_or(0) as u64,
+                        });
                     }
                     tokio::time::sleep(wait).await;
                     continue;
@@ -770,6 +744,9 @@ impl Client {
                 );
                 tokio::time::sleep(wait).await;
                 continue;
+            }
+            if let Some(error) = input_limit_error(cfg, &working_messages, status, &body_text) {
+                return Err(error);
             }
             return Err(LlmError::ApiStatus {
                 status: status.as_u16(),
@@ -788,7 +765,7 @@ impl Client {
             return self.openai_responses_messages(cfg, messages).await;
         }
         const MAX_RETRIES: u32 = 20;
-        let mut working_messages: Vec<Message> = messages.to_vec();
+        let working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
         for attempt in 0..=MAX_RETRIES {
             let body = OpenAiChatRequest::from_config(cfg, &working_messages, false);
@@ -831,32 +808,28 @@ impl Client {
                     base_wait
                 };
                 if status.as_u16() == 429 {
-                    let estimated = estimate_message_tokens(&working_messages);
-                    let over_limit = cfg
-                        .max_input_tokens
-                        .map(|limit| estimated > limit as u64)
-                        .unwrap_or(false);
+                    // No exact count is available on this provider, so a 429
+                    // cannot be attributed to request size here: the chars/4
+                    // estimate is far too coarse to turn a shared-budget 429
+                    // into a hard failure. A genuine capability rejection
+                    // arrives as a 400 naming the context limit and is typed
+                    // by `input_limit_error` below.
                     kres_core::async_eprintln!(
-                        "[rate-limit] 429 (openai) attempt={}/{} consecutive={} estimated_tokens={} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
+                        "[rate-limit] 429 (openai) attempt={}/{} consecutive={} estimated_tokens={} max_input_tokens={:?} retry_after={:?} wait={:?} reason=wait",
                         attempt,
                         MAX_RETRIES,
                         consecutive_429s,
-                        estimated,
+                        estimate_message_tokens(&working_messages),
                         cfg.max_input_tokens,
                         retry_after,
                         wait,
-                        over_limit,
-                        if over_limit { "over-limit" } else { "wait" },
                     );
-                    if over_limit {
-                        let target_tokens = (cfg.max_input_tokens.unwrap() as u64 * 9) / 10;
-                        let target_chars = (target_tokens as usize).saturating_mul(4);
-                        let _ =
-                            shrink_last_user_message_for_retry(&mut working_messages, target_chars);
-                    }
                 }
                 tokio::time::sleep(wait).await;
                 continue;
+            }
+            if let Some(error) = input_limit_error(cfg, &working_messages, status, &body_text) {
+                return Err(error);
             }
             return Err(LlmError::ApiStatus {
                 status: status.as_u16(),
@@ -872,7 +845,7 @@ impl Client {
         messages: &[Message],
     ) -> Result<MessagesResponse, LlmError> {
         const MAX_RETRIES: u32 = 20;
-        let mut working_messages: Vec<Message> = messages.to_vec();
+        let working_messages: Vec<Message> = messages.to_vec();
         let mut consecutive_429s: u32 = 0;
         for attempt in 0..=MAX_RETRIES {
             let body = OpenAiResponsesRequest::from_config(cfg, &working_messages, false);
@@ -921,32 +894,28 @@ impl Client {
                     base_wait
                 };
                 if status.as_u16() == 429 {
-                    let estimated = estimate_message_tokens(&working_messages);
-                    let over_limit = cfg
-                        .max_input_tokens
-                        .map(|limit| estimated > limit as u64)
-                        .unwrap_or(false);
+                    // No exact count is available on this provider, so a 429
+                    // cannot be attributed to request size here: the chars/4
+                    // estimate is far too coarse to turn a shared-budget 429
+                    // into a hard failure. A genuine capability rejection
+                    // arrives as a 400 naming the context limit and is typed
+                    // by `input_limit_error` below.
                     kres_core::async_eprintln!(
-                        "[rate-limit] 429 (openai responses) attempt={}/{} consecutive={} estimated_tokens={} max_input_tokens={:?} retry_after={:?} wait={:?} shrink={} reason={}",
+                        "[rate-limit] 429 (openai responses) attempt={}/{} consecutive={} estimated_tokens={} max_input_tokens={:?} retry_after={:?} wait={:?} reason=wait",
                         attempt,
                         MAX_RETRIES,
                         consecutive_429s,
-                        estimated,
+                        estimate_message_tokens(&working_messages),
                         cfg.max_input_tokens,
                         retry_after,
                         wait,
-                        over_limit,
-                        if over_limit { "over-limit" } else { "wait" },
                     );
-                    if over_limit {
-                        let target_tokens = (cfg.max_input_tokens.unwrap() as u64 * 9) / 10;
-                        let target_chars = (target_tokens as usize).saturating_mul(4);
-                        let _ =
-                            shrink_last_user_message_for_retry(&mut working_messages, target_chars);
-                    }
                 }
                 tokio::time::sleep(wait).await;
                 continue;
+            }
+            if let Some(error) = input_limit_error(cfg, &working_messages, status, &body_text) {
+                return Err(error);
             }
             return Err(LlmError::ApiStatus {
                 status: status.as_u16(),
@@ -1411,6 +1380,51 @@ fn estimate_message_tokens(messages: &[Message]) -> u64 {
         .sum()
 }
 
+fn input_limit_error(
+    cfg: &CallConfig,
+    messages: &[Message],
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Option<LlmError> {
+    // Only a status a provider actually uses to reject an oversized request
+    // can mean "over limit". Without this gate, any terminal error — 401, 403,
+    // 404, an exhausted 5xx retry — on a request whose estimate happens to
+    // exceed the configured capability would be reported as OverInputLimit,
+    // hiding the real cause and sending a semantic owner off to partition work
+    // that was never too large.
+    if !matches!(status.as_u16(), 400 | 413 | 422) {
+        return None;
+    }
+    let estimated = estimate_message_tokens(messages);
+    let body = body.to_ascii_lowercase();
+    let provider_reports_limit = [
+        "context_length_exceeded",
+        "maximum context length",
+        "prompt is too long",
+        "input is too long",
+        "too many input tokens",
+        "exceeds the context window",
+        "input exceeds",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker));
+    let configured_limit = cfg.max_input_tokens.map(u64::from);
+    let exceeds_configured = configured_limit.is_some_and(|limit| estimated > limit);
+    if !exceeds_configured && !provider_reports_limit {
+        return None;
+    }
+    // Some providers report only that the request exceeded their context
+    // without returning the numeric capability. Give semantic callers a
+    // conservative smaller partition target instead of losing the typed
+    // over-limit signal. This value is used for partition sizing, never to
+    // discard request content.
+    let limit = configured_limit.unwrap_or_else(|| estimated.saturating_mul(3).div_ceil(4).max(1));
+    Some(LlmError::OverInputLimit {
+        actual: estimated.max(limit.saturating_add(1)),
+        limit,
+    })
+}
+
 fn response_text(resp: &MessagesResponse) -> String {
     let mut out = String::new();
     for block in &resp.content {
@@ -1709,26 +1723,6 @@ impl From<OpenAiUsage> for Usage {
                 .unwrap_or(0),
         }
     }
-}
-
-fn shrink_last_user_message_for_retry(
-    messages: &mut [Message],
-    target_chars: usize,
-) -> Option<(usize, usize)> {
-    let last = messages.last_mut()?;
-    if last.role != "user" {
-        return None;
-    }
-    let visible_content = match &last.cached_prefix {
-        Some(prefix) => format!("{prefix}{}", last.content),
-        None => last.content.clone(),
-    };
-    let before = visible_content.len();
-    let new_content = kres_core::shrink::shrink_last_user_message(&visible_content, target_chars)?;
-    let after = new_content.len();
-    last.content = new_content;
-    last.cached_prefix = None;
-    Some((before, after))
 }
 
 /// Walk the SSE byte stream from an already-validated 200 response
@@ -2397,16 +2391,20 @@ async fn start_codex_turn(
         }
     };
     let thread_id = thread.thread.id;
+    let input = split_utf8_losslessly(&request.prompt, CODEX_CODES_TEXT_ITEM_BYTES)
+        .into_iter()
+        .map(|text| UserInput::Text {
+            text,
+            text_elements: None,
+        })
+        .collect();
     let turn_params = TurnStartParams {
         approval_policy: Some(AskForApproval::Never),
         approvals_reviewer: None,
         client_user_message_id: None,
         cwd,
         effort: request.effort.map(codex_codes::ReasoningEffort),
-        input: vec![UserInput::Text {
-            text: request.prompt,
-            text_elements: None,
-        }],
+        input,
         model: Some(request.model.clone()),
         output_schema: None,
         personality: None,
@@ -2434,6 +2432,30 @@ async fn start_codex_turn(
     );
 }
 
+fn split_utf8_losslessly(text: &str, item_bytes: usize) -> Vec<String> {
+    assert!(item_bytes > 0, "transport item size must be positive");
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + item_bytes).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = text[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(text.len(), |(offset, _)| start + offset);
+        }
+        parts.push(text[start..end].to_string());
+        start = end;
+    }
+    parts
+}
+
 fn fail_codex_turns(active: &mut HashMap<String, ActiveCodexTurn>, message: &str) {
     for (_, turn) in active.drain() {
         let _ = turn
@@ -2446,6 +2468,79 @@ fn fail_codex_turns(active: &mut HashMap<String, ActiveCodexTurn>, message: &str
 mod tests {
     use super::*;
     use crate::model::Model;
+
+    #[test]
+    fn provider_context_rejection_is_typed_without_configured_limit() {
+        let cfg = CallConfig::defaults_for(Model::from_id("test-model"));
+        let messages = [Message::plain("user", "x".repeat(4_000))];
+        let error = input_limit_error(
+            &cfg,
+            &messages,
+            reqwest::StatusCode::BAD_REQUEST,
+            "input exceeds the context window",
+        )
+        .expect("provider rejection should become a partitionable error");
+
+        assert!(matches!(
+            error,
+            LlmError::OverInputLimit { actual, limit } if actual > limit && limit > 0
+        ));
+    }
+
+    #[test]
+    fn terminal_non_size_errors_are_not_misclassified_as_context_limit() {
+        // A large request that fails auth must surface the auth failure. The
+        // estimate exceeding the configured capability is not evidence that
+        // THIS error was a size rejection.
+        let cfg = CallConfig::defaults_for(Model::from_id("test-model")).with_max_input_tokens(10);
+        let messages = [Message::plain("user", "x".repeat(400_000))];
+        assert!(estimate_message_tokens(&messages) > 10);
+
+        for status in [401u16, 403, 404, 500, 503] {
+            assert!(
+                input_limit_error(
+                    &cfg,
+                    &messages,
+                    reqwest::StatusCode::from_u16(status).unwrap(),
+                    "invalid api key",
+                )
+                .is_none(),
+                "status {status} must not be reported as an input-limit error"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_request_on_a_size_status_is_still_typed() {
+        // The gate must not suppress the real case: a 400 on a request whose
+        // estimate exceeds the configured capability stays partitionable even
+        // when the provider body carries no recognizable marker.
+        let cfg = CallConfig::defaults_for(Model::from_id("test-model")).with_max_input_tokens(10);
+        let messages = [Message::plain("user", "x".repeat(400_000))];
+
+        assert!(matches!(
+            input_limit_error(
+                &cfg,
+                &messages,
+                reqwest::StatusCode::BAD_REQUEST,
+                "request failed",
+            ),
+            Some(LlmError::OverInputLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn ordinary_bad_request_is_not_misclassified_as_context_limit() {
+        let cfg = CallConfig::defaults_for(Model::from_id("test-model"));
+        let messages = [Message::plain("user", "payload")];
+        assert!(input_limit_error(
+            &cfg,
+            &messages,
+            reqwest::StatusCode::BAD_REQUEST,
+            "invalid request field",
+        )
+        .is_none());
+    }
 
     #[tokio::test]
     async fn builder_sets_base_url() {
@@ -2633,29 +2728,20 @@ mod tests {
     }
 
     #[test]
-    fn retry_shrink_reconstructs_cached_prefix_prompt() {
-        let big = "x".repeat(5000);
-        let prefix = "{\n  \"skills\": [\"stable skill body\"],\n".to_string();
-        let suffix = format!(
-            "  \"question\": \"q\",\n  \"symbols\": [{{\"definition\": \"{big}\"}}, {{\"definition\": \"small\"}}]\n}}\n"
+    fn codex_transport_framing_preserves_every_utf8_byte() {
+        let input = format!(
+            "{}λ{}🙂{}",
+            "a".repeat(999_999),
+            "b".repeat(9),
+            "c".repeat(1_100_000)
         );
-        let mut messages = vec![Message {
-            role: "user".into(),
-            content: suffix,
-            cache: false,
-            cached_prefix: Some(prefix.clone()),
-        }];
+        let parts = split_utf8_losslessly(&input, CODEX_CODES_TEXT_ITEM_BYTES);
 
-        let before = prefix.len() + messages[0].content.len();
-        let shrunk = shrink_last_user_message_for_retry(&mut messages, 1000).unwrap();
-
-        assert_eq!(shrunk.0, before);
-        assert!(shrunk.1 < before);
-        assert!(messages[0].cached_prefix.is_none());
-        let parsed: serde_json::Value = serde_json::from_str(&messages[0].content).unwrap();
-        assert_eq!(parsed["skills"][0], "stable skill body");
-        assert_eq!(parsed["symbols"].as_array().unwrap().len(), 1);
-        assert_eq!(parsed["symbols"][0]["definition"], "small");
+        assert!(parts.len() >= 3);
+        assert!(parts
+            .iter()
+            .all(|part| part.len() <= CODEX_CODES_TEXT_ITEM_BYTES));
+        assert_eq!(parts.concat(), input);
     }
 
     #[test]

@@ -1,18 +1,29 @@
 //! REPL session loop.
 
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures::{stream, StreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use kres_agents::{AgentConfig, AgentKind, AgentRunner, DataFetcher, RunContext};
+use kres_agents::{AgentConfig, AgentKind, AgentRunner, DataFetcher, Followup, RunContext};
 use kres_core::log::TurnLogger;
 use kres_core::{format_usage_summary, FindingsStore, TaskManager, TaskState, UsageTracker};
 use kres_llm::RateLimiter;
 
+use crate::change_survey::{
+    change_survey_chunk_prompt, change_survey_prompt, complete_function_coverage,
+    parse_inference_risks, split_diff_for_inference, split_source_for_inference,
+    validate_function_coverage, validate_function_subset, ChangeSurveyDiffChunk,
+    ChangeSurveyPrompt, ChangeSurveyReport, ChangeSurveySourceChunk,
+};
 use crate::commands::{parse_command, Command};
 
 #[derive(Debug, Clone)]
@@ -85,6 +96,10 @@ pub struct ReplConfig {
     /// resumed by re-invoking kres with the same `--results DIR`.
     /// None disables persistence (no-op writes).
     pub persist_path: Option<PathBuf>,
+    /// Reuse a matching `change-survey.json` checkpoint. This follows the
+    /// same explicit-resume contract as `session.json`; fresh sessions still
+    /// write checkpoints but never inherit one from an earlier run.
+    pub resume_change_survey: bool,
     /// When true, exit the REPL once the work-stop condition fires
     /// (`--turns 0` goal-met / no-progress / no-goal-batch-finished),
     /// instead of staying open waiting for further operator input.
@@ -114,6 +129,7 @@ impl Default for ReplConfig {
             workspace: PathBuf::from("."),
             mcp_config: None,
             persist_path: None,
+            resume_change_survey: false,
             exit_on_idle: false,
             assisted_by: "kres:claude-sonnet-5".to_string(),
         }
@@ -338,10 +354,22 @@ async fn persist_session_state_to(
     // generation so plan, todo, and the turn counter cannot disagree.
     let (plan_after, todo, deferred, completed_run_count) = mgr.sync_and_snapshot_runtime().await;
     log_plan_status_transitions(plan_before.as_ref(), plan_after.as_ref());
+    let review_file_scan = mgr
+        .get_cached_context(REVIEW_FILE_SCAN_CACHE_KEY)
+        .await
+        .and_then(|value| serde_json::from_value(value).ok())
+        .filter(|state: &kres_core::ReviewFileScanState| {
+            !state.target.trim().is_empty()
+                && !state.source_hash.trim().is_empty()
+                && !state.baseline.trim().is_empty()
+                && !state.head.trim().is_empty()
+                && !state.scan.trim().is_empty()
+        });
     let state = kres_core::SessionState {
-        version: 1,
+        version: 3,
         last_prompt,
         plan: plan_after,
+        review_file_scan,
         todo,
         deferred,
         completed_run_count,
@@ -621,6 +649,31 @@ impl Session {
                 state.completed_run_count,
             )
             .await;
+        self.mgr
+            .remove_cached_context(REVIEW_FILE_SCAN_CACHE_KEY)
+            .await;
+        *self.review_file_scan_target.write().await = None;
+        if let Some(scan) = state.review_file_scan.as_ref() {
+            *self.review_file_scan_target.write().await = Some(scan.target.clone());
+            match review_file_scan_matches_current_window(&self.cfg.workspace, scan).await {
+                Ok(true) => {
+                    self.mgr
+                        .cache_context(
+                            REVIEW_FILE_SCAN_CACHE_KEY,
+                            serde_json::to_value(scan).expect("review scan state serializes"),
+                        )
+                        .await;
+                }
+                Ok(false) => kres_core::async_eprintln!(
+                    "/resume: discarded stale whole-file risk scan for {}",
+                    scan.target
+                ),
+                Err(error) => kres_core::async_eprintln!(
+                    "/resume: could not validate whole-file risk scan for {}: {error}",
+                    scan.target
+                ),
+            }
+        }
         // Pull deferred items back into the active todo list as
         // Pending so auto-continue can dispatch them immediately
         // after resume. Without this, the deferred list is
@@ -661,18 +714,40 @@ impl Session {
     }
 
     async fn install_review_config_and_submit(&self, cfg: crate::workflow::ReviewPromptConfig) {
+        let previous_lenses = self.lenses.read().await.clone();
+        let previous_rules = self.lens_consolidate_rules.read().await.clone();
+        let previous_target = self.review_file_scan_target.read().await.clone();
+        let previous_scan = self
+            .mgr
+            .remove_cached_context(REVIEW_FILE_SCAN_CACHE_KEY)
+            .await;
         *self.lenses.write().await = cfg.prompt_file.lenses;
         *self.lens_consolidate_rules.write().await = cfg.consolidate_rules;
         *self.review_file_scan_target.write().await = cfg.file_scan_target;
         if !cfg.prompt_file.prompt.trim().is_empty() {
-            self.submit_prompt_inner(
-                cfg.prompt_file.prompt,
-                true,
-                None,
-                None,
-                Some(kres_agents::TaskMode::Audit),
-            )
-            .await;
+            let submitted = self
+                .submit_prompt_inner(
+                    cfg.prompt_file.prompt,
+                    true,
+                    None,
+                    None,
+                    Some(kres_agents::TaskMode::Audit),
+                )
+                .await;
+            if !submitted {
+                *self.lenses.write().await = previous_lenses;
+                *self.lens_consolidate_rules.write().await = previous_rules;
+                *self.review_file_scan_target.write().await = previous_target;
+                if let Some(scan) = previous_scan {
+                    self.mgr
+                        .cache_context(REVIEW_FILE_SCAN_CACHE_KEY, scan)
+                        .await;
+                }
+                self.stop_latched.store(true, Ordering::Release);
+                kres_core::async_eprintln!(
+                    "/review: bootstrap failed; restored prior review configuration and paused continuation"
+                );
+            }
         }
     }
 
@@ -1135,21 +1210,12 @@ impl Session {
                                 } else {
                                     s.push_str(&format!("- {} — {}\n", f.path, purpose));
                                 }
-                                // Include the head of the file so the
-                                // goal agent can see the actual script
-                                // body, not just the filename. Cap at
-                                // 2000 chars so a very long artifact
-                                // doesn't blow out the goal-check
-                                // token budget.
-                                let head: String = f.content.chars().take(2000).collect();
+                                // Include the complete file. Goal checks are
+                                // inference calls too; replacing an artifact
+                                // with an excerpt can change their decision.
                                 s.push_str("```\n");
-                                s.push_str(&head);
-                                if f.content.chars().count() > 2000 {
-                                    s.push_str("\n… (truncated, full content at ");
-                                    s.push_str(&f.path);
-                                    s.push_str(")\n");
-                                }
-                                if !head.ends_with('\n') {
+                                s.push_str(&f.content);
+                                if !f.content.ends_with('\n') {
                                     s.push('\n');
                                 }
                                 s.push_str("```\n");
@@ -1860,10 +1926,8 @@ impl Session {
                                 // appended as new todos.
                                 if !check.missing.is_empty() {
                                     if let Some(tc) = task_todo_client {
-                                        let reason_prefix = format!(
-                                            "goal not met: {}",
-                                            check.reason.chars().take(100).collect::<String>()
-                                        );
+                                        let reason_prefix =
+                                            format!("goal not met: {}", check.reason);
                                         let missing_fus: Vec<serde_json::Value> = check
                                             .missing
                                             .iter()
@@ -2212,8 +2276,34 @@ impl Session {
         }
         if let Some(ref p) = self.initial_prompt {
             kres_core::async_eprintln!("submitting initial prompt from --prompt");
-            self.submit_prompt_inner(p.clone(), true, None, None, self.initial_prompt_mode)
+            let submitted = self
+                .submit_prompt_inner(p.clone(), true, None, None, self.initial_prompt_mode)
                 .await;
+            if !submitted {
+                // `--prompt` is a batch instruction. When it cannot start
+                // there is no work, and a failed review bootstrap also latches
+                // `stop_latched`, so auto-continue will never fire either.
+                // Falling through to the interactive loop leaves the process
+                // alive forever with nothing to do and no exit status — a
+                // scripted run just blocks. Observed on 2026-08-05: a review
+                // whose file survey failed validation sat idle for 25 minutes
+                // until it was killed by hand.
+                //
+                // Every reaper exit path is gated on completed work, so none
+                // of them can rescue this; report and fail here instead.
+                kres_core::async_eprintln!(
+                    "--prompt could not be started; exiting rather than idling with no work"
+                );
+                self.mgr.root_shutdown().cancel();
+                // main() turns this Err into `std::process::exit(1)`, which
+                // skips Drop. The TUI runs on a detached spawn_blocking task
+                // with no guard, so raw mode has to come off here or the
+                // parent shell loses Ctrl-C.
+                self.restore_terminal_for_final_output();
+                return Err(anyhow::anyhow!(
+                    "initial --prompt submission failed; see the errors above"
+                ));
+            }
         }
         let root_shutdown = self.mgr.root_shutdown().clone();
         let turns_cap_reached_for_loop = turns_cap_reached.clone();
@@ -2448,7 +2538,7 @@ impl Session {
     /// Prepends the accumulated-analysis ledger as "Recent context"
     /// so a follow-up operator prompt doesn't start cold.
     async fn submit_prompt(&self, text: String) {
-        self.submit_prompt_inner(text, true, None, None, None).await
+        let _ = self.submit_prompt_inner(text, true, None, None, None).await;
     }
 
     /// Pipeline-driven submission (cmd_next / cmd_continue's
@@ -2481,8 +2571,9 @@ impl Session {
         todo_tag: Option<String>,
         step_id: Option<String>,
     ) {
-        self.submit_prompt_inner(text, false, todo_tag, step_id, None)
-            .await
+        let _ = self
+            .submit_prompt_inner(text, false, todo_tag, step_id, None)
+            .await;
     }
 
     async fn stash_interruptible_prompt(&self, text: &str, operator_submission: bool) {
@@ -2498,13 +2589,13 @@ impl Session {
         todo_tag: Option<String>,
         step_id: Option<String>,
         forced_mode: Option<kres_agents::TaskMode>,
-    ) {
+    ) -> bool {
         let Some(orc) = self.agent_runner.clone() else {
             kres_core::async_eprintln!("(no AgentRunner configured — prompt dropped)");
             kres_core::async_eprintln!(
                 "hint: rerun `kres repl` with agent configs to enable prompt handling"
             );
-            return;
+            return false;
         };
         // Operator engaged — clear the /stop latch so auto-continue
         // works again after this task completes.
@@ -2619,46 +2710,76 @@ impl Session {
         // /resume followed by /continue, or a pipeline submission
         // before any operator submission), fall back to the live
         // define_goal call so we get something rather than nothing.
-        let existing_plan = self.mgr.plan_snapshot().await;
+        let mut existing_plan = self.mgr.plan_snapshot().await;
         let review_submission = forced_mode == Some(kres_agents::TaskMode::Audit)
             && !self.lenses.read().await.is_empty();
-        let text = if include_recent_context && review_submission {
+        let fresh_review_submission = include_recent_context
+            && forced_mode == Some(kres_agents::TaskMode::Audit)
+            && review_submission;
+        // Persist the operator/workflow prompt without the generated risk
+        // scan. Goal and plan inference below still receive the scan, but the
+        // completed scan has its own session-state field and is injected once
+        // into task questions. Keeping it in Plan::prompt as well caused every
+        // fast/slow request to carry two identical copies.
+        let persisted_plan_prompt = text.clone();
+        if include_recent_context && !review_submission {
+            self.mgr
+                .remove_cached_context(REVIEW_FILE_SCAN_CACHE_KEY)
+                .await;
+        }
+        let planning_text = if include_recent_context && review_submission {
             let target = self.review_file_scan_target.read().await.clone();
             if let Some(target) = target {
-                let scan = match review_file_scan_context(&self.mgr).await {
+                let prior_scan = if fresh_review_submission {
+                    None
+                } else {
+                    review_file_scan_context(&self.mgr, &self.cfg.workspace, &target).await
+                };
+                let scan = match prior_scan {
                     Some(scan) => Some(scan),
                     None => {
-                        match run_review_file_scan(&orc, &target, self.mgr.root_shutdown()).await {
+                        match run_review_file_scan(
+                            &orc,
+                            &self.cfg.workspace,
+                            &target,
+                            self.cfg
+                                .persist_path
+                                .as_ref()
+                                .map(|path| path.with_file_name("change-survey.json")),
+                            self.cfg.resume_change_survey,
+                            self.mgr.root_shutdown(),
+                        )
+                        .await
+                        {
                             Ok(scan) => {
-                                self.mgr
-                                    .cache_context(
-                                        REVIEW_FILE_SCAN_CACHE_KEY,
-                                        serde_json::Value::String(scan.clone()),
-                                    )
-                                    .await;
-                                Some(scan)
+                                cache_review_file_scan(&self.mgr, &scan).await;
+                                Some(scan.scan)
                             }
                             Err(error) => {
                                 kres_core::async_eprintln!(
                                     "review bootstrap scan failed for {target}: {error}"
                                 );
-                                None
+                                return false;
                             }
                         }
                     }
                 };
                 match scan {
                     Some(scan) => format!(
-                        "{text}\n\n--- WHOLE-FILE RISK SCAN ---\n{scan}\n--- END WHOLE-FILE RISK SCAN ---\nUse this source-derived ranking when defining the completion goal and semantic coverage plan. Do not add a survey/scan step to the plan."
+                        "{persisted_plan_prompt}\n\n--- WHOLE-FILE RISK SCAN ---\n{scan}\n--- END WHOLE-FILE RISK SCAN ---\nUse this source-derived ranking when defining the completion goal and semantic coverage plan. Do not add a survey/scan step to the plan."
                     ),
-                    None => text,
+                    None => persisted_plan_prompt.clone(),
                 }
             } else {
-                text
+                persisted_plan_prompt.clone()
             }
         } else {
-            text
+            persisted_plan_prompt.clone()
         };
+        if fresh_review_submission {
+            self.mgr.clear_session_work().await;
+            existing_plan = None;
+        }
         let planning_goal_client = if review_submission {
             self.review_goal_client.as_ref()
         } else {
@@ -2669,7 +2790,12 @@ impl Session {
                 // Operator-typed submission: derive a fresh goal and
                 // cache it for downstream pipeline follow-ups.
                 let r = self
-                    .derive_goal(planning_goal_client, &text, existing_plan.as_ref(), "fresh")
+                    .derive_goal(
+                        planning_goal_client,
+                        &planning_text,
+                        existing_plan.as_ref(),
+                        "fresh",
+                    )
                     .await;
                 let r = if let Some(mode) = forced_mode {
                     kres_core::async_eprintln!(
@@ -2706,7 +2832,7 @@ impl Session {
                     let r = self
                         .derive_goal(
                             planning_goal_client,
-                            &text,
+                            &planning_text,
                             existing_plan.as_ref(),
                             "fallback",
                         )
@@ -2723,23 +2849,30 @@ impl Session {
         // step's protocol directly in the question where the slow
         // agent can't miss it, without changing the pipeline mode
         // or system prompt.
-        let text = if let Some(ref sid) = step_id {
-            let ctx = existing_plan
+        let step_context = if let Some(ref sid) = step_id {
+            existing_plan
                 .as_ref()
                 .map(|p| p.step_context(sid))
-                .unwrap_or("");
-            if ctx.is_empty() {
-                text
-            } else {
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        let text = if step_context.is_empty() {
+            persisted_plan_prompt.clone()
+        } else {
+            if let Some(ref sid) = step_id {
                 kres_core::async_eprintln!(
                     "injecting step context from plan step {} ({}k chars)",
                     sid,
-                    ctx.len() / 1000,
+                    step_context.len() / 1000,
                 );
-                format!("{ctx}\n\n---\n\n{text}")
             }
+            format!("{step_context}\n\n---\n\n{persisted_plan_prompt}")
+        };
+        let planning_text = if step_context.is_empty() {
+            planning_text
         } else {
-            text
+            format!("{step_context}\n\n---\n\n{planning_text}")
         };
         // Ask the goal agent for a plan decomposition, but only on
         // operator-typed submissions — pipeline-driven follow-ups
@@ -2758,7 +2891,7 @@ impl Session {
                     if steps.is_empty() {
                         kres_agents::define_plan(
                             gc,
-                            &text,
+                            &planning_text,
                             goal,
                             task_mode,
                             existing.as_ref(),
@@ -2770,14 +2903,15 @@ impl Session {
                             "[embedded plan] {} step(s) from prompt template",
                             steps.len()
                         );
-                        let mut plan = kres_core::Plan::new(&text, goal, task_mode);
+                        let mut plan =
+                            kres_core::Plan::new(&persisted_plan_prompt, goal, task_mode);
                         plan.steps = steps;
                         Some(plan)
                     }
                 } else {
                     kres_agents::define_plan(
                         gc,
-                        &text,
+                        &planning_text,
                         goal,
                         task_mode,
                         existing.as_ref(),
@@ -2785,7 +2919,10 @@ impl Session {
                     )
                     .await
                 };
-                if let Some(plan) = plan {
+                if let Some(mut plan) = plan {
+                    // define_plan needs the scan to rank its steps, but the
+                    // persisted plan owns only the immutable operator prompt.
+                    plan.prompt.clone_from(&persisted_plan_prompt);
                     log_plan_change("define_plan", existing.as_ref(), &plan);
                     self.mgr.set_plan(Some(plan.clone())).await;
                     if review_submission {
@@ -2797,7 +2934,7 @@ impl Session {
                                 todo_count
                             );
                             self.interrupted_prompt.lock().await.take();
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -2808,12 +2945,27 @@ impl Session {
         // RunContext sees the running list. bugs.md#H1: the read is
         // cheap and doesn't hold any lock across the API call.
         let previous_findings = self.mgr.findings_snapshot().await;
-        let task_brief = format!("prompt: {}", truncate(&text, 60));
+        // This value reaches the promoter and lens consolidator, so it must be
+        // the complete task scope. UI renderers truncate independently.
+        let task_brief = text.clone();
         let task_brief_clone = task_brief.clone();
+        let active_plan_step_id = step_id.clone();
         let lenses = self.lenses.read().await.clone();
         let lens_consolidate_rules = self.lens_consolidate_rules.read().await.clone();
         let consolidator = self.consolidator.clone();
-        let original_prompt = text.clone();
+        // The current operator submission is already the full prompt. Derived
+        // todo tasks instead inherit the clean top-level plan prompt, so the
+        // pipeline can prepend real original scope without duplicating the
+        // current task (or its whole-file scan).
+        let plan_for_ctx = self.mgr.plan_snapshot().await;
+        let original_prompt = if include_recent_context {
+            String::new()
+        } else {
+            plan_for_ctx
+                .as_ref()
+                .map(|plan| plan.prompt.clone())
+                .unwrap_or_default()
+        };
         let prompt_for_park = text.clone();
         // Build the prompt that actually reaches the fast agent:
         // for operator-typed submissions (`include_recent_context =
@@ -2835,10 +2987,7 @@ impl Session {
         let include_preamble =
             include_recent_context || matches!(task_mode, kres_agents::TaskMode::Coding);
         let text = if include_preamble {
-            let context_preamble = build_recent_context_preamble(
-                &self.accumulated.lock().await,
-                RECENT_CONTEXT_CAP_CHARS,
-            );
+            let context_preamble = build_recent_context_preamble(&self.accumulated.lock().await);
             if context_preamble.is_empty() {
                 text
             } else {
@@ -2853,12 +3002,28 @@ impl Session {
         // (set_plan(Some(new))) while this task is still mid-run;
         // the cloned snapshot keeps each task pinned to its own
         // plan for the duration.
-        let plan_for_ctx = self.mgr.plan_snapshot().await;
+        let review_target = self.review_file_scan_target.read().await.clone();
         let review_scan = if matches!(task_mode, kres_agents::TaskMode::Audit) {
-            review_file_scan_context(&self.mgr).await
+            match review_target.as_deref() {
+                Some(target) => {
+                    review_file_scan_context(&self.mgr, &self.cfg.workspace, target).await
+                }
+                None => None,
+            }
         } else {
             None
         };
+        if matches!(task_mode, kres_agents::TaskMode::Audit)
+            && review_target.is_some()
+            && review_scan.is_none()
+        {
+            self.stop_latched.store(true, Ordering::Release);
+            *self.interrupted_prompt.lock().await = Some(prompt_for_park.clone());
+            kres_core::async_eprintln!(
+                "review target or revision changed after the whole-file risk scan; task was parked instead of running without authoritative ratings"
+            );
+            return false;
+        }
         let has_review_scan = review_scan.is_some();
         let text = match review_scan {
                 Some(scan) => format!(
@@ -2879,6 +3044,7 @@ impl Session {
             .spawn(task_brief, todo_tag, move |handle| async move {
                 let ctx = RunContext {
                     previous_findings,
+                    active_plan_step_id,
                     task_brief: task_brief_clone,
                     original_prompt,
                     gather_prompt: None,
@@ -2899,7 +3065,6 @@ impl Session {
                     mode: task_mode,
                     plan: plan_for_ctx,
                     allow_plan_rewrite,
-                    surface_over_input_limit: false,
                     synthesis_use_fast: false,
                     synthesis_use_routing_prompt: false,
                     // The REPL task path uses TaskManager's own
@@ -3004,6 +3169,7 @@ impl Session {
             .await
             .insert(task_id, prompt_for_park);
         kres_core::async_eprintln!("submitted task #{task_id}");
+        true
     }
 
     async fn print_tasks(&self) {
@@ -3605,6 +3771,7 @@ impl Session {
             max_input_tokens: orc.fast_max_input_tokens,
             thinking: orc.fast_thinking,
             validated_findings,
+            logger: self.logger.clone(),
         };
         let label = if markdown {
             "/summary-markdown"
@@ -4164,6 +4331,17 @@ impl Session {
         // inherit the prior topic's goal — exactly the
         // cross-topic bleed /clear exists to prevent.
         *self.session_goal.lock().await = None;
+        let removed_change_checkpoint = self
+            .cfg
+            .persist_path
+            .as_ref()
+            .map(|path| remove_change_survey_checkpoint(&path.with_file_name("change-survey.json")))
+            .transpose()
+            .map(Option::unwrap_or_default)
+            .unwrap_or_else(|error| {
+                kres_core::async_eprintln!("/clear: failed to remove change survey: {error}");
+                false
+            });
         // Drop every outside-workspace consent. The store is
         // global (OnceLock); without this a /clear would leave
         // grants from the prior topic in place and a follow-up
@@ -4171,9 +4349,10 @@ impl Session {
         // operator forgot they'd allowed.
         let dropped_grants = kres_core::consent::get().map(|s| s.clear()).unwrap_or(0);
         kres_core::async_eprintln!(
-            "/clear: stopped {} task(s), reset findings + todo + accumulated context, dropped {} consent grant(s)",
+            "/clear: stopped {} task(s), reset findings + todo + accumulated context, dropped {} consent grant(s), removed change survey: {}",
             out.stopped + out.grace_expired,
-            dropped_grants
+            dropped_grants,
+            removed_change_checkpoint
         );
     }
 
@@ -4237,7 +4416,8 @@ impl Session {
             cached_prefix: None,
         }];
         if let Some(lg) = &self.logger {
-            lg.log_main("user", &body, None, None);
+            let request = cfg.request_meta();
+            lg.log_main_with_request("user", &body, None, None, Some(&request));
         }
         let resp = match orc.fast_client.messages_streaming(&cfg, &messages).await {
             Ok(r) => r,
@@ -4330,38 +4510,34 @@ fn review_todos_from_plan(plan: &kres_core::Plan) -> Vec<kres_core::TodoItem> {
 /// capping here keeps the attached-context cost bounded. Use
 /// /compact to trim the ledger itself; this cap only limits what
 /// leaks into each new task's prompt.
-const RECENT_CONTEXT_CAP_CHARS: usize = 8_000;
 const REVIEW_FILE_SCAN_CACHE_KEY: &str = "review:file-risk-scan";
+const CHANGE_SURVEY_CHECKPOINT_VERSION: u32 = 3;
+/// A semantic partition target, never a request or information ceiling. Every
+/// byte of the diff is sent exactly once across the chunk bodies (with repeated
+/// hunk headers for orientation), and provider transport may frame each prompt
+/// further without altering its visible content.
+const CHANGE_SURVEY_DIFF_PARTITION_BYTES: usize = 500_000;
+// A large change-survey map request carries one source partition and one diff
+// partition. Keep their combined payload near the same target as the small
+// path instead of allowing two individually-large halves to double it.
+const CHANGE_SURVEY_PAIR_PARTITION_BYTES: usize = CHANGE_SURVEY_DIFF_PARTITION_BYTES / 2;
+const CHANGE_SURVEY_CHUNK_CONCURRENCY: usize = 8;
 
-/// Render the most recent accumulated-analysis entries into a
-/// short preamble, newest-first, capped at `cap` characters.
+/// Render every accumulated-analysis entry into the inference preamble,
+/// newest-first. Selection happens at the call-site; once selected, an entry
+/// is preserved completely.
 /// Returns an empty string when the ledger is empty.
-fn build_recent_context_preamble(entries: &[AccumulatedEntry], cap: usize) -> String {
-    if entries.is_empty() || cap == 0 {
+fn build_recent_context_preamble(entries: &[AccumulatedEntry]) -> String {
+    if entries.is_empty() {
         return String::new();
     }
     let mut out = String::from("Recent context from this session (most recent first):\n\n");
     for e in entries.iter().rev() {
-        if out.len() >= cap {
-            break;
-        }
-        let remaining = cap.saturating_sub(out.len());
-        // Budget each entry: at most half the remaining cap, so an
-        // early giant entry can't starve the rest. Cap at 2k chars
-        // per entry regardless.
-        let entry_budget = (remaining / 2).clamp(400, 2_000);
-        let head: String = e.analysis.chars().take(entry_budget).collect();
-        out.push_str(&format!("### {}\n{}", e.task, head));
-        if e.analysis.chars().count() > entry_budget {
-            out.push_str("\n… (entry truncated)\n");
-        } else if !head.ends_with('\n') {
+        out.push_str(&format!("### {}\n{}", e.task, e.analysis));
+        if !e.analysis.ends_with('\n') {
             out.push('\n');
         }
         out.push('\n');
-    }
-    if out.len() > cap {
-        out.truncate(cap);
-        out.push_str("\n… (preamble truncated at cap)\n");
     }
     out
 }
@@ -4595,7 +4771,7 @@ pub async fn build_agent_runner(
         client: slow_client.clone(),
         model: slow_model.clone(),
         system: Some(format!(
-            "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For a named source-file target, the prompt contains a WHOLE-FILE RISK SCAN gathered before goal selection. Use that ranked inventory to define an evidence-backed completion goal and a staged plan; never add another survey or scan step. Return 3 or 4 independent semantic path/contract groups with no dependencies, partitioned by real code paths and prioritized by the ranked functions, plus exactly one final cross-contract completeness step depending on every group. For other targets, create one orientation/context step, a bounded middle wave, and a final completeness step. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Never partition by generic review lenses. Do not create more than 5 total steps for a scanned file. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
+            "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For a named source-file target, the prompt contains a WHOLE-FILE RISK SCAN gathered before goal selection. It includes six-month change-informed function ratings, interaction-filtered external research questions, and one final file risk rating. Use that ranked inventory to define an evidence-backed completion goal and a staged plan; never add another survey or scan step. Give retained external research questions priority only because the file survey established an interaction with the target. Return 3 or 4 independent semantic path/contract groups with no dependencies, partitioned by real code paths and prioritized by the ranked functions, plus exactly one final cross-contract completeness step depending on every group. For other targets, create one orientation/context step, a bounded middle wave, and a final completeness step. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Never partition by generic review lenses. Do not create more than 5 total steps for a scanned file. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
             kres_agents::GOAL_INSTRUCTIONS
         )),
         max_tokens: slow_max_tokens,
@@ -5231,43 +5407,1594 @@ async fn reconcile_turn_cap_todos(mgr: &Arc<TaskManager>) -> (usize, usize) {
     (reset, deferred)
 }
 
-async fn review_file_scan_context(mgr: &Arc<TaskManager>) -> Option<String> {
-    if let Some(serde_json::Value::String(scan)) =
-        mgr.get_cached_context(REVIEW_FILE_SCAN_CACHE_KEY).await
-    {
-        return Some(scan);
+#[derive(Debug, Clone)]
+struct CompletedReviewFileScan {
+    target: String,
+    source_hash: String,
+    baseline: String,
+    head: String,
+    scan: String,
+}
+
+impl CompletedReviewFileScan {
+    fn persisted(&self) -> kres_core::ReviewFileScanState {
+        kres_core::ReviewFileScanState {
+            target: self.target.clone(),
+            source_hash: self.source_hash.clone(),
+            baseline: self.baseline.clone(),
+            head: self.head.clone(),
+            scan: self.scan.clone(),
+        }
     }
-    let plan = mgr.plan_snapshot().await?;
-    let (_, tail) = plan.prompt.split_once("--- WHOLE-FILE RISK SCAN ---\n")?;
-    let (scan, _) = tail.split_once("\n--- END WHOLE-FILE RISK SCAN ---")?;
-    (!scan.trim().is_empty()).then(|| scan.trim().to_string())
+}
+
+async fn cache_review_file_scan(mgr: &Arc<TaskManager>, scan: &CompletedReviewFileScan) {
+    mgr.cache_context(
+        REVIEW_FILE_SCAN_CACHE_KEY,
+        serde_json::to_value(scan.persisted()).expect("review scan state serializes"),
+    )
+    .await;
+}
+
+fn review_target_path(workspace: &Path, target: &str) -> PathBuf {
+    if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace.join(target)
+    }
+}
+
+fn current_review_head(workspace: &Path) -> Result<String> {
+    let head = gix::discover(workspace)
+        .context("discovering review repository")?
+        .head_id()
+        .context("resolving review repository HEAD")?
+        .to_string();
+    Ok(format!("WORKTREE@{head}"))
+}
+
+fn review_file_scan_matches_current_source(
+    workspace: &Path,
+    state: &kres_core::ReviewFileScanState,
+) -> Result<bool> {
+    let target = review_target_path(workspace, &state.target);
+    let source = std::fs::read_to_string(&target)?;
+    Ok(
+        change_survey_source_hash(&target, &source)? == state.source_hash
+            && current_review_head(workspace)? == state.head,
+    )
+}
+
+async fn review_file_scan_matches_current_window(
+    workspace: &Path,
+    state: &kres_core::ReviewFileScanState,
+) -> Result<bool> {
+    if !review_file_scan_matches_current_source(workspace, state)? {
+        return Ok(false);
+    }
+    let cutoff = chrono::Utc::now()
+        .checked_sub_months(chrono::Months::new(6))
+        .context("computing six-month review scan cutoff")?
+        .timestamp();
+    let workspace = workspace.to_path_buf();
+    let target = state.target.clone();
+    let window = tokio::task::spawn_blocking(move || {
+        crate::change_survey::aggregate_target_diff(&workspace, &target, cutoff)
+    })
+    .await
+    .context("joining review scan fingerprint computation")??;
+    Ok(window.baseline == state.baseline && window.head == state.head)
+}
+
+async fn review_file_scan_context(
+    mgr: &Arc<TaskManager>,
+    workspace: &Path,
+    expected_target: &str,
+) -> Option<String> {
+    let value = mgr.get_cached_context(REVIEW_FILE_SCAN_CACHE_KEY).await?;
+    let state: kres_core::ReviewFileScanState = serde_json::from_value(value).ok()?;
+    if state.target != expected_target
+        || state.scan.trim().is_empty()
+        || !review_file_scan_matches_current_source(workspace, &state).unwrap_or(false)
+    {
+        mgr.remove_cached_context(REVIEW_FILE_SCAN_CACHE_KEY).await;
+        return None;
+    }
+    Some(state.scan)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangeSurveyCheckpoint {
+    version: u32,
+    target: String,
+    source_hash: String,
+    baseline: String,
+    head: String,
+    report: Option<ChangeSurveyReport>,
+}
+
+#[derive(Clone)]
+struct ChangeSurveyCheckpointStore {
+    path: PathBuf,
+    state: Arc<tokio::sync::Mutex<ChangeSurveyCheckpoint>>,
+}
+
+impl ChangeSurveyCheckpointStore {
+    fn open(
+        path: PathBuf,
+        target: String,
+        source_hash: String,
+        baseline: String,
+        head: String,
+        reuse_existing: bool,
+    ) -> Result<Self> {
+        let loaded = reuse_existing
+            .then(|| std::fs::read_to_string(&path).ok())
+            .flatten()
+            .and_then(|body| serde_json::from_str::<ChangeSurveyCheckpoint>(&body).ok())
+            .filter(|checkpoint| {
+                checkpoint.version == CHANGE_SURVEY_CHECKPOINT_VERSION
+                    && checkpoint.target == target
+                    && checkpoint.source_hash == source_hash
+                    && checkpoint.baseline == baseline
+                    && checkpoint.head == head
+            });
+        let state = loaded.unwrap_or(ChangeSurveyCheckpoint {
+            version: CHANGE_SURVEY_CHECKPOINT_VERSION,
+            target,
+            source_hash,
+            baseline,
+            head,
+            report: None,
+        });
+        save_change_survey_checkpoint(&path, &state)?;
+        Ok(Self {
+            path,
+            state: Arc::new(tokio::sync::Mutex::new(state)),
+        })
+    }
+
+    async fn report(&self) -> Option<ChangeSurveyReport> {
+        self.state.lock().await.report.clone()
+    }
+
+    async fn record(&self, report: ChangeSurveyReport) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.report = Some(report);
+        let snapshot = state.clone();
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || save_change_survey_checkpoint(&path, &snapshot))
+            .await
+            .context("joining change-survey checkpoint write")??;
+        Ok(())
+    }
+}
+
+fn save_change_survey_checkpoint(path: &Path, checkpoint: &ChangeSurveyCheckpoint) -> Result<()> {
+    use std::io::Write;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(checkpoint)?;
+    let temporary = path.with_extension("json.tmp");
+    {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary, path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn remove_change_survey_checkpoint(path: &Path) -> Result<bool> {
+    let mut removed = false;
+    for candidate in [path.to_path_buf(), path.with_extension("json.tmp")] {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("removing change-survey checkpoint {}", candidate.display())
+                });
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn change_survey_source_hash(target: &Path, source: &str) -> Result<String> {
+    let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
+    hasher.update(source.as_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = std::fs::metadata(target)?.permissions().mode() & 0o111 != 0;
+        hasher.update(if executable {
+            b"\0mode=100755"
+        } else {
+            b"\0mode=100644"
+        });
+    }
+    Ok(hasher
+        .try_finalize()
+        .context("hashing whole-file change-survey source")?
+        .to_string())
+}
+
+fn compact_change_survey_report(report: &ChangeSurveyReport) -> serde_json::Value {
+    let target_function_risks = report
+        .target_function_risks
+        .iter()
+        .map(|risk| {
+            if risk.risk_rating == 0 {
+                serde_json::json!([risk.name, risk.risk_rating])
+            } else {
+                serde_json::json!([risk.name, risk.risk_rating, risk.reason])
+            }
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "baseline": report.baseline,
+        "head": report.head,
+        "target_function_risks": target_function_risks,
+        "external_major_risks": report.external_major_risks,
+    })
 }
 
 async fn run_review_file_scan(
     runner: &Arc<AgentRunner>,
+    workspace: &Path,
     target: &str,
+    checkpoint_path: Option<PathBuf>,
+    reuse_checkpoint: bool,
     shutdown: &kres_core::Shutdown,
-) -> Result<String> {
-    let prompt = format!(
-        "Whole-file review bootstrap scan for {target}. In the first gather round request exactly one `survey` followup for {target}. Do not request skills or any other followup. After receiving the file_survey inventory, set ready_for_slow=true. The slow response must set `analysis` to a compact JSON array with exactly one object per defined function: {{\"name\":string,\"uses\":nonnegative integer,\"bug_likelihood\":integer 0-100}}. Guess without reasoning from use/reference counts and internal metrics. Do not score referenced-only functions. Return empty findings and followups."
-    );
-    let ctx = RunContext {
-        task_brief: format!("review bootstrap scan: {target}"),
-        mode: kres_core::TaskMode::Audit,
-        disable_skill_reads: true,
-        allowed_gather_kinds: Some(std::iter::once("survey".to_string()).collect()),
-        ..RunContext::default()
-    };
-    let summary = runner
-        .run_once_with_ctx(&prompt, &ctx, shutdown)
+) -> Result<CompletedReviewFileScan> {
+    let (change_window, mut change_report, checkpoint) = run_review_change_survey(
+        runner,
+        workspace,
+        target,
+        checkpoint_path,
+        reuse_checkpoint,
+        shutdown,
+    )
+    .await?;
+    let survey = runner
+        .fetcher
+        .fetch(
+            &[Followup {
+                kind: "survey".to_string(),
+                name: target.to_string(),
+                reason: "whole-file structural inventory".to_string(),
+                path: None,
+                nice_to_have: false,
+            }],
+            None,
+        )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let value: serde_json::Value = serde_json::from_str(&summary.analysis)
-        .context("slow scan analysis is not a JSON array")?;
-    if !value.is_array() {
-        anyhow::bail!("slow scan analysis is not a JSON array");
+    let (inventory, fallback_inventory) = match FileSurveyInventory::from_context(&survey.context) {
+        Some(inventory) => (inventory, None),
+        None => {
+            let inventory = infer_fallback_file_survey_inventory(
+                runner,
+                workspace,
+                target,
+                &survey.context,
+                shutdown,
+            )
+            .await?;
+            let context = inventory.as_context_value(target);
+            (inventory, Some(context))
+        }
+    };
+    let inventory_functions = inventory.function_names();
+    change_report = match change_report {
+        Some(report) => match complete_function_coverage(report, &inventory_functions) {
+            Ok(report) => Some(report),
+            Err(error) => {
+                kres_core::async_eprintln!(
+                    "[change survey] sparse pre-survey result needs one corrective pass against the authoritative function set: {error}"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    if change_report.is_none() {
+        kres_core::async_eprintln!(
+            "[change survey] assessing the six-month target-file diff against the authoritative function set"
+        );
+        change_report = assess_change_survey(
+            runner,
+            target,
+            &std::fs::read_to_string(if Path::new(target).is_absolute() {
+                PathBuf::from(target)
+            } else {
+                workspace.join(target)
+            })?,
+            &change_window,
+            Some(&inventory_functions),
+            shutdown,
+        )
+        .await?;
+        if let (Some(checkpoint), Some(report)) = (&checkpoint, &change_report) {
+            checkpoint.record(report.clone()).await?;
+        }
     }
-    serde_json::to_string(&value).context("serializing review scan")
+    let change_report = change_report.context("six-month change survey produced no ratings")?;
+    let target_path = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace.join(target)
+    };
+    let target_source = std::fs::read_to_string(&target_path)
+        .with_context(|| format!("reading whole-file review target {}", target_path.display()))?;
+    let external_interactions = change_report
+        .external_major_risks
+        .iter()
+        .filter_map(|risk| {
+            inventory
+                .interaction_kind(&risk.name, &target_source)
+                .map(|kind| {
+                    serde_json::json!({
+                        "function": risk.name,
+                        "file": risk.file,
+                        "evidence": kind,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+    let change_risks = serde_json::to_string(&compact_change_survey_report(&change_report))
+        .context("serializing whole-file change survey")?;
+    // Exactly one inventory reaches the model. When the semcode survey was
+    // rejected and rebuilt by inference, shipping the rejected copy alongside
+    // the replacement put two contradictory `functions_defined` arrays in the
+    // same prompt with nothing marking which was authoritative.
+    let survey_context_values = match fallback_inventory {
+        Some(fallback_inventory) => vec![fallback_inventory],
+        None => survey.context,
+    };
+    let survey_context = serde_json::to_string(&survey_context_values)
+        .context("serializing whole-file structural survey")?;
+    let external_interactions = serde_json::to_string(&external_interactions)
+        .context("serializing external interaction evidence")?;
+    let prompt = format!(
+        "Complete the whole-file review file survey for {target}. A Rust change survey has assessed one net target-file diff covering the last six months, and Rust has fetched file_survey exactly once. In CHANGE SURVEY REPORT, each target risk tuple is `[function,rating]` or `[function,rating,reason]`; a reason is included only for a nonzero rating.\n\nCHANGE SURVEY REPORT:\n{change_risks}\n\nFILE_SURVEY CONTEXT:\n{survey_context}\n\nEXTERNAL INTERACTIONS ESTABLISHED BY RUST:\n{external_interactions}\n\nReturn exactly one raw compact JSON object with fields in this order: `functions`, `research_questions`, then `file_risk_rating`. `functions` must contain exactly one object per function defined by file_survey: {{\"name\":string,\"risk_rating\":integer 0-100}}. Do not report use counts; Rust owns them. Combine structural survey evidence with the net-change risk into the function's single final risk_rating. A combined function rating must never be lower than its CHANGE SURVEY REPORT rating. Return only that single combined rating per function. Do not score referenced-only functions.\n\nTurn every entry under EXTERNAL INTERACTIONS ESTABLISHED BY RUST into exactly one non-empty research question, and omit every external risk not listed there. Each retained question is {{\"function\":string,\"file\":string,\"question\":string,\"priority\":integer 80-100}}. `file_risk_rating` is one integer 0-100 for the whole target, must be at least the highest combined function rating, and must be the final field. No markdown or prose outside the JSON object."
+    );
+    let mut errors = Vec::new();
+    let mut completed = None;
+    for attempt in 1..=2 {
+        let repair_prompt;
+        let attempt_prompt = if let Some(previous_error) = errors.last() {
+            repair_prompt = format!(
+                "{prompt}\n\nYour previous response failed validation: {previous_error}\nReturn a corrected complete JSON object."
+            );
+            repair_prompt.as_str()
+        } else {
+            prompt.as_str()
+        };
+        let response = runner
+            .run_primary_slow_inference(
+                "You combine a structural file inventory with six-month net-change risks. Follow the requested JSON schema exactly and do not emit markdown or commentary.",
+                attempt_prompt,
+                &format!("file-survey {target} attempt {attempt}"),
+                shutdown,
+            )
+            .await;
+        match response {
+            Ok(response) => {
+                let parsed = serde_json::from_str::<ReviewFileSurvey>(&response)
+                    .context("slow file survey analysis is not a JSON object")
+                    .and_then(|value| {
+                        value.validate(&inventory, &change_report, &target_source)?;
+                        Ok(value)
+                    });
+                match parsed {
+                    Ok(value) => {
+                        completed = Some(value);
+                        break;
+                    }
+                    Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+                }
+            }
+            Err(error) if shutdown.is_cancelled() => {
+                anyhow::bail!("cancelled during final whole-file survey: {error}")
+            }
+            Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+        }
+    }
+    let value = completed.with_context(|| {
+        format!(
+            "final whole-file survey failed after retries: {}",
+            errors.join("; ")
+        )
+    })?;
+    // Join Rust's authoritative spelling counts onto the model's ratings so
+    // the scan the agents receive keeps the same shape it always had.
+    let scan = ScanFileSurvey {
+        functions: value
+            .functions
+            .iter()
+            .map(|function| ScanFunctionRisk {
+                name: function.name.as_str(),
+                uses: inventory
+                    .functions
+                    .get(&function.name)
+                    .copied()
+                    .unwrap_or_default(),
+                risk_rating: function.risk_rating,
+            })
+            .collect(),
+        research_questions: &value.research_questions,
+        file_risk_rating: value.file_risk_rating,
+    };
+    let serialized = serde_json::to_string(&scan).context("serializing review scan")?;
+    // Keep the completed checkpoint beside session.json so the net-diff
+    // assessment remains resumable until the scan reaches the persisted plan.
+    Ok(CompletedReviewFileScan {
+        target: target.to_string(),
+        source_hash: change_survey_source_hash(&target_path, &target_source)?,
+        baseline: change_report.baseline,
+        head: change_report.head,
+        scan: serialized,
+    })
+}
+
+async fn run_review_change_survey(
+    runner: &Arc<AgentRunner>,
+    workspace: &Path,
+    target: &str,
+    checkpoint_path: Option<PathBuf>,
+    reuse_checkpoint: bool,
+    shutdown: &kres_core::Shutdown,
+) -> Result<(
+    crate::change_survey::AggregateTargetDiff,
+    Option<ChangeSurveyReport>,
+    Option<ChangeSurveyCheckpointStore>,
+)> {
+    let cutoff = chrono::Utc::now()
+        .checked_sub_months(chrono::Months::new(6))
+        .context("computing six-month change-survey cutoff")?
+        .timestamp();
+    let diff_workspace = workspace.to_path_buf();
+    let diff_target = target.to_string();
+    let window = tokio::task::spawn_blocking(move || {
+        crate::change_survey::aggregate_target_diff(&diff_workspace, &diff_target, cutoff)
+    })
+    .await
+    .context("joining gix six-month target diff")??;
+    let target_path = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace.join(target)
+    };
+    let target_source = std::fs::read_to_string(&target_path)
+        .with_context(|| format!("reading whole-file review target {}", target_path.display()))?;
+    let checkpoint = if let Some(path) = checkpoint_path {
+        Some(ChangeSurveyCheckpointStore::open(
+            path,
+            target_path.to_string_lossy().into_owned(),
+            change_survey_source_hash(&target_path, &target_source)?,
+            window.baseline.clone(),
+            window.head.clone(),
+            reuse_checkpoint,
+        )?)
+    } else {
+        None
+    };
+    let mut report = if let Some(checkpoint) = &checkpoint {
+        checkpoint.report().await
+    } else {
+        None
+    };
+    if report.is_some() {
+        kres_core::async_eprintln!(
+            "[change survey] resumed completed six-month net-diff assessment"
+        );
+    } else {
+        kres_core::async_eprintln!(
+            "[change survey] generated {}-byte target-file diff from {} to {}",
+            window.diff.len(),
+            window.baseline,
+            window.head
+        );
+        report =
+            assess_change_survey(runner, target, &target_source, &window, None, shutdown).await?;
+        if let (Some(checkpoint), Some(report)) = (&checkpoint, &report) {
+            checkpoint.record(report.clone()).await?;
+        }
+    }
+    Ok((window, report, checkpoint))
+}
+
+async fn infer_fallback_file_survey_inventory(
+    runner: &Arc<AgentRunner>,
+    workspace: &Path,
+    target: &str,
+    fallback_context: &[serde_json::Value],
+    shutdown: &kres_core::Shutdown,
+) -> Result<FileSurveyInventory> {
+    let target_path = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        workspace.join(target)
+    };
+    let target_source = std::fs::read_to_string(&target_path)
+        .with_context(|| format!("reading whole-file review target {}", target_path.display()))?;
+    let ctags_functions = ctags_function_inventory(&target_path)?;
+    let ctags_context = serde_json::to_string(&ctags_functions)
+        .context("serializing deterministic fallback function inventory")?;
+    let fallback_context = serde_json::to_string(fallback_context)
+        .context("serializing local file-survey fallback evidence")?;
+    if target_source.len() > CHANGE_SURVEY_DIFF_PARTITION_BYTES {
+        return infer_fallback_file_survey_chunks(
+            runner,
+            target,
+            &target_source,
+            &ctags_functions,
+            &ctags_context,
+            &fallback_context,
+            shutdown,
+        )
+        .await;
+    }
+    let prompt = format!(
+        "Semcode file_survey was unavailable for {target}. Build the typed structural inventory from the complete current source below, using the preserved local fallback matches as supporting evidence. Return exactly one raw JSON object {{\"functions\":[{{\"name\":string}}],\"calls\":[string]}}. `functions` must list every function defined in the target. Do not report use counts; Rust computes them from source. `calls` must list every function named by a call expression in the target; retain qualified/member call spellings when present. Do not include declarations or referenced-only names in `functions`. Every name in CTAGS FUNCTION FLOOR is known to be defined and must be present; inspect the complete source for macro-shaped definitions ctags may miss. No markdown or prose outside JSON.\n\nCTAGS FUNCTION FLOOR:\n{ctags_context}\n\nLOCAL FALLBACK EVIDENCE:\n{fallback_context}\n\nCURRENT TARGET FILE ({target}):\n{target_source}"
+    );
+    let mut errors = Vec::new();
+    for attempt in 1..=2 {
+        let retry_prompt;
+        let attempt_prompt = if let Some(previous_error) = errors.last() {
+            retry_prompt = format!(
+                "{prompt}\n\nYour previous response failed validation: {previous_error}\nReturn a corrected complete JSON object."
+            );
+            retry_prompt.as_str()
+        } else {
+            prompt.as_str()
+        };
+        let response = runner
+            .run_primary_slow_inference(
+                "You produce a typed structural inventory for one source file. Follow the requested JSON schema exactly and do not emit markdown or commentary.",
+                attempt_prompt,
+                &format!("fallback-file-survey {target} attempt {attempt}"),
+                shutdown,
+            )
+            .await;
+        match response {
+            Ok(response) => match serde_json::from_str::<InferredFileSurveyInventory>(&response)
+                .context("fallback file survey response is not raw JSON")
+                .and_then(|inventory| {
+                    let inventory =
+                        FileSurveyInventory::try_from_inferred(inventory, &target_source)?;
+                    inventory.validate_fallback(&ctags_functions)?;
+                    Ok(inventory)
+                }) {
+                Ok(inventory) => return Ok(inventory),
+                Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+            },
+            Err(error) if shutdown.is_cancelled() => {
+                anyhow::bail!("cancelled during fallback file survey: {error}")
+            }
+            Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+        }
+    }
+    anyhow::bail!(
+        "fallback file survey failed after retries: {}",
+        errors.join("; ")
+    )
+}
+
+async fn infer_fallback_file_survey_chunks(
+    runner: &Arc<AgentRunner>,
+    target: &str,
+    target_source: &str,
+    ctags_functions: &BTreeSet<String>,
+    ctags_context: &str,
+    fallback_context: &str,
+    shutdown: &kres_core::Shutdown,
+) -> Result<FileSurveyInventory> {
+    const SOURCE_OVERLAP_BYTES: usize = 4096;
+    let chunks = split_source_for_inference(target_source, CHANGE_SURVEY_DIFF_PARTITION_BYTES)?;
+    let count = chunks.len();
+    let cached_prefix = format!(
+        "Build a sparse structural inventory from one lossless source partition of {target}. Return exactly one raw JSON object {{\"functions\":[{{\"name\":string}}],\"calls\":[string]}}. List every function definition visible in the supplied chunk and every function call expression visible in it. Adjacent chunks overlap for syntax context; duplicates are merged by Rust. Do not report use counts; Rust computes whole-file spelling counts itself. Do not invent definitions merely because CTAGS FUNCTION FLOOR names them. No markdown or prose outside JSON.\n\nCTAGS FUNCTION FLOOR:\n{ctags_context}\n\nLOCAL FALLBACK EVIDENCE:\n{fallback_context}\n\n"
+    );
+    kres_core::async_eprintln!(
+        "[file survey] fallback source is large; inventorying {} lossless chunk(s)",
+        count
+    );
+    let reports = stream::iter(chunks.iter().enumerate().map(|(index, chunk)| {
+        let mut context_start = chunk.source_start.saturating_sub(SOURCE_OVERLAP_BYTES);
+        while context_start < chunk.source_start && !target_source.is_char_boundary(context_start) {
+            context_start += 1;
+        }
+        let source = &target_source[context_start..chunk.source_end];
+        let prompt_tail = format!(
+            "SOURCE CHUNK: {}/{}\n\nCURRENT TARGET FILE CHUNK:\n{source}",
+            index + 1,
+            count,
+        );
+        let cached_prefix = cached_prefix.as_str();
+        async move {
+            let mut errors = Vec::new();
+            for attempt in 1..=2 {
+                if shutdown.is_cancelled() {
+                    anyhow::bail!("cancelled during fallback file survey");
+                }
+                let retry;
+                let attempt_tail = if let Some(error) = errors.last() {
+                    retry = format!(
+                        "{prompt_tail}\n\nYour previous response failed validation: {error}\nReturn corrected raw JSON."
+                    );
+                    retry.as_str()
+                } else {
+                    prompt_tail.as_str()
+                };
+                let response = runner
+                    .run_primary_slow_inference_low_effort(
+                        "You produce a sparse typed structural inventory for one source-file chunk. Follow the requested JSON schema exactly and do not emit markdown or commentary.",
+                        cached_prefix,
+                        attempt_tail,
+                        true,
+                        &format!("fallback-file-survey {target} chunk {}/{} attempt {attempt}", index + 1, count),
+                        shutdown,
+                    )
+                    .await;
+                match response {
+                    Ok(response) => match serde_json::from_str::<InferredFileSurveyInventory>(&response)
+                        .context("fallback file survey chunk is not raw JSON")
+                        .and_then(|inventory| {
+                            FileSurveyInventory::try_from_inferred(inventory, target_source)
+                        })
+                    {
+                        Ok(inventory) => return Ok(inventory),
+                        Err(error) => errors.push(error.to_string()),
+                    },
+                    Err(error) if shutdown.is_cancelled() => {
+                        anyhow::bail!("cancelled during fallback file survey: {error}")
+                    }
+                    Err(error) => errors.push(error.to_string()),
+                }
+            }
+            anyhow::bail!(errors.join("; "))
+        }
+    }))
+    .buffer_unordered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+
+    let mut names = ctags_functions.clone();
+    let mut calls = BTreeSet::new();
+    for report in reports {
+        names.extend(report.functions.into_keys());
+        calls.extend(report.calls);
+    }
+    let inventory = FileSurveyInventory {
+        functions: names
+            .into_iter()
+            .map(|name| {
+                let uses = identifier_occurrences(target_source, &name);
+                (name, uses)
+            })
+            .collect(),
+        calls: calls.into_iter().collect(),
+    };
+    inventory.validate_fallback(ctags_functions)?;
+    Ok(inventory)
+}
+
+async fn assess_change_survey(
+    runner: &Arc<AgentRunner>,
+    target: &str,
+    target_source: &str,
+    window: &crate::change_survey::AggregateTargetDiff,
+    expected_functions: Option<&BTreeSet<String>>,
+    shutdown: &kres_core::Shutdown,
+) -> Result<Option<ChangeSurveyReport>> {
+    if shutdown.is_cancelled() {
+        anyhow::bail!("cancelled during whole-file change survey");
+    }
+    let prompt = change_survey_prompt(target, target_source, window, expected_functions);
+    if window.diff.len().saturating_add(target_source.len()) <= CHANGE_SURVEY_DIFF_PARTITION_BYTES {
+        let coverage =
+            expected_functions.map_or(ChangeSurveyCoverage::Unchecked, ChangeSurveyCoverage::Exact);
+        return infer_change_survey_prompt(
+            runner,
+            &prompt,
+            ChangeSurveyWindowId {
+                baseline: &window.baseline,
+                head: &window.head,
+            },
+            coverage,
+            ChangeSurveyCall {
+                task_kind: "change-survey net-diff",
+                cache_prefix: false,
+            },
+            shutdown,
+        )
+        .await
+        .map(Some);
+    }
+
+    let chunks = split_diff_for_inference(&window.diff, CHANGE_SURVEY_PAIR_PARTITION_BYTES)?;
+    let source_chunks = if target_source
+        .len()
+        .saturating_add(CHANGE_SURVEY_PAIR_PARTITION_BYTES)
+        <= CHANGE_SURVEY_DIFF_PARTITION_BYTES
+    {
+        vec![crate::change_survey::PreparedDiffChunk {
+            text: target_source.to_string(),
+            source_start: 0,
+            source_end: target_source.len(),
+        }]
+    } else {
+        split_source_for_inference(target_source, CHANGE_SURVEY_PAIR_PARTITION_BYTES)?
+    };
+    let pair_count = chunks.len().saturating_mul(source_chunks.len());
+    kres_core::async_eprintln!(
+        "[change survey] target-file input is large ({} diff bytes, {} source bytes); assessing {} source scope(s) against {} diff chunk(s) in {} semantic call(s), concurrency {}",
+        window.diff.len(),
+        target_source.len(),
+        source_chunks.len(),
+        chunks.len(),
+        pair_count,
+        CHANGE_SURVEY_CHUNK_CONCURRENCY,
+    );
+    let chunk_count = chunks.len();
+    let source_count = source_chunks.len();
+    let run_prompt = |chunk_prompt: ChangeSurveyPrompt, label: String| async move {
+        if shutdown.is_cancelled() {
+            anyhow::bail!("cancelled during whole-file change survey");
+        }
+        infer_change_survey_prompt(
+            runner,
+            &chunk_prompt,
+            ChangeSurveyWindowId {
+                baseline: &window.baseline,
+                head: &window.head,
+            },
+            expected_functions.map_or(
+                ChangeSurveyCoverage::Unchecked,
+                ChangeSurveyCoverage::Subset,
+            ),
+            ChangeSurveyCall {
+                task_kind: &label,
+                // every diff chunk for one source scope shares this prefix
+                cache_prefix: true,
+            },
+            shutdown,
+        )
+        .await
+    };
+    // Prime each source-specific cached prefix once. The remaining diff chunks
+    // then run in parallel without a cache-creation stampede.
+    let mut chunk_surveys = stream::iter(source_chunks.iter().enumerate().map(
+        |(source_index, source)| {
+            let chunk = &chunks[0];
+            let prompt = change_survey_chunk_prompt(
+                target,
+                window,
+                expected_functions,
+                Some(ChangeSurveySourceChunk {
+                    text: &source.text,
+                    index: source_index,
+                    count: source_count,
+                }),
+                Some(ChangeSurveyDiffChunk {
+                    text: &chunk.text,
+                    index: 0,
+                    count: chunk_count,
+                }),
+            );
+            let label = format!(
+                "change-survey source {}/{} diff 1/{}",
+                source_index + 1,
+                source_count,
+                chunk_count
+            );
+            async move {
+                run_prompt(prompt, label)
+                    .await
+                    .map(|report| (source_index * chunk_count, report))
+            }
+        },
+    ))
+    .buffer_unordered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    let remaining = stream::iter(source_chunks.iter().enumerate().flat_map(
+        |(source_index, source)| {
+            chunks
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(move |(diff_index, chunk)| {
+                    let prompt = change_survey_chunk_prompt(
+                        target,
+                        window,
+                        expected_functions,
+                        Some(ChangeSurveySourceChunk {
+                            text: &source.text,
+                            index: source_index,
+                            count: source_count,
+                        }),
+                        Some(ChangeSurveyDiffChunk {
+                            text: &chunk.text,
+                            index: diff_index,
+                            count: chunk_count,
+                        }),
+                    );
+                    let label = format!(
+                        "change-survey source {}/{} diff {}/{}",
+                        source_index + 1,
+                        source_count,
+                        diff_index + 1,
+                        chunk_count
+                    );
+                    async move {
+                        run_prompt(prompt, label)
+                            .await
+                            .map(|report| (source_index * chunk_count + diff_index, report))
+                    }
+                })
+        },
+    ))
+    .buffer_unordered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    chunk_surveys.extend(remaining);
+    chunk_surveys.sort_by_key(|(index, _)| *index);
+    let chunk_surveys = chunk_surveys
+        .into_iter()
+        .map(|(_, report)| report)
+        .collect::<Vec<_>>();
+    let mut partial_reports = chunk_surveys;
+    while serialized_change_survey_reports_len(&partial_reports)?
+        > CHANGE_SURVEY_DIFF_PARTITION_BYTES
+        && partial_reports.len() > 1
+    {
+        let batches =
+            pack_change_survey_reports(partial_reports, CHANGE_SURVEY_DIFF_PARTITION_BYTES)?;
+        if batches.len() >= batches.iter().map(Vec::len).sum::<usize>() {
+            anyhow::bail!(
+                "change-survey reports cannot be reduced without splitting a typed report"
+            );
+        }
+        kres_core::async_eprintln!(
+            "[change survey] reducing oversized report set through {} semantic batch(es)",
+            batches.len()
+        );
+        let batch_count = batches.len();
+        partial_reports = stream::iter(batches.into_iter().enumerate().map(|(index, batch)| {
+            let prompt =
+                change_survey_reduction_prompt(target, window, &batch, expected_functions, false);
+            async move {
+                let label = format!(
+                    "change-survey report reduction {}/{}",
+                    index + 1,
+                    batch_count
+                );
+                infer_change_survey_prompt(
+                    runner,
+                    &prompt,
+                    ChangeSurveyWindowId {
+                        baseline: &window.baseline,
+                        head: &window.head,
+                    },
+                    expected_functions.map_or(
+                        ChangeSurveyCoverage::Unchecked,
+                        ChangeSurveyCoverage::Subset,
+                    ),
+                    ChangeSurveyCall {
+                        task_kind: &label,
+                        // each batch builds its own reduction prefix
+                        cache_prefix: false,
+                    },
+                    shutdown,
+                )
+                .await
+            }
+        }))
+        .buffered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    }
+    let reduction_prompt =
+        change_survey_reduction_prompt(target, window, &partial_reports, expected_functions, true);
+    infer_change_survey_prompt(
+        runner,
+        &reduction_prompt,
+        ChangeSurveyWindowId {
+            baseline: &window.baseline,
+            head: &window.head,
+        },
+        expected_functions.map_or(ChangeSurveyCoverage::Unchecked, ChangeSurveyCoverage::Exact),
+        ChangeSurveyCall {
+            task_kind: "change-survey chunk reduction",
+            cache_prefix: false,
+        },
+        shutdown,
+    )
+    .await
+    .map(Some)
+}
+
+fn serialized_change_survey_reports_len(reports: &[ChangeSurveyReport]) -> Result<usize> {
+    serde_json::to_vec(reports)
+        .map(|serialized| serialized.len())
+        .context("serializing change-survey reports")
+}
+
+fn pack_change_survey_reports(
+    reports: Vec<ChangeSurveyReport>,
+    target_bytes: usize,
+) -> Result<Vec<Vec<ChangeSurveyReport>>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    for report in reports {
+        current.push(report);
+        if serialized_change_survey_reports_len(&current)? <= target_bytes {
+            continue;
+        }
+        let last = current.pop().expect("report was just pushed");
+        if current.is_empty() {
+            batches.push(vec![last]);
+        } else {
+            batches.push(std::mem::take(&mut current));
+            current.push(last);
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    Ok(batches)
+}
+
+fn change_survey_reduction_prompt(
+    target: &str,
+    window: &crate::change_survey::AggregateTargetDiff,
+    reports: &[ChangeSurveyReport],
+    expected_functions: Option<&BTreeSet<String>>,
+    final_pass: bool,
+) -> ChangeSurveyPrompt {
+    let reports = serde_json::to_string(reports)
+        .expect("serializing validated change-survey reports cannot fail");
+    let function_scope = if final_pass {
+        expected_functions.map_or_else(
+            || {
+                "Emit one final entry for every target-file function named by the reports. This pre-file-survey result may remain sparse; after the structural inventory is available, a corrective inference pass will assess every missing function.".to_string()
+            },
+            |functions| {
+                format!(
+                    "Emit exactly one target_function_risks entry for every authoritative target function and no others: {}.",
+                    serde_json::to_string(functions)
+                        .expect("serializing function names cannot fail")
+                )
+            },
+        )
+    } else {
+        "Emit one entry for every target-file function named by these reports and no function absent from them. This is an intermediate reduction; do not manufacture no-evidence ratings.".to_string()
+    };
+    ChangeSurveyPrompt {
+        cached_prefix: format!(
+            "Reconcile source/diff chunk risk reports into one six-month net-change assessment for {target}. The reports are partial evidence from one logical diff, not independent commits. A high rating in an early chunk must be lowered when another chunk shows the risky change was fixed. {function_scope} Preserve an external risk only when the combined reports still justify major risk (80-100). Return exactly one raw JSON object {{\"target_function_risks\":[{{\"name\":string,\"risk_rating\":integer,\"reason\":string}}],\"external_major_risks\":[{{\"name\":string,\"file\":string,\"risk_rating\":integer,\"reason\":string}}]}}. Keep reasons to at most 12 words. No markdown or prose outside JSON.\n\nCHUNK REPORTS:\n{reports}\n\n",
+        ),
+        tail: format!("BASELINE: {}\nHEAD: {}", window.baseline, window.head),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChangeSurveyCoverage<'a> {
+    Unchecked,
+    Subset(&'a BTreeSet<String>),
+    Exact(&'a BTreeSet<String>),
+}
+
+impl ChangeSurveyCoverage<'_> {
+    fn validate(self, report: &ChangeSurveyReport) -> Result<()> {
+        match self {
+            Self::Unchecked => Ok(()),
+            Self::Subset(expected) => validate_function_subset(report, expected),
+            Self::Exact(expected) => validate_function_coverage(report, expected),
+        }
+    }
+}
+
+/// Identity of the six-month window a change-survey call is assessing.
+/// Carried together because every call needs both halves and neither is
+/// meaningful alone.
+#[derive(Clone, Copy)]
+struct ChangeSurveyWindowId<'a> {
+    baseline: &'a str,
+    head: &'a str,
+}
+
+/// How one change-survey inference call is issued.
+#[derive(Clone, Copy)]
+struct ChangeSurveyCall<'a> {
+    task_kind: &'a str,
+    /// True only when sibling calls reuse these exact prefix bytes. A cache
+    /// write costs more than plain input, so a single-use prefix must not be
+    /// marked.
+    cache_prefix: bool,
+}
+
+async fn infer_change_survey_prompt(
+    runner: &Arc<AgentRunner>,
+    prompt: &crate::change_survey::ChangeSurveyPrompt,
+    window: ChangeSurveyWindowId<'_>,
+    coverage: ChangeSurveyCoverage<'_>,
+    call: ChangeSurveyCall<'_>,
+    shutdown: &kres_core::Shutdown,
+) -> Result<ChangeSurveyReport> {
+    let ChangeSurveyWindowId { baseline, head } = window;
+    let ChangeSurveyCall {
+        task_kind,
+        cache_prefix,
+    } = call;
+    let mut errors = Vec::new();
+    for attempt in 1..=2 {
+        if shutdown.is_cancelled() {
+            anyhow::bail!("cancelled during whole-file change survey");
+        }
+        let retry_tail;
+        let attempt_tail = if let Some(previous_error) = errors.last() {
+            retry_tail = format!(
+                "{}\n\nYour previous response failed validation: {previous_error}\nReturn a corrected complete JSON object.",
+                prompt.tail
+            );
+            retry_tail.as_str()
+        } else {
+            prompt.tail.as_str()
+        };
+        let response = runner
+            .run_primary_slow_inference_low_effort(
+                "You quickly classify code-change risk from one six-month net target-file diff. Judge the final code, use low reasoning effort, keep reasons terse, follow the requested JSON schema exactly, and do not emit markdown or commentary.",
+                &prompt.cached_prefix,
+                attempt_tail,
+                cache_prefix,
+                &format!("{task_kind} attempt {attempt}"),
+                shutdown,
+            )
+            .await;
+        match response {
+            Ok(response) => {
+                match parse_inference_risks(&response, baseline, head).and_then(|rating| {
+                    coverage.validate(&rating)?;
+                    Ok(rating)
+                }) {
+                    Ok(rating) => return Ok(rating),
+                    Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+                }
+            }
+            Err(error) if shutdown.is_cancelled() => {
+                return Err(anyhow::anyhow!(error.to_string()));
+            }
+            Err(error) => errors.push(format!("attempt {attempt}: {error}")),
+        }
+    }
+    anyhow::bail!(errors.join("; "))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewFileSurvey {
+    functions: Vec<ReviewFunctionRisk>,
+    research_questions: Vec<ReviewResearchQuestion>,
+    file_risk_rating: u8,
+}
+
+/// One function's final combined risk, as returned by the file-survey model.
+///
+/// No `uses` field: Rust holds the authoritative spelling count and joins it
+/// back when the scan is serialized. Asking the model to echo it made a wrong
+/// integer fail the whole survey, and when two inventories disagreed there was
+/// no way for the model to know which column was authoritative.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewFunctionRisk {
+    name: String,
+    risk_rating: u8,
+}
+
+/// Serialized shape of the completed scan. Same fields the agents have always
+/// seen, with `uses` supplied by Rust rather than echoed by the model.
+#[derive(Debug, Serialize)]
+struct ScanFunctionRisk<'a> {
+    name: &'a str,
+    uses: u64,
+    risk_rating: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct ScanFileSurvey<'a> {
+    functions: Vec<ScanFunctionRisk<'a>>,
+    research_questions: &'a [ReviewResearchQuestion],
+    file_risk_rating: u8,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewResearchQuestion {
+    function: String,
+    file: String,
+    question: String,
+    priority: u8,
+}
+
+#[derive(Debug)]
+struct FileSurveyInventory {
+    functions: std::collections::BTreeMap<String, u64>,
+    calls: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InferredFileSurveyInventory {
+    functions: Vec<InferredFunctionInventory>,
+    calls: Vec<String>,
+}
+
+/// A function definition reported by the fallback inventory inference.
+///
+/// Deliberately has no `uses` field. Rust computes spelling counts from source
+/// with `identifier_occurrences`, so asking the model to reproduce them added
+/// nothing and turned a single wrong integer into a whole-response rejection.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InferredFunctionInventory {
+    name: String,
+}
+
+impl FileSurveyInventory {
+    fn from_context(context: &[serde_json::Value]) -> Option<Self> {
+        let survey = context
+            .iter()
+            .find_map(|item| item.get("result").filter(|result| result.is_object()))?;
+        let function_entries = survey.get("functions_defined")?.as_array()?;
+        let parsed_functions = function_entries
+            .iter()
+            .map(|entry| {
+                let entry = entry.as_array()?;
+                Some((
+                    entry.first()?.as_str()?.to_string(),
+                    entry.get(1)?.as_u64()?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        // A function may be defined more than once in one translation unit
+        // under mutually exclusive preprocessor branches — mm/vmscan.c:204 and
+        // :249 both define `cgroup_reclaim` across the `#ifdef CONFIG_MEMCG`
+        // at :201, and twelve other pairs do the same. Rejecting the whole
+        // survey for that discarded a perfectly good inventory and forced an
+        // expensive inference fallback on most kernel files. Keep the highest
+        // reported count per name instead; Rust recomputes the authoritative
+        // count from source anyway.
+        let mut functions: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for (name, uses) in parsed_functions {
+            let slot = functions.entry(name).or_insert(0);
+            *slot = (*slot).max(uses);
+        }
+        let calls = survey
+            .get("calls")?
+            .as_array()?
+            .iter()
+            .map(|entry| entry.as_array()?.first()?.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()?;
+        if functions.is_empty() {
+            return None;
+        }
+        Some(Self { functions, calls })
+    }
+
+    fn try_from_inferred(
+        inferred: InferredFileSurveyInventory,
+        target_source: &str,
+    ) -> Result<Self> {
+        if inferred
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .chain(inferred.calls.iter().map(String::as_str))
+            .any(|name| name.trim().is_empty())
+        {
+            anyhow::bail!("fallback file survey returned an empty function name");
+        }
+        // Rust owns the counts. The model supplies only the names it can see.
+        let functions: std::collections::BTreeMap<String, u64> = inferred
+            .functions
+            .into_iter()
+            .map(|function| {
+                let uses = identifier_occurrences(target_source, &function.name);
+                (function.name, uses)
+            })
+            .collect();
+        Ok(Self {
+            functions,
+            calls: inferred.calls,
+        })
+    }
+
+    fn as_context_value(&self, target: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source": format!("inference:fallback-file-survey:{target}"),
+            "result": {
+                "file": target,
+                "functions_defined": self.functions.iter().map(|(name, uses)| serde_json::json!([name, uses])).collect::<Vec<_>>(),
+                "calls": self.calls.iter().map(|name| serde_json::json!([name, 0])).collect::<Vec<_>>(),
+                "fallback": true,
+            },
+            "note": "typed slow-agent inventory built from complete source after semcode file_survey was unavailable; local grep evidence remains preserved separately"
+        })
+    }
+
+    fn function_names(&self) -> BTreeSet<String> {
+        self.functions.keys().cloned().collect()
+    }
+
+    /// The model is only trusted for the set of names it can see. Counts are
+    /// computed by Rust, so there is nothing left to disagree about.
+    fn validate_fallback(&self, ctags_functions: &BTreeSet<String>) -> Result<()> {
+        let names = self.function_names();
+        if let Some(missing) = ctags_functions.difference(&names).next() {
+            anyhow::bail!("fallback file survey omitted ctags function {missing}");
+        }
+        Ok(())
+    }
+
+    fn calls_function(&self, function: &str) -> bool {
+        let Some(function) = terminal_identifier(function) else {
+            return false;
+        };
+        self.calls.iter().any(|call| {
+            call.split(|character: char| !(character.is_alphanumeric() || character == '_'))
+                .any(|token| token == function)
+        })
+    }
+
+    fn interaction_kind(&self, function: &str, target_source: &str) -> Option<&'static str> {
+        let terminal = terminal_identifier(function)?;
+        // A target-local definition shadows a same-named external function in
+        // this translation unit. Keep the external risk in the survey report,
+        // but do not manufacture a research question from calls that resolve
+        // to the local definition.
+        if self.functions.contains_key(terminal) {
+            return None;
+        }
+        if self.calls_function(function) {
+            return Some("call");
+        }
+        source_references_function_value(target_source, terminal)
+            .then_some("function_value_reference")
+    }
+}
+
+fn ctags_function_inventory(target: &Path) -> Result<BTreeSet<String>> {
+    let output = match std::process::Command::new("ctags")
+        .args([
+            "--output-format=json",
+            "--languages=C",
+            "--kinds-C=f",
+            "--sort=no",
+            "-o",
+            "-",
+        ])
+        .arg(target)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error).context("running ctags fallback inventory"),
+    };
+    if !output.status.success() {
+        kres_core::async_eprintln!(
+            "[file survey] optional ctags inventory unavailable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        return Ok(BTreeSet::new());
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        kres_core::async_eprintln!(
+            "[file survey] optional ctags inventory returned non-UTF-8 output"
+        );
+        return Ok(BTreeSet::new());
+    };
+    let mut functions = BTreeSet::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            kres_core::async_eprintln!(
+                "[file survey] optional ctags inventory returned non-JSON output"
+            );
+            return Ok(BTreeSet::new());
+        };
+        if value.get("kind").and_then(serde_json::Value::as_str) == Some("function") {
+            let Some(name) = value.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            functions.insert(name.to_string());
+        }
+    }
+    Ok(functions)
+}
+
+fn identifier_occurrences(source: &str, identifier: &str) -> u64 {
+    let code = code_without_comments_and_literals(source);
+    let identifier = identifier.as_bytes();
+    if identifier.is_empty() {
+        return 0;
+    }
+    code.split(|byte| !is_identifier_byte(*byte))
+        .filter(|token| *token == identifier)
+        .count() as u64
+}
+
+fn terminal_identifier(name: &str) -> Option<&str> {
+    name.split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .rfind(|token| !token.is_empty())
+}
+
+fn source_references_function_value(source: &str, identifier: &str) -> bool {
+    let code = code_without_comments_and_literals(source);
+    let identifier = identifier.as_bytes();
+    if identifier.is_empty() {
+        return false;
+    }
+    let mut offset = 0;
+    while let Some(relative) = code[offset..]
+        .windows(identifier.len())
+        .position(|window| window == identifier)
+    {
+        let start = offset + relative;
+        let end = start + identifier.len();
+        offset = end;
+        let token_start = start == 0 || !is_identifier_byte(code[start - 1]);
+        let token_end = end == code.len() || !is_identifier_byte(code[end]);
+        if !token_start || !token_end {
+            continue;
+        }
+        let next = code[end..]
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .map(|index| end + index);
+        let next_byte = next.map(|index| code[index]);
+
+        // A following '(' is either a call (covered by the structured call
+        // inventory) or a declaration/definition, never callback evidence.
+        if next_byte == Some(b'(') {
+            continue;
+        }
+        // The external name is not a target-local definition (checked by the
+        // caller), and declarations/prototypes put '(' after the identifier.
+        // Every remaining code occurrence is conservatively an interaction:
+        // assignment, address-taking, cast, ternary, initializer, macro
+        // argument, return value, or typeof-style reference.
+        return true;
+    }
+    false
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn code_without_comments_and_literals(source: &str) -> Vec<u8> {
+    let input = source.as_bytes();
+    let mut output = input.to_vec();
+    let mut index = 0;
+    while index < input.len() {
+        if input[index..].starts_with(b"//") {
+            let end = input[index..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(input.len(), |relative| index + relative);
+            output[index..end].fill(b' ');
+            index = end;
+        } else if input[index..].starts_with(b"/*") {
+            let start = index;
+            index += 2;
+            let mut depth = 1usize;
+            while index < input.len() && depth > 0 {
+                if input[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if input[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            output[start..index].fill(b' ');
+        } else if input[index] == b'"' || is_character_literal_start(input, index) {
+            let quote = input[index];
+            let start = index;
+            index += 1;
+            while index < input.len() {
+                if input[index] == b'\\' {
+                    index = (index + 2).min(input.len());
+                } else {
+                    let byte = input[index];
+                    index += 1;
+                    if byte == quote || byte == b'\n' {
+                        break;
+                    }
+                }
+            }
+            output[start..index].fill(b' ');
+        } else {
+            index += 1;
+        }
+    }
+    output
+}
+
+fn is_character_literal_start(input: &[u8], index: usize) -> bool {
+    if input[index] != b'\'' {
+        return false;
+    }
+    input[index + 1..]
+        .iter()
+        .take(12)
+        .take_while(|byte| **byte != b'\n')
+        .position(|byte| *byte == b'\'')
+        .is_some()
+}
+
+impl ReviewFileSurvey {
+    fn validate(
+        &self,
+        inventory: &FileSurveyInventory,
+        change_report: &ChangeSurveyReport,
+        target_source: &str,
+    ) -> Result<()> {
+        if self.file_risk_rating > 100 {
+            anyhow::bail!("slow file survey file_risk_rating exceeds 100");
+        }
+        if let Some(function) = self
+            .functions
+            .iter()
+            .find(|risk| risk.name.trim().is_empty())
+        {
+            anyhow::bail!(
+                "slow file survey returned an empty function name at risk {}",
+                function.risk_rating
+            );
+        }
+        if let Some(function) = self.functions.iter().find(|risk| risk.risk_rating > 100) {
+            anyhow::bail!("slow file survey risk for {} exceeds 100", function.name);
+        }
+        if let Some(question) = self
+            .research_questions
+            .iter()
+            .find(|question| !(80..=100).contains(&question.priority))
+        {
+            anyhow::bail!(
+                "slow file survey gave non-major external function {} priority {}",
+                question.function,
+                question.priority
+            );
+        }
+        if let Some(question) = self
+            .research_questions
+            .iter()
+            .find(|question| question.question.trim().is_empty())
+        {
+            anyhow::bail!(
+                "slow file survey returned an empty research question for {}",
+                question.function
+            );
+        }
+        let rated: BTreeSet<&str> = self
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        if rated.len() != self.functions.len()
+            || rated
+                != inventory
+                    .functions
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
+        {
+            anyhow::bail!("slow file survey did not rate every target function exactly once");
+        }
+        for change_risk in &change_report.target_function_risks {
+            let combined = self
+                .functions
+                .iter()
+                .find(|function| function.name == change_risk.name)
+                .context("change survey function is absent from final file survey")?;
+            if combined.risk_rating < change_risk.risk_rating {
+                anyhow::bail!(
+                    "slow file survey lowered change risk for {} from {} to {}",
+                    change_risk.name,
+                    change_risk.risk_rating,
+                    combined.risk_rating
+                );
+            }
+        }
+        if let Some(highest) = self
+            .functions
+            .iter()
+            .map(|function| function.risk_rating)
+            .max()
+        {
+            if self.file_risk_rating < highest {
+                anyhow::bail!(
+                    "slow file survey file risk {} is below function risk {}",
+                    self.file_risk_rating,
+                    highest
+                );
+            }
+        }
+        if let Some(question) = self.research_questions.iter().find(|question| {
+            inventory
+                .interaction_kind(&question.function, target_source)
+                .is_none()
+        }) {
+            anyhow::bail!(
+                "slow file survey prioritized external function {} without a target-file interaction",
+                question.function
+            );
+        }
+        if let Some(question) = self.research_questions.iter().find(|question| {
+            !change_report
+                .external_major_risks
+                .iter()
+                .any(|risk| risk.name == question.function && risk.file == question.file)
+        }) {
+            anyhow::bail!(
+                "slow file survey invented external research for {}",
+                question.function
+            );
+        }
+        let actual_questions: BTreeSet<(&str, &str)> = self
+            .research_questions
+            .iter()
+            .map(|question| (question.function.as_str(), question.file.as_str()))
+            .collect();
+        let expected_questions: BTreeSet<(&str, &str)> = change_report
+            .external_major_risks
+            .iter()
+            .filter(|risk| {
+                inventory
+                    .interaction_kind(&risk.name, target_source)
+                    .is_some()
+            })
+            .map(|risk| (risk.name.as_str(), risk.file.as_str()))
+            .collect();
+        if actual_questions.len() != self.research_questions.len()
+            || actual_questions != expected_questions
+        {
+            anyhow::bail!(
+                "slow file survey did not preserve every interaction-filtered external risk exactly once"
+            );
+        }
+        Ok(())
+    }
 }
 
 async fn ensure_review_followups_remain_pending(
@@ -5810,7 +7537,7 @@ fn recorded_findings_goal_context(findings: &[kres_core::Finding]) -> String {
     }
 
     let mut out = String::from("## Recorded findings in findings.json\n\n");
-    for f in active.iter().take(50) {
+    for f in active {
         let locs = f
             .relevant_symbols
             .iter()
@@ -5820,23 +7547,16 @@ fn recorded_findings_goal_context(findings: &[kres_core::Finding]) -> String {
                     .iter()
                     .map(|s| format!("{}:{}-{}", s.filename, s.line_start, s.line_end)),
             )
-            .take(8)
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
             "- id: `{}`; title: {}; severity: {:?}; status: {:?}; locations: {}; summary: {}\n",
             f.id,
-            truncate(&f.title, 160),
+            f.title,
             f.severity,
             f.status,
             if locs.is_empty() { "(none)" } else { &locs },
-            truncate(&f.summary, 500)
-        ));
-    }
-    if active.len() > 50 {
-        out.push_str(&format!(
-            "- ... {} additional active finding(s) omitted from goal context\n",
-            active.len() - 50
+            f.summary
         ));
     }
     out
@@ -5993,6 +7713,87 @@ mod tests {
         assert_eq!(s.initial_prompt_mode, Some(kres_agents::TaskMode::Audit));
     }
 
+    #[tokio::test]
+    async fn failed_review_submission_restores_config_and_pauses_old_work() {
+        let mgr = TaskManager::new();
+        let old_lens = kres_core::LensSpec {
+            id: "old".to_string(),
+            kind: "review".to_string(),
+            name: "Old lens".to_string(),
+            reason: "old reason".to_string(),
+        };
+        let old_cfg = crate::workflow::ReviewPromptConfig {
+            source: "old".to_string(),
+            prompt_file: kres_agents::PromptFile {
+                prompt: "old review".to_string(),
+                lenses: vec![old_lens.clone()],
+            },
+            consolidate_rules: Some("old rules".to_string()),
+            file_scan_target: Some("old.c".to_string()),
+        };
+        let session = Session::new(mgr.clone(), ReplConfig::default())
+            .await
+            .with_review_prompt_config(old_cfg);
+        let plan = kres_core::Plan::new("old review", "old goal", kres_core::TaskMode::Audit);
+        mgr.set_plan(Some(plan.clone())).await;
+        let old_todo = kres_core::TodoItem::new("old todo", "review");
+        assert!(mgr.seed_todo_if_empty(vec![old_todo.clone()]).await);
+        cache_review_file_scan(
+            &mgr,
+            &CompletedReviewFileScan {
+                target: "old.c".into(),
+                source_hash: "old-source".into(),
+                baseline: "old-baseline".into(),
+                head: "old-head".into(),
+                scan: "old scan".into(),
+            },
+        )
+        .await;
+        let old_scan = mgr
+            .get_cached_context(REVIEW_FILE_SCAN_CACHE_KEY)
+            .await
+            .unwrap();
+
+        session
+            .install_review_config_and_submit(crate::workflow::ReviewPromptConfig {
+                source: "new".to_string(),
+                prompt_file: kres_agents::PromptFile {
+                    prompt: "new review".to_string(),
+                    lenses: vec![kres_core::LensSpec {
+                        id: "new".to_string(),
+                        kind: "review".to_string(),
+                        name: "New lens".to_string(),
+                        reason: "new reason".to_string(),
+                    }],
+                },
+                consolidate_rules: Some("new rules".to_string()),
+                file_scan_target: Some("new.c".to_string()),
+            })
+            .await;
+
+        assert_eq!(*session.lenses.read().await, vec![old_lens]);
+        assert_eq!(
+            session.lens_consolidate_rules.read().await.as_deref(),
+            Some("old rules")
+        );
+        assert_eq!(
+            session.review_file_scan_target.read().await.as_deref(),
+            Some("old.c")
+        );
+        let restored_plan = mgr.plan_snapshot().await.unwrap();
+        assert_eq!(restored_plan.prompt, plan.prompt);
+        assert_eq!(restored_plan.goal, plan.goal);
+        let restored_todos = mgr.todo_snapshot().await;
+        assert_eq!(restored_todos.len(), 1);
+        assert_eq!(restored_todos[0].id, old_todo.id);
+        assert_eq!(restored_todos[0].name, old_todo.name);
+        assert_eq!(
+            mgr.get_cached_context(REVIEW_FILE_SCAN_CACHE_KEY).await,
+            Some(old_scan)
+        );
+        assert!(session.stop_latched.load(Ordering::Acquire));
+    }
+
     #[test]
     fn review_plan_steps_seed_linked_pending_todos() {
         let mut plan = kres_core::Plan::new(
@@ -6115,9 +7916,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_scan_context_survives_resume_via_plan_prompt() {
+    async fn review_scan_context_does_not_parse_plan_prose() {
         let mgr = TaskManager::new();
-        let scan = r#"[{"name":"filemap_fault","uses":6,"bug_likelihood":72}]"#;
+        let scan = r#"{"functions":[{"name":"filemap_fault","risk_rating":72}],"research_questions":[],"file_risk_rating":72}"#;
         let plan = kres_core::Plan::new(
             format!(
                 "review\n--- WHOLE-FILE RISK SCAN ---\n{scan}\n--- END WHOLE-FILE RISK SCAN ---"
@@ -6129,24 +7930,626 @@ mod tests {
             .await;
 
         assert_eq!(
-            review_file_scan_context(&mgr).await.as_deref(),
-            Some(r#"[{"name":"filemap_fault","uses":6,"bug_likelihood":72}]"#)
+            review_file_scan_context(&mgr, Path::new(env!("CARGO_MANIFEST_DIR")), "mm/filemap.c")
+                .await,
+            None
         );
     }
 
-    #[tokio::test]
-    async fn review_scan_context_prefers_live_cache() {
-        let mgr = TaskManager::new();
-        mgr.cache_context(
-            REVIEW_FILE_SCAN_CACHE_KEY,
-            serde_json::Value::String("live scan".into()),
+    #[test]
+    fn file_survey_serialization_puts_single_file_risk_last() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":84}],"research_questions":[{"function":"folio_put","file":"mm/swap.c","question":"Does the changed release contract affect this call?","priority":90}],"file_risk_rating":84}"#,
         )
-        .await;
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: vec!["folio_put".to_string()],
+        };
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: vec![crate::change_survey::FunctionRisk {
+                name: "filemap_fault".into(),
+                risk_rating: 80,
+                reason: "changed".into(),
+            }],
+            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
+                name: "folio_put".into(),
+                file: "mm/swap.c".into(),
+                risk_rating: 90,
+                reason: "release contract".into(),
+            }],
+        };
+        survey.validate(&inventory, &report, "").unwrap();
+        let scan = ScanFileSurvey {
+            functions: survey
+                .functions
+                .iter()
+                .map(|function| ScanFunctionRisk {
+                    name: function.name.as_str(),
+                    uses: inventory
+                        .functions
+                        .get(&function.name)
+                        .copied()
+                        .unwrap_or_default(),
+                    risk_rating: function.risk_rating,
+                })
+                .collect(),
+            research_questions: &survey.research_questions,
+            file_risk_rating: survey.file_risk_rating,
+        };
+        let serialized = serde_json::to_string(&scan).unwrap();
+        assert!(serialized.ends_with(r#""file_risk_rating":84}"#));
+        // Rust supplies the count; the model never sent one.
+        assert!(serialized.contains(r#""name":"filemap_fault","uses":6"#));
+    }
+
+    #[test]
+    fn file_survey_response_may_not_carry_a_use_count() {
+        // The model echoing counts Rust already owns is what aborted the
+        // 2026-08-05 mm/vmscan.c review: two inventories in one prompt
+        // disagreed on 159 of 191 counts, so every attempt failed validation
+        // and the whole run never started. `uses` is no longer accepted.
+        assert!(serde_json::from_str::<ReviewFileSurvey>(
+            r#"{"functions":[{"name":"filemap_fault","uses":6,"risk_rating":84}],"research_questions":[],"file_risk_rating":84}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn file_survey_rejects_per_commit_rating_matrix() {
+        assert!(serde_json::from_str::<ReviewFileSurvey>(
+            r#"{"functions":[{"name":"filemap_fault","change_risks":[{"commit":"abc","risk_rating":80}],"risk_rating":84}],"research_questions":[],"file_risk_rating":84}"#,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn file_survey_cannot_lower_net_change_risk() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":79}],"research_questions":[],"file_risk_rating":79}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: Vec::new(),
+        };
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: vec![crate::change_survey::FunctionRisk {
+                name: "filemap_fault".into(),
+                risk_rating: 80,
+                reason: "changed".into(),
+            }],
+            external_major_risks: Vec::new(),
+        };
+
+        assert!(survey.validate(&inventory, &report, "").is_err());
+    }
+
+    #[test]
+    fn file_survey_file_risk_cannot_be_below_a_function() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":80}],"research_questions":[],"file_risk_rating":79}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: Vec::new(),
+        };
+
+        assert!(survey
+            .validate(&inventory, &ChangeSurveyReport::default(), "")
+            .is_err());
+    }
+
+    #[test]
+    fn compact_change_report_omits_repeated_zero_risk_reasons() {
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: vec![crate::change_survey::FunctionRisk {
+                name: "unchanged".into(),
+                risk_rating: 0,
+                reason: "No net-diff evidence.".into(),
+            }],
+            external_major_risks: Vec::new(),
+        };
+
+        let compact = serde_json::to_string(&compact_change_survey_report(&report)).unwrap();
+        assert!(compact.contains(r#"["unchanged",0]"#));
+        assert!(!compact.contains("No net-diff evidence."));
+    }
+
+    #[test]
+    fn independently_large_source_crosses_every_scope_with_every_diff_chunk() {
+        let target_source = "x".repeat(1_228_126);
+        let expected = (0..191)
+            .map(|index| format!("function_{index}"))
+            .collect::<BTreeSet<_>>();
+        let window = crate::change_survey::AggregateTargetDiff {
+            baseline: "base".into(),
+            head: "head".into(),
+            diff: "d".repeat(6_885_530),
+        };
+        let chunks =
+            split_diff_for_inference(&window.diff, CHANGE_SURVEY_PAIR_PARTITION_BYTES).unwrap();
+        let source_chunks =
+            split_source_for_inference(&target_source, CHANGE_SURVEY_PAIR_PARTITION_BYTES).unwrap();
 
         assert_eq!(
-            review_file_scan_context(&mgr).await.as_deref(),
+            chunks
+                .iter()
+                .map(|chunk| &window.diff[chunk.source_start..chunk.source_end])
+                .collect::<String>(),
+            window.diff
+        );
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            source_chunks
+                .iter()
+                .map(|chunk| &target_source[chunk.source_start..chunk.source_end])
+                .collect::<String>(),
+            target_source
+        );
+        assert!(source_chunks.len() > 1);
+        let pair_count = chunks.len() * source_chunks.len();
+        let source_bytes_sent: usize = source_chunks
+            .iter()
+            .map(|chunk| chunk.text.len() * chunks.len())
+            .sum();
+        let diff_bytes_sent: usize = chunks
+            .iter()
+            .map(|chunk| (chunk.source_end - chunk.source_start) * source_chunks.len())
+            .sum();
+        assert_eq!(source_bytes_sent, target_source.len() * chunks.len());
+        assert_eq!(diff_bytes_sent, window.diff.len() * source_chunks.len());
+        assert_eq!(pair_count, chunks.len() * source_chunks.len());
+        let prompt = change_survey_chunk_prompt(
+            "mm/vmscan.c",
+            &window,
+            Some(&expected),
+            Some(ChangeSurveySourceChunk {
+                text: &source_chunks[0].text,
+                index: 0,
+                count: source_chunks.len(),
+            }),
+            Some(ChangeSurveyDiffChunk {
+                text: &chunks[0].text,
+                index: 0,
+                count: chunks.len(),
+            }),
+        );
+        assert!(prompt.cached_prefix.contains(&source_chunks[0].text));
+        assert!(prompt.tail.contains(&chunks[0].text));
+    }
+
+    #[test]
+    fn change_survey_report_batches_keep_each_typed_report_whole() {
+        let reports = (0..3)
+            .map(|index| ChangeSurveyReport {
+                baseline: "base".into(),
+                head: "head".into(),
+                target_function_risks: vec![crate::change_survey::FunctionRisk {
+                    name: format!("function_{index}"),
+                    risk_rating: 50,
+                    reason: "complete typed evidence".into(),
+                }],
+                external_major_risks: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let two_report_size = serialized_change_survey_reports_len(&reports[..2]).unwrap();
+        let batches = pack_change_survey_reports(reports.clone(), two_report_size).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0], reports[..2]);
+        assert_eq!(batches[1], reports[2..]);
+        assert_eq!(batches.into_iter().flatten().collect::<Vec<_>>(), reports);
+    }
+
+    #[test]
+    fn change_survey_losslessly_partitions_at_a_small_semantic_target() {
+        let partition_bytes = 1024;
+        let diff = "d".repeat(2048);
+        let chunks = split_diff_for_inference(&diff, partition_bytes).unwrap();
+
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| &diff[chunk.source_start..chunk.source_end])
+                .collect::<String>(),
+            diff
+        );
+        assert!(chunks.len() >= 2);
+        assert!(chunks
+            .iter()
+            .all(|chunk| chunk.text.len() <= partition_bytes));
+    }
+
+    #[test]
+    fn file_survey_rejects_unrelated_external_research_priority() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"unrelated","file":"net/core.c","question":"Investigate it","priority":90}],"file_risk_rating":50}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: vec!["mapping->a_ops->read_folio".to_string()],
+        };
+        assert!(survey
+            .validate(&inventory, &ChangeSurveyReport::default(), "")
+            .is_err());
+    }
+
+    #[test]
+    fn file_survey_requires_every_interacting_external_risk() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":80}],"research_questions":[],"file_risk_rating":80}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: vec!["folio_put".to_string()],
+        };
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: vec![crate::change_survey::FunctionRisk {
+                name: "filemap_fault".into(),
+                risk_rating: 80,
+                reason: "changed".into(),
+            }],
+            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
+                name: "folio_put".into(),
+                file: "mm/swap.c".into(),
+                risk_rating: 90,
+                reason: "release contract".into(),
+            }],
+        };
+
+        assert!(survey.validate(&inventory, &report, "").is_err());
+    }
+
+    #[test]
+    fn file_survey_accepts_external_function_pointer_interaction() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"ops::folio_put","file":"mm/swap.c","question":"Can this callback violate the changed release contract?","priority":90}],"file_risk_rating":50}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: Vec::new(),
+        };
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: Vec::new(),
+            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
+                name: "ops::folio_put".into(),
+                file: "mm/swap.c".into(),
+                risk_rating: 90,
+                reason: "release contract".into(),
+            }],
+        };
+
+        survey
+            .validate(
+                &inventory,
+                &report,
+                "static const struct ops = { .put = folio_put };",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn local_definition_shadows_same_named_external_risk() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"folio_put","risk_rating":20}],"research_questions":[],"file_risk_rating":20}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("folio_put".to_string(), 2)]),
+            calls: vec!["folio_put".to_string()],
+        };
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: Vec::new(),
+            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
+                name: "folio_put".into(),
+                file: "mm/swap.c".into(),
+                risk_rating: 90,
+                reason: "different external implementation".into(),
+            }],
+        };
+
+        survey
+            .validate(
+                &inventory,
+                &report,
+                "static void folio_put(void) {}\nvoid use(void) { folio_put(); }",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn file_survey_ignores_external_names_in_comments_strings_and_declarations() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"folio_put","file":"mm/swap.c","question":"Can this affect the target?","priority":90}],"file_risk_rating":50}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: Vec::new(),
+        };
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: Vec::new(),
+            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
+                name: "folio_put".into(),
+                file: "mm/swap.c".into(),
+                risk_rating: 90,
+                reason: "release contract".into(),
+            }],
+        };
+        let source = r#"
+            /* folio_put is mentioned in documentation. */
+            const char *name = "folio_put";
+            extern void folio_put(void);
+        "#;
+
+        assert!(survey.validate(&inventory, &report, source).is_err());
+    }
+
+    #[test]
+    fn file_survey_rejects_empty_research_question() {
+        let survey: ReviewFileSurvey = serde_json::from_str(
+            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"folio_put","file":"mm/swap.c","question":"   ","priority":90}],"file_risk_rating":50}"#,
+        )
+        .unwrap();
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
+            calls: vec!["folio_put".to_string()],
+        };
+        let report = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: Vec::new(),
+            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
+                name: "folio_put".into(),
+                file: "mm/swap.c".into(),
+                risk_rating: 90,
+                reason: "release contract".into(),
+            }],
+        };
+
+        assert!(survey.validate(&inventory, &report, "").is_err());
+    }
+
+    #[test]
+    fn empty_structured_file_survey_triggers_fallback() {
+        let context = vec![serde_json::json!({
+            "result": {
+                "functions_defined": [],
+                "calls": []
+            }
+        })];
+
+        assert!(FileSurveyInventory::from_context(&context).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_initial_prompt_exits_instead_of_idling() {
+        // A review whose bootstrap fails latches `stop_latched`, so
+        // auto-continue never fires; and `exit_on_idle` is false whenever
+        // stdout is a tty, so no reaper path can exit either. Before this
+        // check the process sat in the interactive loop forever with no work
+        // and no exit status. Assert the two conditions that made that
+        // unrecoverable still hold, so the guard cannot be dropped silently.
+        let session = Session::new(TaskManager::new(), ReplConfig::default()).await;
+        assert!(
+            !session.cfg.exit_on_idle,
+            "default (tty-shaped) config must not exit on idle; that is why the \
+             failed-submission guard exists"
+        );
+        session
+            .stop_latched
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(
+            !session.should_auto_continue().await,
+            "a latched session never resumes on its own"
+        );
+    }
+
+    #[test]
+    fn semcode_inventory_survives_ifdef_duplicate_definitions() {
+        // mm/vmscan.c defines `cgroup_reclaim` at :204 and again at :249
+        // across the `#ifdef CONFIG_MEMCG` at :201, and twelve other pairs do
+        // the same. semcode reports 204 entries for 191 unique names.
+        // Rejecting the survey over that forced a five-minute inference
+        // fallback and ultimately aborted the 2026-08-05 review.
+        let context = vec![serde_json::json!({
+            "source": "mcp:survey:mm/vmscan.c",
+            "result": {
+                "functions_defined": [
+                    ["cgroup_reclaim", 8],
+                    ["shrink_node", 4],
+                    ["cgroup_reclaim", 11],
+                ],
+                "calls": [["folio_put", 0]]
+            }
+        })];
+
+        let inventory =
+            FileSurveyInventory::from_context(&context).expect("ifdef duplicates must not reject");
+
+        assert_eq!(inventory.functions.len(), 2);
+        assert_eq!(inventory.functions.get("cgroup_reclaim").copied(), Some(11));
+        assert_eq!(inventory.functions.get("shrink_node").copied(), Some(4));
+    }
+
+    #[test]
+    fn inferred_file_survey_inventory_takes_names_and_rust_counts_them() {
+        // The model supplies only names it can see; Rust computes every use
+        // count from source, so a duplicate name is a merge rather than a
+        // whole-response rejection.
+        let source = "int one(void) { return one(); }\nint two(void) { return one(); }\n";
+        let inventory = FileSurveyInventory::try_from_inferred(
+            InferredFileSurveyInventory {
+                functions: vec![
+                    InferredFunctionInventory { name: "one".into() },
+                    InferredFunctionInventory { name: "two".into() },
+                    InferredFunctionInventory { name: "one".into() },
+                ],
+                calls: vec!["one".into()],
+            },
+            source,
+        )
+        .unwrap();
+
+        assert_eq!(inventory.functions.get("one").copied(), Some(3));
+        assert_eq!(inventory.functions.get("two").copied(), Some(1));
+        let context = inventory.as_context_value("mm/filemap.c");
+        assert_eq!(context["result"]["calls"][0][0], "one");
+    }
+
+    #[test]
+    fn inferred_inventory_rejects_a_use_count_from_the_model() {
+        let parsed = serde_json::from_str::<InferredFileSurveyInventory>(
+            r#"{"functions":[{"name":"one","uses":2}],"calls":[]}"#,
+        );
+        assert!(parsed.is_err(), "the model must not supply use counts");
+    }
+
+    #[test]
+    fn fallback_inventory_enforces_the_ctags_floor() {
+        // The ctags floor is the only thing left to check: counts are Rust's,
+        // so they can no longer disagree with anything.
+        let inventory = FileSurveyInventory {
+            functions: BTreeMap::from([("one".to_string(), 2)]),
+            calls: vec!["one".into()],
+        };
+        inventory
+            .validate_fallback(&BTreeSet::from(["one".to_string()]))
+            .unwrap();
+        assert!(inventory
+            .validate_fallback(&BTreeSet::from(["one".to_string(), "missing".to_string()]))
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn change_survey_checkpoint_roundtrips_net_diff_assessment() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("change-survey.json");
+        let store = ChangeSurveyCheckpointStore::open(
+            path.clone(),
+            "/repo/target.c".into(),
+            "source-hash".into(),
+            "base".into(),
+            "head".into(),
+            false,
+        )
+        .unwrap();
+        let rating = ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: vec![crate::change_survey::FunctionRisk {
+                name: "target".into(),
+                risk_rating: 70,
+                reason: "recent rewrite".into(),
+            }],
+            external_major_risks: Vec::new(),
+        };
+        store.record(rating.clone()).await.unwrap();
+
+        let reopened = ChangeSurveyCheckpointStore::open(
+            path.clone(),
+            "/repo/target.c".into(),
+            "source-hash".into(),
+            "base".into(),
+            "head".into(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(reopened.report().await, Some(rating));
+
+        let fresh = ChangeSurveyCheckpointStore::open(
+            path,
+            "/repo/target.c".into(),
+            "source-hash".into(),
+            "base".into(),
+            "head".into(),
+            false,
+        )
+        .unwrap();
+        assert!(fresh.report().await.is_none());
+    }
+
+    #[test]
+    fn clear_removes_change_survey_checkpoint_and_temporary_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("change-survey.json");
+        let temporary_path = path.with_extension("json.tmp");
+        std::fs::write(&path, "checkpoint").unwrap();
+        std::fs::write(&temporary_path, "temporary").unwrap();
+
+        assert!(remove_change_survey_checkpoint(&path).unwrap());
+        assert!(!path.exists());
+        assert!(!temporary_path.exists());
+        assert!(!remove_change_survey_checkpoint(&path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn review_scan_context_requires_matching_target() {
+        let mgr = TaskManager::new();
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let target = "Cargo.toml";
+        let source = std::fs::read_to_string(workspace.join(target)).unwrap();
+        let scan = CompletedReviewFileScan {
+            target: target.into(),
+            source_hash: change_survey_source_hash(&workspace.join(target), &source).unwrap(),
+            baseline: "test-baseline".into(),
+            head: current_review_head(workspace).unwrap(),
+            scan: "live scan".into(),
+        };
+        cache_review_file_scan(&mgr, &scan).await;
+
+        assert_eq!(
+            review_file_scan_context(&mgr, workspace, target)
+                .await
+                .as_deref(),
             Some("live scan")
         );
+        assert_eq!(
+            review_file_scan_context(&mgr, workspace, "mm/vmscan.c").await,
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_source_fingerprint_includes_executable_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let target = temporary.path().join("target.c");
+        let source = "int target(void) { return 0; }\n";
+        std::fs::write(&target, source).unwrap();
+
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&target, permissions).unwrap();
+        let ordinary = change_survey_source_hash(&target, source).unwrap();
+
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&target, permissions).unwrap();
+        let executable = change_survey_source_hash(&target, source).unwrap();
+
+        assert_ne!(ordinary, executable);
     }
 
     #[tokio::test]

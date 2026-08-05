@@ -116,13 +116,11 @@ mod tests {
             "fast prompt must require evidence before broad clean review claims"
         );
         assert!(
-            body.contains("bootstrap supplies a ranked file_survey inventory"),
+            body.contains("bootstrap supplies a change-informed ranked file_survey inventory"),
             "fast prompt must consume the bootstrap scan for named-file review"
         );
         assert!(
-            body.contains(
-                "Scheduled review tasks receive that ranking and must not request another survey"
-            ),
+            body.contains("must not request another survey"),
             "fast prompt must not repeat the bootstrap survey"
         );
     }

@@ -61,8 +61,9 @@ construct a JSON envelope by string concatenation. Important producers are:
 - generic repair request;
 - `/compact` request.
 
-Serialization failure aborts the call. Token shrinking operates on typed/request
-values before final serialization and must leave the final request parseable.
+Serialization failure aborts the call. Requests are never token-shrunk. Exact
+deduplication happens on typed values, and naturally partitionable inputs retain
+every byte across their serialized parts.
 
 ## Configuration JSON
 

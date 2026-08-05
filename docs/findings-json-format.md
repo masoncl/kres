@@ -186,8 +186,11 @@ Four points where findings flow:
    `findings.json` atomically on every apply. There is no per-turn
    snapshot history and no LLM round-trip during apply.
 
-4. **Before each slow-agent call**, the slow-agent request includes a
-   `previous_findings` field carrying the current list. The slow
-   agent's system prompt tells it to (a) not rediscover things already
-   in the list, (b) actively look for chains where this task's target
-   combined with a listed finding produces a larger bug.
+4. **Before each agent call**, every current finding is sent in full as
+   `previous_findings`, redacted only of store-owned narrative and provenance.
+   Rust does not decide which prior findings a review may need: an unrelated-
+   looking anchor is exactly the case a cross-file contract review must catch.
+   The payload sits in the shared cached prefix, so parallel lenses over one
+   task cache-read identical bytes instead of each paying to serialize it.
+   Agents use it for deduplication and chain discovery, and request source
+   explicitly when a finding may interact with the current task.

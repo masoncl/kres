@@ -26,7 +26,6 @@ pub mod mode;
 pub mod plan;
 pub mod preview;
 pub mod session_state;
-pub mod shrink;
 pub mod shutdown;
 pub mod task;
 pub mod todo;
@@ -48,14 +47,15 @@ pub use findings::{
     Finding, FindingDetail, FindingsFile, FindingsStore, Severity, Status,
 };
 pub use lens::LensSpec;
-pub use log::{LoggedUsage, RequestMeta, TurnLogger};
-pub use mode::{CodeEdit, CodeFile, TaskMode};
-pub use plan::{extract_embedded_plan, Plan, PlanRewrite, PlanStep, PlanStepStatus};
-pub use session_state::{SessionState, SessionStateError};
-pub use shrink::{
-    estimate_tokens, finding_char_size, fit_payload, shrink_findings_to_budget,
-    shrink_last_user_message, total_char_size,
+pub use log::{
+    duplicate_symbol_bodies_in_context, ContextStats, LoggedUsage, RequestMeta, TurnLogger,
 };
+pub use mode::{CodeEdit, CodeFile, TaskMode};
+pub use plan::{
+    extract_embedded_plan, Plan, PlanPromptView, PlanRewrite, PlanStep, PlanStepPromptView,
+    PlanStepStatus,
+};
+pub use session_state::{ReviewFileScanState, SessionState, SessionStateError};
 pub use shutdown::Shutdown;
 pub use task::{ReapedTask, Task, TaskId, TaskManager, TaskState};
 pub use todo::{TodoItem, TodoStatus};

@@ -283,14 +283,25 @@ async fn spawn_recording_mock(responses: VecDeque<Value>) -> (u16, Arc<Mutex<Vec
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
-            // Drain one request chunk. The test prompts are small enough
-            // for this mock, and reqwest is happy once the server answers.
-            let mut buf = vec![0u8; 65536];
-            let n = socket.read(&mut buf).await.unwrap_or(0);
+            // Read the complete request body. A single socket read is not
+            // guaranteed to contain a large workflow prompt, which made
+            // assertions against the recorded request timing-dependent.
+            let mut buf = Vec::new();
+            loop {
+                let mut chunk = [0u8; 8192];
+                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if complete_http_request_len(&buf).is_some_and(|len| buf.len() >= len) {
+                    break;
+                }
+            }
             recorded
                 .lock()
                 .await
-                .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                .push(String::from_utf8_lossy(&buf).into_owned());
             let body = {
                 let mut q = queue.lock().await;
                 match q.pop_front() {
@@ -309,6 +320,21 @@ async fn spawn_recording_mock(responses: VecDeque<Value>) -> (u16, Arc<Mutex<Vec
         }
     });
     (port, requests)
+}
+
+fn complete_http_request_len(request: &[u8]) -> Option<usize> {
+    let header_end = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")?
+        + 4;
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    Some(header_end + content_length.unwrap_or(0))
 }
 
 async fn spawn_mock(responses: VecDeque<Value>) -> u16 {

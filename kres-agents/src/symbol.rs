@@ -8,45 +8,137 @@
 //! - `tool_source` — build a context-dedup source label from a
 //!   main-agent action.
 
-use serde_json::{json, Map, Value};
+use std::collections::HashSet;
 
-/// Reduce a symbol dict to its identity tuple —
-/// `{name, type, filename, line}` (§42). Used to build the
-/// `previously_fetched` manifest the fast agent sees on round 2+
-/// (§28).
-pub fn sym_identity(sym: &Value) -> Value {
-    const KEYS: [&str; 4] = ["name", "type", "filename", "line"];
-    let mut out = Map::new();
-    if let Some(o) = sym.as_object() {
-        for k in KEYS {
-            if let Some(v) = o.get(k) {
-                out.insert(k.to_string(), v.clone());
-            }
+use serde_json::{json, Map, Value};
+use uuid::Uuid;
+
+/// Canonical representation decision for semcode function/type output.
+/// Successful single-result lookups become one normalized symbol. Ambiguous
+/// multi-result output stays raw so no candidate is hidden. Missing or
+/// unparseable output stays raw and requests the mandatory local fallback.
+#[derive(Debug)]
+pub struct SemcodeEvidence {
+    pub symbol: Option<Value>,
+    pub preserve_raw: bool,
+    pub needs_local_fallback: bool,
+}
+
+pub fn canonical_semcode_evidence(output: &str, tool_name: &str) -> SemcodeEvidence {
+    let header = if tool_name == "find_function" {
+        "Function: "
+    } else {
+        "Type: "
+    };
+    let candidates = output
+        .lines()
+        .filter(|line| line.starts_with(header))
+        .count();
+    let parsed = parse_semcode_symbol(output, tool_name);
+    match (candidates, parsed) {
+        (1, Some(symbol)) => SemcodeEvidence {
+            symbol: Some(symbol),
+            preserve_raw: false,
+            needs_local_fallback: false,
+        },
+        (n, _) if n > 1 => SemcodeEvidence {
+            symbol: None,
+            preserve_raw: true,
+            needs_local_fallback: false,
+        },
+        _ => SemcodeEvidence {
+            symbol: None,
+            preserve_raw: true,
+            needs_local_fallback: true,
+        },
+    }
+}
+
+fn evidence_bytes(value: &Value) -> Vec<u8> {
+    let mut identity = value.clone();
+    if let Some(object) = identity.as_object_mut() {
+        object.remove("evidence_id");
+    }
+    serde_json::to_vec(&identity).unwrap_or_default()
+}
+
+fn with_evidence_id(mut value: Value, prefix: &str) -> Value {
+    let encoded = evidence_bytes(&value);
+    if let Some(obj) = value.as_object_mut() {
+        // Never trust an evidence id supplied by a tool or stale accumulator.
+        // It must describe the current exact record, especially after range
+        // merging or metadata changes.
+        obj.insert(
+            "evidence_id".to_string(),
+            Value::String(format!(
+                "{prefix}-{}",
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, &encoded).simple()
+            )),
+        );
+    }
+    value
+}
+
+/// Attach compact retrieval provenance to a normalized source record. The
+/// source body remains represented only once, in `definition`.
+pub fn with_retrieval_source(mut symbol: Value, source: impl Into<String>) -> Value {
+    if let Some(object) = symbol.as_object_mut() {
+        object.insert("retrieval_source".into(), Value::String(source.into()));
+    }
+    symbol
+}
+
+fn split_semcode_body(output: &str) -> Option<&str> {
+    for marker in ["Body:\n", "Body:\r\n"] {
+        if let Some(start) = output.find(marker) {
+            return Some(&output[start + marker.len()..]);
         }
     }
-    Value::Object(out)
+    None
 }
 
-/// Reduce a context entry to `{source}` only (§42).
-pub fn ctx_identity(ctx: &Value) -> Value {
-    let src = ctx
-        .get("source")
-        .cloned()
-        .unwrap_or_else(|| Value::String(String::new()));
-    json!({"source": src})
+/// Append a canonical prompt record without mutating or reordering records
+/// already sent in earlier gather rounds. Exact duplicates are ignored.
+pub fn append_prompt_evidence(records: &mut Vec<Value>, value: Value) -> bool {
+    if records.iter().any(|existing| existing == &value) {
+        return false;
+    }
+    records.push(value);
+    true
 }
 
-/// Build the `previously_fetched` manifest from the full (older)
-/// symbols + context lists. The fast agent gets identity-only
-/// pointers for items it already saw — full content for those is
-/// suppressed in the next round's delta.
-pub fn previously_fetched_manifest(symbols: &[Value], context: &[Value]) -> Value {
-    let syms: Vec<Value> = symbols.iter().map(sym_identity).collect();
-    let ctxs: Vec<Value> = context.iter().map(ctx_identity).collect();
-    json!({
-        "symbols": syms,
-        "context": ctxs,
-    })
+fn canonical_records(records: &[Value], prefix: &str) -> Vec<Value> {
+    let mut canonical = Vec::with_capacity(records.len());
+    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+    for record in records {
+        let record = with_evidence_id(record.clone(), prefix);
+        if seen.insert(evidence_bytes(&record)) {
+            canonical.push(record);
+        }
+    }
+    canonical
+}
+
+/// Canonicalize evidence immediately before it is sent to an agent:
+///
+/// - add stable structured ids used by diagnostics and dependent steps;
+/// - drop exact duplicate records;
+/// - preserve gather order so multi-turn inference and final synthesis receive
+///   byte-stable canonical evidence.
+///
+/// Choosing between a normalized symbol and raw semcode text is NOT done here.
+/// That decision belongs to the fetcher, which is the only layer that holds the
+/// tool name and the untouched tool output together; see
+/// [`canonical_semcode_evidence`]. Re-deriving it later would mean guessing the
+/// tool from a source label, and a wrong guess could hide a candidate.
+pub fn canonicalize_prompt_evidence(
+    symbols: &[Value],
+    context: &[Value],
+) -> (Vec<Value>, Vec<Value>) {
+    (
+        canonical_records(symbols, "sym"),
+        canonical_records(context, "ctx"),
+    )
 }
 
 /// Parse the textual output of semcode's `find_function` /
@@ -57,7 +149,7 @@ pub fn previously_fetched_manifest(symbols: &[Value], context: &[Value]) -> Valu
 /// "context" entry with the raw output, so slow-agent information
 /// isn't lost.
 pub fn parse_semcode_symbol(output: &str, tool_name: &str) -> Option<Value> {
-    let mut lines: Vec<&str> = output.split('\n').collect();
+    let exact_body = split_semcode_body(output)?;
     let mut sym_type = if tool_name == "find_function" {
         "function".to_string()
     } else {
@@ -70,8 +162,7 @@ pub fn parse_semcode_symbol(output: &str, tool_name: &str) -> Option<Value> {
     let mut calls_count: Option<i64> = None;
     let mut called_by_count: Option<i64> = None;
 
-    for i in 0..lines.len() {
-        let l = lines[i];
+    for l in output.split('\n') {
         if let Some(rest) = l.strip_prefix("Function: ") {
             let head = rest.split_whitespace().next().unwrap_or("").to_string();
             if !head.is_empty() {
@@ -106,9 +197,8 @@ pub fn parse_semcode_symbol(output: &str, tool_name: &str) -> Option<Value> {
             if let Ok(n) = rest.trim().parse::<i64>() {
                 called_by_count = Some(n);
             }
-        } else if l.starts_with("Body:") {
-            let rest: Vec<&str> = lines.drain(i + 1..).collect();
-            body = Some(rest.join("\n").trim_end().to_string());
+        } else if l.trim_end_matches('\r') == "Body:" {
+            body = Some(exact_body.to_string());
             break;
         }
     }
@@ -125,6 +215,9 @@ pub fn parse_semcode_symbol(output: &str, tool_name: &str) -> Option<Value> {
         json!(filename.unwrap_or_else(|| "?".into())),
     );
     obj.insert("line".into(), json!(line_num.unwrap_or(0)));
+    // The source body is represented exactly once, here. The semcode header
+    // lines it was parsed out of are not repeated: `name`, `type`, `filename`,
+    // `line`, and the counts below already carry everything they stated.
     obj.insert("definition".into(), json!(body));
     if let Some(c) = calls_count {
         obj.insert("calls_count".into(), json!(c));
@@ -154,30 +247,11 @@ fn parse_type_header(rest: &str) -> (String, String) {
     }
 }
 
-/// Key used for exact-tuple dedup of non-range (function/type) symbols.
-fn symbol_key(sym: &Value) -> (String, String, i64) {
-    (
-        sym.get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        sym.get("filename")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        sym.get("line").and_then(|v| v.as_i64()).unwrap_or(0),
-    )
-}
-
-/// Parse the `basename:<start>-<end>` name pattern used by file-read
-/// range symbols. Returns `(filename, start, end_exclusive)` or None
-/// for function/type symbols (and other shapes).
-fn range_info(sym: &Value) -> Option<(String, i64, i64)> {
-    let name = sym.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    if name.is_empty() {
-        return None;
-    }
-    // Pattern: `^[^/:\s]+:(\d+)-(\d+)$`
+/// Parse the `basename:<start>-<end>` name a file-read range symbol carries.
+/// Returns `(filename, start, end)`, or `None` for function/type symbols and
+/// any other shape.
+fn range_info(sym: &Value) -> Option<(&str, i64, i64)> {
+    let name = sym.get("name")?.as_str()?;
     let (head, tail) = name.split_once(':')?;
     if head
         .chars()
@@ -185,135 +259,89 @@ fn range_info(sym: &Value) -> Option<(String, i64, i64)> {
     {
         return None;
     }
-    let (start_s, end_s) = tail.split_once('-')?;
-    let start: i64 = start_s.parse().ok()?;
-    let end: i64 = end_s.parse().ok()?;
-    let filename = sym.get("filename").and_then(|v| v.as_str())?.to_string();
+    let (start, end) = tail.split_once('-')?;
+    let filename = sym.get("filename")?.as_str()?;
     if filename.is_empty() {
         return None;
     }
-    Some((filename, start, end))
+    Some((filename, start.parse().ok()?, end.parse().ok()?))
 }
 
-/// Concatenate the definitions of two adjacent range symbols (same
-/// file, exact `a.end == b.start`). Returns the merged symbol. Caller
-/// is responsible for checking adjacency.
-fn merge_range_symbols(a: &Value, b: &Value) -> Value {
-    let ar = range_info(a).expect("range symbol");
-    let br = range_info(b).expect("range symbol");
-    let filename = ar.0.clone();
-    let start = ar.1;
-    let end = br.2;
-    let def = format!(
-        "{}{}",
-        a.get("definition").and_then(|v| v.as_str()).unwrap_or(""),
-        b.get("definition").and_then(|v| v.as_str()).unwrap_or(""),
-    );
-    let base = match filename.rsplit_once('/') {
-        Some((_, b)) => b,
-        None => &filename,
+/// True when `outer` is a read of the same file over a line range that
+/// contains `inner`'s, AND `inner`'s body is literally present in `outer`'s.
+///
+/// Both halves are required. Range containment alone is not enough: the two
+/// reads may have happened either side of an edit, and a stale body must stay
+/// visible rather than be silently represented by a newer one. Requiring the
+/// exact substring means the dropped record contributes no byte the kept
+/// record does not already carry.
+fn range_body_contained(outer: &Value, inner: &Value) -> bool {
+    let (Some((outer_file, outer_start, outer_end)), Some((inner_file, inner_start, inner_end))) =
+        (range_info(outer), range_info(inner))
+    else {
+        return false;
     };
-    let mut merged = a.clone();
-    let obj = merged.as_object_mut().expect("symbol is an object");
-    obj.insert("name".into(), json!(format!("{base}:{start}-{end}")));
-    obj.insert("line".into(), json!(start));
-    obj.insert("definition".into(), json!(def));
-    merged
+    if outer_file != inner_file || outer_start > inner_start || outer_end < inner_end {
+        return false;
+    }
+    let (Some(outer_body), Some(inner_body)) = (
+        outer.get("definition").and_then(Value::as_str),
+        inner.get("definition").and_then(Value::as_str),
+    ) else {
+        return false;
+    };
+    !inner_body.is_empty() && outer_body.contains(inner_body)
 }
 
-/// Append a symbol with dedup + range-merge. Returns `true` when the
-/// list was modified (a new entry was added or existing entries were
-/// merged), `false` when the new symbol was fully covered by existing
-/// entries and nothing changed.
+/// Append a symbol, dropping records whose bytes are already present.
+///
+/// Exact duplicates go first. Beyond that, overlapping file reads are the one
+/// case worth collapsing: a read of lines 1-100 followed by a read of 10-20
+/// ships the smaller body twice inside the same request, which is precisely
+/// the intra-request duplication this pipeline exists to remove. The
+/// containment test above is deliberately strict, so nothing is dropped
+/// without proof that the retained record already contains it verbatim.
 pub fn append_symbol(symbols: &mut Vec<Value>, sym: Value) -> bool {
     if !sym.is_object() {
         return false;
     }
-    // Non-range symbols use exact-tuple dedup.
-    let Some((_, mut curr_start, mut curr_end)) = range_info(&sym) else {
-        let key = symbol_key(&sym);
-        if symbols.iter().any(|e| symbol_key(e) == key) {
-            return false;
-        }
-        symbols.push(sym);
-        return true;
-    };
-    let new_file = range_info(&sym).unwrap().0;
-    let mut current = sym;
-
-    // Iteratively absorb covered-or-adjacent existing entries. Restart
-    // after each mutation so chained merges work (1-201 + 201-401 +
-    // 401-601 collapses to 1-601).
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let mut idx_remove: Option<usize> = None;
-        for (i, ex) in symbols.iter().enumerate() {
-            let Some((ef, es, ee)) = range_info(ex) else {
-                continue;
-            };
-            if ef != new_file {
-                continue;
-            }
-            // Existing fully covers the new one → drop the new symbol.
-            if es <= curr_start && ee >= curr_end {
-                return false;
-            }
-            // New fully covers the existing → drop the existing.
-            if curr_start <= es && curr_end >= ee {
-                idx_remove = Some(i);
-                changed = true;
-                break;
-            }
-            if ee == curr_start {
-                let merged = merge_range_symbols(ex, &current);
-                current = merged;
-                curr_start = es;
-                idx_remove = Some(i);
-                changed = true;
-                break;
-            }
-            if curr_end == es {
-                let merged = merge_range_symbols(&current, ex);
-                current = merged;
-                curr_end = ee;
-                idx_remove = Some(i);
-                changed = true;
-                break;
-            }
-        }
-        if let Some(i) = idx_remove {
-            symbols.remove(i);
-        }
+    if symbols
+        .iter()
+        .any(|existing| range_body_contained(existing, &sym))
+    {
+        return false;
     }
-    symbols.push(current);
-    true
+    let superseded: Vec<usize> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(_, existing)| range_body_contained(&sym, existing))
+        .map(|(index, _)| index)
+        .collect();
+    for index in superseded.into_iter().rev() {
+        symbols.remove(index);
+    }
+    append_prompt_evidence(symbols, sym)
 }
 
-/// Append a context entry, dropping exact `(source, content)`
-/// duplicates and empty / whitespace-only content.
+/// Append a nonempty context record, dropping exact duplicates only. Empty
+/// tool output remains meaningful when paired with its source label: it proves
+/// that a search ran and found nothing.
 pub fn append_context(context: &mut Vec<Value>, ctx: Value) -> bool {
     let Some(obj) = ctx.as_object() else {
         return false;
     };
-    let content = obj
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if content.is_empty() {
+    let has_payload = obj.values().any(|value| match value {
+        Value::Null => false,
+        Value::String(text) => !text.is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    });
+    if !has_payload {
         return false;
     }
-    let src = obj.get("source").cloned().unwrap_or(Value::Null);
-    for existing in context.iter() {
-        let exs = existing.get("source").cloned().unwrap_or(Value::Null);
-        let exc = existing
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if exs == src && exc == obj.get("content").and_then(|v| v.as_str()).unwrap_or("") {
-            return false;
-        }
+    if context.iter().any(|existing| existing == &ctx) {
+        return false;
     }
     context.push(ctx);
     true
@@ -436,6 +464,115 @@ mod tests {
     }
 
     #[test]
+    fn canonical_semcode_single_result_uses_only_normalized_symbol() {
+        let raw = "Function: one\nFile: a.c:1\nBody:\nint one(void) { return 1; }\n";
+        let evidence = canonical_semcode_evidence(raw, "find_function");
+        assert!(evidence.symbol.is_some());
+        assert!(!evidence.preserve_raw);
+        assert!(!evidence.needs_local_fallback);
+    }
+
+    #[test]
+    fn canonical_semcode_multiple_results_preserve_raw_candidates() {
+        let raw = "Function: one\nFile: a.c:1\nBody:\nint one(void) {}\nFunction: one\nFile: b.c:2\nBody:\nint one(void) {}\n";
+        let evidence = canonical_semcode_evidence(raw, "find_function");
+        assert!(evidence.symbol.is_none());
+        assert!(evidence.preserve_raw);
+        assert!(!evidence.needs_local_fallback);
+    }
+
+    #[test]
+    fn canonical_semcode_unparseable_result_requires_local_fallback() {
+        let evidence = canonical_semcode_evidence("not found", "find_function");
+        assert!(evidence.symbol.is_none());
+        assert!(evidence.preserve_raw);
+        assert!(evidence.needs_local_fallback);
+    }
+
+    #[test]
+    fn single_result_semcode_is_represented_only_as_a_symbol() {
+        // The fetcher, not the prompt layer, decides this: it holds the tool
+        // name and the raw output together. A successful single-result parse
+        // yields a symbol and no raw context copy.
+        let raw = "Function: one\nFile: a.c:1\nBody:\nint one(void) { return 1; }\n";
+        let evidence = canonical_semcode_evidence(raw, "find_function");
+
+        assert!(!evidence.preserve_raw, "raw copy would duplicate the body");
+        let symbol = evidence.symbol.expect("single result parses");
+        // Every byte after the Body: marker survives verbatim, and the header
+        // lines it replaced are fully represented by the structured fields.
+        assert_eq!(
+            symbol["definition"].as_str().unwrap(),
+            "int one(void) { return 1; }\n"
+        );
+        assert_eq!(symbol["name"], "one");
+        assert_eq!(symbol["filename"], "a.c");
+        assert_eq!(symbol["line"], 1);
+        assert!(
+            symbol.get("retrieval_preamble").is_none(),
+            "the semcode header must not ship a second time"
+        );
+    }
+
+    #[test]
+    fn canonicalize_never_drops_a_distinct_context_record() {
+        // Prompt-layer canonicalization assigns ids and collapses exact
+        // duplicates. It must not second-guess the fetcher by re-deriving a
+        // tool from a source label and discarding a candidate.
+        let raw = "Function: one\nFile: a.c:1\nBody:\nreturn 0;\n";
+        let symbol = json!({
+            "name": "one",
+            "type": "function",
+            "filename": "a.c",
+            "line": 1,
+            "definition": "return 0;\n"
+        });
+        let context = json!({"source":"mcp:source:one","content":raw});
+
+        let (symbols, context) = canonicalize_prompt_evidence(&[symbol], &[context]);
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(context.len(), 1);
+        assert_eq!(context[0]["content"], raw);
+    }
+
+    #[test]
+    fn canonical_prompt_evidence_keeps_ambiguous_and_local_context() {
+        let ambiguous = "Function: one\nFile: a.c:1\nBody:\nint one(void) {}\nFunction: one\nFile: b.c:2\nBody:\nint one(void) {}\n";
+        let context = vec![
+            json!({"source":"mcp:source:one","content":ambiguous}),
+            json!({"source":"grep:one","content":"a.c:1:int one(void)"}),
+        ];
+        let (_, context) = canonicalize_prompt_evidence(&[], &context);
+        assert_eq!(context.len(), 2);
+        assert!(context.iter().all(|item| item.get("evidence_id").is_some()));
+    }
+
+    #[test]
+    fn canonical_prompt_evidence_preserves_gather_order() {
+        let symbols = vec![
+            json!({"name":"first","filename":"a.c","line":1,"definition":"a"}),
+            json!({"name":"second","filename":"b.c","line":2,"definition":"b"}),
+        ];
+        let (symbols, _) = canonicalize_prompt_evidence(&symbols, &[]);
+        assert_eq!(symbols[0]["name"], "first");
+        assert_eq!(symbols[1]["name"], "second");
+    }
+
+    #[test]
+    fn canonical_prompt_evidence_recomputes_untrusted_ids() {
+        let original = json!({
+            "evidence_id":"forged",
+            "name":"one",
+            "filename":"a.c",
+            "line":1,
+            "definition":"a"
+        });
+        let (symbols, _) = canonicalize_prompt_evidence(&[original], &[]);
+        assert_ne!(symbols[0]["evidence_id"], "forged");
+    }
+
+    #[test]
     fn parse_type_output() {
         let raw = "Type: struct foo\nFile: include/foo.h:10\nBody:\nstruct foo { int x; };\n";
         let s = parse_semcode_symbol(raw, "find_type").unwrap();
@@ -489,73 +626,140 @@ mod tests {
     }
 
     #[test]
-    fn append_symbol_merges_adjacent_ranges() {
+    fn append_symbol_keeps_adjacent_ranges_that_share_no_bytes() {
+        // Adjacent but non-overlapping: neither body contains the other, so
+        // both must survive.
         let mut syms: Vec<Value> = vec![];
         append_symbol(
             &mut syms,
-            json!({
-                "name": "slab.c:1-11",
-                "filename": "mm/slab.c",
-                "line": 1,
-                "definition": "A",
-            }),
+            json!({"name": "slab.c:1-11", "filename": "mm/slab.c", "line": 1, "definition": "A"}),
         );
         append_symbol(
             &mut syms,
-            json!({
-                "name": "slab.c:11-21",
-                "filename": "mm/slab.c",
-                "line": 11,
-                "definition": "B",
-            }),
+            json!({"name": "slab.c:11-21", "filename": "mm/slab.c", "line": 11, "definition": "B"}),
         );
-        assert_eq!(syms.len(), 1);
-        let merged = &syms[0];
-        assert_eq!(merged.get("name").unwrap(), "slab.c:1-21");
-        assert_eq!(merged.get("definition").unwrap(), "AB");
+        assert_eq!(syms.len(), 2);
+        assert_eq!(syms[0].get("definition").unwrap(), "A");
+        assert_eq!(syms[1].get("definition").unwrap(), "B");
     }
 
     #[test]
-    fn append_symbol_drops_covered() {
+    fn append_symbol_drops_a_range_already_contained_verbatim() {
         let mut syms = vec![json!({
             "name": "slab.c:1-100",
             "filename": "mm/slab.c",
             "line": 1,
-            "definition": "big",
+            "definition": "line one\nline two\nline three\n",
         })];
+
         let added = append_symbol(
             &mut syms,
             json!({
-                "name": "slab.c:10-20",
+                "name": "slab.c:2-3",
                 "filename": "mm/slab.c",
-                "line": 10,
-                "definition": "small",
+                "line": 2,
+                "definition": "line two\n",
             }),
         );
-        assert!(!added, "covered symbols should not be appended");
+
+        assert!(
+            !added,
+            "a body already present verbatim must not ship twice"
+        );
         assert_eq!(syms.len(), 1);
     }
 
     #[test]
-    fn append_symbol_replaces_with_covering() {
+    fn append_symbol_replaces_a_range_it_contains_verbatim() {
         let mut syms = vec![json!({
-            "name": "slab.c:10-20",
+            "name": "slab.c:2-3",
             "filename": "mm/slab.c",
-            "line": 10,
-            "definition": "small",
+            "line": 2,
+            "definition": "line two\n",
         })];
+
         let added = append_symbol(
             &mut syms,
             json!({
                 "name": "slab.c:1-100",
                 "filename": "mm/slab.c",
                 "line": 1,
-                "definition": "big",
+                "definition": "line one\nline two\nline three\n",
             }),
         );
+
         assert!(added);
         assert_eq!(syms.len(), 1);
         assert_eq!(syms[0].get("name").unwrap(), "slab.c:1-100");
+    }
+
+    #[test]
+    fn append_symbol_keeps_a_contained_range_whose_body_differs() {
+        // Same file, containing range, but the smaller read does not appear in
+        // the larger one — the file changed between reads. Dropping either
+        // would hide evidence, so both stay.
+        let mut syms = vec![json!({
+            "name": "slab.c:1-100",
+            "filename": "mm/slab.c",
+            "line": 1,
+            "definition": "after the edit\n",
+        })];
+
+        let added = append_symbol(
+            &mut syms,
+            json!({
+                "name": "slab.c:2-3",
+                "filename": "mm/slab.c",
+                "line": 2,
+                "definition": "before the edit\n",
+            }),
+        );
+
+        assert!(added, "a stale body is evidence and must stay visible");
+        assert_eq!(syms.len(), 2);
+    }
+
+    #[test]
+    fn append_symbol_never_collapses_across_files() {
+        let mut syms = vec![json!({
+            "name": "slab.c:1-100",
+            "filename": "mm/slab.c",
+            "line": 1,
+            "definition": "shared text\n",
+        })];
+
+        let added = append_symbol(
+            &mut syms,
+            json!({
+                "name": "slub.c:1-10",
+                "filename": "mm/slub.c",
+                "line": 1,
+                "definition": "shared text\n",
+            }),
+        );
+
+        assert!(added);
+        assert_eq!(syms.len(), 2);
+    }
+
+    #[test]
+    fn append_symbol_never_collapses_function_symbols() {
+        // Function/type records have no range in their name, so containment
+        // never applies to them even when one body contains another.
+        let mut syms = vec![json!({
+            "name": "outer",
+            "filename": "a.c",
+            "line": 1,
+            "definition": "void outer(void) { inner(); }",
+        })];
+
+        let added = append_symbol(
+            &mut syms,
+            json!({"name": "inner", "filename": "a.c", "line": 9, "definition": "inner()"}),
+        );
+
+        assert!(added);
+        assert_eq!(syms.len(), 2);
     }
 
     #[test]
@@ -583,13 +787,44 @@ mod tests {
     }
 
     #[test]
-    fn append_context_skips_whitespace_only() {
+    fn append_context_preserves_empty_tool_result_with_source() {
         let mut ctx: Vec<Value> = vec![];
-        assert!(!append_context(
+        assert!(append_context(
             &mut ctx,
             json!({"source": "grep/x", "content": "   \n"})
         ));
-        assert!(ctx.is_empty());
+        assert_eq!(ctx.len(), 1);
+    }
+
+    #[test]
+    fn append_context_preserves_and_deduplicates_error_only_evidence() {
+        let mut context = Vec::new();
+        let error = json!({"source":"mcp:source:x","error":"not found"});
+        assert!(append_context(&mut context, error.clone()));
+        assert!(!append_context(&mut context, error));
+        assert_eq!(context.len(), 1);
+    }
+
+    #[test]
+    fn append_context_preserves_result_envelopes() {
+        let mut context = Vec::new();
+        let callers = json!({"source":"mcp:callers:foo","result":"foo <- bar"});
+        assert!(append_context(&mut context, callers));
+        assert_eq!(context.len(), 1);
+    }
+
+    #[test]
+    fn append_prompt_evidence_is_append_only_and_exact() {
+        let mut records = vec![json!({"evidence_id":"sym-a","definition":"a"})];
+        assert!(append_prompt_evidence(
+            &mut records,
+            json!({"evidence_id":"sym-b","definition":"b"})
+        ));
+        assert!(!append_prompt_evidence(
+            &mut records,
+            json!({"evidence_id":"sym-b","definition":"b"})
+        ));
+        assert_eq!(records.len(), 2);
     }
 
     #[test]

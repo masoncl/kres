@@ -1074,6 +1074,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
                 max_input_tokens: built.agent_runner.fast_max_input_tokens,
                 thinking: built.agent_runner.fast_thinking,
                 validated_findings,
+                logger: built.agent_runner.logger.clone(),
             })
             .await
         };
@@ -1238,6 +1239,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         workspace: args.workspace.clone(),
         mcp_config: mcp_config.clone(),
         persist_path,
+        resume_change_survey: args.resume,
         assisted_by,
         // Piped/redirected stdout has no operator on the other end,
         // so once the work-stop condition fires there is no one to

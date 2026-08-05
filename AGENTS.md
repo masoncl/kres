@@ -83,14 +83,28 @@ User prompt → Task created → Task thread starts
   evidence before research, review, todo, or goal logic treats source as
   unavailable or a symbol as absent. Never mark a finding unconfirmed,
   invalid, clean, or fully covered based only on semcode absence.
-- Local fallback must preserve the grep match list for the requesting
+- Local fallback must preserve the complete grep match list for the requesting
   agent, because Rust cannot know which match is semantically relevant.
-  Do not add special per-file source fallback caps that hide candidates;
-  rely on the shared tool-output cap, whose truncation marker is visible
-  to the agent. Do not expand broad grep fallback results into full
+  Do not add per-file or shared output caps that hide candidates. Do not expand broad grep fallback results into full
   source reads for every hit; return the matches and require targeted
   `read` followups for the specific file:line ranges that need full
   context.
+- Build and shell output is the one exception, and it is not a cap.
+  Above `TOOL_OUTPUT_INLINE_MAX` the complete output is written to
+  `<workspace>/.kres/tool-output/` and the tool result carries the
+  head, the tail, the exact byte count, and that path. Nothing is
+  discarded and the omission is explicit, so a targeted `read`
+  recovers any region. Do not extend this to grep, source, or any
+  evidence a review reasons over, and do not turn it into a silent
+  truncation by dropping the pointer or the byte count.
+- Prior findings are sent to agents in full, every time. Do not add
+  relevance routing, anchor heuristics, source-body-free manifests, or
+  any other scheme that decides which findings a review is allowed to
+  see: a finding that looks unrelated by filename is exactly what a
+  cross-file contract review must catch. Cost is handled by placing
+  `previous_findings` in the shared cached lens prefix, not by sending
+  less. If the accumulated set ever approaches model capability, add a
+  semantic partitioner over findings — do not hide them.
 - Rust must not infer semantic workflow state from free-form AI prose.
   Do not add substring/regex classifiers over model `analysis`,
   `invalid_evidence`, defect text, commit-message prose, or other natural
@@ -392,14 +406,17 @@ used by the fix workflow after `Assisted-by:`. When omitted, kres derives
 
 ### Rate Limiting
 - Shared `RateLimiter` when agents use same API key (same workspace limit)
-- On 429: count_tokens for exact size, auto-shrink if over max_input_tokens, retry
-- `_shrink_messages` removes largest symbols/context first
+- On 429: count tokens to distinguish provider/model input capability from
+  shared rate limiting. Never shrink or delete request content; partition only
+  naturally partitionable inputs and preserve every byte.
 - 8 retries with exponential backoff, retry-after header support
 
 ### Token Management
-- `fit_payload` checks payload size before sending to slow agent
-- Cheap estimate first (chars/4), exact count via `count_tokens` API if close to limit
-- `max_input_tokens` config (default 900K) caps payload size
+- Request construction never trims, caps, or deletes inference input.
+- Cheap estimates and exact `count_tokens` calls are diagnostics or choose
+  lossless partition boundaries for naturally partitionable inputs.
+- `max_input_tokens` describes a provider/model capability. It is not a Kres
+  request ceiling and does not authorize shortening a request.
 
 ### Thread Safety
 - `todo_lock` on TaskManager protects todo_list mutations
@@ -468,7 +485,10 @@ overlapping intervals show concurrent calls.
 Alternating user/assistant records for the fast+slow agent pipeline.
 
 **User records** (`role: "user"`): the `content` field is a JSON
-string containing the prompt assembled by the pipeline. Key fields:
+string containing the newest prompt turn assembled by the pipeline. Multi-turn
+fast-gather calls also carry `request_content`, an ordered JSON representation of
+the complete model-visible conversation; `context_stats` accounts for that complete
+request. Key prompt fields:
 
 | Field | Description |
 |-------|-------------|
@@ -477,7 +497,6 @@ string containing the prompt assembled by the pipeline. Key fields:
 | `skills` | Loaded skill file contents |
 | `symbols` | Source code gathered by the main agent |
 | `context` | Additional context (prior analysis, tool results) |
-| `previously_fetched` | Manifest of data gathered in earlier rounds |
 
 **Assistant records** (`role: "assistant"`): `content` is either
 structured JSON (fast agent) or raw prose (slow agent).

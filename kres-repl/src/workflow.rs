@@ -280,9 +280,11 @@ files, symbols, and unchanged contract consumers.\n\n",
             "\nTARGET KIND: current-workspace source scope (not a git ref)\n\n\
 Review the current source named by TARGET. There is no implied commit, range, \
 base revision, or target diff. Do not invent one and do not request `git show` \
-or `git diff` merely to establish scope. Before goal and plan creation, survey \
-the file exactly once, perform no other fetches, and have one non-lensed slow \
-call rank every defined function. Use that ranking to build the initial semantic \
+or `git diff` merely to establish scope. Before goal and plan creation, generate \
+one rename-aware target-file diff covering the last six months, assess that net diff \
+with one low-effort change survey (chunking it when necessary), survey the file \
+exactly once, then have one non-lensed slow call combine the structural and change \
+ratings. Use that ranking to build the initial semantic \
 coverage plan. Later review tasks \
 gather targeted function bodies, types, callers, and line ranges. Request git history only for a specific semantic \
 question that source alone cannot answer.\n\n",
@@ -2190,7 +2192,7 @@ mod tests {
         assert!(cfg
             .prompt_file
             .prompt
-            .contains("Before goal and plan creation"));
+            .contains("one low-effort change survey"));
         assert_eq!(
             cfg.file_scan_target.as_deref(),
             Some("drivers/example/example.c")

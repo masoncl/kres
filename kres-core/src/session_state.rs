@@ -27,6 +27,16 @@ use thiserror::Error;
 use crate::plan::{Plan, PlanStepStatus};
 use crate::todo::{TodoItem, TodoStatus};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewFileScanState {
+    pub target: String,
+    pub source_hash: String,
+    pub baseline: String,
+    pub head: String,
+    pub scan: String,
+}
+
 #[derive(Debug, Error)]
 pub enum SessionStateError {
     #[error("i/o: {0}")]
@@ -51,6 +61,11 @@ pub struct SessionState {
     pub last_prompt: Option<String>,
     #[serde(default)]
     pub plan: Option<Plan>,
+    /// Completed whole-file review bootstrap scan. Stored separately from
+    /// `Plan::prompt` so task agents do not receive the scan twice and resume
+    /// does not need to regenerate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_file_scan: Option<ReviewFileScanState>,
     #[serde(default)]
     pub todo: Vec<TodoItem>,
     /// Items parked by `/stop`, goal-met, or `--turns` drain.
@@ -63,7 +78,7 @@ pub struct SessionState {
 }
 
 fn default_version() -> u32 {
-    1
+    3
 }
 
 impl Default for SessionState {
@@ -72,6 +87,7 @@ impl Default for SessionState {
             version: default_version(),
             last_prompt: None,
             plan: None,
+            review_file_scan: None,
             todo: Vec::new(),
             deferred: Vec::new(),
             completed_run_count: 0,
@@ -184,9 +200,42 @@ mod tests {
         let s = SessionState::default();
         s.save(&p).unwrap();
         let loaded = SessionState::load(&p).unwrap().unwrap();
-        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.version, 3);
         assert!(loaded.todo.is_empty());
         assert!(loaded.plan.is_none());
+        assert!(loaded.review_file_scan.is_none());
+    }
+
+    #[test]
+    fn review_file_scan_roundtrips_outside_plan_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = SessionState::path_in(dir.path());
+        let state = SessionState {
+            plan: Some(Plan::new("review mm/vmscan.c", "goal", TaskMode::Audit)),
+            review_file_scan: Some(ReviewFileScanState {
+                target: "mm/vmscan.c".into(),
+                source_hash: "source-hash".into(),
+                baseline: "baseline".into(),
+                head: "head".into(),
+                scan: r#"{"functions":[{"name":"shrink_node","risk_rating":81}]}"#.into(),
+            }),
+            ..Default::default()
+        };
+
+        state.save(&p).unwrap();
+        let loaded = SessionState::load(&p).unwrap().unwrap();
+
+        assert_eq!(loaded.plan.unwrap().prompt, "review mm/vmscan.c");
+        assert_eq!(
+            loaded.review_file_scan,
+            Some(ReviewFileScanState {
+                target: "mm/vmscan.c".into(),
+                source_hash: "source-hash".into(),
+                baseline: "baseline".into(),
+                head: "head".into(),
+                scan: r#"{"functions":[{"name":"shrink_node","risk_rating":81}]}"#.into(),
+            })
+        );
     }
 
     #[test]

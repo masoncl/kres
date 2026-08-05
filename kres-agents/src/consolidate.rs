@@ -86,14 +86,10 @@ pub async fn consolidate_lenses_with_logger(
     let max_tokens = consolidator.max_tokens;
     let max_input_tokens = consolidator.max_input_tokens;
 
-    // caps task_brief at 300 chars when it reaches the
-    // consolidator. This prevents a long operator prompt from
-    // dominating every per-lens slow call's context window.
-    let brief_capped: String = task_brief.chars().take(300).collect();
     let instructions = consolidator_instructions(workflow_rules);
     let request = ConsolidatorRequest {
         task: "consolidate_lenses",
-        task_brief: &brief_capped,
+        task_brief,
         lens_outputs,
         instructions: &instructions,
     };
@@ -121,7 +117,15 @@ pub async fn consolidate_lenses_with_logger(
         cached_prefix: None,
     }];
     if let Some(lg) = &logger {
-        lg.log_code("user", &messages[0].content, None, None);
+        let request = cfg.request_meta();
+        lg.log_code_labeled_with_request(
+            "user",
+            Some("phase=consolidate"),
+            &messages[0].content,
+            None,
+            None,
+            Some(&request),
+        );
     }
     kres_core::async_eprintln!(
         "[consolidator] merging {} lens output(s)",
@@ -135,7 +139,7 @@ pub async fn consolidate_lenses_with_logger(
     } else {
         client.messages_streaming(&cfg, &messages).await
     }
-    .map_err(|e| AgentError::Other(e.to_string()))?;
+    .map_err(AgentError::from)?;
     if let Some(usage) = &consolidator.usage {
         usage.record(
             "consolidator",

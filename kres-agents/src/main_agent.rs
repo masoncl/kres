@@ -41,13 +41,10 @@ use crate::{
     followup::Followup,
     mcp_fetcher::mcp_text_unavailable,
     pipeline::{DataFetcher, FetchResult},
-    symbol::{
-        append_context, append_symbol, parse_semcode_symbol, propagate_tool_result, tool_source,
-    },
+    symbol::{append_context, append_symbol, propagate_tool_result, tool_source},
     tools::{
         bash_run, cargo_run, edit_file, find, git, grep, make_run, meson_run, read_file_range,
-        truncate_output, BashArgs, EditArgs, FindArgs, GitArgs, GrepArgs, ReadArgs,
-        TOOL_OUTPUT_CAP_GREP_FIND, TOOL_OUTPUT_CAP_MCP,
+        BashArgs, EditArgs, FindArgs, GitArgs, GrepArgs, ReadArgs,
     },
 };
 
@@ -139,9 +136,10 @@ impl MainAgent {
         }
     }
 
-    fn log_user(&self, content: &str) {
+    fn log_user(&self, content: &str, cfg: &CallConfig) {
         if let Some(lg) = &self.logger {
-            lg.log_main("user", content, None, None);
+            let request = cfg.request_meta();
+            lg.log_main_with_request("user", content, None, None, Some(&request));
         }
     }
 
@@ -179,13 +177,14 @@ impl DataFetcher for MainAgent {
         if !self.task_brief.is_empty() && self.task_brief != self.user_query {
             main_payload.insert("task_brief".into(), json!(self.task_brief));
         }
-        // Include the plan the caller handed in so the main-agent
-        // LLM sees the same decomposition the fast + slow agents
-        // see. Per-call delivery (vs a shared slot) means two
+        // Include the compact model-facing plan so the main-agent LLM sees
+        // the same goal and execution graph as fast + slow without another
+        // copy of the immutable operator/workflow prompt. Per-call delivery
+        // (vs a shared slot) means two
         // concurrent tasks with different plans cannot clobber each
         // other's snapshot between the push and the LLM call.
         if let Some(plan) = plan {
-            if let Ok(v) = serde_json::to_value(plan) {
+            if let Ok(v) = serde_json::to_value(plan.prompt_view(None)) {
                 main_payload.insert("plan".into(), v);
             }
         }
@@ -210,7 +209,7 @@ impl DataFetcher for MainAgent {
             cache: false,
             cached_prefix: None,
         }];
-        self.log_user(&opening);
+        self.log_user(&opening, &cfg);
 
         kres_core::async_eprintln!(
             "[main] fetch: {} followup(s) from fast, {} MCP server(s) configured",
@@ -252,7 +251,7 @@ impl DataFetcher for MainAgent {
                 .client
                 .messages_streaming(&turn_cfg, &history)
                 .await
-                .map_err(|e| AgentError::Other(e.to_string()))?;
+                .map_err(AgentError::from)?;
             if let Some(t) = &self.usage {
                 t.record(
                     "main",
@@ -292,7 +291,7 @@ impl DataFetcher for MainAgent {
                         )
                     })
                     .to_string();
-                    self.log_user(&correction);
+                    self.log_user(&correction, &cfg);
                     history.push(Message {
                         role: "user".into(),
                         content: correction,
@@ -350,7 +349,7 @@ impl DataFetcher for MainAgent {
                 context.len(),
             );
             let tool_msg = json!({"tools": actions.len(), "result": combined}).to_string();
-            self.log_user(&tool_msg);
+            self.log_user(&tool_msg, &cfg);
             history.push(Message {
                 role: "user".into(),
                 content: tool_msg,
@@ -410,58 +409,61 @@ impl MainAgent {
         for (server, calls) in &mcp_by_server {
             let client_opt = self.mcp_servers.get(server);
             for (idx, tool, args) in calls {
-                let (text, sym) = match client_opt {
-                    None => (format!("MCP server not found: {server}"), None),
+                let text = match client_opt {
+                    None => format!("MCP server not found: {server}"),
                     Some(c) => {
                         let mut guard = c.lock().await;
                         match guard.call_tool(tool, args).await {
-                            Ok(t) => {
-                                let t = truncate_output(&t, TOOL_OUTPUT_CAP_MCP);
-                                let sym = if tool == "find_function" || tool == "find_type" {
-                                    parse_semcode_symbol(&t, tool)
-                                } else {
-                                    None
-                                };
-                                (t, sym)
-                            }
-                            Err(e) => (format!("{e}"), None),
+                            Ok(t) => t,
+                            Err(e) => format!("{e}"),
                         }
                     }
                 };
                 let source = format!("{server}/{tool}");
-                let fallback = mcp_semcode_fallback_followup(tool, args, sym.is_none(), &text);
                 if matches!(tool.as_str(), "find_function" | "find_type") {
-                    append_context(
-                        context,
-                        json!({
-                            "source": source.clone(),
-                            "content": text.clone(),
-                            "note": "raw semcode output; agents must choose the relevant result when semcode returns multiple candidates",
-                        }),
+                    let evidence = crate::symbol::canonical_semcode_evidence(&text, tool);
+                    let fallback = mcp_semcode_fallback_followup(
+                        tool,
+                        args,
+                        evidence.needs_local_fallback,
+                        &text,
                     );
-                    if let Some(sym) = sym {
-                        append_symbol(symbols, sym);
+                    if evidence.preserve_raw {
+                        append_context(
+                            context,
+                            json!({
+                                "source": source.clone(),
+                                "content": text.clone(),
+                                "note": "raw semcode output preserved because it is ambiguous or unparseable",
+                            }),
+                        );
+                    }
+                    if let Some(sym) = evidence.symbol {
+                        append_symbol(
+                            symbols,
+                            crate::symbol::with_retrieval_source(sym, source.clone()),
+                        );
+                    }
+                    if let Some(fu) = fallback {
+                        let local = WorkspaceFetcher::new(self.workspace.clone());
+                        match local.fetch(&[fu], None).await {
+                            Ok(r) => {
+                                symbols.extend(r.symbols);
+                                context.extend(r.context);
+                            }
+                            Err(e) => {
+                                append_context(
+                                    context,
+                                    json!({
+                                        "source": format!("fallback:{source}"),
+                                        "error": e.to_string(),
+                                    }),
+                                );
+                            }
+                        }
                     }
                 } else {
-                    propagate_tool_result(&text, sym, &source, symbols, context);
-                }
-                if let Some(fu) = fallback {
-                    let local = WorkspaceFetcher::new(self.workspace.clone());
-                    match local.fetch(&[fu], None).await {
-                        Ok(r) => {
-                            symbols.extend(r.symbols);
-                            context.extend(r.context);
-                        }
-                        Err(e) => {
-                            append_context(
-                                context,
-                                json!({
-                                    "source": format!("fallback:{source}"),
-                                    "error": e.to_string(),
-                                }),
-                            );
-                        }
-                    }
+                    propagate_tool_result(&text, None, &source, symbols, context);
                 }
                 per_action.push((*idx, text));
             }
@@ -579,11 +581,6 @@ async fn dispatch_non_mcp(
                     .get("path")
                     .and_then(|v| v.as_str())
                     .map(String::from),
-                limit: action
-                    .get("max_count")
-                    .or_else(|| action.get("limit"))
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n as u32),
                 glob: action
                     .get("glob")
                     .and_then(|v| v.as_str())
@@ -685,7 +682,7 @@ async fn dispatch_non_mcp(
                     // 2026-04-21). Truncate at the same envelope
                     // grep/find use so a runaway whole-file read
                     // can't blow the turn budget.
-                    let body = truncate_output(&def, TOOL_OUTPUT_CAP_GREP_FIND);
+                    let body = def.clone();
                     let header = format!(
                         "Read {}:{}-{} ({} chars), symbol '{}'",
                         sym.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
@@ -947,12 +944,10 @@ fn valid_action_envelope(value: &Value) -> bool {
     };
     match kind {
         "grep" => {
-            only(&["type", "pattern", "path", "max_count", "limit", "glob"])
+            only(&["type", "pattern", "path", "glob"])
                 && nonempty(&["pattern"])
                 && optional_string("path")
                 && optional_string("glob")
-                && optional_u64("max_count")
-                && optional_u64("limit")
         }
         "find" => {
             only(&[

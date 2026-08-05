@@ -23,16 +23,15 @@
 //!      condense result. Batch outputs are concatenated into a
 //!      single `task_observations` string the render pass quotes
 //!      from. A single task that alone exceeds the budget falls
-//!      back to `condense_single_task`, which recursively splits
-//!      per_finding halves and drops task_prose with a breadcrumb.
+//!      back to `condense_single_task`, which recursively partitions
+//!      every per-finding analysis and task-prose body without dropping data.
 //!   6. Render pass: send the sorted findings (with `details`
 //!      stripped via `redact_findings_for_agent`) plus the
 //!      `task_observations` string to the `summary` (or
 //!      `summary-markdown`) slash-command template. Single-shot
-//!      when the prompt fits `max_input_tokens`; otherwise split
-//!      findings into batches that each fit (every batch carries
-//!      the full observations string), render one partial per
-//!      batch, then combine the partials.
+//!      when the prompt fits `max_input_tokens`; otherwise partition
+//!      complete findings while retaining the task observations on every
+//!      render call, then combine the partials.
 //!
 //! The `/summary` / `/summary-markdown` commands and the CLI flags
 //! `--summary` / `--summary-markdown` all land here — only the
@@ -47,7 +46,7 @@ use anyhow::{anyhow, Context, Result};
 use kres_core::findings::{
     redact_findings_for_agent, Finding, FindingsFile, FindingsStore, Severity, Status,
 };
-use kres_core::Shutdown;
+use kres_core::{LoggedUsage, Shutdown, TurnLogger};
 use serde_json::json;
 use tokio::task::JoinSet;
 
@@ -58,10 +57,6 @@ use kres_llm::{
     client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
 };
 
-/// Conservative fallback when the caller didn't set max_input_tokens
-/// and we need a budget to decide staging. Claude's default 200K
-/// context, minus headroom for the output and protocol overhead.
-const DEFAULT_INPUT_BUDGET: u32 = 180_000;
 const SUMMARY_VALIDATION_CONCURRENCY: usize = 20;
 
 /// Default on-disk override location for the plain-text template.
@@ -110,6 +105,20 @@ pub struct SummaryInputs {
     /// Validation-produced findings. The renderer never reads stale narrative
     /// or task prose directly from the canonical findings store.
     pub validated_findings: Vec<Finding>,
+    /// Session logger. Summary render/condense calls are ordinary inference
+    /// spend and belong in `code.jsonl` alongside every other call, or the
+    /// context accounting under-reports the session.
+    pub logger: Option<Arc<TurnLogger>>,
+}
+
+/// Client, call config and logger for one summary inference call. Bundled
+/// because every helper below needs all three and threading them separately
+/// grew the signatures without making anything clearer.
+#[derive(Clone, Copy)]
+struct SummaryCall<'a> {
+    client: &'a Client,
+    cfg: &'a CallConfig,
+    logger: Option<&'a TurnLogger>,
 }
 
 pub struct SummaryValidationInputs {
@@ -498,7 +507,7 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     // one per task. A run with 37 tasks collapses to ~2-3 calls
     // instead of 37. Per-task overflow (a single task too big to
     // batch with anything else) falls through to the single-task
-    // split+drop fallback in `condense_single_task`.
+    // lossless recursive partition fallback in `condense_single_task`.
     let condense_system = kres_agents::embedded_prompts::lookup("condense-task.system.md")
         .ok_or_else(|| anyhow!("condense-task.system.md missing from embedded table — build bug"))?
         .to_string();
@@ -511,16 +520,18 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
         condense_cfg = condense_cfg.with_max_input_tokens(n);
     }
 
-    let budget = inputs.max_input_tokens.unwrap_or(DEFAULT_INPUT_BUDGET);
+    // A configured value describes provider capability; it is not a content
+    // budget. When capability is unknown, try the complete request first and
+    // partition only after the provider returns a typed over-limit response.
+    let budget = inputs.max_input_tokens.unwrap_or(u32::MAX);
 
-    let task_observations: String = condense_tasks_batched(
-        &inputs.client,
-        &condense_cfg,
-        &task_order,
-        &mut tasks,
-        budget,
-    )
-    .await?;
+    let condense_call = SummaryCall {
+        client: &inputs.client,
+        cfg: &condense_cfg,
+        logger: inputs.logger.as_deref(),
+    };
+    let task_observations: String =
+        condense_tasks_batched(condense_call, &task_order, &mut tasks, budget).await?;
 
     // 5. Render pass. Resolve the template once; reuse it for the
     // single-shot attempt and any partial renders below.
@@ -545,9 +556,9 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
 
     // One-shot attempt first. `size_call` short-circuits the exact
     // count when the chars/4 estimate is comfortably under budget.
-    // The observations block is typically small relative to
-    // findings bodies — we always send it whole alongside every
-    // render call (single-shot and each partial).
+    // The staged path partitions only complete findings. Every partial keeps
+    // the task observations so the renderer never has to infer relationships
+    // between findings and observations that were sent to different calls.
     let full_prompt =
         build_render_prompt(original_prompt, &render_findings, &task_observations, None)?;
     let full_messages = vec![user_message(&full_prompt)];
@@ -572,13 +583,31 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
                 "yes"
             },
         );
-        call_and_extract(
-            &inputs.client,
-            &render_cfg,
-            &full_messages,
-            "summary render",
-        )
-        .await?
+        let render_call = SummaryCall {
+            client: &inputs.client,
+            cfg: &render_cfg,
+            logger: inputs.logger.as_deref(),
+        };
+        match try_call_and_extract(render_call, &full_messages, "summary render").await {
+            Ok(text) => text,
+            Err(SummaryCallError::OverInput { limit }) => {
+                let provider_budget = smaller_partition_budget(budget, limit)?;
+                kres_core::async_eprintln!(
+                    "summary: provider rejected complete render; partitioning at reported {}-token capability",
+                    provider_budget,
+                );
+                stage_render(
+                    &inputs,
+                    &render_cfg,
+                    original_prompt,
+                    &render_findings,
+                    &task_observations,
+                    provider_budget,
+                )
+                .await?
+            }
+            Err(SummaryCallError::Other(error)) => return Err(error),
+        }
     } else {
         stage_render(
             &inputs,
@@ -675,8 +704,7 @@ fn bucket_task_material(
 ///
 /// `tasks` is consumed as we go (`.remove()` on each key).
 async fn condense_tasks_batched(
-    client: &Client,
-    cfg: &CallConfig,
+    call: SummaryCall<'_>,
     task_order: &[String],
     tasks: &mut BTreeMap<String, TaskMaterial>,
     budget: u32,
@@ -700,7 +728,7 @@ async fn condense_tasks_batched(
         pending.push((task_id.clone(), material));
         let prompt = build_batch_condense_prompt(&pending)?;
         let messages = vec![user_message(&prompt)];
-        let size = size_call(client, cfg, &messages, budget).await;
+        let size = size_call(call.client, call.cfg, &messages, budget).await;
         let fits = size.map(|t| t <= budget as u64).unwrap_or(true);
         if fits {
             continue;
@@ -710,7 +738,7 @@ async fn condense_tasks_batched(
         let (offender_id, offender_material) = pending.pop().expect("just pushed");
         if !pending.is_empty() {
             batch_n += 1;
-            let block = flush_batch(client, cfg, &pending, batch_n).await?;
+            let block = flush_batch(call, &pending, batch_n).await?;
             blocks.push(block);
             pending.clear();
         }
@@ -724,7 +752,7 @@ async fn condense_tasks_batched(
         let probe_one = vec![(offender_id.clone(), offender_material.clone())];
         let probe_prompt = build_batch_condense_prompt(&probe_one)?;
         let probe_msgs = vec![user_message(&probe_prompt)];
-        let probe_size = size_call(client, cfg, &probe_msgs, budget).await;
+        let probe_size = size_call(call.client, call.cfg, &probe_msgs, budget).await;
         let probe_fits = probe_size.map(|t| t <= budget as u64).unwrap_or(true);
         if probe_fits {
             pending.push((offender_id, offender_material));
@@ -737,8 +765,7 @@ async fn condense_tasks_batched(
         );
         let single_label = format!("summary condense single {}", truncate(&offender_id, 40));
         let block = condense_single_task(
-            client,
-            cfg,
+            call,
             &offender_id,
             &offender_material,
             &single_label,
@@ -750,7 +777,7 @@ async fn condense_tasks_batched(
 
     if !pending.is_empty() {
         batch_n += 1;
-        let block = flush_batch(client, cfg, &pending, batch_n).await?;
+        let block = flush_batch(call, &pending, batch_n).await?;
         blocks.push(block);
     }
 
@@ -787,8 +814,7 @@ fn join_blocks(blocks: &[String]) -> String {
 /// Fire one batch-condense call and return its prose output.
 /// `batch_n` is the 1-based batch index used for the stream label.
 async fn flush_batch(
-    client: &Client,
-    cfg: &CallConfig,
+    call: SummaryCall<'_>,
     batch: &[(String, TaskMaterial)],
     batch_n: usize,
 ) -> Result<String> {
@@ -800,16 +826,29 @@ async fn flush_batch(
         batch_n,
         batch.len()
     );
-    call_and_extract(client, cfg, &messages, &label).await
+    match try_call_and_extract(call, &messages, &label).await {
+        Ok(text) => Ok(text),
+        Err(SummaryCallError::OverInput { .. }) if batch.len() > 1 => {
+            let midpoint = batch.len() / 2;
+            let left = Box::pin(flush_batch(call, &batch[..midpoint], batch_n));
+            let right = Box::pin(flush_batch(call, &batch[midpoint..], batch_n));
+            let (left, right) = tokio::try_join!(left, right)?;
+            Ok(join_blocks(&[left, right]))
+        }
+        Err(SummaryCallError::OverInput { limit }) => {
+            let provider_budget = u32::try_from(limit).unwrap_or(u32::MAX);
+            let (task_id, material) = &batch[0];
+            condense_single_task(call, task_id, material, &label, provider_budget).await
+        }
+        Err(SummaryCallError::Other(error)) => Err(error),
+    }
 }
 
-/// Single-task fallback: used only when a task on its own is too
-/// big to fit in a batch. Recursively splits `per_finding` and
-/// drops `task_prose` with a breadcrumb, reusing the batch prompt
-/// shape with a one-item list.
+/// Single-task fallback: used only when a task on its own is too big to fit in
+/// a batch. Recursively partitions every body; no task prose or finding
+/// analysis is discarded.
 async fn condense_single_task(
-    client: &Client,
-    cfg: &CallConfig,
+    call: SummaryCall<'_>,
     task_id: &str,
     material: &TaskMaterial,
     label: &str,
@@ -818,11 +857,17 @@ async fn condense_single_task(
     let pending: Vec<(String, TaskMaterial)> = vec![(task_id.to_string(), material.clone())];
     let prompt = build_batch_condense_prompt(&pending)?;
     let messages = vec![user_message(&prompt)];
-    let size = size_call(client, cfg, &messages, budget).await;
+    let size = size_call(call.client, call.cfg, &messages, budget).await;
     let fits = size.map(|t| t <= budget as u64).unwrap_or(true);
-    if fits {
-        return call_and_extract(client, cfg, &messages, label).await;
-    }
+    let budget = if fits {
+        match try_call_and_extract(call, &messages, label).await {
+            Ok(text) => return Ok(text),
+            Err(SummaryCallError::OverInput { limit }) => smaller_partition_budget(budget, limit)?,
+            Err(SummaryCallError::Other(error)) => return Err(error),
+        }
+    } else {
+        budget
+    };
     kres_core::async_eprintln!(
         "summary: single-task condense oversize for {} (budget={}); splitting",
         truncate(task_id, 40),
@@ -843,14 +888,8 @@ async fn condense_single_task(
         };
         let l1 = format!("{label} 1/2");
         let l2 = format!("{label} 2/2");
-        let a = Box::pin(condense_single_task(
-            client, cfg, task_id, &first, &l1, budget,
-        ))
-        .await?;
-        let b = Box::pin(condense_single_task(
-            client, cfg, task_id, &second, &l2, budget,
-        ))
-        .await?;
+        let a = Box::pin(condense_single_task(call, task_id, &first, &l1, budget)).await?;
+        let b = Box::pin(condense_single_task(call, task_id, &second, &l2, budget)).await?;
         let mut joined = a;
         if !joined.ends_with('\n') {
             joined.push('\n');
@@ -860,50 +899,117 @@ async fn condense_single_task(
         return Ok(joined);
     }
 
-    // One (or zero) per_finding entry left. Prose is the overflow.
+    // Partition prose losslessly. The finding material stays with the first
+    // fragment and is not duplicated into the second.
     if !material.prose.is_empty() {
-        let stripped = TaskMaterial {
-            per_finding: material.per_finding.clone(),
-            prose: String::new(),
-        };
-        let stripped_pending: Vec<(String, TaskMaterial)> = vec![(task_id.to_string(), stripped)];
-        let stripped_prompt = build_batch_condense_prompt(&stripped_pending)?;
-        let stripped_messages = vec![user_message(&stripped_prompt)];
-        let stripped_size = size_call(client, cfg, &stripped_messages, budget).await;
-        if stripped_size.map(|t| t <= budget as u64).unwrap_or(true) {
-            kres_core::async_eprintln!(
-                "summary: condense dropping task_prose ({} chars) for {} to fit budget",
-                material.prose.len(),
-                truncate(task_id, 40),
-            );
-            let body = call_and_extract(client, cfg, &stripped_messages, label).await?;
-            let mut out = body;
-            if !out.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push_str(
-                "\n[DROPPED task_prose] The file-level narrative for this task \
-                 exceeded the condense input budget and was elided.\n",
-            );
-            return Ok(out);
+        let (left_prose, right_prose) = split_utf8_mid(&material.prose);
+        if !right_prose.is_empty() {
+            let first = TaskMaterial {
+                per_finding: material.per_finding.clone(),
+                prose: left_prose.to_string(),
+            };
+            let second = TaskMaterial {
+                per_finding: Vec::new(),
+                prose: right_prose.to_string(),
+            };
+            let a = Box::pin(condense_single_task(
+                call,
+                task_id,
+                &first,
+                &format!("{label} prose 1/2"),
+                budget,
+            ))
+            .await?;
+            let b = Box::pin(condense_single_task(
+                call,
+                task_id,
+                &second,
+                &format!("{label} prose 2/2"),
+                budget,
+            ))
+            .await?;
+            return Ok(join_blocks(&[a, b]));
+        }
+    }
+
+    // A single finding analysis may itself be larger than a provider request.
+    // Partition only its analysis; repeat the finding identity so both pieces
+    // remain attributable.
+    if let Some((finding_id, title, analysis)) = material.per_finding.first() {
+        let (left_analysis, right_analysis) = split_utf8_mid(analysis);
+        if !right_analysis.is_empty() {
+            let first = TaskMaterial {
+                per_finding: vec![(finding_id.clone(), title.clone(), left_analysis.to_string())],
+                prose: String::new(),
+            };
+            let second = TaskMaterial {
+                per_finding: vec![(
+                    finding_id.clone(),
+                    title.clone(),
+                    right_analysis.to_string(),
+                )],
+                prose: String::new(),
+            };
+            let a = Box::pin(condense_single_task(
+                call,
+                task_id,
+                &first,
+                &format!("{label} finding 1/2"),
+                budget,
+            ))
+            .await?;
+            let b = Box::pin(condense_single_task(
+                call,
+                task_id,
+                &second,
+                &format!("{label} finding 2/2"),
+                budget,
+            ))
+            .await?;
+            return Ok(join_blocks(&[a, b]));
         }
     }
 
     Err(anyhow!(
-        "condense call for task {} exceeds the {} input-token budget even with \
-         a single finding and no task_prose — raise max_input_tokens or \
-         shrink the finding.details[] analysis body",
+        "condense call for task {} exceeds the provider's {}-token input capability, and its remaining indivisible identity/schema framing cannot be partitioned",
         truncate(task_id, 60),
         budget,
     ))
 }
 
-/// Map-reduce render path: split findings into batches that fit the
-/// input budget, call the render template on each with the full
-/// `task_observations` string, then combine the partials. The
-/// observations string is small relative to findings bodies and
-/// already condensed, so it always rides along in full — batching
-/// happens only on the findings axis.
+fn split_utf8_mid(text: &str) -> (&str, &str) {
+    if text.len() < 2 {
+        return (text, "");
+    }
+    let mut midpoint = text.len() / 2;
+    while midpoint > 0 && !text.is_char_boundary(midpoint) {
+        midpoint -= 1;
+    }
+    if midpoint == 0 {
+        midpoint = text
+            .char_indices()
+            .nth(1)
+            .map_or(text.len(), |(index, _)| index);
+    }
+    text.split_at(midpoint)
+}
+
+fn smaller_partition_budget(current: u32, reported: u64) -> Result<u32> {
+    if current <= 1 {
+        return Err(anyhow!(
+            "provider rejected an indivisible one-token summary framing"
+        ));
+    }
+    let reported = u32::try_from(reported).unwrap_or(u32::MAX);
+    let smaller = reported
+        .min(current.saturating_sub(1))
+        .min(current.saturating_mul(3) / 4)
+        .max(1);
+    Ok(smaller)
+}
+
+/// Map-reduce render path over complete findings. Task observations accompany
+/// every partition because separating the two destroys their semantic links.
 async fn stage_render(
     inputs: &SummaryInputs,
     cfg: &CallConfig,
@@ -912,51 +1018,54 @@ async fn stage_render(
     task_observations: &str,
     budget: u32,
 ) -> Result<String> {
-    if findings.is_empty() {
-        return Err(anyhow!(
-            "render prompt exceeds {} input tokens but there are no findings to chunk \
-             (observations alone overflow budget). Trim task_prose entries or raise \
-             max_input_tokens.",
-            budget
-        ));
-    }
-    let batches = chunk_findings_to_fit(
-        &inputs.client,
+    let call = SummaryCall {
+        client: &inputs.client,
         cfg,
-        original_prompt,
-        findings,
-        task_observations,
-        budget,
-    )
-    .await?;
+        logger: inputs.logger.as_deref(),
+    };
+    let finding_batches =
+        partition_findings_to_fit(call, original_prompt, findings, task_observations, budget)
+            .await?;
     kres_core::async_eprintln!(
-        "summary: staging: {} batch(es) over {} finding(s); rendering partials then combining",
-        batches.len(),
-        findings.len(),
+        "summary: staging {} complete-finding partition(s), each with task observations",
+        finding_batches.len(),
     );
-
-    let mut partials = Vec::with_capacity(batches.len());
-    for (idx, batch) in batches.iter().enumerate() {
-        let note = partial_note(idx + 1, batches.len());
-        let prompt_json = build_render_prompt(
-            original_prompt,
-            batch,
-            task_observations,
-            Some(note.as_str()),
-        )?;
-        let messages = vec![user_message(&prompt_json)];
-        let label = format!("summary render partial {}/{}", idx + 1, batches.len());
-        kres_core::async_eprintln!(
-            "summary: partial {}/{} — {} finding(s), observations_chars={}",
-            idx + 1,
-            batches.len(),
-            batch.len(),
-            task_observations.len(),
+    let mut partials = Vec::new();
+    for (index, batch) in finding_batches.iter().enumerate() {
+        let note = format!(
+            "This is complete-finding partition {}/{}. Preserve every supplied finding and its relationships to the supplied task observations; a later pass combines all partitions.",
+            index + 1,
+            finding_batches.len(),
         );
-        let text = call_and_extract(&inputs.client, cfg, &messages, &label).await?;
-        partials.push(text);
+        let prompt_json =
+            build_render_prompt(original_prompt, batch, task_observations, Some(&note))?;
+        let messages = vec![user_message(&prompt_json)];
+        let label = format!(
+            "summary render finding partition {}/{}",
+            index + 1,
+            finding_batches.len(),
+        );
+        match try_call_and_extract(call, &messages, &label).await {
+            Ok(text) => partials.push(text),
+            Err(SummaryCallError::OverInput { limit }) => {
+                let smaller_budget = smaller_partition_budget(budget, limit)?;
+                kres_core::async_eprintln!(
+                    "summary: provider rejected render partition; repartitioning all findings at {} tokens",
+                    smaller_budget
+                );
+                return Box::pin(stage_render(
+                    inputs,
+                    cfg,
+                    original_prompt,
+                    findings,
+                    task_observations,
+                    smaller_budget,
+                ))
+                .await;
+            }
+            Err(SummaryCallError::Other(error)) => return Err(error),
+        }
     }
-
     let combine_system = combine_system_prompt(inputs.markdown);
     let mut combine_cfg = CallConfig::defaults_for(inputs.model.clone())
         .with_max_tokens(inputs.max_tokens)
@@ -966,111 +1075,326 @@ async fn stage_render(
     if let Some(n) = inputs.max_input_tokens {
         combine_cfg = combine_cfg.with_max_input_tokens(n);
     }
-    let combine_json = serde_json::to_string(&json!({
-        "task": "combine_summaries",
-        "original_prompt": original_prompt,
-        "partials": partials,
-    }))?;
-    let combine_messages = vec![user_message(&combine_json)];
-    let combine_size = size_call(&inputs.client, &combine_cfg, &combine_messages, budget).await;
-    kres_core::async_eprintln!(
-        "summary: combine sizing partials={} tokens={:?} budget={}",
-        partials.len(),
-        combine_size,
-        budget,
-    );
-    if let Some(n) = combine_size {
-        if n > budget as u64 {
-            return Err(anyhow!(
-                "combined partials ({n} tokens) exceed the {budget}-token input budget — \
-                 raise max_input_tokens or shrink task_prose entries"
-            ));
-        }
-    }
-    kres_core::async_eprintln!(
-        "summary: combining {} partial(s) into final output",
-        partials.len()
-    );
-    call_and_extract(
-        &inputs.client,
-        &combine_cfg,
-        &combine_messages,
-        "summary combine",
-    )
-    .await
+    let combine_call = SummaryCall {
+        client: &inputs.client,
+        cfg: &combine_cfg,
+        logger: inputs.logger.as_deref(),
+    };
+    combine_summary_parts(combine_call, original_prompt, partials, budget, 0).await
 }
 
-/// Split findings into consecutive chunks such that each (chunk +
-/// full task_observations + template) fits `budget` input tokens.
-/// Starts at 2 parts and doubles until every partition fits or
-/// each chunk is a single finding.
-async fn chunk_findings_to_fit<'a>(
-    client: &Client,
-    cfg: &CallConfig,
-    original_prompt: &str,
-    findings: &'a [Finding],
-    task_observations: &str,
+fn combine_summary_parts<'a>(
+    call: SummaryCall<'a>,
+    original_prompt: &'a str,
+    parts: Vec<String>,
     budget: u32,
-) -> Result<Vec<&'a [Finding]>> {
-    if findings.len() < 2 {
-        return Err(anyhow!(
-            "cannot chunk {} finding(s) to fit the {} input-token budget; \
-             observations or a single finding is the overflow source",
-            findings.len(),
-            budget
-        ));
-    }
-    let mut parts: usize = 2;
-    loop {
-        let chunks = split_evenly(findings, parts);
-        let mut all_fit = true;
-        for (idx, chunk) in chunks.iter().enumerate() {
-            let probe_note = partial_note(idx + 1, chunks.len());
-            let prompt = build_render_prompt(
-                original_prompt,
-                chunk,
-                task_observations,
-                Some(probe_note.as_str()),
-            )?;
-            let messages = vec![user_message(&prompt)];
-            let size = size_call(client, cfg, &messages, budget).await;
-            let over = size.map(|t| t > budget as u64).unwrap_or(false);
-            if over {
-                all_fit = false;
-                break;
+    depth: usize,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+    Box::pin(async move {
+        if parts.is_empty() {
+            return Ok(String::new());
+        }
+        if parts.len() == 1 {
+            return Ok(parts.into_iter().next().expect("one summary part"));
+        }
+        let combine_json = serde_json::to_string(&json!({
+            "task": "combine_summaries",
+            "original_prompt": original_prompt,
+            "partials": &parts,
+        }))?;
+        let messages = vec![user_message(&combine_json)];
+        let size = size_call(call.client, call.cfg, &messages, budget)
+            .await
+            .unwrap_or(0);
+        if size <= budget as u64 {
+            kres_core::async_eprintln!(
+                "summary: combining {} partial(s) at tree depth {} ({} tokens)",
+                parts.len(),
+                depth,
+                size,
+            );
+            match try_call_and_extract(call, &messages, "summary combine").await {
+                Ok(text) => return Ok(text),
+                Err(SummaryCallError::OverInput { .. }) => {
+                    kres_core::async_eprintln!(
+                        "summary: provider rejected estimated combine; reducing fan-in"
+                    );
+                }
+                Err(SummaryCallError::Other(error)) => return Err(error),
             }
         }
-        if all_fit {
-            return Ok(chunks);
+
+        if parts.len() == 2 {
+            kres_core::async_eprintln!(
+                "summary: two complete partials exceed combine capability; preserving both verbatim"
+            );
+            return Ok(join_blocks(&parts));
         }
-        if parts >= findings.len() {
-            return Err(anyhow!(
-                "even one finding per chunk exceeds the {} input-token budget; \
-                 observations are likely the overflow source",
-                budget
-            ));
-        }
-        parts = (parts * 2).min(findings.len());
-    }
+        let midpoint = parts.len() / 2;
+        let (left, right) = (parts[..midpoint].to_vec(), parts[midpoint..].to_vec());
+        let left = combine_summary_parts(call, original_prompt, left, budget, depth + 1);
+        let right = combine_summary_parts(call, original_prompt, right, budget, depth + 1);
+        let (left, right) = tokio::try_join!(left, right)?;
+        combine_summary_parts(call, original_prompt, vec![left, right], budget, depth + 1).await
+    })
 }
 
-fn split_evenly<T>(items: &[T], parts: usize) -> Vec<&[T]> {
-    if parts == 0 || items.is_empty() {
-        return vec![items];
+/// Turn findings into complete render units and greedily pack fitting calls.
+/// Serialized findings are never split at arbitrary byte offsets: a model that
+/// sees half a JSON object cannot preserve that finding's meaning.
+async fn partition_findings_to_fit(
+    call: SummaryCall<'_>,
+    original_prompt: &str,
+    findings: &[Finding],
+    task_observations: &str,
+    budget: u32,
+) -> Result<Vec<Vec<serde_json::Value>>> {
+    if findings.is_empty() {
+        return Ok(vec![Vec::new()]);
     }
-    let base = items.len() / parts;
-    let rem = items.len() % parts;
-    let mut out = Vec::with_capacity(parts);
-    let mut start = 0;
-    for i in 0..parts {
-        let len = base + if i < rem { 1 } else { 0 };
-        if len == 0 {
+
+    let mut units = Vec::new();
+    for finding in findings {
+        let value = serde_json::to_value(finding)?;
+        if render_units_fit(
+            call,
+            original_prompt,
+            std::slice::from_ref(&value),
+            task_observations,
+            budget,
+        )
+        .await?
+        {
+            units.push(value);
             continue;
         }
-        out.push(&items[start..start + len]);
-        start += len;
+
+        units.extend(
+            partition_finding_evidence(call, original_prompt, finding, task_observations, budget)
+                .await?,
+        );
     }
-    out
+
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    for unit in units {
+        current.push(unit);
+        if render_units_fit(call, original_prompt, &current, task_observations, budget).await? {
+            continue;
+        }
+        let last = current.pop().expect("unit was just pushed");
+        if current.is_empty() {
+            return Err(anyhow!(
+                "summary render unit exceeds the provider's {budget}-token input capability"
+            ));
+        }
+        batches.push(std::mem::take(&mut current));
+        current.push(last);
+        if !render_units_fit(call, original_prompt, &current, task_observations, budget).await? {
+            return Err(anyhow!(
+                "summary render fragment exceeds the provider's {budget}-token input capability"
+            ));
+        }
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    Ok(batches)
+}
+
+/// Partition only the source-evidence collections of one finding. Every unit
+/// repeats the complete semantic finding record, so no call receives a partial
+/// title, mechanism, impact, reproducer, or fix. Oversized source bodies are
+/// split as explicitly labelled exact-text partitions; their JSON structure is
+/// never split.
+async fn partition_finding_evidence(
+    call: SummaryCall<'_>,
+    original_prompt: &str,
+    finding: &Finding,
+    task_observations: &str,
+    budget: u32,
+) -> Result<Vec<serde_json::Value>> {
+    let mut core = finding.clone();
+    let symbols = std::mem::take(&mut core.relevant_symbols);
+    let sections = std::mem::take(&mut core.relevant_file_sections);
+    let core = serde_json::to_value(core)?;
+    let mut evidence = Vec::with_capacity(symbols.len() + sections.len());
+    evidence.extend(symbols.into_iter().map(|symbol| {
+        json!({
+            "kind": "relevant_symbol",
+            "name": symbol.name,
+            "filename": symbol.filename,
+            "line": symbol.line,
+            "exact_text": symbol.definition,
+        })
+    }));
+    evidence.extend(sections.into_iter().map(|section| {
+        json!({
+            "kind": "relevant_file_section",
+            "filename": section.filename,
+            "line_start": section.line_start,
+            "line_end": section.line_end,
+            "exact_text": section.content,
+        })
+    }));
+
+    let wrap = |items: Vec<serde_json::Value>| {
+        json!({
+            "finding": core,
+            "source_evidence_partition": items,
+            "source_evidence_partition_note": "The complete semantic finding is repeated in every sibling unit; source-evidence arrays are partitioned without omission.",
+        })
+    };
+    let empty = wrap(Vec::new());
+    if !render_units_fit(
+        call,
+        original_prompt,
+        std::slice::from_ref(&empty),
+        task_observations,
+        budget,
+    )
+    .await?
+    {
+        return Err(anyhow!(
+            "summary finding {} has an indivisible semantic core larger than the provider's {budget}-token input capability",
+            finding.id
+        ));
+    }
+
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    for item in evidence {
+        let mut candidate = current.clone();
+        candidate.push(item.clone());
+        let wrapped = wrap(candidate.clone());
+        if render_units_fit(
+            call,
+            original_prompt,
+            std::slice::from_ref(&wrapped),
+            task_observations,
+            budget,
+        )
+        .await?
+        {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            out.push(wrap(std::mem::take(&mut current)));
+        }
+        let single = wrap(vec![item.clone()]);
+        if render_units_fit(
+            call,
+            original_prompt,
+            std::slice::from_ref(&single),
+            task_observations,
+            budget,
+        )
+        .await?
+        {
+            current.push(item);
+            continue;
+        }
+        out.extend(
+            partition_source_evidence_item(
+                call,
+                original_prompt,
+                task_observations,
+                budget,
+                &wrap,
+                item,
+            )
+            .await?,
+        );
+    }
+    if !current.is_empty() {
+        out.push(wrap(current));
+    }
+    if out.is_empty() {
+        out.push(empty);
+    }
+    Ok(out)
+}
+
+async fn partition_source_evidence_item<F>(
+    call: SummaryCall<'_>,
+    original_prompt: &str,
+    task_observations: &str,
+    budget: u32,
+    wrap: &F,
+    item: serde_json::Value,
+) -> Result<Vec<serde_json::Value>>
+where
+    F: Fn(Vec<serde_json::Value>) -> serde_json::Value,
+{
+    let text = item
+        .get("exact_text")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("source evidence is missing exact_text"))?;
+    let mut pending = vec![text.to_string()];
+    let mut chunks = Vec::new();
+    while let Some(candidate_text) = pending.pop() {
+        let mut candidate = item.clone();
+        candidate["exact_text"] = json!(candidate_text);
+        candidate["exact_text_is_partitioned"] = json!(true);
+        // Reserve the largest possible partition metadata before deciding the
+        // source body fits. Adding the real (smaller) index/count later cannot
+        // push an accepted unit back over the provider capability.
+        candidate["exact_text_partition"] = json!({"index": usize::MAX, "count": usize::MAX});
+        let wrapped = wrap(vec![candidate.clone()]);
+        if render_units_fit(
+            call,
+            original_prompt,
+            std::slice::from_ref(&wrapped),
+            task_observations,
+            budget,
+        )
+        .await?
+        {
+            chunks.push(candidate);
+            continue;
+        }
+        let candidate_text = candidate["exact_text"]
+            .as_str()
+            .expect("source evidence partition retains exact_text");
+        let (left, right) = split_utf8_mid(candidate_text);
+        if right.is_empty() {
+            return Err(anyhow!(
+                "summary source-evidence framing exceeds the provider's {budget}-token input capability"
+            ));
+        }
+        pending.push(right.to_string());
+        pending.push(left.to_string());
+    }
+    let count = chunks.len();
+    Ok(chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut chunk)| {
+            chunk["exact_text_partition"] = json!({"index": index + 1, "count": count});
+            wrap(vec![chunk])
+        })
+        .collect())
+}
+
+async fn render_units_fit(
+    call: SummaryCall<'_>,
+    original_prompt: &str,
+    units: &[serde_json::Value],
+    task_observations: &str,
+    budget: u32,
+) -> Result<bool> {
+    let prompt = build_render_prompt(
+        original_prompt,
+        units,
+        task_observations,
+        Some("Lossless finding partition; preserve the supplied content."),
+    )?;
+    let messages = vec![user_message(&prompt)];
+    Ok(size_call(call.client, call.cfg, &messages, budget)
+        .await
+        .map(|tokens| tokens <= budget as u64)
+        .unwrap_or(true))
 }
 
 fn build_batch_condense_prompt(batch: &[(String, TaskMaterial)]) -> Result<String> {
@@ -1101,9 +1425,9 @@ fn build_batch_condense_prompt(batch: &[(String, TaskMaterial)]) -> Result<Strin
     }))?)
 }
 
-fn build_render_prompt(
+fn build_render_prompt<T: serde::Serialize>(
     original_prompt: &str,
-    findings: &[Finding],
+    findings: &[T],
     task_observations: &str,
     note: Option<&str>,
 ) -> Result<String> {
@@ -1114,16 +1438,6 @@ fn build_render_prompt(
         "task_observations": task_observations,
         "note": note.unwrap_or(""),
     }))?)
-}
-
-fn partial_note(idx: usize, total: usize) -> String {
-    format!(
-        "You are rendering partial summary {idx} of {total} for the same research run. \
-         Cover only the findings provided in this chunk. A later stage will merge the \
-         partials into a single final summary, so emit the candidate commit messages \
-         in the template's normal shape and skip any closing or global framing that \
-         would duplicate across partials."
-    )
 }
 
 fn combine_system_prompt(markdown: bool) -> String {
@@ -1202,22 +1516,73 @@ async fn size_call(
     count_or_estimate(client, cfg, messages).await
 }
 
-async fn call_and_extract(
-    client: &Client,
-    cfg: &CallConfig,
+enum SummaryCallError {
+    OverInput { limit: u64 },
+    Other(anyhow::Error),
+}
+
+async fn try_call_and_extract(
+    call: SummaryCall<'_>,
     messages: &[Message],
     stage: &str,
-) -> Result<String> {
-    let resp = client
-        .messages_streaming(cfg, messages)
+) -> std::result::Result<String, SummaryCallError> {
+    // Every summary inference funnels through here, so this is the one place
+    // that has to log for the whole pipeline to be visible in `code.jsonl`.
+    let label = format!("phase=summary stage={stage}");
+    if let Some(logger) = call.logger {
+        let request = call.cfg.request_meta();
+        let rendered = messages
+            .iter()
+            .map(|message| {
+                format!(
+                    "{}{}",
+                    message.cached_prefix.as_deref().unwrap_or(""),
+                    message.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        logger.log_code_labeled_with_request(
+            "user",
+            Some(&label),
+            &rendered,
+            None,
+            None,
+            Some(&request),
+        );
+    }
+    let resp = call
+        .client
+        .messages_streaming(call.cfg, messages)
         .await
-        .map_err(|e| anyhow!("{stage}: call failed: {e}"))?;
+        .map_err(|error| {
+            if let kres_llm::LlmError::OverInputLimit { limit, .. } = error {
+                SummaryCallError::OverInput { limit }
+            } else {
+                SummaryCallError::Other(anyhow!("{stage}: call failed: {error}"))
+            }
+        })?;
     let text = extract_text(&resp);
+    if let Some(logger) = call.logger {
+        logger.log_code_labeled_with_model(
+            "assistant",
+            Some(&label),
+            &text,
+            Some(LoggedUsage {
+                input: resp.usage.input_tokens,
+                output: resp.usage.output_tokens,
+                cache_creation: resp.usage.cache_creation_input_tokens,
+                cache_read: resp.usage.cache_read_input_tokens,
+            }),
+            None,
+            resp.model.as_deref(),
+        );
+    }
     if text.trim().is_empty() {
-        return Err(anyhow!(
+        return Err(SummaryCallError::Other(anyhow!(
             "{stage}: empty body (stop_reason={:?})",
             resp.stop_reason
-        ));
+        )));
     }
     kres_core::async_eprintln!(
         "{stage}: {} chars (usage in={} out={})",
@@ -1240,6 +1605,34 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Every summary inference must funnel through `try_call_and_extract`,
+    /// because that is the only place the pipeline logs to `code.jsonl`.
+    ///
+    /// This file previously made its provider calls with no logging at all, so
+    /// `/summary` spend was invisible to the context accounting the rest of
+    /// kres is measured by. A new call site that talks to a client directly
+    /// would silently reintroduce that hole, and no behavioural test would
+    /// notice — the summary would still be correct, just unaccounted. Hence a
+    /// structural guard.
+    #[test]
+    fn all_summary_inference_goes_through_the_one_logged_call_site() {
+        let source = include_str!("summary.rs");
+        // Split so this guard's own needle is not present in the source text
+        // it scans.
+        let needle = concat!(".messages", "_streaming(");
+        let calls = source.matches(needle).count();
+        assert_eq!(
+            calls, 1,
+            "expected exactly one provider call site (inside try_call_and_extract); \
+found {calls}. If you added a summary inference path, route it through \
+try_call_and_extract so it is logged."
+        );
+        assert!(
+            source.contains(concat!("fn try_call", "_and_extract")),
+            "the logged call site was renamed; update this guard"
+        );
+    }
+
     use super::*;
     use kres_core::findings::{FindingDetail, RelevantFileSection, RelevantSymbol, TaskProse};
     use kres_llm::model::Effort;
@@ -1531,6 +1924,22 @@ mod tests {
     fn join_blocks_empty_input_returns_empty() {
         let blocks: Vec<String> = vec![];
         assert!(join_blocks(&blocks).is_empty());
+    }
+
+    #[test]
+    fn provider_rejection_always_reduces_partition_budget() {
+        assert_eq!(smaller_partition_budget(1_000, 900).unwrap(), 750);
+        assert_eq!(smaller_partition_budget(1_000, 100).unwrap(), 100);
+        assert!(smaller_partition_budget(1, 1).is_err());
+    }
+
+    #[test]
+    fn utf8_partition_reconstructs_every_byte() {
+        let input = format!("{}🦀{}", "a".repeat(127), "β".repeat(129));
+        let (left, right) = split_utf8_mid(&input);
+        assert!(!left.is_empty());
+        assert!(!right.is_empty());
+        assert_eq!(format!("{left}{right}"), input);
     }
 
     #[test]

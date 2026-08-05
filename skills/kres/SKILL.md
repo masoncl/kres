@@ -266,8 +266,7 @@ for the fast + slow agent pipeline. Fields:
 - `role` — `user` or `assistant`.
 - `label` — opaque phase tag. Common values: `phase=fast-gather
   task=<step> round=N`, `phase=slow task=<step>`, `phase=slow-lens
-  task=<step> lens=<id> model=<id>`, `phase=fast-gather-lenses
-  round=N`, `phase=review-ledger ...`.
+  task=<step> lens=<id> model=<id>`, `phase=review-ledger ...`.
 - `content` — the prompt or response body. User records are
   the assembled prompt (JSON-encoded payload with `question`,
   `symbols`, `context`, `plan`, etc.). Assistant records are

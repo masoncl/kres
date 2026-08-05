@@ -56,10 +56,18 @@ work for later review turns.
 For a whole-file review, kres performs the scan before defining the review
 goal:
 
-1. `file_survey` obtains the file's defined and referenced functions.
-2. The primary slow model reads and ranks the surveyed functions by estimated
-   bug likelihood.
-3. The review planner uses that ranked inventory to form the initial goal,
+1. `gix` follows target renames and builds one target-file diff from immediately
+   before the oldest relevant change in the six-month window to the working-tree file.
+   One low-effort slow-agent call assesses that net diff; oversized diffs are
+   partitioned losslessly at hunk or line boundaries, assessed in parallel, and merged. The completed assessment has a durable
+   checkpoint that is reused only by explicit resume.
+2. `file_survey` obtains the file's defined and referenced functions.
+3. The primary slow model combines the change ratings with structural evidence,
+   retains external major-risk research only when the target interacts with that function,
+   and emits per-function plus whole-file risk ratings. Rust prevents the combined
+   function ratings from falling below their change ratings and keeps the file rating
+   at least as high as its highest function rating.
+4. The review planner uses that ranked inventory to form the initial goal,
    plan, and todo list.
 
 The scanned-file plan has at most five stages: three or four semantic groups
@@ -127,9 +135,6 @@ termination depends on follow-up exhaustion, the goal configuration, and
 - Todo reconciliation and goal evaluation are separate structured calls, so
   transient model failure can delay convergence even though persisted work is
   retained.
-- A syntactically valid but empty structured `file_survey` result is accepted as
-  an empty inventory. Transport failures and empty text use local fallback; the
-  structured-empty case does not currently trigger that fallback.
 - Planning, todo, and goal calls use configured agent roles rather than a
   separately configurable planning role.
 

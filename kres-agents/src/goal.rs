@@ -150,7 +150,7 @@ struct PlanResponse {
 fn build_define_goal_request(prompt: &str, plan: Option<&kres_core::Plan>) -> serde_json::Value {
     let mut request = json!({
         "task": "define_goal",
-        "query": prompt.chars().take(2000).collect::<String>(),
+        "query": prompt,
         "instructions": "Define a clear, specific goal for this query \
                          AND classify the work mode. What must be true \
                          for this query to be considered complete? Be \
@@ -251,7 +251,8 @@ pub async fn define_goal(
         cached_prefix: None,
     }];
     if let Some(lg) = &gc.logger {
-        lg.log_main("user", &body, None, None);
+        let request = cfg.request_meta();
+        lg.log_main_with_request("user", &body, None, None, Some(&request));
     }
     let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
@@ -379,7 +380,8 @@ pub async fn check_goal(
         cached_prefix: None,
     }];
     if let Some(lg) = &gc.logger {
-        lg.log_main("user", &body, None, None);
+        let request = cfg.request_meta();
+        lg.log_main_with_request("user", &body, None, None, Some(&request));
     }
     let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
@@ -520,7 +522,8 @@ pub async fn define_plan(
         cached_prefix: None,
     }];
     if let Some(lg) = &gc.logger {
-        lg.log_main("user", &body, None, None);
+        let request = cfg.request_meta();
+        lg.log_main_with_request("user", &body, None, None, Some(&request));
     }
     let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
@@ -771,6 +774,13 @@ mod tests {
             r.as_object().unwrap().get("plan").is_none(),
             "plan key should be absent when caller passes None",
         );
+    }
+
+    #[test]
+    fn define_goal_request_preserves_long_operator_prompt() {
+        let prompt = format!("begin:{}:end", "full-context-🦀".repeat(10_000));
+        let request = build_define_goal_request(&prompt, None);
+        assert_eq!(request["query"].as_str(), Some(prompt.as_str()));
     }
 
     #[test]

@@ -16,8 +16,9 @@ Map each followup type to a tool:
 - "callees" → MCP find_calls. Fall back to grep/search for the symbol when
   semcode is unavailable or returns no callees.
 - "search" → use the grep tool type, NOT semcode grep_functions. Use
-  {"type": "grep", "pattern": "REGEX", "path": "DIR", "glob": "*.c",
-  "limit": 200}. `glob` filters files; `limit` caps matches.
+  {"type": "grep", "pattern": "REGEX", "path": "DIR", "glob": "*.c"}.
+  `glob` filters files. Grep returns every match; narrow the pattern or path
+  when the request calls for a more focused search.
 - "file" → locate a file by name via `find(1)`. Use
   {"type": "find", "name": "report.md", "path": "sub/dir",
    "kind": "f"}. `name` is the `-name` glob (accepts the literal
@@ -60,8 +61,8 @@ Map each followup type to a tool:
   {"type": "make", "command": "-j8 net/ipv4/tcp_ipv4.o",
   "timeout_secs": 300}. `command` is the args after `make`; `cmd`
   and `name` are accepted aliases. `timeout_secs` defaults to 300
-  (hard cap 600). Output is `[exit N]` + `[stdout]` + `[stderr]`,
-  capped at 20k chars. Enabled by default. Use for kernel build
+  (hard cap 600). Output is `[exit N]` + complete `[stdout]` + `[stderr]`.
+  Enabled by default. Use for kernel build
   verification after applying a fix.
 - "meson" → run `meson <args>` from the workspace root. Same shape
   as `make`. Use for systemd configure/test/build actions that are
@@ -76,7 +77,7 @@ Map each followup type to a tool:
   followup-shaped requests work too. `timeout_secs` defaults to 60
   (hard cap 600). `cwd` is workspace-relative; absolute paths and
   `..` are rejected. Output is `[exit N]` + `[stdout]` + `[stderr]`,
-  capped at 20k chars.
+  returned completely.
   NOTE: `bash` is OFF by default — it is only available when the
   operator adds it to the action allowlist (via settings.json or
   `--allow bash`). When it is not enabled, a `bash` action will

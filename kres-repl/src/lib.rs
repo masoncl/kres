@@ -19,6 +19,7 @@
 //!   "unknown command" instead of being interpreted as a prompt
 //!   (bugs.md#M8 UX, adapted).
 
+mod change_survey;
 pub mod commands;
 pub mod export;
 pub mod report;

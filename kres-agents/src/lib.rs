@@ -53,11 +53,12 @@ pub use prompt_file::{parse as parse_prompt_file, PromptFile};
 pub use response::CodeResponse;
 pub use skills::{InvocationPolicy, Skill, Skills};
 pub use symbol::{
-    append_context, append_symbol, ctx_identity, parse_semcode_symbol, previously_fetched_manifest,
-    propagate_tool_result, sym_identity, tool_source,
+    append_context, append_prompt_evidence, append_symbol, canonical_semcode_evidence,
+    canonicalize_prompt_evidence, parse_semcode_symbol, propagate_tool_result, tool_source,
+    with_retrieval_source, SemcodeEvidence,
 };
 pub use todo_agent::{
-    dedup_tokens, extract_citations, parse_todo_response, update_todo_via_agent,
-    update_todo_via_agent_with_logger, TodoAgentInputs, TodoClient, TodoUpdate, TODO_INSTRUCTIONS,
+    dedup_tokens, parse_todo_response, update_todo_via_agent, update_todo_via_agent_with_logger,
+    TodoAgentInputs, TodoClient, TodoUpdate, TODO_INSTRUCTIONS,
 };
 pub use workspace::{detect_workspace, BuildSystem, WorkspaceKind, WorkspaceProfile};

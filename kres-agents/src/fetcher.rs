@@ -78,7 +78,6 @@ impl DataFetcher for WorkspaceFetcher {
                     let args = GrepArgs {
                         pattern: r"^[[:space:]]*(struct|union|enum|typedef)[[:space:]]|^[A-Za-z_][A-Za-z0-9_[:space:]_*]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(".into(),
                         path: Some(fu.name.clone()),
-                        limit: None,
                         glob: None,
                     };
                     match grep(&self.workspace, &args).await {
@@ -113,7 +112,6 @@ impl DataFetcher for WorkspaceFetcher {
                     let args = GrepArgs {
                         pattern: fu.name.clone(),
                         path: fu.path.clone(),
-                        limit: Some(500),
                         glob: None,
                     };
                     match grep(&self.workspace, &args).await {
@@ -131,7 +129,6 @@ impl DataFetcher for WorkspaceFetcher {
                     let args = GrepArgs {
                         pattern: type_definition_pattern(&fu.name),
                         path: fu.path.clone(),
-                        limit: Some(500),
                         glob: None,
                     };
                     match grep(&self.workspace, &args).await {
@@ -147,7 +144,7 @@ impl DataFetcher for WorkspaceFetcher {
                 }
                 "source" => fetch_source_fallback(&self.workspace, fu, &mut out).await,
                 "callers" | "callees" => {
-                    let args = symbol_grep_args(&fu.name, fu.path.clone(), Some(4), Some("*.[chS]"));
+                    let args = symbol_grep_args(&fu.name, fu.path.clone(), Some("*.[chS]"));
                     match grep(&self.workspace, &args).await {
                         Ok(content) => out.context.push(json!({
                             "source": format!("fallback:{}:{}", fu.kind, fu.name),
@@ -295,34 +292,28 @@ fn symbol_reference_pattern(name: &str) -> String {
     format!(r"\b{name}\b")
 }
 
-fn symbol_grep_args(
-    name: &str,
-    path: Option<String>,
-    per_file_limit: Option<u32>,
-    glob: Option<&str>,
-) -> GrepArgs {
+fn symbol_grep_args(name: &str, path: Option<String>, glob: Option<&str>) -> GrepArgs {
     GrepArgs {
         pattern: symbol_reference_pattern(name),
         path,
-        limit: per_file_limit,
         glob: glob.map(str::to_string),
     }
 }
 
 async fn fetch_source_fallback(workspace: &Path, fu: &Followup, out: &mut FetchResult) {
-    let args = symbol_grep_args(&fu.name, fu.path.clone(), None, Some("*.[chS]"));
+    let args = symbol_grep_args(&fu.name, fu.path.clone(), Some("*.[chS]"));
     match grep(workspace, &args).await {
         Ok(content) => {
             let read_targets = source_fallback_read_targets(&content);
             let auto_read = read_targets.len() <= SOURCE_FALLBACK_AUTO_READ_MAX_TARGETS;
             let note = if auto_read {
                 format!(
-                    "semcode source lookup was unavailable or not configured; this is a local ripgrep fallback. Grep matches are listed below, subject only to the visible shared tool-output truncation marker. Because there are {} parseable match(es), bounded read ranges follow.",
+                    "semcode source lookup was unavailable or not configured; this is a local ripgrep fallback. Every grep match is listed below. Because there are {} parseable match(es), bounded read ranges follow.",
                     read_targets.len()
                 )
             } else {
                 format!(
-                    "semcode source lookup was unavailable or not configured; this is a local ripgrep fallback. Grep matches are listed below, subject only to the visible shared tool-output truncation marker. There are {} parseable matches, so bounded reads were not expanded automatically; request targeted read followups for the specific file:line ranges needed.",
+                    "semcode source lookup was unavailable or not configured; this is a local ripgrep fallback. Every grep match is listed below. There are {} parseable matches, so bounded reads were not expanded automatically; request targeted read followups for the specific file:line ranges needed.",
                     read_targets.len()
                 )
             };
@@ -335,7 +326,7 @@ async fn fetch_source_fallback(workspace: &Path, fu: &Followup, out: &mut FetchR
                 out.context.push(json!({
                     "source": format!("fallback:source-read-skipped:{}", fu.name),
                     "content": format!(
-                        "{} parseable grep matches for `{}` were listed in fallback:source:{}. Automatic {}-line source reads are skipped for broad fallback searches to preserve context budget. Request explicit read followups such as `path/to/file.c:123+80` for the matches that need full context.",
+                        "{} parseable grep matches for `{}` were listed in fallback:source:{}. Automatic {}-line source reads are skipped for broad fallback searches so the same match list is not immediately expanded into many unrelated full bodies. Request explicit read followups such as `path/to/file.c:123+80` for the matches that need full context.",
                         read_targets.len(),
                         fu.name,
                         fu.name,

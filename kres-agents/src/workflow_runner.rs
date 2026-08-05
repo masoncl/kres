@@ -14,8 +14,8 @@
 //!    `followups` (typed: `read`, `source`, `type`, `search`, `git`,
 //!    `bash`, `callers`, `question`); the AgentRunner's
 //!    [`crate::pipeline::DataFetcher`] resolves them into
-//!    `symbols` + `context`; the next fast round sees the
-//!    accumulated context plus a `previously_fetched` manifest.
+//!    `symbols` + `context`; the next turn appends only new records to the
+//!    existing fast-agent conversation.
 //!    Loops until `ready_for_slow == true`, no novel followups,
 //!    or `max_fast_rounds` is hit.
 //! 2. **Slow synthesis**: ONE slow-agent call with all gathered
@@ -371,22 +371,21 @@ impl LlmDriver {
         if deps.is_empty() {
             return (symbols, context);
         }
-        // Dedup by symbol/context identity so a diamond dependency
-        // (the same source reachable through two dep paths) ships each
-        // item once instead of N times. Uses the same identity the
-        // previously_fetched manifest uses.
+        // Remove only exact duplicate records from diamond dependencies. A
+        // name/source-only identity is insufficient because two records can
+        // carry distinct bodies, ranges, or retrieval failures.
         let mut seen_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_ctx: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Ok(cache) = self.gathered_cache.lock() {
             for dep in deps {
                 if let Some((s, c)) = cache.get(dep) {
                     for sym in s {
-                        if seen_syms.insert(crate::symbol::sym_identity(sym).to_string()) {
+                        if seen_syms.insert(serde_json::to_string(sym).unwrap_or_default()) {
                             symbols.push(sym.clone());
                         }
                     }
                     for ctx in c {
-                        if seen_ctx.insert(crate::symbol::ctx_identity(ctx).to_string()) {
+                        if seen_ctx.insert(serde_json::to_string(ctx).unwrap_or_default()) {
                             context.push(ctx.clone());
                         }
                     }
@@ -618,17 +617,19 @@ impl LlmDriver {
         };
         let user_text = build_review_ledger_prompt(step, attempt, ctx)?;
         let messages = vec![Message::plain("user", user_text.clone())];
+        let call_cfg = self.config_with_mode(&base_cfg, Some(Mode::Generic));
         if let Some(lg) = &self.logger {
             let label = format!("phase=review-ledger step={} attempt={attempt}", step.id);
-            lg.log_code_labeled(
+            let request = call_cfg.request_meta();
+            lg.log_code_labeled_with_request(
                 "user",
                 Some(&label),
                 &format!("[step={} review_ledger]\n{}", step.id, user_text),
                 None,
                 None,
+                Some(&request),
             );
         }
-        let call_cfg = self.config_with_mode(&base_cfg, Some(Mode::Generic));
         let resp = tokio::select! {
             _ = self.shutdown.cancelled() => {
                 return Err(format!(
@@ -919,7 +920,6 @@ impl LlmDriver {
                         allowed_response_extensions: step.outputs.keys().cloned().collect(),
                         gather_prompt: Some(gather_prompt),
                         disable_skill_reads: self.workflow.skills.is_empty(),
-                        surface_over_input_limit: true,
                         synthesis_use_fast,
                         synthesis_use_routing_prompt,
                         seed_symbols: run_seed_symbols,
@@ -1039,16 +1039,6 @@ impl LlmDriver {
                 &mut last_parse_err,
             );
             let messages = vec![Message::plain("user", user_text.clone())];
-            let log_user = match lens {
-                Some(l) => format!(
-                    "[step={} lens={} attempt={} json_retry={}]\n{}",
-                    step.id, l.id, attempt, json_retry, user_text
-                ),
-                None => format!(
-                    "[step={} attempt={} json_retry={}]\n{}",
-                    step.id, attempt, json_retry, user_text
-                ),
-            };
             if let Some(lg) = &self.logger {
                 let label = match lens {
                     Some(l) => format!(
@@ -1060,7 +1050,15 @@ impl LlmDriver {
                         step.id, attempt, json_retry
                     ),
                 };
-                lg.log_code_labeled("user", Some(&label), &log_user, None, None);
+                let request = call_cfg.request_meta();
+                lg.log_code_labeled_with_request(
+                    "user",
+                    Some(&label),
+                    &user_text,
+                    None,
+                    None,
+                    Some(&request),
+                );
             }
 
             let resp = tokio::select! {
@@ -1786,17 +1784,19 @@ impl Driver for LlmDriver {
             rules = interpolated_prompt
         );
         let messages = vec![Message::plain("user", user_text.clone())];
+        let call_cfg = self.config_with_mode(&base_cfg, self.mode_for(step));
         if let Some(lg) = &self.logger {
             let label = format!("phase=judge step={}", step.id);
-            lg.log_code_labeled(
+            let request = call_cfg.request_meta();
+            lg.log_code_labeled_with_request(
                 "user",
                 Some(&label),
                 &format!("[step={} judge_llm]\n{}", step.id, user_text),
                 None,
                 None,
+                Some(&request),
             );
         }
-        let call_cfg = self.config_with_mode(&base_cfg, self.mode_for(step));
         let resp = tokio::select! {
             _ = self.shutdown.cancelled() => {
                 return Err(format!(
@@ -1922,17 +1922,19 @@ impl Driver for LlmDriver {
             SCHEMA_HEADER = "OUTPUT SCHEMA"
         );
         let messages = vec![Message::plain("user", user_text.clone())];
+        let call_cfg = self.config_with_mode(&base_cfg, self.mode_for(step));
         if let Some(lg) = &self.logger {
             let label = format!("phase=consolidate step={}", step.id);
-            lg.log_code_labeled(
+            let request = call_cfg.request_meta();
+            lg.log_code_labeled_with_request(
                 "user",
                 Some(&label),
                 &format!("[step={} consolidate]\n{}", step.id, user_text),
                 None,
                 None,
+                Some(&request),
             );
         }
-        let call_cfg = self.config_with_mode(&base_cfg, self.mode_for(step));
         let resp = tokio::select! {
             _ = self.shutdown.cancelled() => {
                 return Err(format!(
@@ -2006,7 +2008,10 @@ impl Driver for LlmDriver {
             _ => kres_core::TaskMode::Audit,
         };
         let rctx = crate::pipeline::RunContext {
-            task_brief: step.id.clone(),
+            // The consolidator does not receive the original lens prompt by
+            // any other field. Give it the complete scope, not a step-id
+            // label; labels are only appropriate for logs.
+            task_brief: prompt_texts.user_text_base.clone(),
             mode,
             allowed_response_extensions: step.outputs.keys().cloned().collect(),
             gather_prompt: Some(prompt_texts.gather_user_text_base),
@@ -3473,11 +3478,11 @@ async fn run_make_step(
     );
     map.insert(
         "stdout".into(),
-        Value::String(tail_lossy(&out.stdout, 16 * 1024)),
+        Value::String(String::from_utf8_lossy(&out.stdout).into_owned()),
     );
     map.insert(
         "stderr".into(),
-        Value::String(tail_lossy(&out.stderr, 16 * 1024)),
+        Value::String(String::from_utf8_lossy(&out.stderr).into_owned()),
     );
     map.insert(
         "skipped_targets".into(),
@@ -3533,11 +3538,11 @@ async fn run_meson_build_step(
     );
     map.insert(
         "stdout".into(),
-        Value::String(tail_lossy(&out.stdout, 16 * 1024)),
+        Value::String(String::from_utf8_lossy(&out.stdout).into_owned()),
     );
     map.insert(
         "stderr".into(),
-        Value::String(tail_lossy(&out.stderr, 16 * 1024)),
+        Value::String(String::from_utf8_lossy(&out.stderr).into_owned()),
     );
     map.insert("skipped_targets".into(), Value::Array(Vec::new()));
     Ok(map)
@@ -3721,17 +3726,6 @@ fn config_enabled(workspace: &Path, config: &str) -> Option<bool> {
     } else {
         None
     }
-}
-
-fn tail_lossy(bytes: &[u8], max: usize) -> String {
-    if bytes.len() <= max {
-        return String::from_utf8_lossy(bytes).into_owned();
-    }
-    let start = bytes.len().saturating_sub(max);
-    format!(
-        "[truncated to last {max} bytes]\n{}",
-        String::from_utf8_lossy(&bytes[start..])
-    )
 }
 
 fn parse_finding_results(value: Option<&Value>) -> Result<Vec<kres_core::FindingResult>, String> {
@@ -8432,18 +8426,21 @@ mod tests {
 
     #[test]
     fn persist_code_output_accepts_relative_workspace_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
+        // Keep the workspace relative without changing the process-wide cwd;
+        // Rust tests run in parallel, so set_current_dir races every sibling.
+        let tmp = tempfile::Builder::new()
+            .prefix("kres-relative-workspace-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative_workspace = Path::new(tmp.path().file_name().unwrap());
         let result = persist_code_output(
-            Path::new("."),
+            relative_workspace,
             &[kres_core::CodeFile {
                 path: ".kres-commit-msg.tmp".into(),
                 content: "subject\n\nbody\n".into(),
                 purpose: "commit message".into(),
             }],
         );
-        std::env::set_current_dir(old_cwd).unwrap();
 
         let out = result.unwrap();
         assert_eq!(out.len(), 1);

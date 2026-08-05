@@ -114,6 +114,31 @@ pub struct Plan {
     pub created_at: DateTime<Utc>,
 }
 
+/// Compact, model-facing projection of a [`Plan`]. Task agents need the
+/// current goal and execution graph, but not another copy of the immutable
+/// operator/workflow prompt or persistence timestamp. Goal and todo agents
+/// still receive the complete Plan because they own plan judgment and rewrite.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanPromptView<'a> {
+    pub goal: &'a str,
+    pub mode: TaskMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_step_id: Option<&'a str>,
+    pub steps: Vec<PlanStepPromptView<'a>>,
+}
+
+/// Scheduler-relevant part of a plan step. `todo_ids` are internal linkage,
+/// and `context` is injected separately into the active task question; sending
+/// either for every step would duplicate state without helping task agents.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PlanStepPromptView<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub description: &'a str,
+    pub status: PlanStepStatus,
+    pub depends_on: &'a [String],
+}
+
 /// Wire-format for rewrites emitted by the slow agent or the
 /// todo agent. LLMs forget fields all the time; accepting only
 /// `{steps: [...]}` means the plan's identifying metadata
@@ -325,6 +350,29 @@ impl Plan {
         }
     }
 
+    /// Return the compact plan representation sent to fast, slow, and source
+    /// retrieval agents. The complete plan remains the persisted source of
+    /// truth; this projection only removes immutable fields that those roles
+    /// cannot act on.
+    pub fn prompt_view<'a>(&'a self, active_step_id: Option<&'a str>) -> PlanPromptView<'a> {
+        PlanPromptView {
+            goal: &self.goal,
+            mode: self.mode,
+            active_step_id,
+            steps: self
+                .steps
+                .iter()
+                .map(|step| PlanStepPromptView {
+                    id: &step.id,
+                    title: &step.title,
+                    description: &step.description,
+                    status: step.status,
+                    depends_on: &step.depends_on,
+                })
+                .collect(),
+        }
+    }
+
     /// Look up the context for a step by id. Returns an empty
     /// string when the step doesn't exist or has no context.
     pub fn step_context(&self, step_id: &str) -> &str {
@@ -433,6 +481,27 @@ mod tests {
         assert_eq!(back.prompt, "review foo");
         assert_eq!(back.steps.len(), 1);
         assert_eq!(back.steps[0].status, PlanStepStatus::Pending);
+    }
+
+    #[test]
+    fn prompt_view_omits_immutable_prompt_and_timestamp() {
+        let mut plan = Plan::new(
+            "very large operator prompt and whole-file scan",
+            "audit every semantic path",
+            TaskMode::Audit,
+        );
+        let mut step = PlanStep::new("audit-path", "audit path");
+        step.todo_ids.push("internal-todo".into());
+        step.context = "large active-step contract injected in question".into();
+        plan.steps.push(step);
+        let value = serde_json::to_value(plan.prompt_view(Some("audit-path"))).unwrap();
+        assert_eq!(value["goal"], "audit every semantic path");
+        assert_eq!(value["active_step_id"], "audit-path");
+        assert_eq!(value["steps"].as_array().unwrap().len(), 1);
+        assert!(value.get("prompt").is_none());
+        assert!(value.get("created_at").is_none());
+        assert!(value["steps"][0].get("todo_ids").is_none());
+        assert!(value["steps"][0].get("context").is_none());
     }
 
     #[test]

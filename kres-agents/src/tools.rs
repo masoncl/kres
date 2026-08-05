@@ -65,11 +65,6 @@ pub struct GrepArgs {
     /// Search root (relative to workspace).
     #[serde(default)]
     pub path: Option<String>,
-    /// Optional max matches per file. When absent, grep relies on the
-    /// shared output cap and timeout rather than hiding matches with a
-    /// per-file limit.
-    #[serde(default)]
-    pub limit: Option<u32>,
     /// File glob to filter (e.g. "*.c").
     #[serde(default)]
     pub glob: Option<String>,
@@ -88,9 +83,9 @@ pub struct FindArgs {
     pub kind: Option<String>,
 }
 
-/// Thin wrapper around the `find(1)` binary, matching 's
-/// `find` dispatch. Output is capped at
-/// 20 000 chars with the same `... (truncated at 20000 chars)` tail.
+/// Thin wrapper around the `find(1)` binary. Every output byte is preserved;
+/// downstream prompt construction may deduplicate or transport-frame it but
+/// never truncates it.
 pub async fn find(workspace: &Path, args: &FindArgs) -> Result<String, AgentError> {
     let root = match &args.path {
         Some(p) => resolve_workspace(workspace, p)?,
@@ -118,7 +113,7 @@ pub async fn find(workspace: &Path, args: &FindArgs) -> Result<String, AgentErro
         text.push_str("[stderr]\n");
         text.push_str(&err);
     }
-    Ok(truncate_output(&text, TOOL_OUTPUT_CAP_GREP_FIND))
+    Ok(text)
 }
 
 pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentError> {
@@ -142,9 +137,6 @@ pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentErro
         }
     }
     cmd.arg(&root);
-    if let Some(limit) = args.limit {
-        cmd.arg("--max-count").arg(limit.to_string());
-    }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
@@ -178,7 +170,7 @@ pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentErro
             format!("{stdout_text}\n[stderr]\n{err}")
         }
     };
-    Ok(truncate_output(&combined, TOOL_OUTPUT_CAP_GREP_FIND))
+    Ok(combined)
 }
 
 /// Review/search followups are meant to inspect the target source
@@ -236,32 +228,6 @@ pub const GIT_ALLOWED: &[&str] = &[
     "rm",
 ];
 
-/// Per-tool output caps. Both are sized to roughly 500k tokens using
-/// the same coarse 4 chars/token estimate used elsewhere in kres.
-/// Truncated output gets a `… (truncated at Nk chars)` tail so the
-/// agent can see the clip.
-pub const TOOL_OUTPUT_CAP_GREP_FIND: usize = 2_000_000;
-pub const TOOL_OUTPUT_CAP_MCP: usize = 2_000_000;
-
-/// Truncate `s` to `cap` chars (byte-indexed: works for ASCII-heavy
-/// tool output, which is what grep/find/MCP return), appending
-/// "\n… (truncated at Ncc chars)" so the agent can see the clip.
-pub fn truncate_output(s: &str, cap: usize) -> String {
-    if s.len() <= cap {
-        return s.to_string();
-    }
-    // Clip at cap bytes, then back up to the next char boundary so we
-    // don't split a multi-byte character mid-sequence.
-    let mut cut = cap.min(s.len());
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let mut out = String::with_capacity(cut + 48);
-    out.push_str(&s[..cut]);
-    out.push_str(&format!("\n... (truncated at {} chars)", cap));
-    out
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitArgs {
     /// The full command string after the `git` binary (e.g. `"log --oneline -5"`).
@@ -285,8 +251,7 @@ pub struct GitArgs {
 /// - Default 60s timeout (BASH_DEFAULT_TIMEOUT_SECS), capped at
 ///   BASH_MAX_TIMEOUT_SECS. On timeout the bash child is dropped and
 ///   SIGKILL'd via tokio's `kill_on_drop(true)`.
-/// - Output (stdout + stderr + exit code) is captured and capped at
-///   TOOL_OUTPUT_CAP_BASH chars — same envelope size as grep/find.
+/// - Output (stdout + stderr + exit code) is captured in full.
 /// - cwd defaults to the workspace root; a relative `cwd` is
 ///   resolved via resolve_workspace so `..` traversal is rejected.
 ///   Absolute cwd paths are also rejected.
@@ -313,11 +278,6 @@ pub struct BashArgs {
     pub cwd: Option<String>,
 }
 
-/// Max output captured from a bash command. Same cap as grep/find
-/// so the slow agent's input budget can't be blown by a runaway
-/// build log.
-pub const TOOL_OUTPUT_CAP_BASH: usize = 20_000;
-
 /// Default timeout for `bash`. Enough for most compile-and-run
 /// cycles without letting a stuck process stall the main agent for
 /// minutes.
@@ -337,6 +297,115 @@ async fn argv_tool_run(
     let parts = shell_split(args)
         .ok_or_else(|| AgentError::Other(format!("unparseable {program} arguments: {args}")))?;
     argv_tool_run_parts(workspace, program, &parts, timeout_secs).await
+}
+
+/// Command output above this many bytes is spilled to a file and represented
+/// in the tool result by its head, its tail, and the path to the complete log.
+///
+/// This is NOT a truncation cap in the sense the preservation invariants
+/// forbid: no byte is discarded, the exact size and location are stated, and
+/// the agent recovers any region with a targeted `read`. It is the same
+/// contract the local grep fallback uses — return what is needed to choose,
+/// require an explicit read for the rest. Build logs are the one tool output
+/// with no natural semantic partitioner: a failed kernel build is megabytes of
+/// interleaved diagnostics, and inlining all of it turns a recoverable compile
+/// error into a hard over-input failure for the whole workflow step.
+pub const TOOL_OUTPUT_INLINE_MAX: usize = 200_000;
+
+/// Bytes of head and of tail retained inline when output is spilled. Build
+/// diagnostics cluster at both ends: the first errors and the final summary.
+const TOOL_OUTPUT_SPILL_EDGE: usize = 60_000;
+
+fn spill_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".kres").join("tool-output")
+}
+
+/// Move `body` to disk when it exceeds the inline budget, returning the
+/// representation to put in the tool result. On any I/O failure the complete
+/// body is returned inline: failing to write a diagnostic file must never
+/// cost the caller its output.
+fn spill_oversized_output(workspace: &Path, kind: &str, body: String) -> String {
+    if body.len() <= TOOL_OUTPUT_INLINE_MAX {
+        return body;
+    }
+    let digest = body
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    let dir = spill_dir(workspace);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return body;
+    }
+    let path = dir.join(format!("{kind}-{digest:016x}.log"));
+    if std::fs::write(&path, body.as_bytes()).is_err() {
+        return body;
+    }
+    // Cut on line boundaries so the omitted region can be named as a line
+    // range. `read` takes line numbers, so reporting byte offsets would leave
+    // the agent unable to act on the pointer.
+    let mut head_end = TOOL_OUTPUT_SPILL_EDGE.min(body.len());
+    while head_end > 0 && !body.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    if let Some(newline) = body[..head_end].rfind('\n') {
+        head_end = newline + 1;
+    }
+    let mut tail_start = body
+        .len()
+        .saturating_sub(TOOL_OUTPUT_SPILL_EDGE)
+        .max(head_end);
+    while tail_start < body.len() && !body.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if let Some(newline) = body[tail_start..].find('\n') {
+        tail_start += newline + 1;
+    }
+
+    let head_lines = line_count(&body[..head_end]);
+    let tail_lines = line_count(&body[tail_start..]);
+    let total_lines = line_count(&body);
+    let display = path
+        .strip_prefix(workspace)
+        .unwrap_or(&path)
+        .display()
+        .to_string();
+    let omitted = if total_lines > head_lines + tail_lines {
+        format!(
+            "[... lines {}-{} omitted from this message; `read` `{}` with that line range to recover them ...]",
+            head_lines + 1,
+            total_lines - tail_lines,
+            display,
+        )
+    } else {
+        // Line-boundary cuts can leave nothing between head and tail even
+        // though the byte count exceeded the budget (one enormous line).
+        format!(
+            "[... {} bytes omitted from this message; `read` `{}` to recover them ...]",
+            tail_start - head_end,
+            display,
+        )
+    };
+    format!(
+        "{}\n[kres] {kind} output was {} bytes over {} lines. The complete log is at `{}`; \
+no byte was discarded. Lines 1-{} and {}-{} are shown here.\n\n{omitted}\n\n{}",
+        &body[..head_end],
+        body.len(),
+        total_lines,
+        display,
+        head_lines,
+        total_lines - tail_lines + 1,
+        total_lines,
+        &body[tail_start..],
+    )
+}
+
+fn line_count(s: &str) -> usize {
+    if s.is_empty() {
+        return 0;
+    }
+    s.matches('\n').count() + usize::from(!s.ends_with('\n'))
 }
 
 async fn argv_tool_run_parts(
@@ -373,7 +442,7 @@ async fn argv_tool_run_parts(
         body.push_str("\n[stderr]\n");
         body.push_str(&stderr_text);
     }
-    let body = truncate_output(&body, TOOL_OUTPUT_CAP_BASH);
+    let body = spill_oversized_output(workspace, program, body);
     if out.status.success() {
         Ok(body)
     } else {
@@ -457,14 +526,11 @@ pub async fn bash_run(workspace: &Path, args: &BashArgs) -> Result<String, Agent
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Err(AgentError::Other(format!("bash spawn: {e}"))),
         Err(_) => {
-            return Ok(truncate_output(
-                &format!(
-                    "[error] bash timed out after {}s; cwd={} cmd={}",
-                    timeout.as_secs(),
-                    run_cwd.display(),
-                    args.command
-                ),
-                TOOL_OUTPUT_CAP_BASH,
+            return Ok(format!(
+                "[error] bash timed out after {}s; cwd={} cmd={}",
+                timeout.as_secs(),
+                run_cwd.display(),
+                args.command
             ));
         }
     };
@@ -491,7 +557,7 @@ pub async fn bash_run(workspace: &Path, args: &BashArgs) -> Result<String, Agent
             body.push('\n');
         }
     }
-    Ok(truncate_output(&body, TOOL_OUTPUT_CAP_BASH))
+    Ok(spill_oversized_output(workspace, "bash", body))
 }
 
 /// String-replacement edit to an existing file, modelled on
@@ -1389,21 +1455,170 @@ mod tests {
         std::fs::remove_dir_all(&outside_dir).ok();
     }
 
-    /// CWD is process-global. Serialize tests that mutate it so they
-    /// don't race with each other under cargo's default parallel test
-    /// runner. Other tests in this crate use absolute tmpdirs and
-    /// don't read CWD, so they're unaffected.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[tokio::test]
+    async fn oversized_build_output_is_spilled_whole_and_pointed_at() {
+        let dir = tmpdir("spill-build-output");
+        // Well over the inline budget, with a distinct marker at each end so
+        // the retained head and tail are identifiable.
+        let payload = format!(
+            "FIRST_ERROR\n{}\nLAST_ERROR",
+            "warning: something\n".repeat(40_000)
+        );
+        assert!(payload.len() > TOOL_OUTPUT_INLINE_MAX);
+        std::fs::write(dir.join("payload.txt"), &payload).unwrap();
 
-    /// Restores CWD on drop so an assertion panic doesn't strand the
-    /// test process in a tmpdir that subsequent tests can't find.
-    struct CwdGuard {
-        prev: PathBuf,
+        let out = bash_run(
+            &dir,
+            &BashArgs {
+                command: "cat payload.txt".into(),
+                timeout_secs: None,
+                cwd: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Bounded in the prompt...
+        assert!(
+            out.len() < payload.len(),
+            "oversized output must not be inlined whole"
+        );
+        // ...but both ends still visible, and the omission is explicit.
+        assert!(out.contains("FIRST_ERROR"));
+        assert!(out.contains("LAST_ERROR"));
+        assert!(out.contains("omitted from this message"));
+        assert!(out.contains(".kres/tool-output/bash-"));
+        // The omission must be stated as a line range, because `read` takes
+        // line numbers and a byte offset would be unusable.
+        let marker = out
+            .lines()
+            .find(|line| line.contains("omitted from this message"))
+            .expect("omission marker present");
+        let range = marker
+            .split_once("lines ")
+            .and_then(|(_, rest)| rest.split_once(' '))
+            .map(|(range, _)| range.trim_end_matches(','))
+            .expect("marker names a line range");
+        let (first, last) = range.split_once('-').expect("range is first-last");
+        let first: usize = first.parse().expect("first line is numeric");
+        let last: usize = last.parse().expect("last line is numeric");
+        assert!(
+            first > 1 && last > first,
+            "implausible range {first}-{last}"
+        );
+
+        // Nothing was discarded: the spilled log holds every byte.
+        let spilled: Vec<_> = std::fs::read_dir(dir.join(".kres").join("tool-output"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(spilled.len(), 1);
+        let complete = std::fs::read_to_string(&spilled[0]).unwrap();
+        assert!(complete.contains(&payload), "spilled log lost bytes");
+        std::fs::remove_dir_all(&dir).ok();
     }
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.prev);
-        }
+
+    #[tokio::test]
+    async fn spilling_one_enormous_line_falls_back_to_a_byte_pointer() {
+        // Line-boundary cuts leave nothing between head and tail when the
+        // output has no newlines. The marker must still be honest and still
+        // point at the complete log rather than claim an empty line range.
+        let dir = tmpdir("spill-one-line");
+        let payload = "x".repeat(TOOL_OUTPUT_INLINE_MAX + 5_000);
+        std::fs::write(dir.join("payload.txt"), &payload).unwrap();
+
+        let out = bash_run(
+            &dir,
+            &BashArgs {
+                command: "cat payload.txt".into(),
+                timeout_secs: None,
+                cwd: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("omitted from this message"));
+        assert!(out.contains(".kres/tool-output/bash-"));
+        assert!(out.len() < payload.len());
+        let spilled: Vec<_> = std::fs::read_dir(dir.join(".kres").join("tool-output"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(spilled.len(), 1);
+        assert!(std::fs::read_to_string(&spilled[0])
+            .unwrap()
+            .contains(&payload));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_spilled_log_is_readable_back_through_the_read_tool() {
+        // The whole spill design rests on this: the omitted region is not lost
+        // because the agent can fetch it with the same `read` followup it uses
+        // for source. If workspace resolution ever rejected the `.kres` path,
+        // the spill would become silent truncation.
+        let dir = tmpdir("spill-readback");
+        let payload = format!("HEAD\n{}TAIL\n", "filler line\n".repeat(30_000));
+        assert!(payload.len() > TOOL_OUTPUT_INLINE_MAX);
+        std::fs::write(dir.join("payload.txt"), &payload).unwrap();
+
+        let out = bash_run(
+            &dir,
+            &BashArgs {
+                command: "cat payload.txt".into(),
+                timeout_secs: None,
+                cwd: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Recover the workspace-relative path exactly as an agent would read
+        // it out of the tool result.
+        let start = out
+            .find(".kres/tool-output/")
+            .expect("spill path is stated");
+        let end = start + out[start..].find(".log").expect("path ends in .log") + ".log".len();
+        let relative = &out[start..end];
+
+        let recovered = read_file_range(
+            &dir,
+            &ReadArgs {
+                file: relative.to_string(),
+                line: None,
+                count: None,
+                end_line: None,
+            },
+        )
+        .expect("the spilled log must be readable back from the workspace");
+
+        assert!(
+            recovered.contains("HEAD") && recovered.contains("TAIL"),
+            "read-back must return the complete spilled log"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn output_within_budget_is_returned_inline_untouched() {
+        let dir = tmpdir("no-spill-small-output");
+
+        let out = bash_run(
+            &dir,
+            &BashArgs {
+                command: "printf 'small output'".into(),
+                timeout_secs: None,
+                cwd: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(out.contains("small output"));
+        assert!(!out.contains("omitted from this message"));
+        assert!(!dir.join(".kres").join("tool-output").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Regression: when kres is invoked with `--workspace .` (the
@@ -1416,14 +1631,11 @@ mod tests {
     /// the cg_kill_unbounded_retry_pid1_dos fix run end-to-end.
     #[test]
     fn read_relative_workspace_reports_missing_file_not_escape() {
-        let _serial = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let workspace = tmpdir("read-rel-ws-missing");
-        let _cwd = CwdGuard {
-            prev: std::env::current_dir().unwrap(),
-        };
-        std::env::set_current_dir(&workspace).unwrap();
         let args = ReadArgs {
-            file: "test/not-yet-created.c".into(),
+            file: format!(
+                "target/kres-not-created-{}.c",
+                uuid::Uuid::new_v4().simple()
+            ),
             line: None,
             count: None,
             end_line: None,
@@ -1439,8 +1651,6 @@ mod tests {
             }
             other => panic!("expected NotFound-style read error, got {other:?}"),
         }
-        drop(_cwd);
-        std::fs::remove_dir_all(&workspace).ok();
     }
 
     #[test]
@@ -1475,7 +1685,6 @@ mod tests {
         let args = GrepArgs {
             pattern: "not_present".into(),
             path: Some("a.c".into()),
-            limit: Some(20),
             glob: None,
         };
         let text = grep(&dir, &args).await.unwrap();
@@ -1508,7 +1717,6 @@ mod tests {
         let args = GrepArgs {
             pattern: "old_result_only_symbol".into(),
             path: Some(".".into()),
-            limit: Some(20),
             glob: None,
         };
         let text = grep(&dir, &args).await.unwrap();
@@ -1524,7 +1732,6 @@ mod tests {
         let args = GrepArgs {
             pattern: "real_source_symbol".into(),
             path: Some(".".into()),
-            limit: Some(20),
             glob: None,
         };
         let text = grep(&dir, &args).await.unwrap();

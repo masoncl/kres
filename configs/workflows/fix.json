@@ -754,9 +754,9 @@
         "When the ORCHESTRATOR INSTRUCTION above names specific functions, helpers, structs, fields, or file:line callsites, the fast-gather phase MUST have the verbatim source of those symbols in its accumulated context before setting `ready_for_slow=true`. The orchestrator can only PROSE-describe what a function does or what a struct contains; that description is unverifiable from the slow-agent's seat without the actual code. Without source in context, the slow agent guesses at lifetime, refcount, locking, ordering, or ABI semantics and emits kerneldoc/comment/changelog claims that look plausible but are factually wrong. Each such wrong claim costs a full review fan-out + orchestrator cycle to catch and re-route; repeated misses can exhaust the orchestrator's attempt budget on a single defect.",
         "",
         "Concretely, for every distinct symbol the instruction names:",
-        "1. Check `previously_fetched` first — if its body is already in there, you're done for that symbol.",
+        "1. Check the complete accumulated `symbols` and `context` first — if the body is already present, you're done for that symbol.",
         "2. Otherwise emit `source:<symbol>` (or `type:<name>` for a struct/union/typedef). If semcode returns nothing, fall back to `read:<file>:<line>+<lines>` using a file path the instruction gave you (or the affected_files list).",
-        "3. Do NOT set `ready_for_slow=true` until the union of (current symbols/context + previously_fetched) covers every symbol the instruction named.",
+        "3. Do NOT set `ready_for_slow=true` until the current symbols/context cover every symbol the instruction named.",
         "Trust the orchestrator's prose for routing intent (which defect to fix, what shape the fix should take); verify its factual claims about a symbol's body by fetching that body.",
         "",
         "RESEARCH RESULT:",
@@ -861,7 +861,7 @@
         },
         "code_edits": {
           "type": "array<object>",
-          "description": "The verbatim file_path/old_string/new_string edits the slow agent emitted. Carried into prior_attempts so the next retry can see the verbatim patch shapes already tried and avoid restating them. Pruned oldest-first when the prior_attempts payload exceeds the soft cap."
+          "description": "The verbatim file_path/old_string/new_string edits the slow agent emitted. Carried into prior_attempts so the next retry can see every verbatim patch shape already tried and avoid restating them. Prior attempts are never pruned for request sizing."
         },
         "followups": {
           "type": "array<Followup>",

@@ -84,8 +84,8 @@ pub struct AgentConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    /// Soft payload ceiling for input tokens; caller is responsible
-    /// for shrinking when exceeded.
+    /// Declared provider/model input capability. Callers may losslessly
+    /// partition naturally partitionable work, but never shrink content.
     #[serde(default)]
     pub max_input_tokens: Option<u32>,
     /// Rate-limit bucket in tokens-per-minute.

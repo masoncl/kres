@@ -61,6 +61,23 @@ metadata only; it is not sent to the model and does not affect prompt
 caching. Use it to pair interleaved lensed user/assistant records
 instead of relying on adjacent JSONL lines.
 
+User records in `code.jsonl` and `main.jsonl` also carry a
+`context_stats` object computed after request construction. It reports the
+serialized size, a stable content fingerprint, per-field and per-category
+character counts, whole-file scan occurrences, and exact duplicate evidence
+counts. Request paths that log wire metadata also include the system-prompt
+size and fingerprint, with its bytes classified separately. Warnings identify
+duplicate scans, duplicate source bodies, repeated context entries, skill
+payloads above 80K characters, and requests above one million characters. This
+metadata is diagnostic only and is never sent to a model. Pair it with the
+matching assistant record's provider usage to compare fresh, cache-created,
+and cache-read tokens.
+
+For multi-turn fast-gather calls, `content` remains the newest user turn for
+compatibility with existing readers and `request_content` contains the complete
+ordered model-visible conversation. `context_stats` is computed from that full
+conversation, not only from the newest evidence delta.
+
 All structured agent prompts require exactly one JSON value with no prose,
 embedded JSON string, or transport wrapper. Prompts end with an explicit
 raw-JSON-only instruction and prohibit Markdown headings, preambles, fences,
@@ -997,12 +1014,54 @@ separate hardcoded review lens list. `/review <target>` and
 `--prompt "review: <target>"` are only two entry points into that same
 workflow-defined task loop. It uses the optimized lens path:
 
-1. For a named source-file review, bootstrap requests semcode's compact Tree-sitter
-   `file_survey` exactly once, performs no other semantic fetches, and sends that inventory to one
-   non-lensed slow call. The slow call emits a no-reasoning 0-100 bug-likelihood guess
-   for every defined function. That ranking is supplied to `define_goal` and
+1. For a named source-file review, a Rust bootstrap uses `gix` to follow target
+   renames and build one target-file diff from immediately before the oldest relevant
+   change in the six-month window to the current working-tree file, including dirty
+   edits. The primary slow agent assesses
+   that net diff with low reasoning effort, judging the final code rather than retaining
+   risks fixed later in the window. If the combined diff and current target source are
+   large, kres partitions the target-file diff at hunk/line boundaries. Each diff
+   chunk is assessed with the complete current target source when that fits the
+   provider capability. For an independently large source, source scopes are crossed
+   with the diff chunks so no ordinal source/diff pairing can hide a relationship.
+   The calls run in parallel at low effort. Results are restored to deterministic
+   source/diff order; an oversized set of complete typed reports is reduced through
+   semantic batches before the final low-effort call reconciles later fixes,
+   contradictions, and distinct evidence. No serialized report is split. Before the
+   structural inventory exists this report may be sparse; after inventory, any missing
+   authoritative function forces a corrective inference pass. Rust never fabricates a
+   zero rating from an omitted function.
+   It never takes a per-chunk maximum. The completed assessment is atomically written to `change-survey.json`
+   beside `session.json`, keyed by target source content and mode, baseline, and working-tree endpoint. An explicit
+   `--resume` reuses a matching assessment; fresh runs overwrite old state, and `/clear`
+   deletes it. Major risks in functions outside the target are retained only as research
+   candidates. The bootstrap then requests
+   semcode's compact Tree-sitter `file_survey` exactly once. If semcode is unavailable,
+   preserved local grep evidence plus lossless target-source partitions go through typed slow-agent
+   fallback inventory calls when the source is large; Rust unions structural names and recomputes
+   whole-file use counts. The bootstrap checks the net-diff response against the
+   authoritative file-survey function set. Unknown target-function names trigger one
+   corrective exact assessment; missing names are rejected until inference supplies a
+   rating. It sends that inventory plus the compact net-change ratings to one
+   non-lensed slow call. The file survey output contains one combined 0-100 risk rating for every defined
+   function and one final file risk rating. Rust rejects a combined rating below its
+   net-change rating or a file rating below its highest function rating. It converts
+   every external risk into exactly one prioritized research question only when the structural
+   call inventory or a code-level function-value reference in the target shows an interaction.
+   Comments, string literals, and declarations do not establish an interaction. Rust rejects empty, missing,
+   duplicate, or unrelated questions. The final file-survey synthesis is retried on malformed or
+   semantically incomplete output; if it remains invalid, review bootstrap stops instead of
+   silently continuing without the scan. That ranking is supplied to `define_goal` and
    `define_plan`, so the initial semantic groups are source-informed. It is also cached
-   and embedded in the persisted plan prompt for later tasks and resume. Scheduled tasks
+   separately with its target, source hash, baseline, and head in
+   `SessionState.review_file_scan` for later tasks and resume;
+   `Plan::prompt` retains only the operator prompt. Model-facing task plans are
+   compact projections containing the goal, mode, and current steps, not the
+   immutable prompt or creation timestamp. The scan is injected once into each
+   task request whose target matches it, and resume restores the dedicated scan
+   cache without regenerating the survey. The typed scan state is part of
+   session schema version 3; stale source or revision fingerprints are discarded on
+   resume, and plan prose is never parsed to recover it. Scheduled tasks
    cannot request another survey; they gather targeted source, types, callers, grep
    results, and history before parallel slow review lenses run.
 2. The active slow-agent review lenses run in parallel.
@@ -1020,6 +1079,26 @@ workflow-defined task loop. It uses the optimized lens path:
 
 The parallel slow calls are the important part of `/review`; keep them
 unless the operator explicitly chooses a cheaper custom workflow.
+
+Source gathered for those calls has one canonical representation. A single
+parseable semcode result becomes a normalized symbol and its duplicate raw body
+is omitted. Ambiguous semcode results remain raw so the agent can choose the
+candidate. Empty, failed, or unparseable results remain visible and trigger the
+local grep/read fallback. Local grep match lists are never semantically filtered
+or expanded wholesale by Rust. Prompt evidence receives a stable exact-content
+ID and ordering; repeated exact entries are removed, but distinct match lists,
+line ranges, and errors are retained. Parallel lenses share the resulting
+canonical evidence as one cacheable prefix and still all receive the concrete
+source needed for exhaustive review.
+
+Skill routing keeps the subsystem index available to the fast gather agent.
+After it has selected a concrete subsystem guide, slow synthesis receives that
+guide verbatim with the stable skill scaffold and technical-pattern guides, but
+does not receive the now-redundant routing index. Existing findings sent back to
+task agents retain IDs, status, severity, summaries, relationships, and source
+locations while omitting repeated embedded source bodies. Agents request any
+source body they need through typed followups; canonical findings storage and
+consolidation retain the full records.
 
 Review prompts carry a resolved target kind. A source file or directory means the current
 workspace contents and does not imply a revision, base, or diff. Only a target classified

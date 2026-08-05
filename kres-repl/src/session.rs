@@ -4417,7 +4417,14 @@ impl Session {
         }];
         if let Some(lg) = &self.logger {
             let request = cfg.request_meta();
-            lg.log_main_with_request("user", &body, None, None, Some(&request));
+            lg.log_main_with_request(
+                "user",
+                Some("phase=compact"),
+                &body,
+                None,
+                None,
+                Some(&request),
+            );
         }
         let resp = match orc.fast_client.messages_streaming(&cfg, &messages).await {
             Ok(r) => r,
@@ -4440,6 +4447,7 @@ impl Session {
         if let Some(lg) = &self.logger {
             lg.log_main(
                 "assistant",
+                Some("phase=compact"),
                 &text,
                 Some(kres_core::LoggedUsage {
                     input: resp.usage.input_tokens,

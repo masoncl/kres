@@ -357,7 +357,9 @@ fn log_turn(
         RepairLogKind::Code => {
             logger.log_code_labeled_with_request(role, Some(label), text, usage, None, request)
         }
-        RepairLogKind::Main => logger.log_main_with_request(role, text, usage, None, request),
+        RepairLogKind::Main => {
+            logger.log_main_with_request(role, Some(label), text, usage, None, request)
+        }
     }
 }
 

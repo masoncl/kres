@@ -2354,10 +2354,36 @@ impl AgentRunner {
             for fu in &novel {
                 fetched_keys.insert(fu.cache_key());
             }
+            // Evidence retrieval sits between two gather rounds and makes no
+            // model call, so it left no record at all: its cost could only be
+            // inferred from the gap between one round's response and the
+            // next round's request, and concurrency hides that entirely.
+            // Log it with its own duration so wall-time analysis can see it.
+            let fetch_started = std::time::Instant::now();
             let fetched = tokio::select! {
                 _ = shutdown.cancelled() => return Err(AgentError::Other("cancelled during fetch".into())),
                 f = self.fetcher.fetch(&novel, ctx.plan.as_ref()) => f?,
             };
+            if let Some(lg) = &self.logger {
+                let task = if ctx.task_brief.is_empty() {
+                    "task"
+                } else {
+                    &ctx.task_brief
+                };
+                lg.log_code_labeled(
+                    "fetch",
+                    Some(&format!("phase=fetch task={task} round={fast_rounds}")),
+                    &serde_json::to_string(&json!({
+                        "duration_ms": fetch_started.elapsed().as_millis() as u64,
+                        "followups": novel.iter().map(|fu| format!("{}:{}", fu.kind, fu.name))
+                            .collect::<Vec<_>>(),
+                        "symbols": fetched.symbols.len(),
+                        "context": fetched.context.len(),
+                    }))?,
+                    None,
+                    None,
+                );
+            }
             let (fetched_symbols, fetched_context) =
                 crate::symbol::canonicalize_prompt_evidence(&fetched.symbols, &fetched.context);
             for symbol in fetched_symbols {

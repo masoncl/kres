@@ -252,7 +252,14 @@ pub async fn define_goal(
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();
-        lg.log_main_with_request("user", &body, None, None, Some(&request));
+        lg.log_main_with_request(
+            "user",
+            Some("phase=goal define"),
+            &body,
+            None,
+            None,
+            Some(&request),
+        );
     }
     let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
@@ -266,6 +273,7 @@ pub async fn define_goal(
     if let Some(lg) = &gc.logger {
         lg.log_main(
             "assistant",
+            Some("phase=goal define"),
             &text,
             Some(LoggedUsage {
                 input: resp.usage.input_tokens,
@@ -390,7 +398,14 @@ pub async fn check_goal(
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();
-        lg.log_main_with_request("user", &body, None, None, Some(&request));
+        lg.log_main_with_request(
+            "user",
+            Some("phase=goal check"),
+            &body,
+            None,
+            None,
+            Some(&request),
+        );
     }
     let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
@@ -404,6 +419,7 @@ pub async fn check_goal(
     if let Some(lg) = &gc.logger {
         lg.log_main(
             "assistant",
+            Some("phase=goal check"),
             &text,
             Some(LoggedUsage {
                 input: resp.usage.input_tokens,
@@ -532,7 +548,14 @@ pub async fn define_plan(
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();
-        lg.log_main_with_request("user", &body, None, None, Some(&request));
+        lg.log_main_with_request(
+            "user",
+            Some("phase=plan define"),
+            &body,
+            None,
+            None,
+            Some(&request),
+        );
     }
     let resp = match call_with_shutdown(gc, &cfg, &messages, shutdown.clone()).await {
         Ok(r) => r,
@@ -546,6 +569,7 @@ pub async fn define_plan(
     if let Some(lg) = &gc.logger {
         lg.log_main(
             "assistant",
+            Some("phase=plan define"),
             &text,
             Some(LoggedUsage {
                 input: resp.usage.input_tokens,

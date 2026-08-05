@@ -139,7 +139,14 @@ impl MainAgent {
     fn log_user(&self, content: &str, cfg: &CallConfig) {
         if let Some(lg) = &self.logger {
             let request = cfg.request_meta();
-            lg.log_main_with_request("user", content, None, None, Some(&request));
+            lg.log_main_with_request(
+                "user",
+                Some("phase=main"),
+                content,
+                None,
+                None,
+                Some(&request),
+            );
         }
     }
 
@@ -147,6 +154,7 @@ impl MainAgent {
         if let Some(lg) = &self.logger {
             lg.log_main(
                 "assistant",
+                Some("phase=main"),
                 content,
                 Some(LoggedUsage {
                     input: u.input_tokens,

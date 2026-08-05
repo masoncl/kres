@@ -211,7 +211,14 @@ pub async fn update_todo_via_agent_with_logger(
     }];
     if let Some(lg) = &logger {
         let request = cfg.request_meta();
-        lg.log_main_with_request("user", &request_text, None, None, Some(&request));
+        lg.log_main_with_request(
+            "user",
+            Some("phase=todo"),
+            &request_text,
+            None,
+            None,
+            Some(&request),
+        );
     }
     let resp_result = if let Some(shutdown) = shutdown.clone() {
         tokio::select! {
@@ -241,6 +248,7 @@ pub async fn update_todo_via_agent_with_logger(
     if let Some(lg) = &logger {
         lg.log_main(
             "assistant",
+            Some("phase=todo"),
             &text,
             Some(LoggedUsage {
                 input: resp.usage.input_tokens,

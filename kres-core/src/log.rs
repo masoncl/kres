@@ -476,6 +476,7 @@ impl TurnLogger {
     pub fn log_main(
         &self,
         role: &str,
+        label: Option<&str>,
         content: &str,
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
@@ -484,7 +485,7 @@ impl TurnLogger {
         let entry = LogEntry {
             timestamp: log_timestamp(),
             role,
-            label: None,
+            label,
             content,
             request_content: None,
             usage,
@@ -503,6 +504,7 @@ impl TurnLogger {
     pub fn log_main_with_request(
         &self,
         role: &str,
+        label: Option<&str>,
         content: &str,
         usage: Option<LoggedUsage>,
         thinking: Option<&str>,
@@ -513,7 +515,7 @@ impl TurnLogger {
         let entry = LogEntry {
             timestamp: log_timestamp(),
             role,
-            label: None,
+            label,
             content,
             request_content: None,
             usage,
@@ -575,7 +577,7 @@ mod tests {
             }),
             Some("thought"),
         );
-        log.log_main("user", "plan", None, None);
+        log.log_main("user", Some("phase=todo"), "plan", None, None);
         drop(log);
 
         // session dir is .kres/logs/<uuid>
@@ -759,6 +761,40 @@ mod tests {
         // Cross-turn body retransmission stays detectable, just off the write
         // path: the helper walks every turn of the complete request.
         assert_eq!(duplicate_symbol_bodies_in_context(&complete), 1);
+    }
+
+    #[test]
+    fn main_log_records_carry_a_phase_label() {
+        // main.jsonl had no label parameter at all, so goal, todo, main-agent
+        // and compact calls could not be told apart or paired with their
+        // responses. Wall-time analysis had to guess by file position.
+        let dir = tempdir().unwrap();
+        let log = TurnLogger::new(dir.path()).unwrap();
+        log.log_main_with_request("user", Some("phase=goal check"), "{}", None, None, None);
+        log.log_main(
+            "assistant",
+            Some("phase=goal check"),
+            "met",
+            Some(LoggedUsage {
+                input: 5,
+                output: 1,
+                cache_creation: 0,
+                cache_read: 0,
+            }),
+            None,
+        );
+        let path = log.session_dir().join("main.jsonl");
+        drop(log);
+
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for r in &rows {
+            assert_eq!(r["label"], "phase=goal check");
+        }
     }
 
     #[test]

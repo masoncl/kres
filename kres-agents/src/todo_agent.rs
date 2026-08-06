@@ -841,17 +841,68 @@ fn assign_ids(list: &mut [TodoItem]) {
             seen.insert(t.id.clone());
             continue;
         }
-        let base: String = t.name.chars().take(40).collect();
+        let base = slugify_todo_id(&t.name);
         let mut id = base.clone();
         let mut counter = 2u32;
+        // Suffix the WHOLE slug rather than re-cutting it. Re-cutting
+        // made the first row's id depend on whether a second row
+        // happened to be present that round, so the same followup
+        // could land under different ids on different reaps and any
+        // `depends_on` minted against the earlier one dangled.
         while seen.contains(&id) {
-            let short: String = base.chars().take(37).collect();
-            id = format!("{short}_{counter}");
+            id = format!("{base}-{counter}");
             counter += 1;
         }
         seen.insert(id.clone());
         t.id = id;
     }
+}
+
+/// Longest id `slugify_todo_id` will produce, in characters. Long
+/// enough to stay readable, short enough that the prioritizer's output
+/// stays small — it echoes one id per pick and `crate::prioritize`
+/// exists to be input-bound.
+const TODO_ID_MAX_CHARS: usize = 48;
+
+/// Derive a stable, readable id from a todo's name.
+///
+/// The old derivation was `name.chars().take(40)`, which produced ids
+/// like `Prove pcp->batch can never be 0 on a liv` — 27 of 40 ready
+/// rows in the 2026-08-06 mm/page_alloc.c run were mid-word slices of
+/// their name. Followups arrive with no id (`{type, name, reason,
+/// path?}`), so every promoted followup went through this path.
+///
+/// Cut on token boundaries, never mid-word, and emit only
+/// `[a-z0-9-]` so an id can be typed, logged, and matched without
+/// quoting.
+fn slugify_todo_id(name: &str) -> String {
+    let mut slug = String::with_capacity(TODO_ID_MAX_CHARS);
+    for token in name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        let token = token.to_ascii_lowercase();
+        // Stop at a whole-token boundary rather than truncating one.
+        if !slug.is_empty() && slug.len() + 1 + token.len() > TODO_ID_MAX_CHARS {
+            break;
+        }
+        if !slug.is_empty() {
+            slug.push('-');
+        }
+        // A single token longer than the cap is the only case where a
+        // cut is unavoidable.
+        if token.len() > TODO_ID_MAX_CHARS {
+            slug.push_str(&token[..TODO_ID_MAX_CHARS]);
+            break;
+        }
+        slug.push_str(&token);
+    }
+    if slug.is_empty() {
+        // A name with no alphanumerics at all. Callers still need a
+        // handle; the collision loop makes it unique.
+        slug.push_str("todo");
+    }
+    slug
 }
 
 /// DEDUP_STOP_TOKENS — common words we don't want skewing the token
@@ -2005,6 +2056,93 @@ Actual: {"todo":[{"name":"actual","status":"done"}]}"#;
         assert!(body.contains("status=done requires concrete cited evidence"));
         assert!(body.contains("Do NOT mark such a step done"));
         assert!(body.contains("no remaining users"));
+    }
+
+    /// The 2026-08-06 mm/page_alloc.c run handed the prioritizer 40
+    /// ready rows, 27 of them with an id that was a 40-character
+    /// mid-word slice of the name.
+    #[test]
+    fn synthesized_ids_are_slugs_not_mid_word_slices() {
+        let mut items = vec![
+            TodoItem::new(
+                "Prove pcp->batch can never be 0 on a live pageset (zone_batchsize, zone_set_pageset_high_and_batch)",
+                "review",
+            ),
+            TodoItem::new(
+                "start_isolate_page_range()/undo_isolate_page_range()/set_pageblock_isolate",
+                "review",
+            ),
+        ];
+        assign_ids(&mut items);
+        for item in &items {
+            assert!(
+                item.id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "id is not a slug: {:?}",
+                item.id
+            );
+            assert!(
+                !item.id.starts_with('-') && !item.id.ends_with('-'),
+                "{:?}",
+                item.id
+            );
+            assert!(item.id.len() <= TODO_ID_MAX_CHARS, "{:?}", item.id);
+        }
+        assert_eq!(
+            items[0].id,
+            "prove-pcp-batch-can-never-be-0-on-a-live-pageset"
+        );
+        assert_eq!(
+            items[1].id,
+            "start-isolate-page-range-undo-isolate-page-range"
+        );
+    }
+
+    /// The collision path is where the old code actually broke: it
+    /// re-cut the base to 37 chars, so row A's id changed depending on
+    /// whether row B was in the same batch, and any `depends_on`
+    /// minted against the pre-collision id dangled.
+    #[test]
+    fn a_collision_suffixes_the_slug_and_never_rewrites_the_first_row() {
+        let long_a = "Audit the pageblock migratetype bitmap helpers and the alpha path";
+        let long_b = "Audit the pageblock migratetype bitmap helpers and the beta path";
+        // Both names share far more than 40 leading characters.
+        assert_eq!(long_a[..48], long_b[..48]);
+
+        let mut alone = vec![TodoItem::new(long_a, "review")];
+        assign_ids(&mut alone);
+        let solo_id = alone[0].id.clone();
+
+        let mut together = vec![
+            TodoItem::new(long_a, "review"),
+            TodoItem::new(long_b, "review"),
+        ];
+        assign_ids(&mut together);
+
+        assert_eq!(
+            together[0].id, solo_id,
+            "the first row's id must not depend on the second row's presence"
+        );
+        assert_ne!(together[0].id, together[1].id);
+        assert_eq!(together[1].id, format!("{solo_id}-2"));
+    }
+
+    #[test]
+    fn a_name_with_no_alphanumerics_still_yields_usable_ids() {
+        let mut items = vec![
+            TodoItem::new("///", "review"),
+            TodoItem::new("***", "review"),
+        ];
+        assign_ids(&mut items);
+        assert_eq!(items[0].id, "todo");
+        assert_eq!(items[1].id, "todo-2");
+    }
+
+    #[test]
+    fn a_single_oversized_token_is_cut_only_as_a_last_resort() {
+        let name = "a".repeat(TODO_ID_MAX_CHARS + 20);
+        assert_eq!(slugify_todo_id(&name).len(), TODO_ID_MAX_CHARS);
     }
 
     #[test]

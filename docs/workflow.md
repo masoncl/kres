@@ -1069,10 +1069,11 @@ workflow-defined task loop. It uses the optimized lens path:
 4. The lensed step completes with `findings` and typed `followups` in
    its output.
 5. The normal kres task reaper sends those followups to the todo agent,
-   which deduplicates and prioritizes them against completed work,
-   session lenses, and the current plan. Selected followups become the
-   next todos, and each todo runs as a fresh review task through the
-   same JSON-defined lenses. If a lensed review task emits typed
+   which deduplicates them against completed work and the current
+   plan. Surviving followups become todos. At dispatch the
+   prioritization agent ranks the runnable rows and picks the batch,
+   and each picked todo runs as a fresh review task through the same
+   JSON-defined lenses. If a lensed review task emits typed
    followups and the todo agent fails to keep any pending/blocked next
    work, the reaper restores those followups as pending todos instead
    of letting a narrow goal check terminate the run.

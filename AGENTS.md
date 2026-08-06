@@ -44,9 +44,10 @@ User prompt → Task created → Task thread starts
   instead of preserving alternate behavior.
 - `/review` specifically must remain one JSON workflow with the old
   forward-progress semantics: each turn runs parallel slow-agent
-  lenses, emits Findings plus typed followups, prioritizes/dedups those
-  followups through the todo agent into the next review task, and
-  continues until the turn cap or followup exhaustion. Do not replace
+  lenses, emits Findings plus typed followups, dedups those followups
+  through the todo agent and ranks the runnable ones through the
+  prioritization agent into the next review task, and continues until
+  the turn cap or followup exhaustion. Do not replace
   this with workflow-local "fetch followups and repeat the same step"
   logic.
 - Do not weaken the golden review prompt contract: every lens is
@@ -591,7 +592,7 @@ instead; both shapes parse.
 
 | Field | Description |
 |-------|-------------|
-| `todo` | Pending rows only, in priority order. Each carries `id` (the handle), `name`, `reason`, `type`. A row absent from `current_todo` is new and also carries `depends_on` and `step_id` |
+| `todo` | Pending rows only, order-insensitive. An unchanged row is just `{"id":"..."}`; `name`/`reason`/`type` appear only when being edited, and an absent field means unchanged. A row absent from `current_todo` is new and carries `name` (required) plus `type`, `reason`, `depends_on`, `step_id` |
 | `newly_done` | `[{id, coverage}]` — completions. `coverage` is written once, at this completion |
 | `retired` | `[{id, reason}]` — pending rows deliberately abandoned. Logged, not stored |
 | `plan` | Optional `{steps:[...]}` rewrite |

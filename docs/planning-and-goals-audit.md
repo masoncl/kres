@@ -33,7 +33,7 @@ completion goal and a structured plan. A `Plan` contains:
 Each runnable todo becomes a `Task`. The fast agent gathers evidence, the
 deterministic data-fetch path services typed requests, and the slow agent
 performs the final analysis. Follow-ups emitted by completed tasks pass through
-the todo agent, which deduplicates and prioritizes them against both pending and
+the todo agent, which deduplicates them against both pending and
 completed work.
 
 The goal agent evaluates the session completion goal after task completion. If

@@ -95,12 +95,70 @@ struct RetireMark {
 }
 
 /// Parsed response shape from the todo agent.
+/// One row of the agent's `todo` array.
+///
+/// Deliberately NOT `TodoItem`: this is an edit, not a record. Every
+/// mutable field is `Option`, so `None` means "leave it alone" and is
+/// distinct from `Some("")` meaning "clear it". `TodoItem` requires
+/// `name`, which made the id-only reply the prompt asks for fail
+/// schema validation — five of six calls in the 2026-08-06
+/// mm/page_alloc.c run were rejected with "missing field `name`" and
+/// went through a repair round trip, and the repairing model
+/// satisfied the required field by copying the id over the row's real
+/// name. 27 of 28 rows in that session ended up with `name == id`.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TodoEdit {
+    /// Handle for an existing row. Empty on a row being created.
+    #[serde(default)]
+    id: String,
+    /// Prose. Required when creating a row, omitted to leave an
+    /// existing row's name untouched.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    /// Accepted for a completion declared inline rather than through
+    /// `newly_done`. Rust restores it for every other row.
+    #[serde(default)]
+    status: Option<TodoStatus>,
+    #[serde(default)]
+    coverage: Option<String>,
+    /// Meaningful only on a row being created; restored from the
+    /// original otherwise.
+    #[serde(default)]
+    depends_on: Option<Vec<String>>,
+    #[serde(default)]
+    step_id: Option<String>,
+}
+
+impl TodoEdit {
+    /// Build the row this edit is creating. Returns None when the
+    /// edit names no existing row and carries no name, which is not
+    /// something Rust can turn into work.
+    fn into_new_item(self) -> Option<TodoItem> {
+        let name = self.name.filter(|n| !n.trim().is_empty())?;
+        Some(TodoItem {
+            name,
+            kind: self.kind.unwrap_or_default(),
+            status: TodoStatus::Pending,
+            reason: self.reason.unwrap_or_default(),
+            depends_on: self.depends_on.unwrap_or_default(),
+            coverage: String::new(),
+            id: self.id,
+            step_id: self.step_id.unwrap_or_default(),
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TodoUpdateResponse {
-    /// The PENDING list only, in the order it should execute. Done
-    /// rows are Rust-owned and must not appear here.
-    todo: Vec<TodoItem>,
+    /// The PENDING list only. Done rows are Rust-owned and must not
+    /// appear here.
+    todo: Vec<TodoEdit>,
     /// Items that reached Done this round.
     #[serde(default)]
     newly_done: Vec<DoneMark>,
@@ -216,6 +274,15 @@ pub async fn update_todo_via_agent_with_logger(
     request.insert("analysis_summary".into(), json!(analysis_summary));
     request.insert("new_followups".into(), json!(new_followups));
     request.insert("current_todo".into(), json!(current_payload));
+    // `mark_completed_todo` already flipped the reaped row to Done, so
+    // from the agent's side it did not "reach Done this round" and it
+    // never listed the row in `newly_done`. Five of six calls in the
+    // 2026-08-06 mm/page_alloc.c run left the completion carrying
+    // Rust's placeholder coverage, which is write-once and therefore
+    // permanent. Name the row explicitly and demand its evidence.
+    if let Some(id) = completed_todo_id {
+        request.insert("just_completed".into(), json!(id));
+    }
     // Ship the current plan (if any) so the agent can attach
     // `step_id` to each emitted todo; `build_instructions` flips
     // its plan-linking paragraph on when has_plan is true.
@@ -322,7 +389,7 @@ pub async fn update_todo_via_agent_with_logger(
             contract: crate::json_repair::JsonContract {
                 name: "todo-update",
                 schema: &schema,
-                instructions: "Preserve every pending todo id, status, reason, every newly_done id and its coverage sentence, every retired id, and the plan decision. Correct representation and field types only.",
+                instructions: "Preserve every pending todo id, every newly_done id and its coverage sentence, every retired id, and the plan decision. Correct representation and field types only. NEVER invent a value for an absent field — every field except `id` is optional and absent means unchanged, so omit it rather than filling it in. In particular never copy an id into `name`: that overwrites the row's real title.",
             },
             rejected_response: &text,
             validation_errors: &errors,
@@ -461,7 +528,7 @@ const TODO_RESPONSE_FIELDS: &[&str] = &["todo", "newly_done", "retired", "plan"]
 /// can be cloned across the JSON-repair retry.
 #[derive(Debug, Clone)]
 struct ParsedTodoUpdate {
-    todo: Vec<TodoItem>,
+    todo: Vec<TodoEdit>,
     newly_done: Vec<DoneMark>,
     retired: Vec<RetireMark>,
     plan: Option<kres_core::PlanRewrite>,
@@ -581,39 +648,55 @@ fn reconcile_update(
     let mut appended: Vec<TodoItem> = Vec::new();
     let mut new_ids: HashSet<String> = HashSet::new();
     for row in parsed.todo {
-        let Some(idx) = resolve(&row.id, &row.name) else {
+        let lookup_name = row.name.clone().unwrap_or_default();
+        let Some(idx) = resolve(&row.id, &lookup_name) else {
             // Genuinely new work. The agent owns every field here,
             // including step_id and depends_on, because there is no
             // prior row to restore them from. New rows land after the
             // existing ones, in the order the agent created them.
             let key = if row.id.is_empty() {
-                row.name.to_ascii_lowercase()
+                lookup_name.to_ascii_lowercase()
             } else {
                 row.id.clone()
             };
             if !key.is_empty() && !new_ids.insert(key) {
                 continue;
             }
-            appended.push(row);
+            let handle = if row.id.is_empty() {
+                lookup_name.clone()
+            } else {
+                row.id.clone()
+            };
+            match row.into_new_item() {
+                Some(item) => appended.push(item),
+                None => tracing::info!(
+                    target: "kres_agents",
+                    "todo agent emitted a row naming no known item and no name ({}); ignoring",
+                    truncate(&handle, 60)
+                ),
+            }
             continue;
         };
         if retired.contains(&idx) || !emitted.insert(idx) {
             continue;
         }
-        // Prose and type are the agent's; identity is not.
-        if !row.name.is_empty() {
-            state[idx].name.clone_from(&row.name);
+        // Prose is the agent's, and only where it said so: `None`
+        // means "unchanged", which is how an id-only edit leaves the
+        // stored name alone instead of blanking it.
+        if let Some(name) = row.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            state[idx].name = name.to_string();
         }
-        if !row.reason.is_empty() {
-            state[idx].reason.clone_from(&row.reason);
+        if let Some(reason) = row.reason {
+            state[idx].reason = reason;
         }
-        if !row.kind.is_empty() {
-            state[idx].kind.clone_from(&row.kind);
+        if let Some(kind) = row.kind.filter(|k| !k.is_empty()) {
+            state[idx].kind = kind;
         }
         // A completion declared inline rather than via `newly_done`.
-        if row.status.is_terminal() && !state[idx].status.is_terminal() {
+        if row.status.is_some_and(|s| s.is_terminal()) && !state[idx].status.is_terminal() {
             state[idx].status = TodoStatus::Done;
-            let coverage = row.coverage.trim();
+            let coverage = row.coverage.unwrap_or_default();
+            let coverage = coverage.trim();
             if state[idx].coverage.is_empty() && !coverage.is_empty() {
                 state[idx].coverage = coverage.to_string();
             }
@@ -1000,7 +1083,7 @@ fn build_instructions(has_plan: bool) -> String {
     let mut s = String::from(
         "Update the todo list. Return raw, unfenced JSON only:\n\
          {\n\
-         \u{20}\"todo\": [{\"id\":\"ID\",\"type\":\"T\",\"name\":\"N\",\"reason\":\"R\"}],\n\
+         \u{20}\"todo\": [{\"id\":\"ID\"}, {\"type\":\"T\",\"name\":\"N\",\"reason\":\"R\"}],\n\
          \u{20}\"newly_done\": [{\"id\":\"ID\",\"coverage\":\"C\"}],\n\
          \u{20}\"retired\": [{\"id\":\"ID\",\"reason\":\"R\"}]\n\
          }\n\n",
@@ -1019,6 +1102,13 @@ fn build_instructions(has_plan: bool) -> String {
          the coverage sentence described below. This is the ONLY way to \
          complete an item, and coverage is written once: later rounds \
          cannot reword it.\n\
+         - `just_completed` (in the request, when present) is the id of \
+         the item the reaped task was executing. Its row already shows \
+         status done, but its coverage is EMPTY and only you can write \
+         it. You MUST return that id in `newly_done` with a real \
+         coverage sentence drawn from `analysis_summary`. Skipping it \
+         leaves the row permanently uncovered and blinds every later \
+         dedup pass to what the run has already examined.\n\
          - `retired` — pending items you are deliberately abandoning, \
          with the reason. Leaving an item out of `todo` does NOT delete \
          it; the pipeline restores anything you neither kept, completed, \
@@ -1030,11 +1120,15 @@ fn build_instructions(has_plan: bool) -> String {
         "FIELDS YOU DO NOT EMIT for an item that already exists in \
          `current_todo`: `status`, `coverage`, `depends_on`, `step_id`. \
          The pipeline restores all four from its own copy and discards \
-         whatever you send, so emitting them only costs output. Send \
-         `id` (the handle), plus `name`, `reason` and `type` when you \
-         want to change the prose. For an item you are creating THIS \
-         round there is no prior copy, so a new item DOES carry \
-         `type`, `name`, `reason`, `depends_on` and `step_id`.\n\n",
+         whatever you send, so emitting them only costs output. An \
+         unchanged pending row is exactly `{\"id\":\"ID\"}` and \
+         nothing more. Add `name`, `reason` or `type` ONLY to change \
+         that field; an omitted field means unchanged, so never repeat \
+         a value you are not editing and never fill one in just to \
+         satisfy a shape. For an item you are creating THIS round \
+         there is no prior copy, so a new item DOES carry `type`, \
+         `name`, `reason`, `depends_on` and `step_id` — `name` is \
+         required there and is the only way the row can exist.\n\n",
     );
     if has_plan {
         s.push_str(
@@ -1106,6 +1200,27 @@ fn build_instructions(has_plan: bool) -> String {
          Emit the dropped followup ids/names nowhere — just omit them.\n\n",
     );
     s.push_str(
+        "WHEN TO RETIRE — `retired` went unused across the first six \
+         calls of the 2026-08-06 mm/page_alloc.c run while the list \
+         grew 5 -> 28 rows, so here is what earns a retirement. These \
+         are the only reasons; none of them is \"the list is long\":\n\
+         - The evidence a row was going to gather has since arrived \
+         through another item's coverage, so running it would re-read \
+         what is already known.\n\
+         - The premise is dead: the finding it was going to confirm is \
+         invalidated, or the code path it targets does not exist as \
+         the earlier analysis assumed.\n\
+         - It was created to answer a question a later analysis \
+         answered outright.\n\
+         - Another pending row strictly subsumes it — same files, same \
+         symbols, broader scope. Retire the narrow one and say which \
+         row absorbs it.\n\
+         Give the concrete reason, naming the item or coverage that \
+         made it obsolete. \"No longer needed\" is not a reason. When \
+         in doubt keep the row: unrun work costs nothing, and \
+         retiring a live question destroys it.\n\n",
+    );
+    s.push_str(
         "COVERAGE FIELD — required on every `newly_done` entry:\n\
          - 1-2 sentences naming the concrete files, symbols, and \
          line ranges the analysis examined for that item, plus the \
@@ -1173,16 +1288,6 @@ fn parse_todo_update_full(text: &str) -> Result<ParsedTodoUpdate, Vec<String>> {
     Ok(ParsedTodoUpdate::from(r))
 }
 
-/// Extract the `todo` array from one strict JSON response object.
-pub fn parse_todo_response(text: &str) -> Result<Vec<TodoItem>, Vec<String>> {
-    let r = crate::json_repair::JsonObjectContract {
-        name: "todo-update",
-        fields: TODO_RESPONSE_FIELDS,
-    }
-    .parse::<TodoUpdateResponse>(text)?;
-    Ok(r.todo)
-}
-
 fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
     let mut out = String::new();
     for block in &resp.content {
@@ -1213,7 +1318,7 @@ mod tests {
         item
     }
 
-    fn update(todo: Vec<TodoItem>) -> ParsedTodoUpdate {
+    fn update(todo: Vec<TodoEdit>) -> ParsedTodoUpdate {
         ParsedTodoUpdate {
             todo,
             newly_done: Vec::new(),
@@ -1222,10 +1327,32 @@ mod tests {
         }
     }
 
-    fn pending_row(id: &str, name: &str) -> TodoItem {
-        TodoItem {
+    /// An edit naming an existing row and restating its prose.
+    fn pending_row(id: &str, name: &str) -> TodoEdit {
+        TodoEdit {
             id: id.into(),
-            ..TodoItem::new(name, "review")
+            name: Some(name.into()),
+            kind: Some("review".into()),
+            reason: None,
+            status: None,
+            coverage: None,
+            depends_on: None,
+            step_id: None,
+        }
+    }
+
+    /// The id-only edit the prompt actually asks for: "this row is
+    /// still pending, nothing about it changed".
+    fn keep(id: &str) -> TodoEdit {
+        TodoEdit {
+            id: id.into(),
+            name: None,
+            kind: None,
+            reason: None,
+            status: None,
+            coverage: None,
+            depends_on: None,
+            step_id: None,
         }
     }
 
@@ -1442,9 +1569,9 @@ mod tests {
             TodoStatus::Pending,
         )];
         let mut mangled = pending_row("audit-alloc", "Audit alloc path, take two");
-        mangled.step_id = "some-other-step".into();
-        mangled.depends_on = vec!["invented".into()];
-        mangled.reason = "new rationale".into();
+        mangled.step_id = Some("some-other-step".into());
+        mangled.depends_on = Some(vec!["invented".into()]);
+        mangled.reason = Some("new rationale".into());
 
         let out = reconcile_update(&originals, update(vec![mangled]), None);
         assert_eq!(out.pending.len(), 1);
@@ -1557,7 +1684,7 @@ mod tests {
             TodoStatus::Pending,
         )];
         let mut fresh = pending_row("", "Audit a newly discovered helper");
-        fresh.reason = "followup from this round".into();
+        fresh.reason = Some("followup from this round".into());
         // Emitted first, but it is new, so it lands last.
         let out = reconcile_update(
             &originals,
@@ -1592,6 +1719,96 @@ mod tests {
         );
         assert!(body.contains("DEDUP ALGORITHM"), "dedup must stay");
         assert!(body.contains("COVERAGE FIELD"), "completion must stay");
+    }
+
+    /// Bug 1 of todo-bugs.md: the prompt asks for `{"id":"..."}` and
+    /// `TodoItem` rejected it for a missing `name`. Five of six calls
+    /// in the 2026-08-06 run paid a repair round trip for obeying the
+    /// instructions.
+    #[test]
+    fn an_id_only_row_parses_and_leaves_prose_alone() {
+        let parsed = parse_todo_update_full(r#"{"todo":[{"id":"keep-me"}]}"#)
+            .expect("an id-only row is the documented shape");
+        assert_eq!(parsed.todo.len(), 1);
+        assert!(parsed.todo[0].name.is_none(), "absent means unchanged");
+
+        let mut originals = vec![original(
+            "keep-me",
+            "Audit the allocator slow path",
+            "step",
+            TodoStatus::Pending,
+        )];
+        originals[0].reason = "the original rationale".into();
+
+        let out = reconcile_update(&originals, update(vec![keep("keep-me")]), None);
+        assert_eq!(out.pending.len(), 1);
+        assert_eq!(out.pending[0].name, "Audit the allocator slow path");
+        assert_eq!(out.pending[0].reason, "the original rationale");
+        assert_eq!(out.pending[0].step_id, "step");
+    }
+
+    /// Bug 2: the repair satisfied the missing required field by
+    /// copying the id into `name`, and reconcile only guarded against
+    /// an EMPTY name, so 27 of 28 rows ended the session with
+    /// `name == id`. An absent name can no longer overwrite anything.
+    #[test]
+    fn a_blank_or_absent_name_cannot_erase_the_stored_title() {
+        let originals = vec![original(
+            "audit-alloc",
+            "Audit the allocator slow path",
+            "",
+            TodoStatus::Pending,
+        )];
+        let mut blanked = keep("audit-alloc");
+        blanked.name = Some("   ".into());
+        let out = reconcile_update(&originals, update(vec![blanked]), None);
+        assert_eq!(out.pending[0].name, "Audit the allocator slow path");
+    }
+
+    #[test]
+    fn a_row_naming_nothing_and_carrying_no_name_is_dropped() {
+        let originals = vec![original("real", "Audit alloc", "", TodoStatus::Pending)];
+        let out = reconcile_update(&originals, update(vec![keep("ghost"), keep("real")]), None);
+        let ids: Vec<&str> = out.pending.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["real"],
+            "an unresolvable, nameless row is not work"
+        );
+    }
+
+    /// Bug 3: `mark_completed_todo` flips the reaped row to Done
+    /// before the payload is built, so the agent saw a done row and
+    /// never listed it in `newly_done`. Three of four completions in
+    /// the 2026-08-06 run kept Rust's placeholder coverage, which is
+    /// write-once and therefore permanent.
+    #[test]
+    fn the_request_names_the_row_that_just_completed() {
+        let body = build_instructions(true);
+        assert!(body.contains("just_completed"));
+        assert!(body.contains("its coverage is EMPTY"));
+        assert!(body.contains("MUST return that id in `newly_done`"));
+    }
+
+    #[test]
+    fn instructions_show_the_id_only_row_and_forbid_padding() {
+        let body = build_instructions(true);
+        assert!(body.contains("exactly `{\"id\":\"ID\"}`"));
+        assert!(body.contains("an omitted field means unchanged"));
+        assert!(body.contains("never fill one in just to satisfy a shape"));
+    }
+
+    /// Bug 4: the retirement channel existed with no criteria, so
+    /// the agent never used it. Criteria must stay reason-based —
+    /// list length is explicitly not one, since the cap was removed
+    /// in 00d3bd8 on purpose.
+    #[test]
+    fn retirement_criteria_are_about_the_item_not_the_list_length() {
+        let body = build_instructions(true);
+        assert!(body.contains("WHEN TO RETIRE"));
+        assert!(body.contains("none of them is \"the list is long\""));
+        assert!(body.contains("When in doubt keep the row"));
+        assert!(!body.contains("Max 20"));
     }
 
     #[test]
@@ -1719,49 +1936,49 @@ mod tests {
     #[test]
     fn parse_todo_response_plain_json() {
         let text = r#"{"todo": [{"name": "x", "type": "investigate", "status": "pending"}]}"#;
-        let got = parse_todo_response(text).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].name, "x");
+        let got = parse_todo_update_full(text).unwrap();
+        assert_eq!(got.todo.len(), 1);
+        assert_eq!(got.todo[0].name.as_deref(), Some("x"));
     }
 
     #[test]
     fn parse_todo_response_rejects_transport_wrapper() {
         let text = r#"{"result":{"todo":[]}}"#;
-        assert!(parse_todo_response(text).is_err());
+        assert!(parse_todo_update_full(text).is_err());
     }
 
     #[test]
     fn parse_todo_response_rejects_entire_array_when_one_item_is_invalid() {
         let text = r#"{"todo":[{"id":"good","name":"good","type":"review","status":"pending"},{"id":42}]}"#;
-        assert!(parse_todo_response(text).is_err());
+        assert!(parse_todo_update_full(text).is_err());
     }
 
     #[test]
     fn parse_todo_response_rejects_embedded_object() {
         let text =
             r#"Here you go: {"todo": [{"name": "y", "type": "read", "status": "done"}]} bye."#;
-        assert!(parse_todo_response(text).is_err());
+        assert!(parse_todo_update_full(text).is_err());
     }
 
     #[test]
     fn parse_todo_response_rejects_multiple_candidates() {
         let text = r#"Example: {"todo":[{"name":"example","status":"pending"}]}
 Actual: {"todo":[{"name":"actual","status":"done"}]}"#;
-        assert!(parse_todo_response(text).is_err());
+        assert!(parse_todo_update_full(text).is_err());
     }
 
     #[test]
     fn parse_todo_response_bad_json_returns_error() {
-        assert!(parse_todo_response("not a json object").is_err());
-        assert!(parse_todo_response("{}").is_err());
-        let error = parse_todo_response(r#"{"todo":[]} trailing"#).unwrap_err();
+        assert!(parse_todo_update_full("not a json object").is_err());
+        assert!(parse_todo_update_full("{}").is_err());
+        let error = parse_todo_update_full(r#"{"todo":[]} trailing"#).unwrap_err();
         assert!(error.iter().any(|message| message.contains("trailing")));
     }
 
     #[test]
     fn parse_todo_response_rejects_unknown_item_fields() {
         let text = r#"{"todo":[{"name":"x","status":"pending","depends_onn":[]}]}"#;
-        assert!(parse_todo_response(text).is_err());
+        assert!(parse_todo_update_full(text).is_err());
     }
 
     #[test]

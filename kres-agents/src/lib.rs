@@ -60,7 +60,7 @@ pub use symbol::{
     with_retrieval_source, SemcodeEvidence,
 };
 pub use todo_agent::{
-    dedup_tokens, parse_todo_response, update_todo_via_agent, update_todo_via_agent_with_logger,
-    TodoAgentInputs, TodoClient, TodoUpdate, TODO_INSTRUCTIONS,
+    dedup_tokens, update_todo_via_agent, update_todo_via_agent_with_logger, TodoAgentInputs,
+    TodoClient, TodoUpdate, TODO_INSTRUCTIONS,
 };
 pub use workspace::{detect_workspace, BuildSystem, WorkspaceKind, WorkspaceProfile};

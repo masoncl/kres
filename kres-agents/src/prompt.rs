@@ -182,6 +182,89 @@ impl<'a> CodePrompt<'a> {
     )> {
         Ok(partition_object(serde_json::to_value(self)?, static_keys))
     }
+
+    /// Render as session / task / delta. `session_keys` and
+    /// `task_keys` must not overlap; a key in both lands in `session`,
+    /// since that is the outer partition.
+    ///
+    /// A layer that comes out empty renders as the empty string rather
+    /// than `{}`, so `prefixes()` drops it instead of spending one of
+    /// Anthropic's four `cache_control` slots on nothing.
+    pub fn to_layered_documents(
+        &self,
+        session_keys: &[&str],
+        task_keys: &[&str],
+    ) -> serde_json::Result<LayeredPrompt> {
+        layer_object(serde_json::to_value(self)?, session_keys, task_keys)
+    }
+
+    /// The task + delta layers only, for a caller that already holds a
+    /// rendered `session` document built from the same keys. Used by
+    /// the lens fan-out, where every sibling reuses one session head
+    /// verbatim.
+    pub fn to_layered_tail(
+        &self,
+        session_keys: &[&str],
+        task_keys: &[&str],
+    ) -> serde_json::Result<LayeredPrompt> {
+        let mut layered = self.to_layered_documents(session_keys, task_keys)?;
+        layered.session = String::new();
+        Ok(layered)
+    }
+}
+
+/// Partition one object into three ordered documents.
+pub fn layer_object(
+    value: Value,
+    session_keys: &[&str],
+    task_keys: &[&str],
+) -> serde_json::Result<LayeredPrompt> {
+    let (session_map, rest) = partition_object(value, session_keys);
+    let (task_map, delta_map) = partition_object(Value::Object(rest), task_keys);
+
+    // Documents are separated by a newline that belongs to the
+    // document BEFORE the separator, so only the last non-empty layer
+    // is rendered without one.
+    //
+    // NOTE what layering does and does not preserve. The field set and
+    // every value are unchanged, and with two layers the bytes are
+    // identical to the two-document form. With three, one JSON
+    // document becomes two: the reader sees `{common_skills,
+    // previous_findings}` and `{question, symbols, ...}` where it
+    // previously saw one object holding all of them. That is a real
+    // prompt change, consistent with the multi-document framing the
+    // envelope already uses, and `log::turn_documents` stream-parses
+    // any number of them.
+    //
+    // An empty layer renders as the empty string, not `{}`: an empty
+    // block is not cacheable and would spend one of Anthropic's four
+    // `cache_control` slots on nothing.
+    //
+    // A caller whose delta CAN be empty must not use the layered form
+    // directly — `content` would be empty while the prefixes carry
+    // everything. Both current callers (lens fan-out, cache probe)
+    // always put an instruction in the delta.
+    let mut layers: Vec<(usize, serde_json::Map<String, Value>)> = Vec::new();
+    for (slot, map) in [session_map, task_map, delta_map].into_iter().enumerate() {
+        if !map.is_empty() {
+            layers.push((slot, map));
+        }
+    }
+    let last = layers.len().saturating_sub(1);
+    let mut out = LayeredPrompt::default();
+    for (position, (slot, map)) in layers.into_iter().enumerate() {
+        let rendered = if position == last {
+            delta_document(map)?
+        } else {
+            stable_document(map)?
+        };
+        match slot {
+            0 => out.session = rendered,
+            1 => out.task = rendered,
+            _ => out.delta = rendered,
+        }
+    }
+    Ok(out)
 }
 
 /// Split any request object into a stable document and a per-call delta, with
@@ -195,6 +278,39 @@ impl<'a> CodePrompt<'a> {
 /// 22 of 24 calls carried a 12.4KB `plan` drawn from only 9 distinct
 /// payloads, and none of it was cacheable because the whole request was one
 /// block.
+/// A prompt rendered as an ordered session / task / delta triple.
+///
+/// `session` is the head that survives across TASKS, not merely across
+/// rounds of one task: on the 2026-08-05 mm/page_alloc.c review the
+/// per-task prefix took 52 distinct values while its
+/// `common_skills` + `previous_findings` head took only 6, because
+/// findings are snapshotted at task start and a whole dispatch wave
+/// shares one snapshot. Splitting there turns 52 cache writes into 6.
+///
+/// Order is load-bearing: Anthropic caches by prefix, so `session`
+/// must be emitted first, `task` second, `delta` last.
+#[derive(Debug, Clone, Default)]
+pub struct LayeredPrompt {
+    pub session: String,
+    pub task: String,
+    pub delta: String,
+}
+
+impl LayeredPrompt {
+    /// The exact text the model sees, for logging.
+    pub fn rendered(&self) -> String {
+        format!("{}{}{}", self.session, self.task, self.delta)
+    }
+
+    /// The cached heads, in order, skipping empty ones.
+    pub fn prefixes(&self) -> Vec<String> {
+        [self.session.clone(), self.task.clone()]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+}
+
 pub fn split_request_documents(
     request: &Value,
     stable_keys: &[&str],
@@ -273,6 +389,157 @@ fn delta_document(map: serde_json::Map<String, Value>) -> serde_json::Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With two layers the bytes must be identical to the existing
+    /// two-document form — no stray `{}`, no shifted separator.
+    #[test]
+    fn layering_preserves_the_rendered_text() {
+        let findings: Vec<Finding> = Vec::new();
+        let skills = serde_json::json!({"kernel": {"body": "..."}});
+        let symbols = vec![serde_json::json!({"name": "free_one_page"})];
+        let cp = CodePrompt::new("audit the pcp path")
+            .with_symbols(&symbols)
+            .with_previous_findings(&findings)
+            .with_common_skills(&skills);
+
+        let flat = cp.to_split_documents(SESSION_KEYS_FOR_TEST).unwrap();
+        let two = cp
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+        assert_eq!(
+            flat.rendered(),
+            two.rendered(),
+            "layering must not change what the model reads"
+        );
+    }
+
+    /// Order is load-bearing: Anthropic caches by prefix, so the
+    /// session head has to come first or it can never be the shared
+    /// part.
+    #[test]
+    fn the_session_layer_is_emitted_first_and_holds_only_its_keys() {
+        let findings: Vec<Finding> = Vec::new();
+        let skills = serde_json::json!({"kernel": {"body": "SKILLBODY"}});
+        let symbols = vec![serde_json::json!({"name": "SYMBOLNAME"})];
+        let cp = CodePrompt::new("QUESTIONTEXT")
+            .with_symbols(&symbols)
+            .with_previous_findings(&findings)
+            .with_common_skills(&skills);
+        let l = cp
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+
+        assert!(l.session.contains("SKILLBODY"));
+        assert!(!l.session.contains("SYMBOLNAME"));
+        assert!(!l.session.contains("QUESTIONTEXT"));
+        assert!(l.task.contains("SYMBOLNAME"));
+        assert!(l.task.contains("QUESTIONTEXT"));
+        assert_eq!(l.prefixes(), vec![l.session.clone(), l.task.clone()]);
+        assert!(l.rendered().starts_with(&l.session));
+    }
+
+    /// Two tasks of one wave differ only in their task layer. That is
+    /// the entire saving: 6 session writes instead of 52.
+    #[test]
+    fn two_tasks_sharing_a_wave_share_the_session_layer() {
+        let findings: Vec<Finding> = Vec::new();
+        let skills = serde_json::json!({"kernel": {"body": "..."}});
+        let a_syms = vec![serde_json::json!({"name": "task_a"})];
+        let b_syms = vec![serde_json::json!({"name": "task_b"})];
+        let a = CodePrompt::new("audit A")
+            .with_symbols(&a_syms)
+            .with_previous_findings(&findings)
+            .with_common_skills(&skills)
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+        let b = CodePrompt::new("audit B")
+            .with_symbols(&b_syms)
+            .with_previous_findings(&findings)
+            .with_common_skills(&skills)
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+        assert_eq!(a.session, b.session, "session head must be byte-identical");
+        assert_ne!(a.task, b.task);
+    }
+
+    /// An empty layer must not spend one of the four `cache_control`
+    /// slots, and must not render as a stray `{}`.
+    #[test]
+    fn an_empty_session_layer_is_dropped_not_emitted() {
+        let cp = CodePrompt::new("just a question");
+        let l = cp
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+        assert!(l.session.is_empty());
+        assert_eq!(l.prefixes().len(), 1, "only the task head is cacheable");
+        assert_eq!(
+            l.rendered(),
+            cp.to_split_documents(SESSION_KEYS_FOR_TEST)
+                .unwrap()
+                .rendered()
+        );
+    }
+
+    /// The three-layer case the lens fan-out actually uses. Every
+    /// field and value survives and the order is unchanged; what moves
+    /// is one document boundary, splitting the former single stable
+    /// object in two. Assert exactly that, so nobody later "fixes" the
+    /// boundary back and silently kills the shared session block.
+    #[test]
+    fn three_layers_keep_every_field_and_only_move_a_document_boundary() {
+        let findings: Vec<Finding> = Vec::new();
+        let skills = json!({"kernel": {"body": "SKILLBODY"}});
+        let symbols = vec![json!({"name": "SYMBOLNAME"})];
+        let cp = CodePrompt::new("QUESTIONTEXT")
+            .with_symbols(&symbols)
+            .with_previous_findings(&findings)
+            .with_common_skills(&skills)
+            .with_lens_instruction("LENSINSTRUCTION");
+
+        // What the lens path did before: one stable document over the
+        // union of both key sets, plus the per-lens delta.
+        let union: Vec<&str> = SESSION_KEYS_FOR_TEST
+            .iter()
+            .chain(TASK_KEYS_FOR_TEST.iter())
+            .copied()
+            .collect();
+        let flat = cp.to_split_documents(&union).unwrap();
+        let l = cp
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+
+        // The pipeline still computes `lens_suffix` from the union, so
+        // the layered delta must be byte-identical to it or the two
+        // halves stop fitting together.
+        assert_eq!(l.delta, cp.to_delta_document(&union).unwrap());
+        assert_eq!(l.delta, flat.delta);
+        assert!(l.delta.contains("LENSINSTRUCTION"));
+        assert!(!l.delta.contains("QUESTIONTEXT"));
+
+        // Every value survives, in the same order.
+        for needle in ["SKILLBODY", "QUESTIONTEXT", "SYMBOLNAME", "LENSINSTRUCTION"] {
+            assert!(l.rendered().contains(needle), "lost {needle}");
+        }
+        let r = l.rendered();
+        assert!(r.find("SKILLBODY") < r.find("QUESTIONTEXT"));
+        assert!(r.find("QUESTIONTEXT") < r.find("LENSINSTRUCTION"));
+
+        // The one intended difference: three documents, not two.
+        let docs = |t: &str| {
+            serde_json::Deserializer::from_str(t)
+                .into_iter::<Value>()
+                .count()
+        };
+        assert_eq!(docs(&flat.rendered()), 2);
+        assert_eq!(docs(&r), 3, "the session head is its own document");
+        // ...and every one of them still parses.
+        for d in serde_json::Deserializer::from_str(&r).into_iter::<Value>() {
+            assert!(d.expect("each layer is a valid JSON document").is_object());
+        }
+    }
+
+    const SESSION_KEYS_FOR_TEST: &[&str] = &["common_skills", "previous_findings"];
+    const TASK_KEYS_FOR_TEST: &[&str] = &["question", "symbols", "context", "skills", "plan"];
     use serde_json::json;
 
     #[test]

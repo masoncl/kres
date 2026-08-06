@@ -4556,7 +4556,7 @@ impl Session {
             role: "user".into(),
             content: body.clone(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         if let Some(lg) = &self.logger {
             let request = cfg.request_meta();

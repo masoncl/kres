@@ -200,6 +200,42 @@ const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
     "plan",
 ];
 
+/// The head of the lens prefix that survives across TASKS, not merely
+/// across the lenses of one task.
+///
+/// Measured over the 265 lens prompts of the 2026-08-05
+/// mm/page_alloc.c review, by how many distinct values each field took:
+///
+///   common_skills       1     mean  17,265 chars
+///   parallel_lenses     4     mean   1,346
+///   previous_findings   5     mean 174,193   <- the prize
+///   skills              6     mean  26,386
+///   plan               18     mean   4,805
+///   context            44     mean   5,642
+///   symbols            48     mean  10,676
+///   question           52     mean  24,367
+///
+/// `previous_findings` averages 174KB and peaks at 352KB, yet takes
+/// only 5 values across 245 calls: it is snapshotted at task start, so
+/// a whole dispatch wave shares one snapshot. Splitting the prefix
+/// here takes the run from 52 writes of the full 12.86M chars to 6
+/// writes of this head plus 52 of the tail — 4.52M, a 64.9% cut.
+///
+/// `skills` and `plan` are deliberately excluded even though each has
+/// few distinct values on its own: replaying the same prompts with
+/// `skills` added takes the head from 6 distinct values to 23 (41.3%
+/// saving instead of 64.9%), because its variation does not line up
+/// with the finding generations. `plan` carries a per-task
+/// `active_step_id`. Do not add a field here without re-running that
+/// count — a head that varies per task is strictly worse than no
+/// split at all.
+const LENS_SESSION_CACHE_FIELDS: &[&str] = &["common_skills", "previous_findings"];
+
+/// The rest of the shared prefix: everything scoped to one task. Must
+/// partition `LENS_SHARED_CACHE_FIELDS` together with
+/// `LENS_SESSION_CACHE_FIELDS`, or the per-lens delta changes shape.
+const LENS_TASK_CACHE_FIELDS: &[&str] = &["question", "symbols", "context", "skills", "plan"];
+
 /// Abstraction over the main-agent's data-fetch capability.
 /// Implementations route followups to MCP tools, grep, read, git.
 #[async_trait]
@@ -278,7 +314,8 @@ pub struct LensRepairPolicy<'a> {
 
 struct PreparedLensFanout {
     prompt: String,
-    shared_prefix: String,
+    session_prefix: String,
+    task_prefix: String,
     slow_variants: Vec<SlowAgentVariant>,
     symbols: Vec<Value>,
     context: Vec<Value>,
@@ -304,7 +341,8 @@ struct LensCallSpec {
 /// `build_lens_call_future` invocation. Keeps the call-builder
 /// signature narrow.
 struct LensCallContext {
-    shared_prefix: String,
+    session_prefix: String,
+    task_prefix: String,
     task_brief: String,
     shutdown: Shutdown,
     usage: Option<Arc<UsageTracker>>,
@@ -691,7 +729,8 @@ fn build_cache_probe_future(
         supplemental_lens_only: _,
     } = variant;
     let LensCallContext {
-        shared_prefix,
+        session_prefix,
+        task_prefix,
         task_brief,
         shutdown,
         usage,
@@ -699,13 +738,20 @@ fn build_cache_probe_future(
     } = ctx;
     let log_label = format!("phase=cache-probe task={task_brief} model={model_label}");
     let delta = cache_probe_delta();
-    let logged = format!("{shared_prefix}{delta}");
+    let logged = format!("{session_prefix}{task_prefix}{delta}");
+    // Two cached blocks + the system prompt = three of Anthropic's
+    // four `cache_control` slots. The tail is deliberately uncached:
+    // it is a throwaway instruction no sibling will ever re-send.
+    let prefixes: Vec<String> = [session_prefix, task_prefix]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect();
     async move {
         let messages = vec![Message {
             role: "user".into(),
             content: delta,
             cache: false,
-            cached_prefix: Some(shared_prefix),
+            cached_prefixes: prefixes,
         }];
         // Identical config to a real lens call: only the delta differs.
         let cfg = slow_variant_call_config(
@@ -776,7 +822,8 @@ fn build_lens_call_future(
         supplemental_lens_only: _,
     } = variant;
     let LensCallContext {
-        shared_prefix,
+        session_prefix,
+        task_prefix,
         task_brief,
         shutdown,
         usage,
@@ -784,21 +831,25 @@ fn build_lens_call_future(
     } = ctx;
     let lens_label = format!("lens {lens_name} ({model_label})");
     let log_label = format!("phase=slow-lens task={task_brief} lens={lens_id} model={model_label}");
-    let lens_logged = format!("{shared_prefix}{lens_suffix}");
+    let lens_logged = format!("{session_prefix}{task_prefix}{lens_suffix}");
+    let prefixes: Vec<String> = [session_prefix, task_prefix]
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect();
     async move {
         let messages = if use_cache {
             vec![Message {
                 role: "user".into(),
                 content: lens_suffix,
                 cache: false,
-                cached_prefix: Some(shared_prefix),
+                cached_prefixes: prefixes,
             }]
         } else {
             vec![Message {
                 role: "user".into(),
                 content: lens_logged.clone(),
                 cache: false,
-                cached_prefix: None,
+                cached_prefixes: Vec::new(),
             }]
         };
         let cfg = slow_variant_call_config(
@@ -1026,7 +1077,7 @@ impl AgentRunner {
             role: "user".into(),
             content: prompt_tail.to_string(),
             cache: cached_prefix.is_some(),
-            cached_prefix: cached_prefix.map(str::to_string),
+            cached_prefixes: Vec::from_iter(cached_prefix.map(str::to_string)),
         }];
         let mut cfg = CallConfig::defaults_for(self.slow_model.clone())
             .with_max_tokens(self.slow_max_tokens)
@@ -1169,7 +1220,7 @@ impl AgentRunner {
             role: "user".into(),
             content: slow_logged.clone(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         // Route the synthesis call to the fast client when the
         // caller (typically a workflow step declared `agent: fast`)
@@ -1982,13 +2033,16 @@ impl AgentRunner {
         if let Some(ref p) = ctx.plan {
             shared_cp = shared_cp.with_plan(p, ctx.active_plan_step_id.as_deref());
         }
-        let shared_prefix = shared_cp
-            .to_split_documents(LENS_SHARED_CACHE_FIELDS)?
-            .stable;
+        // Two cached heads rather than one: the session head is byte-
+        // stable across tasks, so only the task head is rewritten per
+        // task. See LENS_SESSION_CACHE_FIELDS for the measurement.
+        let layered =
+            shared_cp.to_layered_documents(LENS_SESSION_CACHE_FIELDS, LENS_TASK_CACHE_FIELDS)?;
 
         Ok(PreparedLensFanout {
             prompt: prompt.to_string(),
-            shared_prefix,
+            session_prefix: layered.session,
+            task_prefix: layered.task,
             slow_variants,
             symbols,
             context,
@@ -2093,7 +2147,8 @@ impl AgentRunner {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let shared_prefix = prepared.shared_prefix.clone();
+            let session_prefix = prepared.session_prefix.clone();
+            let task_prefix = prepared.task_prefix.clone();
             let task_brief = ctx.task_brief.clone();
             let shutdown = shutdown.clone();
             let usage = self.usage.clone();
@@ -2101,7 +2156,8 @@ impl AgentRunner {
             async move {
                 let make_future = |spec: LensCallSpec, use_cache: bool| {
                     let ctx = LensCallContext {
-                        shared_prefix: shared_prefix.clone(),
+                        session_prefix: session_prefix.clone(),
+                        task_prefix: task_prefix.clone(),
                         task_brief: task_brief.clone(),
                         shutdown: shutdown.clone(),
                         usage: usage.clone(),
@@ -2133,7 +2189,8 @@ impl AgentRunner {
                             .await;
                         }
                         let probe_ctx = LensCallContext {
-                            shared_prefix: shared_prefix.clone(),
+                            session_prefix: session_prefix.clone(),
+                            task_prefix: task_prefix.clone(),
                             task_brief: task_brief.clone(),
                             shutdown: shutdown.clone(),
                             usage: usage.clone(),
@@ -2394,10 +2451,10 @@ impl AgentRunner {
                 role: "user".into(),
                 content: split.delta,
                 cache: true,
-                cached_prefix: if split.stable.is_empty() {
-                    None
+                cached_prefixes: if split.stable.is_empty() {
+                    Vec::new()
                 } else {
-                    Some(split.stable)
+                    vec![split.stable]
                 },
             });
             mark_last_n_user_cached(&mut history, 2);
@@ -2407,7 +2464,7 @@ impl AgentRunner {
                         "role": message.role,
                         "content": format!(
                             "{}{}",
-                            message.cached_prefix.as_deref().unwrap_or(""),
+                            message.cached_prefixes.concat(),
                             message.content
                         ),
                     })
@@ -2973,6 +3030,45 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session and task key sets must exactly partition the shared
+    /// prefix. `lens_suffix` is still computed from the union, so a key
+    /// missing from both would land in every lens's delta (defeating
+    /// the cache) and a key in both would be emitted twice.
+    #[test]
+    fn session_and_task_keys_partition_the_shared_prefix() {
+        use std::collections::BTreeSet;
+        let session: BTreeSet<&str> = LENS_SESSION_CACHE_FIELDS.iter().copied().collect();
+        let task: BTreeSet<&str> = LENS_TASK_CACHE_FIELDS.iter().copied().collect();
+        let shared: BTreeSet<&str> = LENS_SHARED_CACHE_FIELDS.iter().copied().collect();
+
+        assert!(
+            session.is_disjoint(&task),
+            "a key in both layers would be emitted twice: {:?}",
+            session.intersection(&task).collect::<Vec<_>>()
+        );
+        let union: BTreeSet<&str> = session.union(&task).copied().collect();
+        assert_eq!(
+            union, shared,
+            "session + task must equal the shared prefix exactly"
+        );
+    }
+
+    /// Guard the measurement that justifies the split. `previous_findings`
+    /// is the field worth caching across tasks — 174KB mean, 352KB peak,
+    /// but only 5 distinct values over 245 calls on the 2026-08-05 run.
+    /// `plan` carries a per-task `active_step_id` and must stay task-scoped.
+    #[test]
+    fn the_session_layer_holds_the_cross_task_stable_fields() {
+        assert!(LENS_SESSION_CACHE_FIELDS.contains(&"previous_findings"));
+        assert!(LENS_SESSION_CACHE_FIELDS.contains(&"common_skills"));
+        for per_task in ["question", "symbols", "context", "plan"] {
+            assert!(
+                !LENS_SESSION_CACHE_FIELDS.contains(&per_task),
+                "`{per_task}` varies per task; caching it across tasks is worse than no split"
+            );
+        }
+    }
 
     /// The prioritization agent and the slow lenses must resolve the
     /// same system prompt or they can never share a cached prefix:

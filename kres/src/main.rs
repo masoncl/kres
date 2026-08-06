@@ -2214,7 +2214,7 @@ async fn run_test(args: TestArgs) -> Result<()> {
         role: "user".into(),
         content: args.prompt,
         cache: false,
-        cached_prefix: None,
+        cached_prefixes: Vec::new(),
     }];
 
     let resp = client.messages(&cfg, &messages).await?;

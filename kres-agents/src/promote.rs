@@ -173,7 +173,7 @@ pub async fn promote_prose_bugs_with_logger(
         role: "user".into(),
         content: request_text,
         cache: false,
-        cached_prefix: None,
+        cached_prefixes: Vec::new(),
     }];
     if let Some(lg) = &logger {
         let request = cfg.request_meta();

@@ -1048,7 +1048,7 @@ async fn stage_render(
                 role: "user".into(),
                 content: split.delta,
                 cache: false,
-                cached_prefix: (!split.stable.is_empty()).then_some(split.stable),
+                cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then_some(split.stable)),
             }]
         } else {
             vec![user_message(&serde_json::to_string(&request)?)]
@@ -1501,7 +1501,7 @@ fn user_message(content: &str) -> Message {
         role: "user".into(),
         content: content.to_string(),
         cache: false,
-        cached_prefix: None,
+        cached_prefixes: Vec::new(),
     }
 }
 
@@ -1567,13 +1567,7 @@ async fn try_call_and_extract(
         let request = call.cfg.request_meta();
         let rendered = messages
             .iter()
-            .map(|message| {
-                format!(
-                    "{}{}",
-                    message.cached_prefix.as_deref().unwrap_or(""),
-                    message.content
-                )
-            })
+            .map(|message| format!("{}{}", message.cached_prefixes.concat(), message.content))
             .collect::<Vec<_>>()
             .join("\n");
         logger.log_code_labeled_with_request(

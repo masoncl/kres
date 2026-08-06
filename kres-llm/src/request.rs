@@ -8,10 +8,13 @@ use crate::{config::CallConfig, model::ThinkingBudget};
 ///
 /// `content` is the per-round / volatile text. `cache` tells the
 /// serialiser to wrap the entire body in a single ephemeral cache
-/// block. `cached_prefix` is an optional stable head of the content
-/// (e.g. the `skills + question` portion of a CodePrompt that doesn't
-/// change across gather rounds). When set, the wire form becomes
-/// two text blocks:
+/// block. `cached_prefixes` are stable heads of the content, emitted
+/// in order before it, each as its own cached block. One prefix is
+/// the common case (e.g. the `skills + question` portion of a
+/// CodePrompt that doesn't change across gather rounds). Two is used
+/// by the lens fan-out, which separates a session-scoped head from a
+/// task-scoped one so the session head survives across tasks. With
+/// one prefix the wire form is two text blocks:
 ///
 /// ```json
 /// [
@@ -29,13 +32,20 @@ pub struct Message {
     pub role: String,
     pub content: String,
     pub cache: bool,
-    /// Static prefix emitted as a separately-cached content block
-    /// before `content`. Set via `Message::with_cached_prefix` when
-    /// the caller has isolated a stable head that should cache-hit
-    /// across rounds even when `content` changes. Anthropic requires
-    /// ≥1024 tokens per cached block; callers choose the split point
-    /// with that in mind.
-    pub cached_prefix: Option<String>,
+    /// Static prefixes emitted as separately-cached content blocks,
+    /// in order, before `content`. Set via
+    /// `Message::with_cached_prefix` / `with_cached_prefixes` when the
+    /// caller has isolated a stable head that should cache-hit across
+    /// rounds even when `content` changes.
+    ///
+    /// Anthropic requires >=1024 tokens per cached block and permits
+    /// at most 4 `cache_control` blocks per request, counting the
+    /// system prompt. So a single-message request can afford at most
+    /// three prefixes, and a multi-turn one far fewer — see
+    /// `mark_last_n_user_cached`, which budgets one marker per
+    /// retained user turn. Callers choose split points with both
+    /// limits in mind.
+    pub cached_prefixes: Vec<String>,
 }
 
 impl Message {
@@ -44,7 +54,7 @@ impl Message {
             role: role.into(),
             content: content.into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }
     }
 
@@ -53,7 +63,7 @@ impl Message {
             role: role.into(),
             content: content.into(),
             cache: true,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }
     }
 
@@ -61,7 +71,23 @@ impl Message {
     /// block on the wire. `content` becomes the tail. Concatenated
     /// prefix + content is what the model sees.
     pub fn with_cached_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.cached_prefix = Some(prefix.into());
+        self.cached_prefixes = vec![prefix.into()];
+        self
+    }
+
+    /// Ordered cached heads. Empty entries are dropped: an empty
+    /// block is not cacheable and would only spend one of the four
+    /// `cache_control` slots.
+    pub fn with_cached_prefixes<I, S>(mut self, prefixes: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cached_prefixes = prefixes
+            .into_iter()
+            .map(Into::into)
+            .filter(|p: &String| !p.is_empty())
+            .collect();
         self
     }
 }
@@ -71,18 +97,24 @@ impl serde::Serialize for Message {
         use serde::ser::SerializeStruct;
         let mut obj = s.serialize_struct("Message", 2)?;
         obj.serialize_field("role", &self.role)?;
-        match (&self.cached_prefix, self.cache) {
-            (Some(prefix), want_cache_tail) => {
-                // Two-block form. The prefix is always cached (that's
+        match (self.cached_prefixes.is_empty(), self.cache) {
+            (false, want_cache_tail) => {
+                // Multi-block form. Every prefix is cached (that's
                 // the whole point); the tail is cached when the
                 // caller asked for it (usual case: latest user turn
                 // stays cached so the next round can extend the cache
                 // boundary past it).
-                let mut blocks = vec![serde_json::json!({
-                    "type": "text",
-                    "text": prefix,
-                    "cache_control": {"type": "ephemeral"},
-                })];
+                let mut blocks: Vec<serde_json::Value> = self
+                    .cached_prefixes
+                    .iter()
+                    .map(|prefix| {
+                        serde_json::json!({
+                            "type": "text",
+                            "text": prefix,
+                            "cache_control": {"type": "ephemeral"},
+                        })
+                    })
+                    .collect();
                 if want_cache_tail {
                     blocks.push(serde_json::json!({
                         "type": "text",
@@ -97,7 +129,7 @@ impl serde::Serialize for Message {
                 }
                 obj.serialize_field("content", &blocks)?;
             }
-            (None, true) => {
+            (true, true) => {
                 let block = serde_json::json!([{
                     "type": "text",
                     "text": self.content,
@@ -105,7 +137,7 @@ impl serde::Serialize for Message {
                 }]);
                 obj.serialize_field("content", &block)?;
             }
-            (None, false) => {
+            (true, false) => {
                 obj.serialize_field("content", &self.content)?;
             }
         }
@@ -120,10 +152,12 @@ impl serde::Serialize for Message {
 pub fn strip_cache_flags(msgs: &mut [Message]) {
     for m in msgs {
         m.cache = false;
-        if let Some(prefix) = m.cached_prefix.take() {
+        if !m.cached_prefixes.is_empty() {
             // Keep the TEXT the model sees identical — fold the
-            // stripped prefix back into `content` as a plain head.
-            m.content = format!("{prefix}{}", m.content);
+            // stripped prefixes back into `content` as a plain head,
+            // in the order they would have been emitted.
+            let head = std::mem::take(&mut m.cached_prefixes).concat();
+            m.content = format!("{head}{}", m.content);
         }
     }
 }
@@ -167,8 +201,9 @@ pub fn mark_last_n_user_cached(msgs: &mut [Message], n: usize) {
             kept += 1;
         } else {
             m.cache = false;
-            if let Some(prefix) = m.cached_prefix.take() {
-                m.content = format!("{prefix}{}", m.content);
+            if !m.cached_prefixes.is_empty() {
+                let head = std::mem::take(&mut m.cached_prefixes).concat();
+                m.content = format!("{head}{}", m.content);
             }
         }
     }
@@ -224,15 +259,80 @@ mod cache_helpers_tests {
                 role: "user".into(),
                 content: "tail".into(),
                 cache: true,
-                cached_prefix: Some("head-".into()),
+                cached_prefixes: vec!["head-".into()],
             },
             a("a1"),
             u("latest"),
         ];
         mark_last_n_user_cached(&mut h, 1); // keep only `latest`
         assert!(!h[0].cache);
-        assert!(h[0].cached_prefix.is_none());
+        assert!(h[0].cached_prefixes.is_empty());
         assert_eq!(h[0].content, "head-tail", "prefix folded");
+    }
+
+    /// Two cached heads render as two `cache_control` blocks ahead of
+    /// the tail, in order. Order is the whole mechanism: Anthropic
+    /// caches by prefix, so a session head that is not first can never
+    /// be the shared part.
+    #[test]
+    fn two_cached_prefixes_serialize_as_two_ordered_cached_blocks() {
+        let m = Message {
+            role: "user".into(),
+            content: "DELTA".into(),
+            cache: false,
+            cached_prefixes: vec!["SESSION".into(), "TASK".into()],
+        };
+        let v = serde_json::to_value(&m).expect("serializes");
+        let blocks = v["content"].as_array().expect("block array");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"], "SESSION");
+        assert_eq!(blocks[1]["text"], "TASK");
+        assert_eq!(blocks[2]["text"], "DELTA");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(
+            blocks[2].get("cache_control").is_none(),
+            "an uncached tail must not spend a cache_control slot"
+        );
+    }
+
+    /// System + two heads + a cached tail is exactly Anthropic's cap of
+    /// four. The lens path leaves the tail uncached, so it sits at
+    /// three; this asserts the ceiling is understood, not exceeded.
+    #[test]
+    fn a_cached_tail_alongside_two_heads_uses_three_message_slots() {
+        let m = Message {
+            role: "user".into(),
+            content: "DELTA".into(),
+            cache: true,
+            cached_prefixes: vec!["SESSION".into(), "TASK".into()],
+        };
+        let v = serde_json::to_value(&m).expect("serializes");
+        let blocks = v["content"].as_array().expect("block array");
+        let cached = blocks
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        assert_eq!(cached, 3, "system prompt would make four — the cap");
+    }
+
+    /// Folding must restore the exact text, in order, or a stripped
+    /// history turn shows the model something different from what it
+    /// saw when the turn was live.
+    #[test]
+    fn folding_two_prefixes_preserves_order_and_text() {
+        let mut h = vec![
+            Message {
+                role: "user".into(),
+                content: "TAIL".into(),
+                cache: true,
+                cached_prefixes: vec!["SESSION-".into(), "TASK-".into()],
+            },
+            u("latest"),
+        ];
+        mark_last_n_user_cached(&mut h, 1);
+        assert!(h[0].cached_prefixes.is_empty());
+        assert_eq!(h[0].content, "SESSION-TASK-TAIL");
     }
 }
 
@@ -415,7 +515,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         let req = MessagesRequest::from_config(&cfg, &msgs, false);
         let v: Value = serde_json::to_value(&req).unwrap();
@@ -431,7 +531,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         let req = MessagesRequest::from_config(&cfg, &msgs, false);
         let v: Value = serde_json::to_value(&req).unwrap();
@@ -459,7 +559,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         let req = MessagesRequest::from_config(&cfg, &msgs, false);
         let v: Value = serde_json::to_value(&req).unwrap();
@@ -482,7 +582,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         let req = MessagesRequest::from_config(&cfg, &msgs, false);
         let v: Value = serde_json::to_value(&req).unwrap();
@@ -499,7 +599,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         let req = MessagesRequest::from_config(&cfg, &msgs, false);
         let v: Value = serde_json::to_value(&req).unwrap();
@@ -517,7 +617,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         let req = MessagesRequest::from_config(&cfg, &msgs, true);
         let v = serde_json::to_value(&req).unwrap();

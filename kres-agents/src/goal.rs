@@ -248,7 +248,7 @@ pub async fn define_goal(
         role: "user".into(),
         content: body.clone(),
         cache: false,
-        cached_prefix: None,
+        cached_prefixes: Vec::new(),
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();
@@ -417,7 +417,7 @@ pub async fn check_goal(
         role: "user".into(),
         content: split.delta,
         cache: false,
-        cached_prefix: (!split.stable.is_empty()).then_some(split.stable),
+        cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then_some(split.stable)),
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();
@@ -567,7 +567,7 @@ pub async fn define_plan(
         role: "user".into(),
         content: body.clone(),
         cache: false,
-        cached_prefix: None,
+        cached_prefixes: Vec::new(),
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();

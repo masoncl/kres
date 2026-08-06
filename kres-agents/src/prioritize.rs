@@ -207,7 +207,7 @@ pub async fn prioritize_pending_with_logger(
         role: "user".into(),
         content: split.delta.clone(),
         cache: false,
-        cached_prefix: (!split.stable.is_empty()).then(|| split.stable.clone()),
+        cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then(|| split.stable.clone())),
     }];
     if let Some(lg) = &logger {
         let meta = cfg.request_meta();

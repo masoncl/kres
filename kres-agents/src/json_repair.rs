@@ -303,7 +303,7 @@ pub async fn repair_json_response(
         role: "user".into(),
         content: body,
         cache: false,
-        cached_prefix: None,
+        cached_prefixes: Vec::new(),
     }];
     let response = if let Some(shutdown) = call.shutdown {
         tokio::select! {

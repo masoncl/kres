@@ -215,7 +215,7 @@ impl DataFetcher for MainAgent {
             role: "user".into(),
             content: opening.clone(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         self.log_user(&opening, &cfg);
 
@@ -281,7 +281,7 @@ impl DataFetcher for MainAgent {
                 role: "assistant".into(),
                 content: history_content,
                 cache: false,
-                cached_prefix: None,
+                cached_prefixes: Vec::new(),
             });
             let actions = match parsed_actions {
                 Ok((actions, _display)) => actions,
@@ -304,7 +304,7 @@ impl DataFetcher for MainAgent {
                         role: "user".into(),
                         content: correction,
                         cache: false,
-                        cached_prefix: None,
+                        cached_prefixes: Vec::new(),
                     });
                     continue;
                 }
@@ -362,7 +362,7 @@ impl DataFetcher for MainAgent {
                 role: "user".into(),
                 content: tool_msg,
                 cache: false,
-                cached_prefix: None,
+                cached_prefixes: Vec::new(),
             });
         }
 

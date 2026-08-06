@@ -80,7 +80,7 @@ pub async fn run_turn(args: TurnArgs) -> Result<()> {
         role: "user".into(),
         content: context,
         cache: false,
-        cached_prefix: None,
+        cached_prefixes: Vec::new(),
     }];
     let mut stream = client.stream_messages(&cfg, &messages).await?;
 

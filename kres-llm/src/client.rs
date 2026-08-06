@@ -1018,7 +1018,7 @@ impl Client {
         for message in messages {
             prompt.push_str(&message.role.to_ascii_uppercase());
             prompt.push('\n');
-            if let Some(prefix) = message.cached_prefix.as_deref() {
+            for prefix in &message.cached_prefixes {
                 prompt.push_str(prefix);
             }
             prompt.push_str(&message.content);
@@ -1261,7 +1261,7 @@ impl Client {
         for message in messages {
             prompt.push_str(&message.role.to_ascii_uppercase());
             prompt.push('\n');
-            if let Some(prefix) = message.cached_prefix.as_deref() {
+            for prefix in &message.cached_prefixes {
                 prompt.push_str(prefix);
             }
             prompt.push_str(&message.content);
@@ -1374,7 +1374,7 @@ fn estimate_message_tokens(messages: &[Message]) -> u64 {
     messages
         .iter()
         .map(|m| {
-            let prefix = m.cached_prefix.as_ref().map(|s| s.len()).unwrap_or(0);
+            let prefix: usize = m.cached_prefixes.iter().map(String::len).sum();
             ((prefix + m.content.len()) / 4) as u64
         })
         .sum()
@@ -1482,9 +1482,10 @@ impl OpenAiResponsesRequest {
                 };
                 OpenAiResponsesInputMessage {
                     role: role.to_string(),
-                    content: match &m.cached_prefix {
-                        Some(prefix) => format!("{prefix}{}", m.content),
-                        None => m.content.clone(),
+                    content: if m.cached_prefixes.is_empty() {
+                        m.content.clone()
+                    } else {
+                        format!("{}{}", m.cached_prefixes.concat(), m.content)
                     },
                 }
             })
@@ -1636,9 +1637,10 @@ impl OpenAiChatRequest {
             };
             out.push(OpenAiChatMessage {
                 role: role.to_string(),
-                content: match &m.cached_prefix {
-                    Some(prefix) => format!("{prefix}{}", m.content),
-                    None => m.content.clone(),
+                content: if m.cached_prefixes.is_empty() {
+                    m.content.clone()
+                } else {
+                    format!("{}{}", m.cached_prefixes.concat(), m.content)
                 },
             });
         }
@@ -2672,7 +2674,7 @@ mod tests {
             role: "user".into(),
             content: "hello".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
 
         assert_eq!(
@@ -2965,7 +2967,7 @@ mod tests {
             role: "user".into(),
             content: "hi".into(),
             cache: false,
-            cached_prefix: None,
+            cached_prefixes: Vec::new(),
         }];
         let res = c.messages(&cfg, &msgs).await;
         // Either an ApiStatus (if something is listening) or Http error

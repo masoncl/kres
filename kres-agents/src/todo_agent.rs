@@ -322,7 +322,7 @@ pub async fn update_todo_via_agent_with_logger(
         role: "user".into(),
         content: split.delta.clone(),
         cache: false,
-        cached_prefix: (!split.stable.is_empty()).then(|| split.stable.clone()),
+        cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then(|| split.stable.clone())),
     }];
     if let Some(lg) = &logger {
         let request = cfg.request_meta();

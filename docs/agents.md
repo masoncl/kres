@@ -23,7 +23,11 @@ remain available for one-off overrides.
   expands every selected model across every active lens.
 - **todo** — for generic sessions, dedups the slow agent's
   followups against the current todo list, reprioritises, and
-  may reshape the plan.
+  may reshape the plan. It edits the list rather than rewriting it:
+  it returns the pending rows in priority order plus typed
+  `newly_done` and `retired` arrays. Done rows, `id`, `step_id`,
+  `depends_on` and settled coverage are Rust-owned, and a pending row
+  it forgets is restored rather than deleted.
 - **consolidator/promoter** — fast-client calls that merge sibling lens
   outputs and recover concrete prose-only bugs. Rust then applies the findings
   delta deterministically; invalidated records remain as negative evidence.

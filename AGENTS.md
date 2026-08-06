@@ -177,6 +177,27 @@ User prompt → Task created → Task thread starts
 - `todo_lock` protects all list mutations from concurrent access
 - Done items preserved even if main agent drops them from its response
 
+The todo list is Rust-owned and the agent's reply is a set of edits
+against it, not a rewrite of it (`kres-agents/src/todo_agent.rs`,
+`reconcile_update`). The agent controls prose (`name`, `reason`,
+`type`), priority (the order of `todo`), completion (`newly_done`)
+and retirement (`retired`). It controls nothing else:
+
+- `todo` carries the PENDING list only. Done rows are reconstructed
+  from Rust's own copy, so the agent never re-emits them.
+- `id`, `step_id` and `depends_on` on an existing row are restored
+  from the original. Do not ask the agent to re-emit fields Rust
+  overwrites; that is pure output cost.
+- Coverage is write-once, at the completion that first marks a row
+  Done. Later rounds cannot paraphrase settled evidence.
+- Omission is not deletion. A pending row the agent neither kept,
+  completed, nor retired is restored and the drop is logged.
+  Deleting work requires naming it in `retired`.
+
+Do not widen this contract back out. If the agent needs to change
+something, add a typed channel for it; do not let it restate the
+whole list and have Rust guess which differences were intentional.
+
 ### Goal System
 - Before processing, main agent defines a concrete completion goal
 - After slow agent finishes, main agent checks if goal is met
@@ -527,16 +548,20 @@ XML containing data-fetch requests (`read`, `source`, `git`, `grep`,
 `mcp`, `make`, `bash`), or JSON with `goal`/`mode` (initial goal
 definition) or `todo` (todo-list updates).
 
-**Todo agent responses** — JSON with a `todo` key containing the
-full todo list. Each item has:
+**Todo agent responses** — JSON edits against the Rust-owned list.
+Logs from before this contract carry the full list under `todo`
+instead; both shapes parse.
 
 | Field | Description |
 |-------|-------------|
-| `id` | Stable identifier (e.g. `research-done`, `compile-triage`) |
-| `name` | Human-readable description |
-| `status` | `pending`, `done`, `blocked`, `skipped` |
-| `reason` | Why the item was created or completed |
-| `depends_on` | List of item ids that must complete first |
+| `todo` | Pending rows only, in priority order. Each carries `id` (the handle), `name`, `reason`, `type`. A row absent from `current_todo` is new and also carries `depends_on` and `step_id` |
+| `newly_done` | `[{id, coverage}]` — completions. `coverage` is written once, at this completion |
+| `retired` | `[{id, reason}]` — pending rows deliberately abandoned. Logged, not stored |
+| `plan` | Optional `{steps:[...]}` rewrite |
+
+A pending row that appears in `current_todo` but in none of the three
+arrays is restored by `reconcile_update` and logged as "dropped … live
+item(s) without retiring them".
 
 **Plain text responses** from the main agent (e.g. `"done"`,
 `"compile clean — ..."`) appear between action rounds when the

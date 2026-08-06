@@ -65,11 +65,50 @@ fn record_usage(tc: &TodoClient, usage: &kres_llm::request::Usage) {
     }
 }
 
+/// One completion the agent declares this round. Replaces re-emitting
+/// the whole done row: Rust already owns every field of a done item
+/// except the coverage sentence, which is written exactly once — when
+/// the item first reaches Done.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DoneMark {
+    /// `id` of an item in `current_todo`.
+    id: String,
+    /// 1-2 sentences naming the files, symbols and line ranges the
+    /// analysis examined, plus the bottom-line finding. Consumed by
+    /// the DEDUP step of later calls.
+    #[serde(default)]
+    coverage: String,
+}
+
+/// One deliberate retirement. Omitting a pending row used to be the
+/// only way to delete it, which made deletion indistinguishable from
+/// a truncated or forgetful reply — at call 20 of the 2026-08-05
+/// mm/page_alloc.c review the agent was handed 57 rows and returned
+/// 34, and nothing restored the missing 23.
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RetireMark {
+    /// `id` of a pending item in `current_todo`.
+    id: String,
+    /// Why the work is no longer worth doing. Logged, not stored.
+    #[serde(default)]
+    reason: String,
+}
+
 /// Parsed response shape from the todo agent.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TodoUpdateResponse {
+    /// The PENDING list only, in the order it should execute. Done
+    /// rows are Rust-owned and must not appear here.
     todo: Vec<TodoItem>,
+    /// Items that reached Done this round.
+    #[serde(default)]
+    newly_done: Vec<DoneMark>,
+    /// Pending items the agent is deliberately abandoning.
+    #[serde(default)]
+    retired: Vec<RetireMark>,
     /// Optional rewritten plan the agent wants to substitute. Agents
     /// may emit this when the existing plan no longer matches the
     /// work actually being done (e.g. a step is complete and the
@@ -143,6 +182,11 @@ pub async fn update_todo_via_agent_with_logger(
     let mut todo_list = current_todo.to_vec();
     assign_ids(&mut todo_list);
     mark_completed_todo(&mut todo_list, completed_todo_id);
+    // The reaped item is Done before the call so the agent cannot
+    // reopen it, but its coverage is left empty on purpose: the whole
+    // point of this round is for the agent to write that sentence via
+    // `newly_done`. `stamp_missing_coverage` fills in a placeholder
+    // afterwards only if it declined.
     let current_payload: Vec<Value> = todo_list.iter().map(todo_to_payload).collect();
 
     let lens_payload: Vec<Value> = lenses
@@ -274,7 +318,7 @@ pub async fn update_todo_via_agent_with_logger(
             contract: crate::json_repair::JsonContract {
                 name: "todo-update",
                 schema: &schema,
-                instructions: "Preserve every todo id, status, dependency, reason, coverage field, and plan decision. Correct representation and field types only.",
+                instructions: "Preserve every pending todo id, status, reason, every newly_done id and its coverage sentence, every retired id, and the plan decision. Correct representation and field types only.",
             },
             rejected_response: &text,
             validation_errors: &errors,
@@ -287,139 +331,40 @@ pub async fn update_todo_via_agent_with_logger(
             record_usage(tc, &repaired.usage);
             let contract = crate::json_repair::JsonObjectContract {
                 name: "todo-update",
-                fields: &["todo", "plan"],
+                fields: TODO_RESPONSE_FIELDS,
             };
             if let Ok(response) = contract.accept_repair::<TodoUpdateResponse>(&repaired.text)
             {
-                parsed_envelope = Some((response.todo, response.plan));
+                parsed_envelope = Some(ParsedTodoUpdate::from(response));
             } else {
                 tracing::warn!(target: "kres_agents", "todo JSON repair failed the strict response contract");
             }
         }
     }
-    let (mut parsed, returned_plan) = match parsed_envelope {
-        Some((todo, plan)) => (todo, plan),
-        None => {
-            tracing::warn!(
-                target: "kres_agents",
-                "todo agent returned no parseable list; falling back"
-            );
-            return Ok(TodoUpdate {
-                todo: fallback_dedup(&todo_list, new_followups),
-                plan: None,
-            });
-        }
+    let Some(parsed) = parsed_envelope else {
+        tracing::warn!(
+            target: "kres_agents",
+            "todo agent returned no parseable list; falling back"
+        );
+        return Ok(TodoUpdate {
+            todo: fallback_dedup(&todo_list, new_followups),
+            plan: None,
+        });
     };
+    let returned_plan = parsed.plan.clone();
 
-    reconcile_agent_identities(&mut parsed, &todo_list, completed_todo_id);
-
-    // --- Reconcile with existing done items ---------------------------
-    let (done_from_agent, mut pending_from_agent): (Vec<TodoItem>, Vec<TodoItem>) = parsed
-        .into_iter()
-        .partition(|t| t.status == TodoStatus::Done);
-    let original_done: HashMap<String, TodoItem> = todo_list
-        .iter()
-        .filter(|t| t.status == TodoStatus::Done)
-        .filter(|t| !t.id.is_empty())
-        .map(|t| (t.id.clone(), t.clone()))
-        .collect();
-    let agent_done_ids: HashSet<String> = done_from_agent
-        .iter()
-        .filter(|t| !t.id.is_empty())
-        .map(|t| t.id.clone())
-        .collect();
-    let preserved: Vec<TodoItem> = original_done
-        .iter()
-        .filter(|(id, _)| !agent_done_ids.contains(*id))
-        .map(|(_, t)| t.clone())
-        .collect();
-
-    // Carry forward prior coverage when the agent dropped it.
-    let mut done_final = done_from_agent;
-    for d in &mut done_final {
-        if d.coverage.is_empty() {
-            if let Some(orig) = original_done.get(&d.id) {
-                if !orig.coverage.is_empty() {
-                    d.coverage = orig.coverage.clone();
-                }
-            }
-        }
-    }
-
-    // --- Preserve plan-linked pending items the agent dropped --------
-    // The reconcile loop above trusts the agent for the pending list:
-    // whatever it returns is the new pending state. That breaks when
-    // the agent's response is truncated or it just forgets an item —
-    // a linked plan step is left orphaned, the rollup never flips it
-    // to done, and dependent steps stall. We can't know which case we
-    // are in, but we DO know which pending items are load-bearing for
-    // the plan: those with a `step_id` pointing at a step that is
-    // still alive (not Done/Skipped). Restore those silently.
-    //
-    // Items without a step_id are operator/agent ad-hoc adds — those
-    // we still trust the agent on. Items whose step IS terminal are
-    // legitimately stale and should disappear.
-    if let Some(plan) = plan {
-        let active_step_ids: HashSet<String> = plan
-            .steps
-            .iter()
-            .filter(|s| !s.status.is_terminal())
-            .map(|s| s.id.clone())
-            .collect();
-        let mut agent_emitted_ids: HashSet<String> = HashSet::new();
-        for t in done_final.iter().chain(pending_from_agent.iter()) {
-            if !t.id.is_empty() {
-                agent_emitted_ids.insert(t.id.clone());
-            }
-        }
-        let mut restored: Vec<String> = Vec::new();
-        for orig in todo_list.iter() {
-            if orig.status != TodoStatus::Pending
-                && orig.status != TodoStatus::InProgress
-                && orig.status != TodoStatus::Blocked
-            {
-                continue;
-            }
-            if orig.id.is_empty() || orig.step_id.is_empty() {
-                continue;
-            }
-            if agent_emitted_ids.contains(&orig.id) {
-                continue;
-            }
-            if !active_step_ids.contains(&orig.step_id) {
-                continue;
-            }
-            // Agent dropped a pending item that's still tied to a
-            // live plan step. Restore it as Pending so the work
-            // stays visible; the agent gets another chance next
-            // round to mark it done or genuinely retire it.
-            let mut item = orig.clone();
-            item.status = if orig.status == TodoStatus::InProgress {
-                TodoStatus::InProgress
-            } else {
-                TodoStatus::Pending
-            };
-            restored.push(item.id.clone());
-            pending_from_agent.push(item);
-        }
-        if !restored.is_empty() {
-            tracing::info!(
-                target: "kres_agents",
-                "todo agent dropped {} plan-linked pending item(s); \
-                 restored: {}",
-                restored.len(),
-                restored.join(", ")
-            );
-        }
-    }
+    let Reconciled {
+        done: done_final,
+        pending: pending_from_agent,
+    } = reconcile_update(&todo_list, parsed, plan);
 
     // --- Programmatic dedup backstop for pending items ----------------
     // Two items are duplicates only when they refer to the same code:
     // either both bags lack file-path tokens (pure-prose tasks like
-    // "investigate slab corruption") and ≥70% of remaining tokens
+    // "investigate slab corruption") and >=70% of remaining tokens
     // overlap, OR their path-token sets share at least one path AND
-    // overall token overlap ≥70%. Items whose path-token sets are
-    // both non-empty and disjoint are NEVER duplicates — they
+    // overall token overlap >=70%. Items whose path-token sets are
+    // both non-empty and disjoint are NEVER duplicates -- they
     // operate on different files. This is what keeps sibling
     // compile-verify-v4 / compile-verify-v6 steps from collapsing
     // into one (their .o paths differ even though the surrounding
@@ -427,7 +372,7 @@ pub async fn update_todo_via_agent_with_logger(
     let mut ref_entries: Vec<DedupEntry> = Vec::new();
     let mut completed_ids: HashSet<String> = HashSet::new();
     let mut completed_names: HashSet<String> = HashSet::new();
-    for d in done_final.iter().chain(preserved.iter()) {
+    for d in done_final.iter() {
         if !d.id.is_empty() {
             completed_ids.insert(d.id.clone());
         }
@@ -475,17 +420,16 @@ pub async fn update_todo_via_agent_with_logger(
             dropped
                 .iter()
                 .take(3)
-                .map(|(p, d)| format!("{}≈{}", truncate(p, 40), truncate(d, 40)))
+                .map(|(p, d)| format!("{}~{}", truncate(p, 40), truncate(d, 40)))
                 .collect::<Vec<_>>()
                 .join("; ")
         );
     }
 
-    // Order: done-from-agent, preserved-done, filtered-pending
-    let mut result =
-        Vec::with_capacity(done_final.len() + preserved.len() + filtered_pending.len());
+    // Order: done rows (Rust-owned), then pending in the agent's
+    // priority order.
+    let mut result = Vec::with_capacity(done_final.len() + filtered_pending.len());
     result.extend(done_final);
-    result.extend(preserved);
     result.extend(filtered_pending);
 
     // The agent is told to emit `id` for every item but new pending
@@ -496,6 +440,7 @@ pub async fn update_todo_via_agent_with_logger(
     // ids here before returning so every downstream consumer can
     // count on `id` being populated.
     assign_ids(&mut result);
+    stamp_missing_coverage(&mut result);
 
     Ok(TodoUpdate {
         todo: result,
@@ -503,73 +448,215 @@ pub async fn update_todo_via_agent_with_logger(
     })
 }
 
-/// Preserve scheduler-owned identity and execution state across an
-/// LLM todo rewrite. The model may reprioritize prose, but it cannot
-/// rename existing IDs, detach plan/dependency links, reopen the
-/// completed item, or make another currently-running task dispatchable.
-fn reconcile_agent_identities(
-    parsed: &mut Vec<TodoItem>,
+/// Fields the todo agent may return at top level. Used by the strict
+/// object contract so a reply that only carries e.g. `newly_done` is
+/// still recognised as a todo update rather than rejected outright.
+const TODO_RESPONSE_FIELDS: &[&str] = &["todo", "newly_done", "retired", "plan"];
+
+/// Owned form of `TodoUpdateResponse`, kept separate so the envelope
+/// can be cloned across the JSON-repair retry.
+#[derive(Debug, Clone)]
+struct ParsedTodoUpdate {
+    todo: Vec<TodoItem>,
+    newly_done: Vec<DoneMark>,
+    retired: Vec<RetireMark>,
+    plan: Option<kres_core::PlanRewrite>,
+}
+
+impl From<TodoUpdateResponse> for ParsedTodoUpdate {
+    fn from(r: TodoUpdateResponse) -> Self {
+        Self {
+            todo: r.todo,
+            newly_done: r.newly_done,
+            retired: r.retired,
+            plan: r.plan,
+        }
+    }
+}
+
+/// Result of folding one agent reply into the authoritative list.
+struct Reconciled {
+    /// Every terminal row, in the order it has always had.
+    done: Vec<TodoItem>,
+    /// Live rows in the agent's priority order, restored rows last.
+    pending: Vec<TodoItem>,
+}
+
+/// Fold an agent reply into the caller's list.
+///
+/// The list is Rust-owned; the reply is a set of edits against it. The
+/// agent controls prose (`name`, `reason`, `type`), priority (the order
+/// of `todo`), completion (`newly_done`) and retirement (`retired`).
+/// It controls nothing else. In particular:
+///
+///   * `id`, `step_id` and `depends_on` on an existing row are restored
+///     from the original, so the agent need not re-emit them and cannot
+///     detach a plan link or a dependency edge by paraphrasing.
+///   * Done rows are reconstructed here rather than echoed back, and a
+///     coverage sentence is written exactly once — when the row first
+///     reaches Done. Later rounds cannot paraphrase it away.
+///   * A pending row the agent simply forgot is restored. Deleting work
+///     requires naming it in `retired`.
+fn reconcile_update(
     originals: &[TodoItem],
-    completed_todo_id: Option<&str>,
-) {
-    let by_id: HashMap<&str, &TodoItem> = originals
-        .iter()
-        .filter(|item| !item.id.is_empty())
-        .map(|item| (item.id.as_str(), item))
-        .collect();
-    let by_name: HashMap<String, &TodoItem> = originals
-        .iter()
-        .filter(|item| !item.name.is_empty())
-        .map(|item| (item.name.to_ascii_lowercase(), item))
-        .collect();
+    parsed: ParsedTodoUpdate,
+    plan: Option<&kres_core::Plan>,
+) -> Reconciled {
+    let mut state: Vec<TodoItem> = originals.to_vec();
 
-    for item in parsed.iter_mut() {
-        let original = by_id
-            .get(item.id.as_str())
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut by_name: HashMap<String, usize> = HashMap::new();
+    for (idx, item) in state.iter().enumerate() {
+        if !item.id.is_empty() {
+            by_id.entry(item.id.clone()).or_insert(idx);
+        }
+        if !item.name.is_empty() {
+            by_name.entry(item.name.to_ascii_lowercase()).or_insert(idx);
+        }
+    }
+    let resolve = |id: &str, name: &str| -> Option<usize> {
+        by_id
+            .get(id)
             .copied()
-            .or_else(|| by_name.get(&item.name.to_ascii_lowercase()).copied());
-        let Some(original) = original else {
+            .or_else(|| by_name.get(&name.to_ascii_lowercase()).copied())
+    };
+
+    // --- Completions --------------------------------------------------
+    for mark in &parsed.newly_done {
+        let Some(idx) = resolve(&mark.id, &mark.id) else {
+            tracing::info!(
+                target: "kres_agents",
+                "todo agent marked unknown id '{}' done; ignoring",
+                truncate(&mark.id, 60)
+            );
             continue;
         };
-        item.id.clone_from(&original.id);
-        item.step_id.clone_from(&original.step_id);
-        item.depends_on.clone_from(&original.depends_on);
-        if item.kind.is_empty() {
-            item.kind.clone_from(&original.kind);
-        }
-        let is_completed = completed_todo_id
-            .is_some_and(|id| original.id == id || (original.id.is_empty() && original.name == id));
-        if is_completed {
-            item.status = TodoStatus::Done;
-            if item.coverage.is_empty() {
-                item.coverage = "completed by the reaped task".to_string();
-            }
-        } else if original.status == TodoStatus::InProgress {
-            item.status = TodoStatus::InProgress;
+        state[idx].status = TodoStatus::Done;
+        let coverage = mark.coverage.trim();
+        if state[idx].coverage.is_empty() && !coverage.is_empty() {
+            state[idx].coverage = coverage.to_string();
         }
     }
 
-    // Exact-name duplicates commonly appear once with the stable
-    // original id and once with a title-derived id. After identity
-    // restoration retain one row, preferring terminal state.
-    let mut positions: HashMap<String, usize> = HashMap::new();
-    let mut deduped: Vec<TodoItem> = Vec::with_capacity(parsed.len());
-    for item in parsed.drain(..) {
-        let key = if !item.id.is_empty() {
-            format!("id:{}", item.id)
-        } else {
-            format!("name:{}", item.name.to_ascii_lowercase())
+    // --- Retirements ----------------------------------------------------
+    // Only live rows can be retired; a done row is history and stays.
+    let mut retired: HashSet<usize> = HashSet::new();
+    let mut retired_log: Vec<String> = Vec::new();
+    for mark in &parsed.retired {
+        let Some(idx) = resolve(&mark.id, &mark.id) else {
+            continue;
         };
-        if let Some(index) = positions.get(&key).copied() {
-            if item.status.is_terminal() && !deduped[index].status.is_terminal() {
-                deduped[index] = item;
-            }
+        if state[idx].status.is_terminal() || !retired.insert(idx) {
             continue;
         }
-        positions.insert(key, deduped.len());
-        deduped.push(item);
+        retired_log.push(format!(
+            "{}: {}",
+            truncate(&state[idx].id, 40),
+            truncate(mark.reason.trim(), 80)
+        ));
     }
-    *parsed = deduped;
+    if !retired.is_empty() {
+        tracing::info!(
+            target: "kres_agents",
+            "todo agent retired {} live item(s): {}",
+            retired.len(),
+            retired_log.join("; ")
+        );
+    }
+
+    // --- Live rows the agent re-emitted, in its priority order ---------
+    let mut emitted: HashSet<usize> = HashSet::new();
+    let mut pending: Vec<TodoItem> = Vec::with_capacity(parsed.todo.len());
+    let mut new_ids: HashSet<String> = HashSet::new();
+    for row in parsed.todo {
+        let Some(idx) = resolve(&row.id, &row.name) else {
+            // Genuinely new work. The agent owns every field here,
+            // including step_id and depends_on, because there is no
+            // prior row to restore them from.
+            let key = if row.id.is_empty() {
+                row.name.to_ascii_lowercase()
+            } else {
+                row.id.clone()
+            };
+            if !key.is_empty() && !new_ids.insert(key) {
+                continue;
+            }
+            pending.push(row);
+            continue;
+        };
+        if retired.contains(&idx) || !emitted.insert(idx) {
+            continue;
+        }
+        // Prose and type are the agent's; identity is not.
+        if !row.name.is_empty() {
+            state[idx].name.clone_from(&row.name);
+        }
+        if !row.reason.is_empty() {
+            state[idx].reason.clone_from(&row.reason);
+        }
+        if !row.kind.is_empty() {
+            state[idx].kind.clone_from(&row.kind);
+        }
+        // A completion declared inline rather than via `newly_done`.
+        if row.status.is_terminal() && !state[idx].status.is_terminal() {
+            state[idx].status = TodoStatus::Done;
+            let coverage = row.coverage.trim();
+            if state[idx].coverage.is_empty() && !coverage.is_empty() {
+                state[idx].coverage = coverage.to_string();
+            }
+        }
+        if !state[idx].status.is_terminal() {
+            pending.push(state[idx].clone());
+        }
+    }
+
+    // --- Rows the agent neither kept, completed, nor retired -----------
+    // Omission is not deletion. Before this, only rows carrying a
+    // step_id that pointed at a live plan step were rescued, which
+    // covered none of the 23 rows dropped at call 20 of the 2026-08-05
+    // mm/page_alloc.c review. Restore them all and say so; the agent
+    // gets another chance next round to retire them on the record.
+    let live_steps: Option<HashSet<&str>> = plan.map(|p| {
+        p.steps
+            .iter()
+            .filter(|s| !s.status.is_terminal())
+            .map(|s| s.id.as_str())
+            .collect()
+    });
+    let mut restored: Vec<String> = Vec::new();
+    for (idx, item) in state.iter().enumerate() {
+        if item.status.is_terminal() || retired.contains(&idx) || emitted.contains(&idx) {
+            continue;
+        }
+        // A row bound to a step the plan has since finished is stale
+        // by construction, not forgotten.
+        if let (Some(live), false) = (live_steps.as_ref(), item.step_id.is_empty()) {
+            if !live.contains(item.step_id.as_str()) {
+                continue;
+            }
+        }
+        restored.push(item.id.clone());
+        pending.push(item.clone());
+    }
+    if !restored.is_empty() {
+        tracing::info!(
+            target: "kres_agents",
+            "todo agent dropped {} live item(s) without retiring them; restored: {}",
+            restored.len(),
+            restored
+                .iter()
+                .take(5)
+                .map(|id| truncate(id, 40))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    let done: Vec<TodoItem> = state
+        .into_iter()
+        .filter(|item| item.status.is_terminal())
+        .collect();
+    Reconciled { done, pending }
 }
 
 fn mark_completed_todo(items: &mut [TodoItem], completed_todo_id: Option<&str>) {
@@ -581,7 +668,16 @@ fn mark_completed_todo(items: &mut [TodoItem], completed_todo_id: Option<&str>) 
         .find(|item| item.id == completed_id || (item.id.is_empty() && item.name == completed_id))
     {
         item.status = TodoStatus::Done;
-        if item.coverage.is_empty() {
+    }
+}
+
+/// Last-resort coverage for a done item the agent never described.
+/// Applied after reconciliation so a real `newly_done.coverage` always
+/// wins; a done item with empty coverage is invisible to the DEDUP
+/// step of later calls, which is worse than a vague sentence.
+fn stamp_missing_coverage(items: &mut [TodoItem]) {
+    for item in items.iter_mut() {
+        if item.status.is_terminal() && item.coverage.is_empty() {
             item.coverage = "completed by the reaped task".to_string();
         }
     }
@@ -806,8 +902,15 @@ fn flush_tok(tok: &mut String, out: &mut HashSet<String>) {
 
 /// Fallback path: token-overlap dedup of new_followups into the
 /// existing todo list when the API call fails.
+///
+/// The reaped item arrives here already flipped to Done but with empty
+/// coverage, because the agent round that was supposed to write that
+/// sentence is the one that just failed. Stamp the placeholder before
+/// deduping: a done item with no coverage is invisible to the DEDUP
+/// step of every later call, so the same work gets re-added forever.
 fn fallback_dedup(existing: &[TodoItem], new_followups: &[Value]) -> Vec<TodoItem> {
     let mut out = existing.to_vec();
+    stamp_missing_coverage(&mut out);
     let mut existing_tokens: Vec<HashSet<String>> = out
         .iter()
         .map(|t| dedup_tokens(&format!("{} {} {}", t.name, t.reason, t.coverage)))
@@ -882,23 +985,53 @@ fn followup_to_todo(fu: &Value) -> Result<TodoItem, serde_json::Error> {
 fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
     let mut s = String::from(
         "Update the todo list. Return raw, unfenced JSON only:\n\
-         {\"todo\": [{\"id\":\"ID\",\"type\":\"T\",\"name\":\"N\",\"reason\":\"R\",\
-         \"status\":\"pending|done\",\"coverage\":\"C\",\"depends_on\":[\"ID1\",\"ID2\"],\
-         \"step_id\":\"PLAN_STEP_ID_OR_EMPTY\"}]}\n\n",
+         {\n\
+         \u{20}\"todo\": [{\"id\":\"ID\",\"type\":\"T\",\"name\":\"N\",\"reason\":\"R\"}],\n\
+         \u{20}\"newly_done\": [{\"id\":\"ID\",\"coverage\":\"C\"}],\n\
+         \u{20}\"retired\": [{\"id\":\"ID\",\"reason\":\"R\"}]\n\
+         }\n\n",
+    );
+    s.push_str(
+        "WHAT EACH FIELD IS FOR — the list is owned by the pipeline, \
+         and your reply is a set of edits against it, not a rewrite \
+         of it:\n\
+         - `todo` — the PENDING items ONLY, in the order you want them \
+         executed. Never put a done item here. The pipeline keeps every \
+         done item itself; re-listing them wastes your output budget \
+         and cannot change them.\n\
+         - `newly_done` — items that reached Done this round, each with \
+         the coverage sentence described below. This is the ONLY way to \
+         complete an item, and coverage is written once: later rounds \
+         cannot reword it.\n\
+         - `retired` — pending items you are deliberately abandoning, \
+         with the reason. Leaving an item out of `todo` does NOT delete \
+         it; the pipeline restores anything you neither kept, completed, \
+         nor retired, because a forgotten item and an abandoned one look \
+         identical on the wire. Retire on purpose, on the record.\n\
+         - Omit `newly_done` or `retired` entirely when empty.\n\n",
+    );
+    s.push_str(
+        "FIELDS YOU DO NOT EMIT for an item that already exists in \
+         `current_todo`: `status`, `coverage`, `depends_on`, `step_id`. \
+         The pipeline restores all four from its own copy and discards \
+         whatever you send, so emitting them only costs output. Send \
+         `id` (the handle), plus `name`, `reason` and `type` when you \
+         want to change the prose. For an item you are creating THIS \
+         round there is no prior copy, so a new item DOES carry \
+         `type`, `name`, `reason`, `depends_on` and `step_id`.\n\n",
     );
     if has_plan {
         s.push_str(
             "PLAN LINKAGE — a `plan` field is present with `steps:[{id,\
-             title,description}]`. For EVERY todo item you emit in the \
-             output (done or pending), set `step_id` to the id of the \
+             title,description}]`. For every NEW todo item you create \
+             this round, set `step_id` to the id of the \
              plan step whose title/description best matches the todo's \
              target. Match on file, symbol, subsystem, or investigation \
              angle — not just keyword overlap. If NO step is a clear \
              fit, set `step_id` to the empty string. Do not invent step \
-             ids; only use ids listed under `plan.steps`. Keep any \
-             step_id already set on a current_todo item unless the new \
-             analysis proves the item was actually executing a \
-             different step.\n\n",
+             ids; only use ids listed under `plan.steps`. An item \
+             already in `current_todo` keeps its step_id \
+             automatically — do not re-emit it.\n\n",
         );
         s.push_str(
             "PLAN REEVALUATION — you MAY also return a top-level \
@@ -930,7 +1063,7 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
                reassigned when steps reorder.\n\
              - Every step you emit MUST have id, title, and status. \
                Description and todo_ids are optional.\n\
-             - After rewriting, set step_id on every emitted todo to \
+             - After rewriting, set step_id on every NEW todo to \
                an id from the NEW plan — do not reference ids you \
                just removed.\n\
              Omit the `plan` field entirely when no rewrite is \
@@ -984,7 +1117,7 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          Emit the dropped followup ids/names nowhere — just omit them.\n\n",
     );
     s.push_str(
-        "COVERAGE FIELD — required on every done item you emit:\n\
+        "COVERAGE FIELD — required on every `newly_done` entry:\n\
          - 1-2 sentences naming the concrete files, symbols, and \
          line ranges the analysis examined for that item, plus the \
          bottom-line finding.\n\
@@ -996,20 +1129,21 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          like 'all paths checked', 'no remaining users', or 'old path \
          unreachable'. Keep it pending or emit a narrow followup when \
          evidence is missing.\n\
-         - If a done item already has a non-empty coverage field, \
-         keep it verbatim unless the new analysis meaningfully extends \
-         what it covered — in which case append one sentence.\n\
-         - Do NOT leave coverage empty on done items. Future dedup \
-         calls depend on it.\n\n",
+         - Coverage is write-once. An item already carrying coverage \
+         in `current_todo` is settled; do not restate or reword it.\n\
+         - Do NOT leave coverage empty on a `newly_done` entry. Future \
+         dedup calls depend on it.\n\n",
     );
     s.push_str(
         "OTHER RULES:\n\
-         - Each item gets a short unique id (use the name, shortened)\n\
-         - KEEP all done items in the list — they prevent re-adding \
-         equivalent work\n\
-         - Mark items as done if the analysis addressed them\n\
-         - Keep pending items that are still relevant\n\
-         - Remove ONLY pending items that are no longer relevant\n\
+         - Each NEW item gets a short unique id (use the name, shortened)\n\
+         - Done items still appear in `current_todo` on every call so \
+         you can dedup against their coverage — read them, do not \
+         re-emit them\n\
+         - Mark items done via `newly_done` when the analysis addressed \
+         them\n\
+         - Keep pending items that are still relevant in `todo`\n\
+         - Move ONLY no-longer-relevant pending items to `retired`\n\
          - Max 20 pending items (done items don't count toward the limit)\n\
          - PARALLELISM: most items can run in parallel. Only add \
          depends_on when an item truly requires another's results first.\n\
@@ -1017,7 +1151,7 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          code_edits were applied and a commit was amended (the patch \
          changed since the last review), any done todo that reviewed \
          or verified the PRIOR version of the patch is now stale. \
-         Re-emit it as a NEW pending item (new id, same step_id) so \
+         Retire it and add a NEW pending item (new id, same step_id) so \
          the amended patch gets a fresh review. This is NOT a new \
          followup — it is a re-creation of a stale done item, so \
          the dedup algorithm does not apply to it. Update \
@@ -1036,22 +1170,20 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
 /// carried a parseable `todo` field; returns `None` when the
 /// envelope itself couldn't be parsed (callers fall back to the
 /// todo-only parser, which tries harder on malformed replies).
-fn parse_todo_update_full(
-    text: &str,
-) -> Result<(Vec<TodoItem>, Option<kres_core::PlanRewrite>), Vec<String>> {
+fn parse_todo_update_full(text: &str) -> Result<ParsedTodoUpdate, Vec<String>> {
     let r = crate::json_repair::JsonObjectContract {
         name: "todo-update",
-        fields: &["todo", "plan"],
+        fields: TODO_RESPONSE_FIELDS,
     }
     .parse::<TodoUpdateResponse>(text)?;
-    Ok((r.todo, r.plan))
+    Ok(ParsedTodoUpdate::from(r))
 }
 
 /// Extract the `todo` array from one strict JSON response object.
 pub fn parse_todo_response(text: &str) -> Result<Vec<TodoItem>, Vec<String>> {
     let r = crate::json_repair::JsonObjectContract {
         name: "todo-update",
-        fields: &["todo", "plan"],
+        fields: TODO_RESPONSE_FIELDS,
     }
     .parse::<TodoUpdateResponse>(text)?;
     Ok(r.todo)
@@ -1078,60 +1210,281 @@ fn truncate(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
 
+    fn original(id: &str, name: &str, step: &str, status: TodoStatus) -> TodoItem {
+        let mut item = TodoItem::new(name, "review");
+        item.id = id.to_string();
+        item.step_id = step.to_string();
+        item.depends_on = vec!["gate".to_string()];
+        item.status = status;
+        item
+    }
+
+    fn update(todo: Vec<TodoItem>) -> ParsedTodoUpdate {
+        ParsedTodoUpdate {
+            todo,
+            newly_done: Vec::new(),
+            retired: Vec::new(),
+            plan: None,
+        }
+    }
+
+    fn pending_row(id: &str, name: &str) -> TodoItem {
+        TodoItem {
+            id: id.into(),
+            ..TodoItem::new(name, "review")
+        }
+    }
+
     #[test]
     fn reconciliation_preserves_completed_id_and_running_siblings() {
-        let mut originals = Vec::new();
-        for (id, name, step) in [
-            ("review-write", "Trace write path", "write"),
-            ("review-read", "Trace read path", "read"),
-            ("review-final", "Verify shared contracts", "final"),
-        ] {
-            let mut item = TodoItem::new(name, "review");
-            item.id = id.to_string();
-            item.step_id = step.to_string();
-            item.status = TodoStatus::InProgress;
-            originals.push(item);
-        }
+        let mut originals = vec![
+            original(
+                "review-write",
+                "Trace write path",
+                "write",
+                TodoStatus::InProgress,
+            ),
+            original(
+                "review-read",
+                "Trace read path",
+                "read",
+                TodoStatus::InProgress,
+            ),
+            original(
+                "review-final",
+                "Verify shared contracts",
+                "final",
+                TodoStatus::InProgress,
+            ),
+        ];
         mark_completed_todo(&mut originals, Some("review-write"));
 
-        // Mirrors sol4: the model rewrote stable IDs from titles,
-        // reopened every item as pending, and emitted a duplicate of
-        // the completed task.
-        let mut parsed = vec![
-            TodoItem {
-                id: "Trace write path".into(),
-                status: TodoStatus::Pending,
-                ..TodoItem::new("Trace write path", "review")
-            },
-            TodoItem {
-                id: "review-write".into(),
-                status: TodoStatus::Pending,
-                ..TodoItem::new("Trace write path", "review")
-            },
-            TodoItem {
-                id: "Trace read path".into(),
-                status: TodoStatus::Pending,
-                ..TodoItem::new("Trace read path", "review")
-            },
-            TodoItem {
-                id: "Verify shared contracts".into(),
-                status: TodoStatus::Pending,
-                ..TodoItem::new("Verify shared contracts", "review")
-            },
+        // Mirrors sol4: the model rewrote stable IDs from titles and
+        // emitted a duplicate of the completed task.
+        let parsed = ParsedTodoUpdate {
+            todo: vec![
+                pending_row("Trace write path", "Trace write path"),
+                pending_row("review-write", "Trace write path"),
+                pending_row("Trace read path", "Trace read path"),
+                pending_row("Verify shared contracts", "Verify shared contracts"),
+            ],
+            newly_done: Vec::new(),
+            retired: Vec::new(),
+            plan: None,
+        };
+
+        let out = reconcile_update(&originals, parsed, None);
+        assert_eq!(out.done.len(), 1);
+        assert_eq!(out.done[0].id, "review-write");
+        assert_eq!(out.done[0].step_id, "write");
+        assert_eq!(out.pending.len(), 2);
+        for item in &out.pending {
+            assert_eq!(item.status, TodoStatus::InProgress);
+            assert_eq!(item.depends_on, vec!["gate".to_string()]);
+        }
+    }
+
+    /// T2: done rows leave the output contract. They were 44.6% of the
+    /// todo agent's emitted characters over the 2026-08-05
+    /// mm/page_alloc.c review, and every field of them is Rust-owned.
+    #[test]
+    fn done_rows_are_reconstructed_when_the_agent_omits_them() {
+        let mut originals = vec![
+            original("done-a", "Audit alloc path", "a", TodoStatus::Done),
+            original("done-b", "Audit free path", "b", TodoStatus::Done),
+            original("live-c", "Audit pcp path", "c", TodoStatus::Pending),
+        ];
+        originals[0].coverage = "read mm/page_alloc.c:2266-2400; clean".into();
+        originals[1].coverage = "read mm/page_alloc.c:2900-2960; clean".into();
+
+        let out = reconcile_update(
+            &originals,
+            update(vec![pending_row("live-c", "Audit pcp path")]),
+            None,
+        );
+
+        assert_eq!(out.done.len(), 2, "both done rows survive the omission");
+        assert_eq!(
+            out.done[0].coverage,
+            "read mm/page_alloc.c:2266-2400; clean"
+        );
+        assert_eq!(
+            out.done[1].coverage,
+            "read mm/page_alloc.c:2900-2960; clean"
+        );
+        assert_eq!(out.pending.len(), 1);
+    }
+
+    /// T4: coverage is write-once. `reason` and `coverage` were
+    /// rewritten on 28.0% and 27.4% of re-emitted rows respectively,
+    /// against an instruction to keep coverage verbatim.
+    #[test]
+    fn coverage_is_written_once_and_cannot_be_paraphrased() {
+        let mut originals = vec![
+            original("settled", "Audit alloc path", "a", TodoStatus::Done),
+            original("finishing", "Audit free path", "b", TodoStatus::Pending),
+        ];
+        originals[0].coverage = "read mm/page_alloc.c:2266-2400; clean".into();
+
+        let parsed = ParsedTodoUpdate {
+            todo: Vec::new(),
+            newly_done: vec![
+                DoneMark {
+                    id: "settled".into(),
+                    coverage: "looked at the allocator, seemed fine".into(),
+                },
+                DoneMark {
+                    id: "finishing".into(),
+                    coverage: "read mm/page_alloc.c:2900-2960; found the pcp leak".into(),
+                },
+            ],
+            retired: Vec::new(),
+            plan: None,
+        };
+
+        let out = reconcile_update(&originals, parsed, None);
+        assert!(out.pending.is_empty());
+        assert_eq!(out.done.len(), 2);
+        let settled = out.done.iter().find(|i| i.id == "settled").unwrap();
+        assert_eq!(
+            settled.coverage, "read mm/page_alloc.c:2266-2400; clean",
+            "existing coverage must not be reworded"
+        );
+        let finishing = out.done.iter().find(|i| i.id == "finishing").unwrap();
+        assert_eq!(
+            finishing.coverage, "read mm/page_alloc.c:2900-2960; found the pcp leak",
+            "a first completion writes coverage"
+        );
+    }
+
+    /// T3: omission is not deletion. At call 20 of the 2026-08-05
+    /// review the agent was handed 57 rows and returned 34; the
+    /// plan-linked-only rescue restored none of the missing 23.
+    #[test]
+    fn silently_dropped_live_items_are_restored() {
+        let originals = vec![
+            original("keep-me", "Audit alloc path", "", TodoStatus::Pending),
+            original("forgotten", "Audit free path", "", TodoStatus::Pending),
+            original("running", "Audit pcp path", "", TodoStatus::InProgress),
         ];
 
-        reconcile_agent_identities(&mut parsed, &originals, Some("review-write"));
-        assert_eq!(parsed.len(), 3);
-        let write = parsed
-            .iter()
-            .find(|item| item.id == "review-write")
-            .unwrap();
-        assert_eq!(write.status, TodoStatus::Done);
-        assert_eq!(write.step_id, "write");
-        for id in ["review-read", "review-final"] {
-            let item = parsed.iter().find(|item| item.id == id).unwrap();
-            assert_eq!(item.status, TodoStatus::InProgress);
-        }
+        let out = reconcile_update(
+            &originals,
+            update(vec![pending_row("keep-me", "Audit alloc path")]),
+            None,
+        );
+
+        let ids: Vec<&str> = out.pending.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["keep-me", "forgotten", "running"]);
+        assert_eq!(
+            out.pending[2].status,
+            TodoStatus::InProgress,
+            "a running task must not be reset by the restore"
+        );
+    }
+
+    #[test]
+    fn retiring_an_item_deletes_it_and_marking_it_done_keeps_it() {
+        let originals = vec![
+            original("abandon", "Audit alloc path", "", TodoStatus::Pending),
+            original("finish", "Audit free path", "", TodoStatus::Pending),
+        ];
+        let parsed = ParsedTodoUpdate {
+            todo: Vec::new(),
+            newly_done: vec![DoneMark {
+                id: "finish".into(),
+                coverage: "read mm/page_alloc.c:1-10".into(),
+            }],
+            retired: vec![RetireMark {
+                id: "abandon".into(),
+                reason: "subsumed by the free-path audit".into(),
+            }],
+            plan: None,
+        };
+
+        let out = reconcile_update(&originals, parsed, None);
+        assert!(out.pending.is_empty(), "retired item must not be restored");
+        assert_eq!(out.done.len(), 1);
+        assert_eq!(out.done[0].id, "finish");
+    }
+
+    /// A row bound to a plan step the plan has since finished is stale
+    /// by construction, not forgotten, so the restore must skip it.
+    #[test]
+    fn restore_skips_items_tied_to_a_finished_plan_step() {
+        use kres_core::{Plan, PlanStep};
+        let originals = vec![
+            original(
+                "stale",
+                "Audit alloc path",
+                "retired-step",
+                TodoStatus::Pending,
+            ),
+            original("live", "Audit free path", "live-step", TodoStatus::Pending),
+        ];
+        let mut plan = Plan::new("review", "goal", kres_core::TaskMode::Audit);
+        plan.steps = vec![
+            PlanStep {
+                status: kres_core::PlanStepStatus::Done,
+                ..PlanStep::new("retired-step", "Alloc path")
+            },
+            PlanStep::new("live-step", "Free path"),
+        ];
+
+        let out = reconcile_update(&originals, update(Vec::new()), Some(&plan));
+        let ids: Vec<&str> = out.pending.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["live"]);
+    }
+
+    /// T1: `step_id` and `depends_on` are Rust-owned (5.1% and 2.4% of
+    /// emitted characters) and a paraphrasing agent must not be able
+    /// to detach a plan link or a dependency edge.
+    #[test]
+    fn identity_fields_survive_an_agent_that_omits_or_mangles_them() {
+        let originals = vec![original(
+            "audit-alloc",
+            "Audit alloc path",
+            "alloc-step",
+            TodoStatus::Pending,
+        )];
+        let mut mangled = pending_row("audit-alloc", "Audit alloc path, take two");
+        mangled.step_id = "some-other-step".into();
+        mangled.depends_on = vec!["invented".into()];
+        mangled.reason = "new rationale".into();
+
+        let out = reconcile_update(&originals, update(vec![mangled]), None);
+        assert_eq!(out.pending.len(), 1);
+        let item = &out.pending[0];
+        assert_eq!(item.step_id, "alloc-step");
+        assert_eq!(item.depends_on, vec!["gate".to_string()]);
+        assert_eq!(
+            item.name, "Audit alloc path, take two",
+            "prose is the agent's"
+        );
+        assert_eq!(item.reason, "new rationale");
+    }
+
+    #[test]
+    fn parse_accepts_the_new_channels_and_rejects_unknown_ones() {
+        let ok = r#"{"todo":[{"id":"a","name":"a","type":"review"}],
+                     "newly_done":[{"id":"b","coverage":"read x.c:1-2"}],
+                     "retired":[{"id":"c","reason":"subsumed"}]}"#;
+        let parsed = parse_todo_update_full(ok).expect("parses");
+        assert_eq!(parsed.todo.len(), 1);
+        assert_eq!(parsed.newly_done[0].id, "b");
+        assert_eq!(parsed.retired[0].reason, "subsumed");
+
+        let bad = r#"{"todo":[],"newly_done":[{"id":"b","covrage":"typo"}]}"#;
+        assert!(parse_todo_update_full(bad).is_err());
+    }
+
+    #[test]
+    fn todo_instructions_state_that_omission_is_not_deletion() {
+        let body = build_instructions(true, true);
+        assert!(body.contains("does NOT delete"));
+        assert!(body.contains("`retired`"));
+        assert!(body.contains("Never put a done item here"));
+        assert!(body.contains("FIELDS YOU DO NOT EMIT"));
     }
 
     #[test]
@@ -1360,6 +1713,28 @@ Actual: {"todo":[{"name":"actual","status":"done"}]}"#;
         let merged = fallback_dedup(&existing, &new_fu);
         // Overlapping tokens (drivers/net/netkit.c) → dropped.
         assert_eq!(merged.len(), 1);
+    }
+
+    /// `mark_completed_todo` deliberately leaves coverage empty so the
+    /// agent can write the real sentence via `newly_done`. When the
+    /// call fails there is no agent sentence, and a done row with no
+    /// coverage is invisible to every later DEDUP pass.
+    #[test]
+    fn fallback_stamps_coverage_on_the_reaped_item() {
+        let mut list = vec![TodoItem::new("Audit alloc path", "review")];
+        list[0].id = "audit-alloc".into();
+        mark_completed_todo(&mut list, Some("audit-alloc"));
+        assert!(
+            list[0].coverage.is_empty(),
+            "empty until the agent writes it"
+        );
+
+        let merged = fallback_dedup(&list, &[]);
+        assert_eq!(merged[0].status, TodoStatus::Done);
+        assert!(
+            !merged[0].coverage.is_empty(),
+            "the fallback must not leave a done row uncovered"
+        );
     }
 
     #[test]

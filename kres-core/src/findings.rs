@@ -503,37 +503,62 @@ fn semantic_duplicate_index(current: &[Finding], incoming: &Finding) -> Option<u
         .position(|existing| is_semantic_duplicate(existing, incoming))
 }
 
+/// Is an incoming finding with a NEW id actually the same defect as one we
+/// already hold?
+///
+/// Sharing a code anchor is necessary but nowhere near sufficient — a single
+/// function hosts many distinct defects — so the identity tokens must agree
+/// as well.
+///
+/// `related_finding_ids` used to short-circuit that check: if either side
+/// named the other, an anchor match alone merged them. But "related to" is a
+/// different relation from "is the same as", and the schema models both
+/// separately. Treating the cross-reference as an identity claim destroyed
+/// the distinction: on the 2026-08-05 mm/page_alloc.c review six records
+/// ended up with an id naming one defect and a title naming another, because
+/// `merge_into`'s longest-title-wins rule then overwrote the title of
+/// whichever record was merged into. `contig_comp_ignores_bad_page`
+/// accumulated nine detail entries from unrelated tasks and finished
+/// describing an `unpoison_memory()` double-put.
+///
+/// A cross-reference now only *permits* a merge; the tokens still have to
+/// agree. Being wrong in this direction costs a duplicate record, which a
+/// later consolidation can still merge. Being wrong the other way silently
+/// destroys a finding.
 fn is_semantic_duplicate(existing: &Finding, incoming: &Finding) -> bool {
     if existing.status == Status::Invalidated || incoming.status == Status::Invalidated {
         return false;
     }
-    if existing
-        .related_finding_ids
-        .iter()
-        .any(|id| id == &incoming.id)
-        || incoming
-            .related_finding_ids
-            .iter()
-            .any(|id| id == &existing.id)
-    {
-        return share_code_anchor(existing, incoming);
-    }
     share_code_anchor(existing, incoming) && id_title_token_overlap(existing, incoming) >= 0.70
 }
 
+/// Do two findings point at the same place in the source?
+///
+/// A line number of 0 is not a location. Agents emit `filename:0` when they
+/// have not resolved a real line, and matching on it made every such finding
+/// share an anchor with every other one in the same file: the 2026-08-05
+/// mm/page_alloc.c review had four findings carrying `mm/page_alloc.c:0`,
+/// i.e. six false anchor pairs feeding `is_semantic_duplicate`. Require a
+/// resolved line, or a matching symbol name, before calling it the same place.
 fn share_code_anchor(a: &Finding, b: &Finding) -> bool {
     for asym in &a.relevant_symbols {
         for bsym in &b.relevant_symbols {
-            if !asym.filename.is_empty()
-                && asym.filename == bsym.filename
-                && ((!asym.name.is_empty() && asym.name == bsym.name) || asym.line == bsym.line)
-            {
+            if asym.filename.is_empty() || asym.filename != bsym.filename {
+                continue;
+            }
+            let same_name = !asym.name.is_empty() && asym.name == bsym.name;
+            let same_line = asym.line != 0 && asym.line == bsym.line;
+            if same_name || same_line {
                 return true;
             }
         }
     }
     for asec in &a.relevant_file_sections {
         for bsec in &b.relevant_file_sections {
+            // A 0..0 section is the same placeholder in section form.
+            if asec.line_end == 0 || bsec.line_end == 0 {
+                continue;
+            }
             if !asec.filename.is_empty()
                 && asec.filename == bsec.filename
                 && ranges_overlap(
@@ -896,6 +921,102 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0)
+    }
+
+    fn sym(name: &str, file: &str, line: u32) -> RelevantSymbol {
+        RelevantSymbol {
+            name: name.into(),
+            filename: file.into(),
+            line,
+            definition: "body".into(),
+        }
+    }
+
+    /// Two unrelated defects that both failed to resolve a line number must
+    /// not be treated as the same place. Four findings in the 2026-08-05
+    /// mm/page_alloc.c review carried `mm/page_alloc.c:0`, which made six
+    /// false anchor pairs and fed the duplicate merge.
+    #[test]
+    fn placeholder_line_zero_is_not_a_shared_anchor() {
+        let mut a = sample_finding("nofail_loop_skips_reclaim_compact_first");
+        a.relevant_symbols
+            .push(sym("__alloc_pages_slowpath", "mm/page_alloc.c", 0));
+        let mut b = sample_finding("pcp_batch_zero_infinite_loop");
+        b.relevant_symbols
+            .push(sym("free_pcppages_bulk", "mm/page_alloc.c", 0));
+
+        assert!(!share_code_anchor(&a, &b));
+        assert!(!is_semantic_duplicate(&a, &b));
+
+        // A resolved line at the same location still anchors.
+        let mut c = sample_finding("c");
+        c.relevant_symbols
+            .push(sym("other", "mm/page_alloc.c", 2266));
+        let mut d = sample_finding("d");
+        d.relevant_symbols
+            .push(sym("thing", "mm/page_alloc.c", 2266));
+        assert!(share_code_anchor(&c, &d));
+    }
+
+    #[test]
+    fn degenerate_zero_length_section_is_not_a_shared_anchor() {
+        let mut a = sample_finding("a");
+        a.relevant_file_sections.push(RelevantFileSection {
+            filename: "mm/page_alloc.c".into(),
+            line_start: 0,
+            line_end: 0,
+            content: String::new(),
+        });
+        let mut b = sample_finding("b");
+        b.relevant_file_sections.push(RelevantFileSection {
+            filename: "mm/page_alloc.c".into(),
+            line_start: 0,
+            line_end: 0,
+            content: String::new(),
+        });
+        assert!(!share_code_anchor(&a, &b));
+    }
+
+    /// "Related to" is not "is the same as". Cross-referencing used to
+    /// short-circuit the token check, so a distinct defect in the same
+    /// function was merged and `merge_into`'s longest-title-wins rule then
+    /// replaced the title — leaving an id naming one bug and a title naming
+    /// another.
+    #[test]
+    fn related_finding_ids_do_not_make_two_defects_one() {
+        let mut existing = sample_finding("contig_comp_ignores_bad_page");
+        existing.title = "alloc_contig ignores a bad page during compaction".into();
+        existing
+            .relevant_symbols
+            .push(sym("free_frozen_page_commit", "mm/page_alloc.c", 2940));
+
+        let mut incoming = sample_finding("unpoison_second_put_underflows_live_page");
+        incoming.title =
+            "unpoison_memory() performs two folio_put() calls against one reference".into();
+        incoming
+            .relevant_symbols
+            .push(sym("free_frozen_page_commit", "mm/page_alloc.c", 2940));
+        // The agent legitimately cross-references the two.
+        incoming.related_finding_ids = vec!["contig_comp_ignores_bad_page".into()];
+
+        assert!(
+            share_code_anchor(&existing, &incoming),
+            "same function, so the anchor genuinely matches"
+        );
+        assert!(
+            !is_semantic_duplicate(&existing, &incoming),
+            "a cross-reference must not override the identity-token test"
+        );
+
+        let mut list = vec![existing];
+        apply_delta_to_list(&mut list, std::slice::from_ref(&incoming), None, None);
+        assert_eq!(list.len(), 2, "the two defects must stay separate records");
+        assert_eq!(list[0].id, "contig_comp_ignores_bad_page");
+        assert!(
+            list[0].title.starts_with("alloc_contig"),
+            "the original title must survive: {}",
+            list[0].title
+        );
     }
 
     fn sample_finding(id: &str) -> Finding {

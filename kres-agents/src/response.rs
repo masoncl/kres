@@ -873,10 +873,17 @@ fn value_to_findings(
     let mut invalid = Vec::new();
     for (index, item) in items.into_iter().enumerate() {
         match serde_json::from_value::<Finding>(item.clone()) {
-            Ok(finding) => {
-                findings.push(finding.redacted_for_agent());
-                positions.push(index);
-            }
+            Ok(finding) => match unresolved_citation(&finding) {
+                Some(error) => invalid.push(InvalidFinding {
+                    index,
+                    raw: item,
+                    error,
+                }),
+                None => {
+                    findings.push(finding.redacted_for_agent());
+                    positions.push(index);
+                }
+            },
             Err(error) => invalid.push(InvalidFinding {
                 index,
                 raw: item,
@@ -887,9 +894,99 @@ fn value_to_findings(
     (findings, positions, invalid, None)
 }
 
+/// Reject a finding whose citation names a file but not a line.
+///
+/// `filename:0` is a placeholder an agent emits when it has not resolved the
+/// location. Such a finding cannot be exported, triaged or verified — it
+/// fails the review's own requirement to cite `filename:line`. On the
+/// 2026-08-05 mm/page_alloc.c review six of thirty-three findings shipped
+/// this way; the goal agent flagged it on its very first check and two
+/// agent-authored repair todos (turns 2 and 51) both failed to clear it.
+///
+/// Returning an error routes the finding into `invalid_findings`, which the
+/// existing `repair_invalid_findings` loop hands back to the model with the
+/// reason attached. Unlike the file survey's use counts, Rust cannot compute
+/// a line number here, so the model has to supply it — but it should be asked
+/// at emit time rather than left for a later turn to notice.
+fn unresolved_citation(finding: &Finding) -> Option<String> {
+    if let Some(symbol) = finding
+        .relevant_symbols
+        .iter()
+        .find(|s| !s.filename.is_empty() && s.line == 0)
+    {
+        return Some(format!(
+            "relevant_symbols entry for `{}` cites {}:0; supply the real line \
+number of the symbol, or drop the entry if you cannot resolve one",
+            symbol.name, symbol.filename
+        ));
+    }
+    if let Some(section) = finding
+        .relevant_file_sections
+        .iter()
+        .find(|s| !s.filename.is_empty() && s.line_end == 0)
+    {
+        return Some(format!(
+            "relevant_file_sections entry cites {}:{}-0; supply the real line \
+range, or drop the entry if you cannot resolve one",
+            section.filename, section.line_start
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod strict_contract_tests {
     use super::*;
+
+    fn finding_json(sym_line: u32) -> String {
+        serde_json::json!({
+            "analysis": "ok",
+            "followups": [],
+            "findings": [{
+                "id": "nofail_loop_skips_reclaim_compact_first",
+                "title": "t", "severity": "high", "summary": "s",
+                "relevant_symbols": [{
+                    "name": "__alloc_pages_slowpath",
+                    "filename": "mm/page_alloc.c",
+                    "line": sym_line,
+                    "definition": "body"
+                }]
+            }]
+        })
+        .to_string()
+    }
+
+    /// A citation of `filename:0` cannot be exported, triaged or verified.
+    /// Six of thirty-three findings shipped that way on 2026-08-05 despite
+    /// the goal agent flagging it on check 1 and two agent repair todos.
+    /// Routing it to `invalid_findings` makes the existing repair loop ask
+    /// the model for a real line at emit time.
+    #[test]
+    fn a_finding_citing_line_zero_is_routed_to_repair() {
+        let parsed = diagnose_code_response(&finding_json(0));
+        assert!(
+            parsed.findings.is_empty(),
+            "placeholder citation must not be accepted as a finding"
+        );
+        assert_eq!(parsed.invalid_findings.len(), 1);
+        let err = &parsed.invalid_findings[0].error;
+        assert!(
+            err.contains("mm/page_alloc.c:0"),
+            "error names the citation: {err}"
+        );
+        assert!(err.contains("real line"), "error says what to do: {err}");
+        assert_eq!(
+            parsed.invalid_findings[0].raw["id"], "nofail_loop_skips_reclaim_compact_first",
+            "the raw finding is retained for repair, not dropped"
+        );
+    }
+
+    #[test]
+    fn a_resolved_citation_is_accepted() {
+        let parsed = diagnose_code_response(&finding_json(4321));
+        assert_eq!(parsed.findings.len(), 1);
+        assert!(parsed.invalid_findings.is_empty());
+    }
 
     #[test]
     fn accepts_exact_object_and_rejects_wrappers_or_prose() {

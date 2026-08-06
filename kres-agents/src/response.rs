@@ -908,7 +908,7 @@ fn value_to_findings(
 /// reason attached. Unlike the file survey's use counts, Rust cannot compute
 /// a line number here, so the model has to supply it — but it should be asked
 /// at emit time rather than left for a later turn to notice.
-fn unresolved_citation(finding: &Finding) -> Option<String> {
+pub(crate) fn unresolved_citation(finding: &Finding) -> Option<String> {
     if let Some(symbol) = finding
         .relevant_symbols
         .iter()

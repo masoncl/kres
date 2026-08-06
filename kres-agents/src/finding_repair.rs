@@ -82,12 +82,30 @@ pub async fn repair_invalid_findings(
             outcome.unrepaired.push(item);
             continue;
         };
+        // Hydration is a shortcut past the LLM: an id we already know
+        // can be completed from the stored record. It is only a valid
+        // shortcut if the result passes the check that rejected the
+        // raw in the first place — otherwise the fast path launders
+        // exactly the defect the slow path exists to fix.
         if let Some(finding) = hydrate_existing_finding(&item.raw, existing_findings) {
-            outcome.findings.push(RepairedFinding {
-                index: item.index,
-                finding,
-            });
-            continue;
+            match crate::response::unresolved_citation(&finding) {
+                None => {
+                    outcome.findings.push(RepairedFinding {
+                        index: item.index,
+                        finding,
+                    });
+                    continue;
+                }
+                Some(reason) => {
+                    // Fall through to the model. Carry the surviving
+                    // reason so it is asked about what is still wrong.
+                    tracing::info!(
+                        target: "kres_agents",
+                        "hydrating '{expected_id}' from the store did not clear its citation: {reason}"
+                    );
+                    item.error = reason;
+                }
+            }
         }
         let rejected_response = serde_json::json!({"findings": [item.raw.clone()]}).to_string();
         let validation_errors = vec![format!("findings[0]: {}", item.error)];
@@ -158,19 +176,56 @@ pub async fn repair_invalid_findings(
 /// complete Finding. Overlay the supplied fields on the stored record so an
 /// update such as `{id, status, summary}` does not need an LLM call merely to
 /// repeat the unchanged title, severity, and evidence fields.
+/// Complete an id-matching raw finding from the stored record.
+///
+/// The raw's fields win, EXCEPT that an unresolvable citation never
+/// displaces a resolved one. Without that carve-out a later delta
+/// naming the same id — typically an invalidation, which needs no new
+/// evidence — silently replaces a good `file:line` with a
+/// placeholder. On the 2026-08-06 mm/page_alloc.c run all six `:0`
+/// citations arrived this way: `fallbacks_table_row_index_mt3` held
+/// `find_suitable_fallback:2254` until a promoter invalidation
+/// overwrote it with `gfp_migratetype:0`.
 fn hydrate_existing_finding(raw: &serde_json::Value, existing: &[Finding]) -> Option<Finding> {
     let raw_object = raw.as_object()?;
     let id = raw_object.get("id")?.as_str()?;
     let prior = existing.iter().find(|finding| finding.id == id)?;
-    let mut hydrated = serde_json::to_value(prior.redacted_for_agent())
+    let redacted_prior = prior.redacted_for_agent();
+    let mut hydrated = serde_json::to_value(&redacted_prior)
         .ok()?
         .as_object()
         .cloned()?;
-    hydrated.extend(raw_object.clone());
+    let prior_citation_is_resolved =
+        crate::response::unresolved_citation(&redacted_prior).is_none();
+    for (key, value) in raw_object.clone() {
+        if prior_citation_is_resolved && CITATION_FIELDS.contains(&key.as_str()) {
+            // Probe whether taking the raw's version would unresolve
+            // the citation; keep the stored one when it would.
+            let mut probe = hydrated.clone();
+            probe.insert(key.clone(), value.clone());
+            let would_unresolve =
+                match serde_json::from_value::<Finding>(serde_json::Value::Object(probe)) {
+                    Ok(candidate) => crate::response::unresolved_citation(&candidate).is_some(),
+                    // Unparseable is not an improvement either.
+                    Err(_) => true,
+                };
+            if would_unresolve {
+                tracing::info!(
+                    target: "kres_agents",
+                    "kept the stored `{key}` for finding '{id}': the incoming one cites no line"
+                );
+                continue;
+            }
+        }
+        hydrated.insert(key, value);
+    }
     serde_json::from_value::<Finding>(serde_json::Value::Object(hydrated))
         .ok()
         .map(|finding| finding.redacted_for_agent())
 }
+
+/// Fields `unresolved_citation` inspects.
+const CITATION_FIELDS: &[&str] = &["relevant_symbols", "relevant_file_sections"];
 
 fn accept_repaired_finding(expected_id: &str, text: &str) -> Option<Finding> {
     let parsed =
@@ -217,6 +272,97 @@ mod tests {
             "severity": "medium",
             "summary": "summary"
         })
+    }
+
+    /// The 2026-08-06 mm/page_alloc.c run, exactly.
+    /// `fallbacks_table_row_index_mt3` held
+    /// `find_suitable_fallback:2254` until a promoter invalidation
+    /// arrived naming `gfp_migratetype:0`. Hydration let the raw's
+    /// keys win wholesale, so the placeholder replaced the resolved
+    /// citation — and the result was pushed as "repaired" without
+    /// re-running the check that had sent it to repair. All six `:0`
+    /// citations in that run's findings.json arrived this way.
+    #[test]
+    fn an_unresolved_citation_never_displaces_a_resolved_one() {
+        let prior: Finding = serde_json::from_value(json!({
+            "id": "fallbacks_table_row_index_mt3",
+            "title": "fallbacks[] row index confuses MIGRATE_HIGHATOMIC",
+            "severity": "high",
+            "summary": "original",
+            "relevant_symbols": [{
+                "name": "find_suitable_fallback",
+                "filename": "mm/page_alloc.c",
+                "line": 2254,
+                "definition": "enum fallback_result find_suitable_fallback(...)"
+            }]
+        }))
+        .unwrap();
+
+        let hydrated = hydrate_existing_finding(
+            &json!({
+                "id": "fallbacks_table_row_index_mt3",
+                "status": "invalidated",
+                "summary": "MIGRATE_HIGHATOMIC is unreachable here",
+                "relevant_symbols": [{
+                    "name": "gfp_migratetype",
+                    "filename": "include/linux/gfp.h",
+                    "line": 0,
+                    "definition": "VM_WARN_ON(...)"
+                }]
+            }),
+            &[prior],
+        )
+        .expect("hydrates");
+
+        // The invalidation's prose lands.
+        assert_eq!(hydrated.status, kres_core::findings::Status::Invalidated);
+        assert_eq!(hydrated.summary, "MIGRATE_HIGHATOMIC is unreachable here");
+        // The resolved citation survives it.
+        assert_eq!(hydrated.relevant_symbols.len(), 1);
+        assert_eq!(hydrated.relevant_symbols[0].name, "find_suitable_fallback");
+        assert_eq!(hydrated.relevant_symbols[0].line, 2254);
+        assert!(crate::response::unresolved_citation(&hydrated).is_none());
+    }
+
+    /// A better citation must still be allowed to replace a worse one:
+    /// the carve-out is about losing a line number, not about freezing
+    /// the field.
+    #[test]
+    fn a_resolved_citation_may_replace_another_resolved_one() {
+        let prior: Finding = serde_json::from_value(json!({
+            "id": "f1", "title": "t", "severity": "medium", "summary": "s",
+            "relevant_symbols": [{"name": "old", "filename": "mm/page_alloc.c", "line": 100, "definition": "d"}]
+        }))
+        .unwrap();
+        let hydrated = hydrate_existing_finding(
+            &json!({
+                "id": "f1",
+                "relevant_symbols": [{"name": "new", "filename": "mm/page_alloc.c", "line": 2266, "definition": "d"}]
+            }),
+            &[prior],
+        )
+        .unwrap();
+        assert_eq!(hydrated.relevant_symbols[0].name, "new");
+        assert_eq!(hydrated.relevant_symbols[0].line, 2266);
+    }
+
+    /// When the stored record is ALSO unresolved there is nothing to
+    /// protect, so hydration cannot clear the citation and the item
+    /// must go to the model rather than be accepted as repaired.
+    #[test]
+    fn hydration_that_cannot_clear_the_citation_is_not_accepted() {
+        let prior: Finding = serde_json::from_value(json!({
+            "id": "f1", "title": "t", "severity": "medium", "summary": "s",
+            "relevant_symbols": [{"name": "a", "filename": "mm/page_alloc.c", "line": 0, "definition": "d"}]
+        }))
+        .unwrap();
+        let hydrated =
+            hydrate_existing_finding(&json!({"id": "f1", "status": "invalidated"}), &[prior])
+                .expect("hydrates");
+        assert!(
+            crate::response::unresolved_citation(&hydrated).is_some(),
+            "the repair loop must see this is still broken and call the model"
+        );
     }
 
     #[test]

@@ -156,13 +156,40 @@ pub async fn update_todo_via_agent(
     update_todo_via_agent_with_logger(tc, inputs, None, None).await
 }
 
-/// Same as `update_todo_via_agent` but also logs the user+assistant
-/// turns to the provided TurnLogger's `main.jsonl`
-/// Fields of an `update_todo` request that repeat across reaps. The todo list
-/// itself and the newly emitted followups are the per-call half.
-const UPDATE_TODO_STABLE_FIELDS: &[&str] =
-    &["task", "instructions", "plan", "lenses", "completed_query"];
+/// Fields of an `update_todo` request that repeat across reaps.
+///
+/// A field belongs here only if it is the SAME BYTES on the next reap.
+/// The stable half is one cached prefix, so a single volatile member
+/// rewrites the entry for every other member too — and because
+/// serde_json orders keys (no `preserve_order` feature in this
+/// workspace), a volatile key that sorts early poisons everything
+/// after it.
+///
+/// Measured over the 51 todo calls of the 2026-08-05 mm/page_alloc.c
+/// review, by how many of the 50 transitions changed the field:
+///
+///   task              0/50       13 chars
+///   instructions      0/50    6,522 chars
+///   lenses            0/50    1,242 chars
+///   plan             10/50   12,592 chars
+///   completed_query  36/50      831 chars   <- was in here
+///   analysis_summary 50/50    4,023 chars
+///   new_followups    50/50    8,586 chars
+///   current_todo     50/50   46,378 chars
+///
+/// `completed_query` is the reaped task's name, so it changes on
+/// nearly every call, and it sorts ahead of `instructions`, `lenses`,
+/// `plan` and `task` — it was invalidating the entire prefix from the
+/// front. That run wrote 323,010 cache-creation tokens against
+/// 154,229 cache reads.
+///
+/// `plan` stays: it holds at 40 of 50 transitions and is the largest
+/// stable member, so caching it and eating the occasional rewrite
+/// beats never caching it at all.
+const UPDATE_TODO_STABLE_FIELDS: &[&str] = &["task", "instructions", "plan", "lenses"];
 
+/// Same as `update_todo_via_agent` but also logs the user+assistant
+/// turns to the provided TurnLogger's `main.jsonl`.
 pub async fn update_todo_via_agent_with_logger(
     tc: &TodoClient,
     inputs: TodoAgentInputs<'_>,
@@ -1484,6 +1511,55 @@ mod tests {
     /// A numeric ceiling on pending work is an instruction to discard
     /// real work for a reason unrelated to its value. Retirement must
     /// be justified by the item, never by the list length.
+    /// The stable half is one cached prefix: a member that changes
+    /// between reaps rewrites the entry for every other member. Only
+    /// fields that are byte-identical on the next call belong there.
+    #[test]
+    fn the_cached_prefix_holds_no_per_reap_field() {
+        for volatile in [
+            "completed_query",
+            "analysis_summary",
+            "new_followups",
+            "current_todo",
+        ] {
+            assert!(
+                !UPDATE_TODO_STABLE_FIELDS.contains(&volatile),
+                "`{volatile}` changes every reap and must stay in the delta half"
+            );
+        }
+        assert!(UPDATE_TODO_STABLE_FIELDS.contains(&"instructions"));
+        assert!(UPDATE_TODO_STABLE_FIELDS.contains(&"plan"));
+    }
+
+    /// The split is by key, so the reaped task's name must land in the
+    /// delta document, after the cache breakpoint.
+    #[test]
+    fn completed_query_is_split_into_the_delta_document() {
+        let request = json!({
+            "task": "update_todo",
+            "instructions": "INSTRUCTIONS",
+            "lenses": [],
+            "plan": {"steps": []},
+            "completed_query": "[review] Audit __alloc_pages_slowpath",
+            "analysis_summary": "SUMMARY",
+            "new_followups": [],
+            "current_todo": [],
+        });
+        let split =
+            crate::prompt::split_request_documents(&request, UPDATE_TODO_STABLE_FIELDS).unwrap();
+        assert!(!split.stable.contains("__alloc_pages_slowpath"));
+        assert!(split.delta.contains("__alloc_pages_slowpath"));
+        assert!(split.stable.contains("INSTRUCTIONS"));
+
+        // Two reaps of different tasks must share the same prefix.
+        let mut other = request.clone();
+        other["completed_query"] = json!("[review] Audit free_pcppages_bulk");
+        other["current_todo"] = json!([{"id": "x", "name": "x", "status": "pending"}]);
+        let split2 =
+            crate::prompt::split_request_documents(&other, UPDATE_TODO_STABLE_FIELDS).unwrap();
+        assert_eq!(split.stable, split2.stable);
+    }
+
     #[test]
     fn todo_instructions_do_not_cap_the_pending_list() {
         let body = build_instructions(true, true);

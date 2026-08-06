@@ -306,10 +306,33 @@ pub async fn define_goal(
 /// every file one by one") against the derived `goal` string that
 /// may have compressed or generalised that intent during
 /// define_goal.
-/// Fields of a `check_goal` request that repeat across reaps. `analysis` is
-/// the accumulator and stays in the per-call half.
-const CHECK_GOAL_STABLE_FIELDS: &[&str] =
-    &["task", "instructions", "goal", "original_prompt", "plan"];
+/// Fields of a `check_goal` request that repeat across reaps.
+///
+/// A field belongs here only if it is the SAME BYTES on the next reap.
+/// The stable half is one cached prefix, so a single volatile member
+/// rewrites the entry for every other member too — and because
+/// serde_json orders keys (no `preserve_order` feature in this
+/// workspace), a volatile key that sorts early poisons everything
+/// after it.
+///
+/// Measured over the 37 goal checks of the 2026-08-05 mm/page_alloc.c
+/// review, by how many of the 36 transitions changed the field:
+///
+///   task              0/36       12 chars
+///   instructions      0/36    1,237 chars
+///   goal              0/36    1,577 chars
+///   plan              6/36   12,593 chars
+///   original_prompt  36/36      824 chars   <- was in here
+///   analysis         34/36  148,527 chars
+///
+/// `original_prompt` is per-task, not per-session: the reaper reads it
+/// from `task_prompts`, keyed by `TaskId`. Consecutive checks shared a
+/// 9-character common prefix. It sorts ahead of `plan` and `task`, so
+/// it was invalidating those from the front. That run wrote 307,143
+/// cache-creation tokens against 118,316 cache reads.
+///
+/// `analysis` is the accumulator and stays in the per-call half.
+const CHECK_GOAL_STABLE_FIELDS: &[&str] = &["task", "instructions", "goal", "plan"];
 
 fn build_check_goal_request(
     original_prompt: &str,
@@ -685,6 +708,35 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stable half is one cached prefix: a member that changes
+    /// between reaps rewrites the entry for every other member.
+    /// `original_prompt` is per-task (session.rs `task_prompts`, keyed
+    /// by TaskId), so it changes on essentially every check.
+    #[test]
+    fn the_cached_prefix_holds_no_per_reap_field() {
+        for volatile in ["original_prompt", "analysis"] {
+            assert!(
+                !CHECK_GOAL_STABLE_FIELDS.contains(&volatile),
+                "`{volatile}` changes every reap and must stay in the delta half"
+            );
+        }
+        assert!(CHECK_GOAL_STABLE_FIELDS.contains(&"goal"));
+        assert!(CHECK_GOAL_STABLE_FIELDS.contains(&"instructions"));
+        assert!(CHECK_GOAL_STABLE_FIELDS.contains(&"plan"));
+    }
+
+    #[test]
+    fn two_checks_of_different_tasks_share_one_cached_prefix() {
+        let a = build_check_goal_request("[review] Audit slowpath", "GOAL", "ANALYSIS A", None);
+        let b = build_check_goal_request("[review] Audit pcp lists", "GOAL", "ANALYSIS B", None);
+        let sa = crate::prompt::split_request_documents(&a, CHECK_GOAL_STABLE_FIELDS).unwrap();
+        let sb = crate::prompt::split_request_documents(&b, CHECK_GOAL_STABLE_FIELDS).unwrap();
+        assert_eq!(sa.stable, sb.stable);
+        assert!(!sa.stable.contains("Audit slowpath"));
+        assert!(sa.delta.contains("Audit slowpath"));
+        assert!(sa.stable.contains("GOAL"));
+    }
 
     #[test]
     fn extract_json_strict() {

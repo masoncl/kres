@@ -1144,7 +1144,10 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          them\n\
          - Keep pending items that are still relevant in `todo`\n\
          - Move ONLY no-longer-relevant pending items to `retired`\n\
-         - Max 20 pending items (done items don't count toward the limit)\n\
+         - There is no limit on how many items may be pending. Keep \
+         every item that is still worth doing; the scheduler works the \
+         list top-down and drains the remainder to the deferred list \
+         when the session ends. Never retire an item to hit a count.\n\
          - PARALLELISM: most items can run in parallel. Only add \
          depends_on when an item truly requires another's results first.\n\
          - FIX-AND-AMEND INVALIDATION: when the analysis shows that \
@@ -1476,6 +1479,17 @@ mod tests {
 
         let bad = r#"{"todo":[],"newly_done":[{"id":"b","covrage":"typo"}]}"#;
         assert!(parse_todo_update_full(bad).is_err());
+    }
+
+    /// A numeric ceiling on pending work is an instruction to discard
+    /// real work for a reason unrelated to its value. Retirement must
+    /// be justified by the item, never by the list length.
+    #[test]
+    fn todo_instructions_do_not_cap_the_pending_list() {
+        let body = build_instructions(true, true);
+        assert!(!body.contains("Max 20"));
+        assert!(body.contains("no limit on how many items may be pending"));
+        assert!(body.contains("Never retire an item to hit a count"));
     }
 
     #[test]

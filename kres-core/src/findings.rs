@@ -192,6 +192,16 @@ impl Finding {
     /// Return a clone suitable for inclusion in an LLM prompt —
     /// Store-owned provenance and details are cleared so they cannot become
     /// part of the model-facing wire contract.
+    ///
+    /// This is ALSO applied to findings a model just emitted, before
+    /// they are stored, so it must never drop anything the store needs
+    /// to keep. Source bodies in particular: `value_to_findings` runs
+    /// it on parsed output that becomes `findings_delta`, so stripping
+    /// `relevant_symbols[].definition` here would silently store every
+    /// new finding without its evidence, and `/summary` renders that
+    /// evidence as `exact_text`. To shrink a PROMPT, use
+    /// [`Finding::without_source_bodies`] at the point the prompt is
+    /// built instead.
     pub fn redacted_for_agent(&self) -> Finding {
         let mut c = self.clone();
         c.first_seen_task = None;
@@ -199,6 +209,131 @@ impl Finding {
         c.first_seen_at = None;
         c.details.clear();
         c
+    }
+
+    /// Return a clone with the source each finding carries removed:
+    /// `relevant_symbols[].definition` and
+    /// `relevant_file_sections[].content`.
+    ///
+    /// For `previous_findings` only. Every finding is still sent, in
+    /// full — this drops no finding and no claim, and `name`,
+    /// `filename` and `line` survive so every symbol stays citable and
+    /// re-fetchable via a `source` or `read` followup.
+    ///
+    /// Measured on the 2026-08-06 mm/swapfile.c review: at 99 findings
+    /// `previous_findings` reached 1187 KB, of which definitions were
+    /// 427 KB and file-section contents 114 KB. The cached head alone
+    /// then passed the 1,048,576-character cap on the codex-codes
+    /// JSON-RPC transport, so the `general` lens failed with -32602 on
+    /// twelve tasks and halted the session twice. Replaying the
+    /// largest failing request through this takes it from 1368 KB to
+    /// 900 KB.
+    ///
+    /// Never apply this to findings on their way INTO the store.
+    pub fn without_source_bodies(&self) -> Finding {
+        let mut c = self.clone();
+        for symbol in &mut c.relevant_symbols {
+            symbol.definition.clear();
+        }
+        for section in &mut c.relevant_file_sections {
+            section.content.clear();
+        }
+        c
+    }
+}
+
+/// Prepare prior findings for a prompt: agent-redacted AND without the
+/// source bodies. The one entry point for `previous_findings`, so the
+/// prioritizer's cached head stays byte-identical to the lens fan-out's.
+pub fn findings_for_prompt_history(findings: &[Finding]) -> Vec<Finding> {
+    findings
+        .iter()
+        .map(|f| f.redacted_for_agent().without_source_bodies())
+        .collect()
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    fn finding_with_bodies() -> Finding {
+        Finding {
+            id: "f1".into(),
+            title: "t".into(),
+            severity: Severity::High,
+            status: Status::Active,
+            relevant_symbols: vec![RelevantSymbol {
+                name: "swap_dup_entries_cluster".into(),
+                filename: "mm/swapfile.c".into(),
+                line: 42,
+                definition: "static int swap_dup_entries_cluster(void) { /* body */ }".into(),
+            }],
+            relevant_file_sections: vec![RelevantFileSection {
+                filename: "mm/swapfile.c".into(),
+                line_start: 40,
+                line_end: 60,
+                content: "twenty lines of source".into(),
+            }],
+            summary: "s".into(),
+            reproducer_sketch: "r".into(),
+            impact: "i".into(),
+            mechanism_detail: None,
+            fix_sketch: None,
+            open_questions: vec![],
+            first_seen_task: Some("task".into()),
+            last_updated_task: Some("task".into()),
+            related_finding_ids: vec![],
+            reactivate: false,
+            details: vec![],
+            introduced_by: None,
+            first_seen_at: None,
+        }
+    }
+
+    /// The bug this guards against: `redacted_for_agent` also runs on
+    /// findings a model just EMITTED, on their way INTO the store
+    /// (`value_to_findings`). Stripping source there would store every
+    /// new finding without its evidence, and `/summary` renders that
+    /// evidence as `exact_text`.
+    #[test]
+    fn agent_redaction_keeps_source_because_it_also_runs_into_the_store() {
+        let redacted = finding_with_bodies().redacted_for_agent();
+        assert!(
+            !redacted.relevant_symbols[0].definition.is_empty(),
+            "redacted_for_agent must not drop source: it sanitizes findings being stored"
+        );
+        assert!(!redacted.relevant_file_sections[0].content.is_empty());
+        // What it does strip: store-owned provenance.
+        assert!(redacted.first_seen_task.is_none());
+        assert!(redacted.details.is_empty());
+    }
+
+    #[test]
+    fn prompt_history_drops_source_bodies_but_keeps_every_citation() {
+        let shipped = findings_for_prompt_history(&[finding_with_bodies()]);
+        assert_eq!(shipped.len(), 1, "no finding is ever dropped");
+        let f = &shipped[0];
+        assert!(f.relevant_symbols[0].definition.is_empty());
+        assert!(f.relevant_file_sections[0].content.is_empty());
+        // Everything needed to cite or re-fetch survives.
+        assert_eq!(f.relevant_symbols[0].name, "swap_dup_entries_cluster");
+        assert_eq!(f.relevant_symbols[0].filename, "mm/swapfile.c");
+        assert_eq!(f.relevant_symbols[0].line, 42);
+        assert_eq!(f.relevant_file_sections[0].line_start, 40);
+        assert_eq!(f.summary, "s");
+        assert_eq!(f.impact, "i");
+        // Prompt history is still agent-redacted.
+        assert!(f.first_seen_task.is_none());
+    }
+
+    #[test]
+    fn stripping_does_not_mutate_the_stored_finding() {
+        // The store keeps the bodies; only the prompt copy loses them,
+        // which is what /summary and the export path depend on.
+        let stored = finding_with_bodies();
+        let _ = stored.without_source_bodies();
+        assert!(!stored.relevant_symbols[0].definition.is_empty());
+        assert!(!stored.relevant_file_sections[0].content.is_empty());
     }
 }
 

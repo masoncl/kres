@@ -1188,7 +1188,7 @@ impl AgentRunner {
         // request-size policy. Provider-specific framing happens below the
         // prompt layer without changing the visible content.
         let (symbols, context) = crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
-        let previous_findings = kres_core::redact_findings_for_agent(&ctx.previous_findings);
+        let previous_findings = kres_core::findings_for_prompt_history(&ctx.previous_findings);
         // Non-lensed slow calls are one-shot. Do not split off a
         // cached prefix here: there is no parallel fan-out to amortize
         // the cache write, and repeated workflow correction passes
@@ -2018,7 +2018,7 @@ impl AgentRunner {
         // lives downstream.
         let slow_variants = self.effective_slow_variants();
         let (symbols, context) = crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
-        let previous_findings = kres_core::redact_findings_for_agent(&ctx.previous_findings);
+        let previous_findings = kres_core::findings_for_prompt_history(&ctx.previous_findings);
         let mut shared_cp = CodePrompt::new(prompt)
             .with_symbols(&symbols)
             .with_context(&context)
@@ -2450,8 +2450,8 @@ impl AgentRunner {
                 .with_context(&round_context);
             // Prior findings ride the round-0 cached prefix. Later rounds
             // retain them through conversation history.
-            let fast_previous_findings =
-                (round == 0).then(|| kres_core::redact_findings_for_agent(&ctx.previous_findings));
+            let fast_previous_findings = (round == 0)
+                .then(|| kres_core::findings_for_prompt_history(&ctx.previous_findings));
             if let Some(findings) = fast_previous_findings.as_ref() {
                 cp = cp.with_previous_findings(findings);
             }
@@ -3516,7 +3516,7 @@ mod tests {
     }
 
     #[test]
-    fn every_prior_finding_reaches_the_prompt_with_its_source_intact() {
+    fn every_prior_finding_reaches_the_prompt_without_its_source_body() {
         fn finding(id: &str) -> Finding {
             Finding {
                 id: id.into(),
@@ -3563,16 +3563,33 @@ mod tests {
             });
 
         let input = vec![anchored_elsewhere, anchored_here];
-        let shipped = kres_core::redact_findings_for_agent(&input);
+        let shipped = kres_core::findings_for_prompt_history(&input);
 
+        // EVERY finding is still shipped. That is the invariant: a
+        // finding that looks unrelated by filename is exactly what a
+        // cross-file contract review must catch, so nothing decides
+        // which findings an agent may see.
         assert_eq!(shipped.len(), 2);
+        let ids: Vec<&str> = shipped.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["elsewhere", "here"]);
         for finding in &shipped {
-            assert_eq!(
-                finding.relevant_symbols[0].definition.len(),
-                1_100_000,
-                "finding {} lost its source body",
+            // The source body is NOT shipped. Two 1.1 MB definitions
+            // are 2.2 MB of prompt on their own, and at 99 findings
+            // this payload passed the 1,048,576-character cap on the
+            // codex-codes transport and failed twelve tasks with
+            // JSON-RPC -32602 (2026-08-06 mm/swapfile.c review).
+            assert!(
+                finding.relevant_symbols[0].definition.is_empty(),
+                "finding {} still carries a source body",
                 finding.id
             );
+            // Everything needed to cite the symbol or re-fetch its
+            // body survives, so the finding stays actionable.
+            assert!(!finding.relevant_symbols[0].name.is_empty());
+            assert!(!finding.relevant_symbols[0].filename.is_empty());
+            assert_ne!(finding.relevant_symbols[0].line, 0);
+            assert!(!finding.summary.is_empty());
+            assert!(!finding.impact.is_empty());
         }
     }
 

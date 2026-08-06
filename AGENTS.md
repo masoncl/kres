@@ -98,25 +98,33 @@ User prompt → Task created → Task thread starts
   recovers any region. Do not extend this to grep, source, or any
   evidence a review reasons over, and do not turn it into a silent
   truncation by dropping the pointer or the byte count.
-- Prior findings are sent to agents in full, every time. Do not add
-  relevance routing, anchor heuristics, source-body-free manifests, or
-  any other scheme that decides which findings a review is allowed to
-  see: a finding that looks unrelated by filename is exactly what a
-  cross-file contract review must catch. Cost is handled by placing
-  `previous_findings` in the shared cached lens prefix, not by sending
-  less. If the accumulated set ever approaches model capability, add a
-  semantic partitioner over findings — do not hide them.
-- Rust must not infer semantic workflow state from free-form AI prose.
-  Do not add substring/regex classifiers over model `analysis`,
-  `invalid_evidence`, defect text, commit-message prose, or other natural
-  language output to decide cleanliness, routing, invalidation, retry,
-  completion, or followup creation. Use explicit JSON fields, typed
-  arrays, enums, booleans, and workflow expressions. If a legacy/free-form
-  output must be interpreted, add a targeted inference/judge step that
-  returns structured JSON and make Rust consume only that structure.
-  Prose may be preserved for humans and logs, but it must not be a hidden
-  control channel.
-
+- Every prior finding is sent to every agent, every time. Do not add
+  relevance routing, anchor heuristics, or any other scheme that
+  decides WHICH findings a review is allowed to see: a finding that
+  looks unrelated by filename is exactly what a cross-file contract
+  review must catch. If the accumulated set ever approaches model
+  capability, add a semantic partitioner — do not hide findings.
+- What is NOT sent is the source each finding carries.
+  `findings_for_prompt_history` clears `relevant_symbols[].definition`
+  and `relevant_file_sections[].content`, keeping name/filename/line so
+  every symbol stays citable and re-fetchable through a `source` or
+  `read` followup. This drops no finding and no claim.
+  It was added after the 2026-08-06 mm/swapfile.c review: at 99
+  findings `previous_findings` reached 1187 KB — definitions 427 KB,
+  file sections 114 KB — and the cached head alone passed the
+  1,048,576-character cap on the codex-codes JSON-RPC transport. The
+  `general` lens failed with -32602 on twelve tasks and halted the
+  session twice. Note this is a TRANSPORT cap, not model capability;
+  if findings later approach the latter, the partitioner above is
+  still the answer.
+- Do NOT fold that stripping into `redacted_for_agent`.  That function
+  also runs on findings a model just emitted, on their way INTO the
+  store (`value_to_findings`), so stripping there stores every new
+  finding without its evidence — and `/summary` renders exactly that
+  evidence as `exact_text`.  Prompt shrinking belongs at the point the
+  prompt is built, which is why `findings_for_prompt_history` is the
+  single entry point for `previous_findings`: it also keeps the
+  prioritizer's cached head byte-identical to the lens fan-out's.
 ### Lints
 - The pre-commit hook runs `cargo clippy --workspace --all-targets
   -- -D warnings`. Do not silence a clippy diagnostic with

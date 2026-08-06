@@ -852,7 +852,7 @@ impl Session {
         // lens fan-out will read, and `prepare_lens_fanout` redacts.
         // Raw findings would differ by the per-task provenance fields
         // and turn a shared block into two writes of ~166KB.
-        let findings = kres_core::redact_findings_for_agent(&self.mgr.findings_snapshot().await);
+        let findings = kres_core::findings_for_prompt_history(&self.mgr.findings_snapshot().await);
         let plan = self.mgr.plan_snapshot().await;
         // The OPERATOR's prompt, not the last thing dispatched.
         // `last_prompt` is overwritten by every pipeline submission

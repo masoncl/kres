@@ -85,7 +85,23 @@ pub struct Settings {
     pub model_aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub actions: ActionSettings,
+    /// Maximum tasks running at once, at least 1. `None` uses
+    /// [`DEFAULT_MAX_PARALLEL`]. Dispatch refills to this cap whenever
+    /// the reap queue is empty, so this is what bounds concurrency —
+    /// not the per-dispatch batch size.
+    #[serde(default)]
+    pub max_parallel: Option<usize>,
 }
+
+/// Tasks allowed to run at once when neither `--max-parallel` nor
+/// `settings.json` says otherwise.
+///
+/// 10 is not arbitrary: it is what the old all-or-nothing dispatch
+/// produced in practice, since a wave was capped at 10 items and no
+/// new wave could start until the previous one fully drained. Keeping
+/// the same number means enabling incremental dispatch changes when
+/// tasks start, not how many run.
+pub const DEFAULT_MAX_PARALLEL: usize = 10;
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +234,9 @@ impl Settings {
         self.model_aliases.extend(proj.model_aliases);
         if proj.actions.allowed.is_some() {
             self.actions.allowed = proj.actions.allowed;
+        }
+        if proj.max_parallel.is_some() {
+            self.max_parallel = proj.max_parallel;
         }
     }
 
@@ -658,6 +677,22 @@ mod tests {
         global.apply_project_overrides(project);
 
         assert_eq!(global.secondary_slow_model(), Some("secondary-v2"));
+    }
+
+    #[test]
+    fn project_max_parallel_overrides_global() {
+        // Every other overlayable field is handled explicitly, so a
+        // new one that is not silently reads as "the project setting
+        // does nothing".
+        let mut global: Settings = serde_json::from_str(r#"{"max_parallel":10}"#).unwrap();
+        let project: Settings = serde_json::from_str(r#"{"max_parallel":3}"#).unwrap();
+        global.apply_project_overrides(project);
+        assert_eq!(global.max_parallel, Some(3));
+
+        // A project file that says nothing leaves the global cap.
+        let mut global: Settings = serde_json::from_str(r#"{"max_parallel":10}"#).unwrap();
+        global.apply_project_overrides(Settings::default());
+        assert_eq!(global.max_parallel, Some(10));
     }
 
     #[test]

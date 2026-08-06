@@ -165,6 +165,86 @@ User prompt → Task created → Task thread starts
 - Task states: `pending → inference → waiting_main → gathering → done`
 - `TaskManager` handles scheduling (respects `depends_on`), servicing, reaping
 
+### Dispatch Backpressure: the Start Budget
+
+The shared todo list is the resource being protected, but protecting
+it by making dispatch WAIT turned out to cost more than it bought.
+Two rules were tried and removed; do not reintroduce either.
+
+- **Removed: "no task starts while any task runs."** Requiring
+  `snapshot().is_empty()` cost 33% of wall-clock time idle.
+- **Removed: "no task starts while the reap queue is non-empty."**
+  This serialised every new task behind a ~65s publication. Measured
+  on the 2026-08-06 aug6-4 run: half the post-reap refills were
+  refused with `N task(s) waiting to be reaped`, handing back much of
+  the idle time the change had just reclaimed.
+
+What bounds dispatch now:
+
+- **The slot cap** — `--max-parallel` (default 10), owned by
+  `TaskManager` and read through `max_parallel()` / `free_slots()`.
+  Do not carry a second copy in `ReplConfig` or anywhere else, or the
+  number that gates `spawn` and the number that sizes a dispatch will
+  drift. A cap of 0 is refused at startup.
+- **The start budget** — at most `max_parallel` tasks may start
+  without a reap batch completing (`Inner.starts_since_reap`, re-armed
+  by `note_reap_completed()` AFTER publication, not after `reap()`).
+  The reaper shares one rate limiter with the tasks it is publishing;
+  without this, a stream of fast tasks keeps claiming work while the
+  reaper never gets a turn.
+- **The turn budget** — the `--turns` remainder minus in-flight tasks.
+
+All three are applied inside `claim_ranked_todos`, under the one write
+lock that also flips the rows. Do not compute a bound in the caller
+and pass a limit down: two dispatches could each read "5 free" and
+each claim 5.
+
+**Claiming during a reap is safe** because the todo list is
+Rust-owned and every mutation takes that write lock. The one hazard —
+a row claimed while the todo agent's round trip is in flight — is
+handled by `merge_inferred_state`, which restores the live status of
+any row that went InProgress or terminal after its inference snapshot
+was taken (`inferred_todo_cannot_redispatch_work_started_after_snapshot`).
+
+Other invariants:
+
+- **One dispatch path.** `/continue`, `/next` and the post-reap refill
+  all go through `Session::dispatch_ready`. Do not add a second
+  claim-and-submit sequence.
+- The reaper decides WHEN to refill, signalling over an
+  `mpsc::channel(1)` that carries nothing. `submit_prompt_inner`
+  reaches change-survey closures whose futures rustc cannot prove
+  `Send`, so it cannot be awaited inside the reaper's spawn. Fix that
+  first if you want to move it.
+- **The bound covers pipeline dispatch, not operator submissions.**
+  `submit_prompt` and `dispatch_workflow` start tasks directly, as
+  they did before this design. Deliberate — an operator typing a
+  prompt is not waiting on a reap.
+- Auto-continue is NOT `/continue`. `Session::auto_continue` skips the
+  two side effects that are statements of operator intent: clearing
+  the `/stop` latch, and pulling the deferred ledger back into the
+  todo list.
+
+### One Reap Batch, One Reconciliation
+
+`reap()` drains every terminal task in one call, and the todo and
+goal agents then run **once over the whole batch**, not once per
+task.
+
+- Per-task work stays per-task: publication, coding side effects,
+  `effective_analysis`, the report append, promote, `apply_delta`,
+  the findings signature, and the consecutive-error watchdog.
+- Batch work is the part that reasons over the shared list: one
+  todo-agent call and one goal check per client group. A batch mixing
+  lensed-review and non-review tasks costs two rounds, never N.
+- The goal is per-task in storage but almost always identical across
+  a batch (pipeline submissions inherit the cached session goal), so
+  the check runs once per DISTINCT (goal, prompt) pair.
+- This is a correctness change as well as a latency one: two parallel
+  tasks routinely emit the same followup, and sequential rounds can
+  only dedup the second against the first after it has already become
+  a row.
+
 ### Shared Symbol Cache
 - `TaskManager.symbol_cache` and `context_cache` are thread-safe (via `cache_lock`)
 - Tasks seed from cache at startup — avoids re-fetching known symbols
@@ -186,6 +266,12 @@ controls nothing else:
 
 - `todo` carries the PENDING list only. Done rows are reconstructed
   from Rust's own copy, so the agent never re-emits them.
+- The request's `completed` is an ARRAY — one entry per task in the
+  reaped batch, each with `{query, analysis, followups}` plus
+  `just_completed` when that task owned a row. `newly_done` must
+  carry one coverage sentence per completed entry, drawn from that
+  entry's own analysis. `InferredTodoUpdate.completed_todo_ids` is
+  likewise a set. Do not narrow either back to a single task.
 - ORDER is not a channel. The pending list is stable storage:
   surviving rows keep their position and new rows are appended.
   Choosing what runs next belongs to the prioritization agent.
@@ -220,21 +306,32 @@ makes the shared cache block below impossible.
   the skills, and the plan — the same material the slow agents reason
   over.
 - Output is at most N ids, best first, each with a one-line rationale
-  that is logged and not otherwise consumed. N is the dispatch budget:
-  `BATCH_CAP` (10) for `/continue`, 1 for `/next`, further clamped by
-  the `--turns` remainder.
+  that is logged and not otherwise consumed. N is the concurrency cap
+  (`--max-parallel`, default 10) — ranking further ahead is output the
+  next refresh overwrites before anything reads it.
 - It cannot edit, complete, retire, merge, or invent work. Ids not in
   the ready set are dropped with a log line; duplicates and
   over-budget picks are truncated.
-- It runs at DISPATCH time, not in the reap sequence — once per wave
-  rather than once per reaped task — and never under the manager's
-  write lock. `ready_pending_snapshot` then `claim_selected_todos` is
-  the snapshot/claim split that makes that safe; rows that stop being
-  ready in between are skipped.
-- When it is unavailable, fails, or returns nothing usable, dispatch
-  falls back to `claim_ready_todos_with_turn_limit` in storage order.
+- **Nothing ever waits for it.** The ranking is a stored artifact
+  (`Inner.ranked_order`, a preference list of ids — NOT a reordering
+  of the todo list), refreshed detached after each reap batch by
+  `Session::spawn_ranking_refresh`. Dispatch reads it via
+  `claim_ranked_todos` and claims under one write lock with no
+  inference call at all. Do not put the ranking call back on the
+  dispatch path: at 17.5s and growing with findings, it idles a slot
+  for its whole duration and destroys the amortisation that made one
+  ranking authorise ten dispatches.
+- Consuming a slightly stale order is safe by construction:
+  `claim_ranked_todos` re-validates status and dependencies under the
+  write lock, so staleness can only mean a suboptimal pick, never an
+  invalid one. The refill right after a reap deliberately uses the
+  order computed before that batch landed.
+- It never runs under the manager's write lock —
+  `ready_pending_snapshot` then rank then `set_ranked_order`.
+- When it is unavailable, fails, or returns nothing usable, the
+  previous order stands and unranked rows dispatch in storage order.
   Ranking is an optimisation and must never stall a wave.
-- A wave where every ready row fits in the budget skips the call
+- A refresh with every ready row fitting the depth skips the call
   entirely — there is nothing to rank.
 - Its ONE cached block is the lens session head
   (`prompt::session_cache_head`, `{common_skills, previous_findings}`),
@@ -421,7 +518,7 @@ this repo's `configs/` tree:
 |------|---------|
 | `models/<model-id>.json` | Model/role config selected by `settings.json` or CLI model flags. Uses `api_key`, provider fields, max_tokens, rate_limit, thinking, and optional role sections (`fast`, `slow`, `main`, `todo`). |
 | `mcp.json` | MCP server definitions (installed only when semcode-mcp is available) |
-| `settings.json` | Per-user defaults for per-role model ids. Optional `models.slow_secondary` adds a supplemental review model (`general` for `/review`, `maintainer` for `/fix`). CLI flags `--fast-model`, `--slow-model`, `--main-model`, and `--todo-model` override matching roles. Any explicit `--slow` selection replaces the configured slow pair; repeat or comma-separate it to select multiple models. Without `--compare`, the first model runs all lenses and later models run only the supplemental lens. `--compare` runs every lens on every selected slow model. `--slow` and `--slow-model` are mutually exclusive. |
+| `settings.json` | Per-user defaults for per-role model ids. Optional `models.slow_secondary` adds a supplemental review model (`general` for `/review`, `maintainer` for `/fix`). CLI flags `--fast-model`, `--slow-model`, `--main-model`, and `--todo-model` override matching roles. Any explicit `--slow` selection replaces the configured slow pair; repeat or comma-separate it to select multiple models. Without `--compare`, the first model runs all lenses and later models run only the supplemental lens. `--compare` runs every lens on every selected slow model. `--slow` and `--slow-model` are mutually exclusive. Optional `max_parallel` sets how many tasks run at once (default 10, 0 = unbounded); `--max-parallel N` overrides it. |
 | `system-prompts/*.system.md` | Optional operator overrides for agent system prompts. Default prompts are embedded in the kres binary (`kres-agents/src/embedded_prompts.rs`); a file at `~/.kres/system-prompts/<basename>` shadows the embedded copy. Empty by default |
 | `commands/<name>.md` | Optional operator overrides (or additions) for non-workflow slash-command templates. Summary rendering reads `summary` / `summary-markdown` templates through `kres-agents/src/user_commands.rs`; workflow-owned names (`fix`, `review`, `triage`, `validate`) are reserved and cannot be resurrected as prompt templates. |
 | `workflows/<name>.json` | Optional operator overrides for shipped workflows such as `fix`, `review`, `triage`, and `validate`. Disk overrides shadow embedded workflow JSON. |
@@ -542,6 +639,16 @@ used by the fix workflow after `Assisted-by:`. When omitted, kres derives
   main.jsonl                  # All main agent turns
 ```
 
+`console.jsonl` is the transcript of everything `async_println`
+emits: dispatch decisions, reap batches, promote/goal/todo verdicts,
+rate-limit notices. It exists because that narrative used to live
+only on the operator's terminal, so nothing reading a finished run
+could explain WHY the scheduler did what the other two logs show it
+doing. The tee lives inside `kres_core::io::async_println` — one hook
+covers everything precisely because every progress line goes through
+that function and nowhere else. A transcript sink must never call
+`async_println` itself; it runs inside it and would recurse.
+
 Note: `~/.kres/sessions/` holds per-run artifacts (findings.json,
 report.md, session.json) but NOT the JSONL logs. The JSONL logs
 live only in `<cwd>/.kres/logs/<uuid>/`, created by `TurnLogger::new`
@@ -555,6 +662,12 @@ line is a `LogEntry` with an RFC 3339 UTC `timestamp`, `role`, `content`,
 and optionally `usage` (token counts) and `thinking` (slow agent reasoning).
 Subtract matching user and assistant timestamps to measure a model call;
 overlapping intervals show concurrent calls.
+
+### console.jsonl
+
+One record per progress line: `{timestamp, line}`. Grep it to
+reconstruct scheduling behaviour — `[dispatch`, `[todo update]`,
+`[goal check]`, `[promote]`, `[findings]`, `[prioritize]`.
 
 ### code.jsonl
 

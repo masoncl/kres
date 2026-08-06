@@ -321,6 +321,7 @@ pub struct TurnLogger {
 struct Inner {
     code: File,
     main: File,
+    console: File,
 }
 
 impl TurnLogger {
@@ -342,11 +343,50 @@ impl TurnLogger {
             .create(true)
             .append(true)
             .open(session_dir.join("main.jsonl"))?;
+        let console = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(session_dir.join("console.jsonl"))?;
         Ok(Self {
             session_id,
             session_dir,
-            inner: Mutex::new(Inner { code, main }),
+            inner: Mutex::new(Inner {
+                code,
+                main,
+                console,
+            }),
         })
+    }
+
+    /// Append one operator-facing progress line to `console.jsonl`.
+    ///
+    /// This is the transcript of everything `async_println` emits —
+    /// dispatch decisions, reap batches, goal verdicts, rate-limit
+    /// notices. Without it that narrative exists only on the
+    /// operator's terminal, so nothing that reads a finished run can
+    /// tell WHY the scheduler did what the other two logs show it
+    /// doing.
+    ///
+    /// Errors are dropped on the floor rather than reported: the
+    /// obvious way to report them is `async_println`, which is what
+    /// called us.
+    pub fn log_console(&self, line: &str) {
+        #[derive(Serialize)]
+        struct ConsoleEntry<'a> {
+            timestamp: String,
+            line: &'a str,
+        }
+        let entry = ConsoleEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            line,
+        };
+        let Ok(mut json) = serde_json::to_string(&entry) else {
+            return;
+        };
+        json.push('\n');
+        if let Ok(mut g) = self.inner.lock() {
+            let _ = g.console.write_all(json.as_bytes());
+        }
     }
 
     pub fn session_id(&self) -> &str {
@@ -549,6 +589,52 @@ fn log_timestamp() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn console_transcript_lands_beside_the_other_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let lg = TurnLogger::new(dir.path()).unwrap();
+        lg.log_console("[dispatch /continue] starting 3 task(s)");
+        lg.log_console("[goal check] met=false reason=needs callers");
+        let raw = std::fs::read_to_string(lg.session_dir().join("console.jsonl")).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["line"], "[dispatch /continue] starting 3 task(s)");
+        assert!(first["timestamp"].as_str().is_some());
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(
+            second["line"],
+            "[goal check] met=false reason=needs callers"
+        );
+    }
+
+    #[test]
+    fn transcript_tee_captures_async_println() {
+        // The tee has to sit inside async_println itself: every
+        // progress line in the system goes through it and nothing
+        // else, which is the only reason one hook is sufficient.
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let prior = crate::io::install_transcript(Box::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_string());
+        }));
+        crate::async_eprintln!("[dispatch post-reap] starting {} task(s)", 2);
+        let captured = seen.lock().unwrap().clone();
+        // Restore whatever was there so this test cannot leak into
+        // another one running in the same process.
+        match prior {
+            Some(f) => {
+                crate::io::install_transcript(f);
+            }
+            None => {
+                crate::io::install_transcript(Box::new(|_| {}));
+            }
+        }
+        assert_eq!(captured, vec!["[dispatch post-reap] starting 2 task(s)"]);
+    }
+
     use super::*;
     use std::io::Read;
     use tempfile::tempdir;

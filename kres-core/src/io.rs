@@ -65,11 +65,44 @@ pub fn has_printer() -> bool {
     slot().read().unwrap().is_some()
 }
 
+/// Transcript sink. Unlike the printer, this is a tee: it does not
+/// replace terminal output, it records it.
+///
+/// Everything an operator sees scroll past — dispatch decisions, reap
+/// batches, goal verdicts, rate-limit notices — goes through
+/// [`async_println`] and nowhere else, so a single tee here is the
+/// whole narrative. Without it that narrative lives only on the
+/// operator's terminal and no post-hoc analysis of a finished run can
+/// explain WHY the scheduler did what code.jsonl and main.jsonl show
+/// it doing.
+pub type TranscriptFn = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
+fn transcript_slot() -> &'static RwLock<Option<TranscriptFn>> {
+    static SLOT: OnceLock<RwLock<Option<TranscriptFn>>> = OnceLock::new();
+    SLOT.get_or_init(|| RwLock::new(None))
+}
+
+/// Install the transcript tee, replacing any previous one. Returns
+/// the handler it displaced.
+///
+/// The sink MUST NOT call [`async_println`]: it is invoked from
+/// inside that function and would recurse. Swallow its own errors.
+pub fn install_transcript(f: TranscriptFn) -> Option<TranscriptFn> {
+    transcript_slot().write().unwrap().replace(f)
+}
+
 /// Route a single line through the installed printer, falling back
 /// to `eprintln!` when none is set. Do not include a trailing
 /// newline — the sink appends one.
 pub fn async_println(line: impl Into<String>) {
     let s = line.into();
+    // Record before displaying, so a line that panics the terminal
+    // sink is still on disk.
+    if let Ok(g) = transcript_slot().read() {
+        if let Some(f) = g.as_ref() {
+            f(&s);
+        }
+    }
     let g = slot().read().unwrap();
     match g.as_ref() {
         Some(f) => f(s),

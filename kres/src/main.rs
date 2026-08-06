@@ -194,6 +194,15 @@ struct ReplArgs {
     /// the default.
     #[arg(long, default_value_t = 0, value_name = "N")]
     turns: u32,
+    /// Maximum tasks running at once. Dispatch refills up to this cap
+    /// whenever the reap queue is empty, so it — not the per-dispatch
+    /// batch size — is what bounds concurrent model calls. Each task
+    /// fans out over its lenses, so the real ceiling on in-flight
+    /// requests is roughly this times the lens count. 0 = unbounded,
+    /// which is not recommended: dispatch will claim every ready row.
+    /// Overrides `max_parallel` in ~/.kres/settings.json.
+    #[arg(long, value_name = "N")]
+    max_parallel: Option<usize>,
     /// When `--turns 0` (unlimited), add a secondary stop on
     /// stagnation: if 3 consecutive analysis-producing runs fail to
     /// grow the findings list, exit even if the goal agent has not
@@ -1208,7 +1217,23 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     // downstream use is follow-on work. Keep them non-dead:
     let _ = (&report_path, &todo_path);
 
-    let mgr = TaskManager::new();
+    // Concurrency cap. Dispatch refills to this whenever the reap
+    // queue empties, so it — not the per-dispatch batch size — is what
+    // bounds how many tasks run at once. The manager's semaphore
+    // enforces the same number at spawn, so an over-eager dispatch
+    // queues rather than over-runs.
+    let max_parallel = args
+        .max_parallel
+        .or(settings.max_parallel)
+        .unwrap_or(kres_repl::settings::DEFAULT_MAX_PARALLEL);
+    if max_parallel == 0 {
+        startup_lines.push(
+            "--max-parallel 0: unbounded concurrency, dispatch will claim every ready row".into(),
+        );
+    } else {
+        startup_lines.push(format!("max parallel tasks: {max_parallel}"));
+    }
+    let mgr = TaskManager::with_max_parallel(max_parallel);
     // session.json lives beside findings.json / report.md so an
     // interrupted run can be resumed via `--results <same dir>`.
     // Always set — even for defaulted session dirs, so crash recovery
@@ -1338,6 +1363,13 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     let logger = match kres_core::log::TurnLogger::new(std::path::Path::new(".")) {
         Ok(lg) => {
             let lg = std::sync::Arc::new(lg);
+            // Tee every progress line into console.jsonl beside the
+            // other two logs. Installed before the first line so the
+            // banner and startup notices are captured too.
+            let for_transcript = lg.clone();
+            kres_core::io::install_transcript(Box::new(move |line: &str| {
+                for_transcript.log_console(line);
+            }));
             kres_core::async_eprintln!("session: {}", lg.session_id());
             kres_core::async_eprintln!("logs:    {}", lg.session_dir().display());
             Some(lg)
@@ -1673,7 +1705,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             }
         }
     }
-    session.run().await
+    Arc::new(session).run().await
 }
 
 /// Build the rule-based fetcher used when `--main-agent` is absent
@@ -1968,8 +2000,16 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     let logger: Option<Arc<kres_core::log::TurnLogger>> =
         match kres_core::log::TurnLogger::new(&logs_base) {
             Ok(lg) => {
+                let lg = Arc::new(lg);
+                // Same transcript tee as the REPL path, so a
+                // non-REPL invocation's progress narrative is
+                // recoverable from its log dir too.
+                let for_transcript = lg.clone();
+                kres_core::io::install_transcript(Box::new(move |line: &str| {
+                    for_transcript.log_console(line);
+                }));
                 eprintln!("logs: {}", lg.session_dir().display());
-                Some(Arc::new(lg))
+                Some(lg)
             }
             Err(e) => {
                 eprintln!("warning: could not init turn logger: {e}");

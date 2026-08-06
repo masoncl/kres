@@ -122,6 +122,13 @@ pub struct TaskManager {
     /// exits. Default is unbounded so tests and callers that do not
     /// opt into a cap keep their existing behavior.
     parallel_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Configured parallelism cap, 0 meaning unbounded. Kept beside
+    /// the semaphore because `Semaphore` cannot report the permit
+    /// count it was built with, and dispatch needs to know how many
+    /// slots exist to decide how many to fill. One source of truth:
+    /// callers must ask [`TaskManager::free_slots`] rather than
+    /// carrying their own copy of the number.
+    max_parallel: usize,
 }
 
 struct Inner {
@@ -140,6 +147,28 @@ struct Inner {
     /// Work intentionally removed from active scheduling by goal,
     /// turn-cap, stop, or error handling.
     deferred: Vec<TodoItem>,
+    /// Tasks started since the last reap batch finished publishing.
+    ///
+    /// Dispatch no longer waits for the reap queue to drain — that
+    /// serialised every new task behind a ~65s publication and gave
+    /// most of the reclaimed idle time straight back. It is bounded
+    /// instead: at most `max_parallel` starts may happen without a
+    /// reap completing. Fast tasks therefore cannot churn indefinitely
+    /// while the reaper never gets a turn at the rate limiter, and a
+    /// slow reaper cannot stall dispatch outright.
+    starts_since_reap: usize,
+    /// Todo ids, best first, as of the last prioritization. A
+    /// preference list over `todo`, NOT a reordering of it: the todo
+    /// list stays stable storage, and this is the separate artifact
+    /// that says what to run next.
+    ///
+    /// Dispatch reads it and claims immediately, so no dispatch ever
+    /// waits on a ranking round-trip. It is refreshed out of band
+    /// after each todo-agent update. Ids that have since been claimed,
+    /// completed or retired simply never match; rows it does not
+    /// mention sort after the ones it does, in storage order, which is
+    /// what makes a new row "append until the next ranking places it".
+    ranked_order: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,7 +179,9 @@ pub struct PlanChange {
 
 pub struct InferredTodoUpdate {
     pub items: Vec<TodoItem>,
-    pub completed_todo_id: Option<String>,
+    /// Rows completed by this reap batch. A batch can complete more
+    /// than one, so this is a set rather than a single id.
+    pub completed_todo_ids: Vec<String>,
     pub inference_snapshot: Vec<TodoItem>,
     pub plan_rewrite: Option<crate::plan::PlanRewrite>,
 }
@@ -344,6 +375,24 @@ impl TaskManager {
     }
 
     pub fn with_caps(symbol_cap: usize, context_cap: usize) -> Arc<Self> {
+        // Default: effectively unbounded so existing tests that spawn
+        // dozens of tasks in a tight loop keep running. The REPL calls
+        // `with_max_parallel` instead.
+        Self::build(symbol_cap, context_cap, 0)
+    }
+
+    /// Build a manager with a specific parallelism cap. `n = 0` is
+    /// treated as "unbounded" (matches `new()` / `with_caps()`).
+    pub fn with_max_parallel(n: usize) -> Arc<Self> {
+        Self::build(2000, 2000, n)
+    }
+
+    fn build(symbol_cap: usize, context_cap: usize, max_parallel: usize) -> Arc<Self> {
+        let permits = if max_parallel == 0 {
+            tokio::sync::Semaphore::MAX_PERMITS
+        } else {
+            max_parallel
+        };
         Arc::new(Self {
             inner: RwLock::new(Inner {
                 tasks: Vec::new(),
@@ -352,6 +401,8 @@ impl TaskManager {
                 completed_run_count: 0,
                 plan: None,
                 deferred: Vec::new(),
+                starts_since_reap: 0,
+                ranked_order: Vec::new(),
             }),
             caches: Mutex::new(Caches {
                 symbol_cache: LruCache::new(symbol_cap),
@@ -359,48 +410,9 @@ impl TaskManager {
             }),
             root_shutdown: Shutdown::new(),
             findings_extract_lock: Mutex::new(()),
-            // Default: effectively unbounded so existing tests that
-            // spawn dozens of tasks in a tight loop keep running.
-            // Call `with_max_parallel_from(cfg)` to lower it.
-            parallel_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                tokio::sync::Semaphore::MAX_PERMITS,
-            )),
+            max_parallel,
+            parallel_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
         })
-    }
-
-    /// Build a manager with a specific parallelism cap. `n = 0` is
-    /// treated as "unbounded" (matches `new()` / `with_caps()`).
-    pub fn with_max_parallel(n: usize) -> Arc<Self> {
-        let mgr = Self::with_caps(2000, 2000);
-        if n > 0 {
-            // Take advantage of Arc::get_mut — we're in a builder
-            // window, no other clones exist yet.
-            let permits = if n == 0 {
-                tokio::sync::Semaphore::MAX_PERMITS
-            } else {
-                n
-            };
-            // Replace the semaphore by constructing a new manager
-            // with the permit count dialed in.
-            return Arc::new(Self {
-                inner: RwLock::new(Inner {
-                    tasks: Vec::new(),
-                    todo: Vec::new(),
-                    findings: Vec::new(),
-                    completed_run_count: 0,
-                    plan: None,
-                    deferred: Vec::new(),
-                }),
-                caches: Mutex::new(Caches {
-                    symbol_cache: LruCache::new(2000),
-                    context_cache: LruCache::new(2000),
-                }),
-                root_shutdown: Shutdown::new(),
-                findings_extract_lock: Mutex::new(()),
-                parallel_semaphore: Arc::new(tokio::sync::Semaphore::new(permits)),
-            });
-        }
-        mgr
     }
 
     pub fn root_shutdown(&self) -> &Shutdown {
@@ -640,6 +652,48 @@ impl TaskManager {
         }
     }
 
+    /// How many tasks have reached a terminal state but have not been
+    /// reaped yet — the depth of the reap queue.
+    ///
+    /// Dispatch requires this to be zero. A terminal-unreaped task has
+    /// findings and todo edits that no agent has seen, so claiming
+    /// work against the list in that window ranks and dispatches
+    /// against a stale world.
+    pub async fn reap_queue_depth(&self) -> usize {
+        let g = self.inner.read().await;
+        g.tasks
+            .iter()
+            .filter(|e| matches!(e.state, TaskState::Done | TaskState::Errored))
+            .count()
+    }
+
+    /// Record that a reap batch finished publishing, re-arming the
+    /// dispatch start budget.
+    ///
+    /// Call this AFTER the batch's findings, todo rows and followups
+    /// have landed — not after `reap()` — because the budget exists to
+    /// guarantee the reaper gets inference time, and it has not had it
+    /// until its agents have run.
+    pub async fn note_reap_completed(&self) {
+        self.inner.write().await.starts_since_reap = 0;
+    }
+
+    /// Starts still allowed before a reap must complete. `usize::MAX`
+    /// when unbounded.
+    pub async fn start_budget(&self) -> usize {
+        if self.max_parallel == 0 {
+            return usize::MAX;
+        }
+        let g = self.inner.read().await;
+        // Mirrors `claim_ranked_todos`: with no tasks tracked there is
+        // nothing that can ever re-arm the budget, so it cannot be
+        // allowed to block.
+        if g.tasks.is_empty() {
+            return usize::MAX;
+        }
+        self.max_parallel.saturating_sub(g.starts_since_reap)
+    }
+
     /// Reap done/errored tasks from the list and return summaries.
     pub async fn reap(&self) -> Vec<ReapedTask> {
         let mut g = self.inner.write().await;
@@ -688,6 +742,25 @@ impl TaskManager {
     /// (i.e. are still consuming a worker slot). Used by the REPL's
     /// auto-continue idle loop (§46) to decide whether to fire a
     /// batch when the operator is AFK.
+    /// Configured parallelism cap. 0 means unbounded.
+    pub fn max_parallel(&self) -> usize {
+        self.max_parallel
+    }
+
+    /// How many more tasks may start right now.
+    ///
+    /// `usize::MAX` when unbounded. Counts every non-terminal task,
+    /// including ones queued on the semaphore but not yet Running, so
+    /// a dispatch cannot double-count a slot it just filled. Computed
+    /// here rather than in the REPL so the cap that gates `spawn` and
+    /// the cap that sizes a dispatch cannot drift apart.
+    pub async fn free_slots(&self) -> usize {
+        if self.max_parallel == 0 {
+            return usize::MAX;
+        }
+        self.max_parallel.saturating_sub(self.active_count().await)
+    }
+
     pub async fn active_count(&self) -> usize {
         let g = self.inner.read().await;
         g.tasks
@@ -745,19 +818,19 @@ impl TaskManager {
     /// transitions win over the stale snapshot. The just-reaped task
     /// is authoritative even though its live row is still InProgress.
     pub async fn merge_inferred_state(&self, update: InferredTodoUpdate) -> Option<PlanChange> {
-        fn matches_completed(item: &TodoItem, completed_todo_id: Option<&str>) -> bool {
-            completed_todo_id.is_some_and(|completed| {
-                (!item.id.is_empty() && item.id == completed) || item.name == completed
+        fn matches_completed(item: &TodoItem, completed_todo_ids: &[String]) -> bool {
+            completed_todo_ids.iter().any(|completed| {
+                (!item.id.is_empty() && &item.id == completed) || &item.name == completed
             })
         }
 
         let InferredTodoUpdate {
             mut items,
-            completed_todo_id,
+            completed_todo_ids,
             inference_snapshot,
             plan_rewrite,
         } = update;
-        let completed_todo_id = completed_todo_id.as_deref();
+        let completed_todo_ids = completed_todo_ids.as_slice();
         let mut g = self.inner.write().await;
         // A row that existed in the inference snapshot but no longer
         // exists live was removed deliberately (`/done`, `/clear`, a
@@ -769,11 +842,11 @@ impl TaskManager {
                 .iter()
                 .any(|snapshot_item| same_todo_item(snapshot_item, item));
             let exists_live = g.todo.iter().any(|live| same_todo_item(live, item));
-            !existed_at_start || exists_live || matches_completed(item, completed_todo_id)
+            !existed_at_start || exists_live || matches_completed(item, completed_todo_ids)
         });
         for item in &mut items {
             let live = g.todo.iter().find(|live| same_todo_item(item, live));
-            if matches_completed(item, completed_todo_id) {
+            if matches_completed(item, completed_todo_ids) {
                 item.status = TodoStatus::Done;
                 if item.coverage.is_empty() {
                     item.coverage = "completed by the reaped task".to_string();
@@ -836,12 +909,12 @@ impl TaskManager {
             if unchanged_since_snapshot
                 && live.status == TodoStatus::Pending
                 && !is_dependency_target
-                && !matches_completed(live, completed_todo_id)
+                && !matches_completed(live, completed_todo_ids)
             {
                 continue;
             }
             let mut retained = live.clone();
-            if matches_completed(&retained, completed_todo_id) {
+            if matches_completed(&retained, completed_todo_ids) {
                 retained.status = TodoStatus::Done;
                 if retained.coverage.is_empty() {
                     retained.coverage = "completed by the reaped task".to_string();
@@ -944,6 +1017,10 @@ impl TaskManager {
         g.todo.clear();
         g.deferred.clear();
         g.plan = None;
+        // Ids are name-derived slugs, so a re-run of the same prompt
+        // regenerates colliding ones. Leaving the order behind would
+        // let a cleared session's ranking silently apply to the next.
+        g.ranked_order.clear();
     }
 
     /// Remove one todo without replacing unrelated rows whose state
@@ -1091,6 +1168,95 @@ impl TaskManager {
         ready
     }
 
+    /// Publish a new ranked order (todo ids, best first). Replaces the
+    /// previous one wholesale; ids are not validated, since a row that
+    /// no longer exists simply never matches during a claim.
+    pub async fn set_ranked_order(&self, ids: Vec<String>) {
+        self.inner.write().await.ranked_order = ids;
+    }
+
+    /// The stored ranked order, for diagnostics and `/todo`.
+    pub async fn ranked_order(&self) -> Vec<String> {
+        self.inner.read().await.ranked_order.clone()
+    }
+
+    /// Claim up to `limit` dependency-ready rows, best-ranked first.
+    ///
+    /// This is the whole dispatch path. It takes the write lock once
+    /// and makes no inference call: ranking already happened, out of
+    /// band, into `ranked_order`. A missing or stale order degrades to
+    /// storage order rather than stalling — ranking is an
+    /// optimisation and must never gate a dispatch.
+    pub async fn claim_ranked_todos(&self, limit: usize, turns_limit: u32) -> TodoClaims {
+        let mut g = self.inner.write().await;
+        // Every bound is applied here, under the one write lock that
+        // also flips the rows. Computing free slots in the caller and
+        // passing a limit down would be a TOCTOU: two dispatches could
+        // each read "5 free" and each claim 5.
+        let (free_slots, start_budget) = if self.max_parallel == 0 {
+            (usize::MAX, usize::MAX)
+        } else {
+            let active = g
+                .tasks
+                .iter()
+                .filter(|e| !matches!(e.state, TaskState::Done | TaskState::Errored))
+                .count();
+            // No tasks tracked at all means no reap can ever complete,
+            // so the budget must not be what blocks. Without this the
+            // budget deadlocks the session whenever a claim fails to
+            // become a task — a claimed row whose `submit_prompt_inner`
+            // returns false is InProgress with no executor, spends
+            // budget, and leaves nothing to reap. Recovery would
+            // require a restart, and even `/continue` could not clear
+            // it.
+            let budget = if g.tasks.is_empty() {
+                usize::MAX
+            } else {
+                self.max_parallel.saturating_sub(g.starts_since_reap)
+            };
+            (self.max_parallel.saturating_sub(active), budget)
+        };
+        let claim_limit = limit
+            .min(turn_budget(&g, turns_limit))
+            .min(free_slots)
+            .min(start_budget);
+        let done = terminal_identities(&g.todo);
+        let rank_of: std::collections::HashMap<&str, usize> = g
+            .ranked_order
+            .iter()
+            .enumerate()
+            .map(|(position, id)| (id.as_str(), position))
+            .collect();
+        let mut result = TodoClaims::default();
+        let mut ready: Vec<(usize, usize)> = Vec::new();
+        for (index, item) in g.todo.iter().enumerate() {
+            if item.status != TodoStatus::Pending {
+                continue;
+            }
+            if !item
+                .depends_on
+                .iter()
+                .all(|dependency| done.contains(dependency))
+            {
+                result.blocked += 1;
+                continue;
+            }
+            // Unranked rows sort after every ranked one, and a stable
+            // sort keeps them in storage order among themselves.
+            let rank = rank_of.get(item.id.as_str()).copied().unwrap_or(usize::MAX);
+            ready.push((rank, index));
+        }
+        ready.sort_by_key(|(rank, _)| *rank);
+        result.remaining = ready.len().saturating_sub(claim_limit);
+        for (_, index) in ready.into_iter().take(claim_limit) {
+            let item = &mut g.todo[index];
+            item.status = TodoStatus::InProgress;
+            result.items.push(item.clone());
+        }
+        g.starts_since_reap = g.starts_since_reap.saturating_add(result.items.len());
+        result
+    }
+
     /// Claim exactly the named rows, in the order given, subject to
     /// the turn budget. Ids that are no longer Pending or whose
     /// dependencies are no longer satisfied are skipped.
@@ -1127,7 +1293,9 @@ impl TaskManager {
     }
 
     pub async fn clear_active_todos(&self) {
-        self.inner.write().await.todo.clear();
+        let mut g = self.inner.write().await;
+        g.todo.clear();
+        g.ranked_order.clear();
     }
 
     #[cfg(test)]
@@ -1401,6 +1569,400 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn max_parallel_caps_concurrently_running_tasks() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        // The cap is the only thing bounding concurrency once the
+        // full-drain dispatch barrier is gone, so assert the
+        // semaphore actually gates `spawn` rather than trusting that
+        // the permit is acquired somewhere.
+        let mgr = TaskManager::with_max_parallel(3);
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        for _ in 0..12 {
+            let live = live.clone();
+            let peak = peak.clone();
+            mgr.spawn("capped", None, move |_| async move {
+                let now = live.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                peak.fetch_max(now, AtomicOrdering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                live.fetch_sub(1, AtomicOrdering::SeqCst);
+                Ok(TaskOutcome {
+                    analysis: "done".into(),
+                    ..Default::default()
+                })
+            })
+            .await;
+        }
+        // Poll rather than sleeping a fixed interval: 12 tasks at 20ms
+        // through 3 slots is ~80ms, but CI timing is not a contract.
+        for _ in 0..200 {
+            if mgr.reap_queue_depth().await == 12 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(mgr.reap_queue_depth().await, 12, "all tasks finished");
+        assert!(
+            peak.load(AtomicOrdering::SeqCst) <= 3,
+            "peak concurrency {} exceeded the cap of 3",
+            peak.load(AtomicOrdering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn reap_queue_depth_counts_terminal_unreaped_only() {
+        let mgr = TaskManager::new();
+        // A task that finishes but has not been reaped is queue depth,
+        // not idleness. This is the distinction the old
+        // `snapshot().is_empty()` dispatch barrier could not express:
+        // it lumped running tasks in with unpublished terminal ones.
+        mgr.spawn("finished", None, |_| async {
+            Ok(TaskOutcome {
+                analysis: "done".into(),
+                ..Default::default()
+            })
+        })
+        .await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let hold = gate.clone();
+        mgr.spawn("still running", None, move |_| async move {
+            hold.notified().await;
+            Ok(TaskOutcome::default())
+        })
+        .await;
+        for _ in 0..200 {
+            if mgr.reap_queue_depth().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(mgr.reap_queue_depth().await, 1, "one terminal, one running");
+        assert_eq!(mgr.active_count().await, 1, "the runner is still active");
+        assert_eq!(mgr.snapshot().await.len(), 2, "both are still tracked");
+
+        assert_eq!(mgr.reap().await.len(), 1);
+        assert_eq!(
+            mgr.reap_queue_depth().await,
+            0,
+            "reaping drains the queue without touching the runner"
+        );
+        assert_eq!(mgr.active_count().await, 1);
+        gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn ranked_claim_prefers_the_stored_order_then_storage_order() {
+        let mgr = TaskManager::new();
+        let row = |id: &str| {
+            let mut t = TodoItem::new(id, "review");
+            t.id = id.to_string();
+            t
+        };
+        mgr.replace_todo(vec![row("a"), row("b"), row("c"), row("d")])
+            .await;
+        // Ranking names two rows; the other two are new since the last
+        // refresh and must follow, in storage order.
+        mgr.set_ranked_order(vec!["c".into(), "a".into()]).await;
+        let claims = mgr.claim_ranked_todos(3, 0).await;
+        let ids: Vec<&str> = claims.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"]);
+        assert_eq!(claims.remaining, 1);
+        assert_eq!(
+            mgr.claim_ranked_todos(9, 0).await.items[0].id,
+            "d",
+            "claimed rows are no longer Pending, so they drop out"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_claim_falls_back_to_storage_order_without_a_ranking() {
+        // Ranking is an optimisation. No stored order, a stale one, or
+        // one naming rows that have since vanished must all still
+        // dispatch rather than stall the wave.
+        let mgr = TaskManager::new();
+        let row = |id: &str| {
+            let mut t = TodoItem::new(id, "review");
+            t.id = id.to_string();
+            t
+        };
+        mgr.replace_todo(vec![row("a"), row("b")]).await;
+        let claims = mgr.claim_ranked_todos(2, 0).await;
+        let ids: Vec<&str> = claims.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+
+        mgr.replace_todo(vec![row("x"), row("y")]).await;
+        mgr.set_ranked_order(vec!["long-gone".into(), "also-gone".into()])
+            .await;
+        let claims = mgr.claim_ranked_todos(2, 0).await;
+        let ids: Vec<&str> = claims.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["x", "y"], "stale ranking degrades, not stalls");
+    }
+
+    #[tokio::test]
+    async fn ranked_claim_skips_blocked_rows_and_respects_the_turn_budget() {
+        let mgr = TaskManager::new();
+        let mut a = TodoItem::new("a", "review");
+        a.id = "a".into();
+        let mut b = TodoItem::new("b", "review");
+        b.id = "b".into();
+        b.depends_on = vec!["a".into()];
+        let mut c = TodoItem::new("c", "review");
+        c.id = "c".into();
+        mgr.replace_todo(vec![a, b, c]).await;
+        // Rank the blocked row first: it must still be held back.
+        mgr.set_ranked_order(vec!["b".into(), "c".into(), "a".into()])
+            .await;
+        let claims = mgr.claim_ranked_todos(10, 2).await;
+        let ids: Vec<&str> = claims.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a"]);
+        assert_eq!(claims.blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn one_update_completes_every_row_the_batch_finished() {
+        // The reaper reconciles a whole reaped batch in one round, so
+        // a single update carries several completions. Each must land
+        // Done with coverage; none may be left Pending for a later
+        // round that will never come.
+        let mgr = TaskManager::new();
+        let row = |id: &str| {
+            let mut t = TodoItem::new(id, "review");
+            t.id = id.to_string();
+            t
+        };
+        mgr.replace_todo(vec![row("a"), row("b"), row("c")]).await;
+        let snapshot = mgr.todo_snapshot().await;
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            // The agent returns pending rows only; the completed ones
+            // are reconstructed from Rust's copy.
+            items: vec![row("c")],
+            completed_todo_ids: vec!["a".into(), "b".into()],
+            inference_snapshot: snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+        let after = mgr.todo_snapshot().await;
+        for id in ["a", "b"] {
+            let item = after.iter().find(|t| t.id == id).expect("row survives");
+            assert_eq!(item.status, TodoStatus::Done, "{id} should be done");
+            assert!(!item.coverage.is_empty(), "{id} needs coverage");
+        }
+        assert_eq!(
+            after.iter().find(|t| t.id == "c").unwrap().status,
+            TodoStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn free_slots_tracks_the_cap_and_survives_it_being_unset() {
+        // Dispatch sizes itself from this, and the manager owns both
+        // it and the semaphore that enforces it, so the number that
+        // gates `spawn` and the number that sizes a dispatch cannot
+        // disagree.
+        let mgr = TaskManager::with_max_parallel(2);
+        assert_eq!(mgr.max_parallel(), 2);
+        assert_eq!(mgr.free_slots().await, 2);
+        let hold = Arc::new(tokio::sync::Notify::new());
+        for _ in 0..2 {
+            let held = hold.clone();
+            mgr.spawn("busy", None, move |_| async move {
+                held.notified().await;
+                Ok(TaskOutcome::default())
+            })
+            .await;
+        }
+        assert_eq!(mgr.free_slots().await, 0);
+        hold.notify_waiters();
+
+        let unbounded = TaskManager::new();
+        assert_eq!(unbounded.max_parallel(), 0);
+        assert_eq!(unbounded.free_slots().await, usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn clearing_work_clears_the_ranked_order_too() {
+        // Ids are name-derived slugs, so a re-run of the same prompt
+        // mints the same ones. A surviving order would silently rank
+        // the next session's rows.
+        let mgr = TaskManager::new();
+        mgr.set_ranked_order(vec!["a".into(), "b".into()]).await;
+        mgr.clear_active_todos().await;
+        assert!(mgr.ranked_order().await.is_empty());
+
+        mgr.set_ranked_order(vec!["a".into()]).await;
+        mgr.clear_session_work().await;
+        assert!(mgr.ranked_order().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tasks_finishing_during_a_reap_are_drained_by_one_later_call() {
+        // The operator's requirement: if A's reap is being published
+        // when B, C and D finish, all three are handled by a single
+        // subsequent reap call, not one call each. Publication is
+        // modelled by simply not calling `reap()` for a while — that
+        // is exactly what the reaper's batch pass looks like to the
+        // rest of the manager.
+        let mgr = TaskManager::new();
+        mgr.spawn("a", None, |_| async { Ok(TaskOutcome::default()) })
+            .await;
+        for _ in 0..200 {
+            if mgr.reap_queue_depth().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mgr.reap().await.len(), 1);
+        for name in ["b", "c", "d"] {
+            mgr.spawn(name, None, |_| async { Ok(TaskOutcome::default()) })
+                .await;
+        }
+        for _ in 0..200 {
+            if mgr.reap_queue_depth().await == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mgr.reap_queue_depth().await, 3, "all three queued");
+        let second = mgr.reap().await;
+        assert_eq!(second.len(), 3, "one call drains the whole queue");
+        assert_eq!(mgr.reap_queue_depth().await, 0);
+    }
+
+    #[tokio::test]
+    async fn start_budget_bounds_claims_between_reap_completions() {
+        // At most `max_parallel` tasks may start without a reap
+        // completing, so a stream of fast tasks cannot starve the
+        // reaper of inference time on the shared rate limiter.
+        //
+        // One task is held open throughout. It keeps the task list
+        // non-empty (the budget deliberately does not block when
+        // nothing could ever re-arm it) and it pins `free_slots` at
+        // cap-1, so the claims that stop below that are stopped by the
+        // budget and nothing else. Claiming does not spawn tasks here,
+        // so free_slots stays at 3 for the whole test.
+        let mgr = TaskManager::with_max_parallel(4);
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let held = hold.clone();
+        mgr.spawn("holder", None, move |_| async move {
+            held.notified().await;
+            Ok(TaskOutcome::default())
+        })
+        .await;
+        for _ in 0..200 {
+            if mgr.active_count().await == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let rows: Vec<TodoItem> = (0..9)
+            .map(|i| {
+                let mut t = TodoItem::new(format!("row{i}"), "review");
+                t.id = format!("row{i}");
+                t
+            })
+            .collect();
+        mgr.replace_todo(rows).await;
+        assert_eq!(mgr.free_slots().await, 3);
+        assert_eq!(mgr.start_budget().await, 4);
+
+        // Bounded by free slots first.
+        assert_eq!(mgr.claim_ranked_todos(9, 0).await.items.len(), 3);
+        assert_eq!(mgr.start_budget().await, 1);
+        // Now the budget is the binding constraint: 3 slots are still
+        // free, but only one start remains.
+        assert_eq!(mgr.free_slots().await, 3);
+        assert_eq!(mgr.claim_ranked_todos(9, 0).await.items.len(), 1);
+        assert_eq!(
+            mgr.claim_ranked_todos(9, 0).await.items.len(),
+            0,
+            "budget exhausted until a reap publishes"
+        );
+
+        mgr.note_reap_completed().await;
+        assert_eq!(mgr.start_budget().await, 4);
+        assert_eq!(mgr.claim_ranked_todos(9, 0).await.items.len(), 3);
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn start_budget_cannot_deadlock_when_nothing_can_be_reaped() {
+        // A claim that never becomes a task — `submit_prompt_inner`
+        // returning false leaves the row InProgress with no executor —
+        // spends budget and leaves nothing to reap. If the budget
+        // still blocked in that state the session would be stuck with
+        // zero tasks running and no way back, not even via /continue.
+        let mgr = TaskManager::with_max_parallel(2);
+        let rows: Vec<TodoItem> = (0..6)
+            .map(|i| {
+                let mut t = TodoItem::new(format!("row{i}"), "review");
+                t.id = format!("row{i}");
+                t
+            })
+            .collect();
+        mgr.replace_todo(rows).await;
+        assert_eq!(mgr.claim_ranked_todos(9, 0).await.items.len(), 2);
+        // Budget is spent, but no task was ever spawned.
+        assert!(mgr.snapshot().await.is_empty());
+        assert_eq!(
+            mgr.start_budget().await,
+            usize::MAX,
+            "with nothing to reap the budget must not be the blocker"
+        );
+        assert_eq!(mgr.claim_ranked_todos(9, 0).await.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unbounded_parallelism_has_no_start_budget() {
+        let mgr = TaskManager::new();
+        assert_eq!(mgr.start_budget().await, usize::MAX);
+        let rows: Vec<TodoItem> = (0..40)
+            .map(|i| {
+                let mut t = TodoItem::new(format!("row{i}"), "review");
+                t.id = format!("row{i}");
+                t
+            })
+            .collect();
+        mgr.replace_todo(rows).await;
+        assert_eq!(mgr.claim_ranked_todos(usize::MAX, 0).await.items.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn ranked_dispatch_cannot_overshoot_the_turn_budget_while_tasks_run() {
+        // Dispatch now fires while tasks are still running, so the
+        // turn budget has to subtract in-flight work — otherwise two
+        // dispatches inside one session each see the full remainder.
+        let mgr = TaskManager::new();
+        let row = |id: &str| {
+            let mut t = TodoItem::new(id, "review");
+            t.id = id.to_string();
+            t
+        };
+        mgr.replace_todo(vec![row("a"), row("b"), row("c"), row("d")])
+            .await;
+        // Budget 3. First dispatch takes two of them and starts them.
+        let first = mgr.claim_ranked_todos(2, 3).await;
+        assert_eq!(first.items.len(), 2);
+        let hold = Arc::new(tokio::sync::Notify::new());
+        for _ in 0..2 {
+            let held = hold.clone();
+            mgr.spawn("running", None, move |_| async move {
+                held.notified().await;
+                Ok(TaskOutcome::default())
+            })
+            .await;
+        }
+        // Two are in flight against a budget of 3, so only one more
+        // may start even though two rows are still ready.
+        let second = mgr.claim_ranked_todos(10, 3).await;
+        assert_eq!(
+            second.items.len(),
+            1,
+            "in-flight tasks must consume the remaining turn budget"
+        );
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
     async fn reset_in_progress_flips_only_inprogress() {
         let mgr = TaskManager::new();
         let mut a = TodoItem::new("a", "investigate");
@@ -1434,7 +1996,7 @@ mod tests {
         stale.status = TodoStatus::Pending;
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![stale],
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot: vec![],
             plan_rewrite: None,
         })
@@ -1457,7 +2019,7 @@ mod tests {
         stale.status = TodoStatus::InProgress;
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![stale],
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot: vec![],
             plan_rewrite: None,
         })
@@ -1494,7 +2056,7 @@ mod tests {
         proposed.depends_on = vec!["broad-pass".into(), "another-followup".into()];
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: std::iter::once(proposed).chain(prerequisites).collect(),
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot,
             plan_rewrite: None,
         })
@@ -1524,7 +2086,7 @@ mod tests {
 
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![first, second],
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot: Vec::new(),
             plan_rewrite: None,
         })
@@ -1549,7 +2111,7 @@ mod tests {
         second.depends_on = vec!["first".into()];
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![second, first],
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot,
             plan_rewrite: None,
         })
@@ -1575,7 +2137,7 @@ mod tests {
 
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![dependent],
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot,
             plan_rewrite: None,
         })
@@ -1597,7 +2159,7 @@ mod tests {
 
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![live],
-            completed_todo_id: Some("review-write".into()),
+            completed_todo_ids: vec!["review-write".into()],
             inference_snapshot: vec![],
             plan_rewrite: None,
         })
@@ -1621,7 +2183,7 @@ mod tests {
         mgr.replace_todo(vec![original.clone(), concurrent]).await;
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![original],
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot,
             plan_rewrite: None,
         })
@@ -1641,7 +2203,7 @@ mod tests {
 
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: Vec::new(),
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot,
             plan_rewrite: None,
         })
@@ -1661,7 +2223,7 @@ mod tests {
 
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: Vec::new(),
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot: vec![snapshot_item],
             plan_rewrite: None,
         })
@@ -1680,7 +2242,7 @@ mod tests {
 
         mgr.merge_inferred_state(InferredTodoUpdate {
             items: vec![removed],
-            completed_todo_id: None,
+            completed_todo_ids: Vec::new(),
             inference_snapshot,
             plan_rewrite: None,
         })
@@ -1910,7 +2472,7 @@ mod tests {
         let change = mgr
             .merge_inferred_state(InferredTodoUpdate {
                 items: vec![live],
-                completed_todo_id: Some("review-todo".into()),
+                completed_todo_ids: vec!["review-todo".into()],
                 inference_snapshot: vec![],
                 plan_rewrite: Some(rewrite),
             })

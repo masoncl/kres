@@ -3,9 +3,9 @@
 //! Port of
 //!
 //! After each task completes, the caller feeds this module:
-//!   - the prompt that drove the task (completed_query)
-//!   - the task's analysis text (analysis_summary)
-//!   - the followups the slow agent produced (new_followups)
+//!   - one `completed` entry per task reaped in this batch, each
+//!     carrying the prompt that drove it (`query`), its analysis text
+//!     (`analysis`), and the followups its slow agent produced
 //!   - the current todo list
 //!
 //! The module packages that into a JSON request (with
@@ -190,14 +190,29 @@ pub struct TodoUpdate {
 
 /// Per-call inputs threaded into the todo agent. Bundles the
 /// caller-side context so the public function signatures stay narrow.
+/// One completed task in a reaped batch.
+///
+/// The reaper drains every terminal task in one call, so a wave of
+/// parallel work arrives together. Reconciling them in one round is
+/// both cheaper and more correct than N sequential rounds: the agent
+/// sees the whole set at once and can dedup a followup emitted twice
+/// by two siblings, which sequential rounds can only do after the
+/// first sibling's followup has already become a row.
+pub struct CompletedTask<'a> {
+    /// Human-readable prompt the task ran under.
+    pub query: &'a str,
+    /// Stable id/name of the todo row this task was executing. The
+    /// model sees `query`; Rust uses this identity to make completion
+    /// deterministic.
+    pub todo_id: Option<&'a str>,
+    pub analysis: &'a str,
+    pub followups: &'a [Value],
+}
+
 pub struct TodoAgentInputs<'a> {
-    pub completed_query: &'a str,
-    /// Stable id/name carried by the task that just completed. The
-    /// model sees human-readable `completed_query`, but Rust uses
-    /// this identity to make completion deterministic.
-    pub completed_todo_id: Option<&'a str>,
-    pub analysis_summary: &'a str,
-    pub new_followups: &'a [Value],
+    /// Every task reaped in this batch, oldest first. Never empty —
+    /// callers with nothing to report must not make the call.
+    pub completed: &'a [CompletedTask<'a>],
     pub current_todo: &'a [TodoItem],
     pub plan: Option<&'a kres_core::Plan>,
 }
@@ -250,17 +265,22 @@ pub async fn update_todo_via_agent_with_logger(
     shutdown: Option<kres_core::Shutdown>,
 ) -> Result<TodoUpdate, AgentError> {
     let TodoAgentInputs {
-        completed_query,
-        completed_todo_id,
-        analysis_summary,
-        new_followups,
+        completed,
         current_todo,
         plan,
     } = inputs;
+    let completed_todo_ids: Vec<&str> = completed.iter().filter_map(|c| c.todo_id).collect();
+    // Every followup the batch emitted, in batch order. The fallback
+    // paths below promote these to rows without an agent, so they must
+    // see the whole batch for the same reason the agent does.
+    let batch_followups: Vec<Value> = completed
+        .iter()
+        .flat_map(|task| task.followups.iter().cloned())
+        .collect();
     // --- Prepare inputs ------------------------------------------------
     let mut todo_list = current_todo.to_vec();
     assign_ids(&mut todo_list);
-    mark_completed_todo(&mut todo_list, completed_todo_id);
+    mark_completed_todo(&mut todo_list, &completed_todo_ids);
     // The reaped item is Done before the call so the agent cannot
     // reopen it, but its coverage is left empty on purpose: the whole
     // point of this round is for the agent to write that sentence via
@@ -270,19 +290,30 @@ pub async fn update_todo_via_agent_with_logger(
 
     let mut request = serde_json::Map::new();
     request.insert("task".into(), json!("update_todo"));
-    request.insert("completed_query".into(), json!(completed_query));
-    request.insert("analysis_summary".into(), json!(analysis_summary));
-    request.insert("new_followups".into(), json!(new_followups));
+    // One entry per task reaped in this batch. `mark_completed_todo`
+    // already flipped each reaped row to Done, so from the agent's
+    // side they did not "reach Done this round" and it never listed
+    // them in `newly_done`. Five of six calls in the 2026-08-06
+    // mm/page_alloc.c run left the completion carrying Rust's
+    // placeholder coverage, which is write-once and therefore
+    // permanent. Name each row explicitly and demand its evidence.
+    let completed_payload: Vec<Value> = completed
+        .iter()
+        .map(|task| {
+            let mut entry = serde_json::Map::new();
+            entry.insert("query".into(), json!(task.query));
+            if let Some(id) = task.todo_id {
+                entry.insert("just_completed".into(), json!(id));
+            }
+            entry.insert("analysis".into(), json!(task.analysis));
+            if !task.followups.is_empty() {
+                entry.insert("followups".into(), json!(task.followups));
+            }
+            Value::Object(entry)
+        })
+        .collect();
+    request.insert("completed".into(), json!(completed_payload));
     request.insert("current_todo".into(), json!(current_payload));
-    // `mark_completed_todo` already flipped the reaped row to Done, so
-    // from the agent's side it did not "reach Done this round" and it
-    // never listed the row in `newly_done`. Five of six calls in the
-    // 2026-08-06 mm/page_alloc.c run left the completion carrying
-    // Rust's placeholder coverage, which is write-once and therefore
-    // permanent. Name the row explicitly and demand its evidence.
-    if let Some(id) = completed_todo_id {
-        request.insert("just_completed".into(), json!(id));
-    }
     // Ship the current plan (if any) so the agent can attach
     // `step_id` to each emitted todo; `build_instructions` flips
     // its plan-linking paragraph on when has_plan is true.
@@ -339,7 +370,7 @@ pub async fn update_todo_via_agent_with_logger(
         tokio::select! {
             _ = shutdown.cancelled() => {
                 return Ok(TodoUpdate {
-                    todo: fallback_dedup(&todo_list, new_followups),
+                    todo: fallback_dedup(&todo_list, &batch_followups),
                     plan: None,
                 });
             }
@@ -353,7 +384,7 @@ pub async fn update_todo_via_agent_with_logger(
         Err(e) => {
             tracing::warn!(target: "kres_agents", "todo agent call failed: {e}; falling back");
             return Ok(TodoUpdate {
-                todo: fallback_dedup(&todo_list, new_followups),
+                todo: fallback_dedup(&todo_list, &batch_followups),
                 plan: None,
             });
         }
@@ -418,7 +449,7 @@ pub async fn update_todo_via_agent_with_logger(
             "todo agent returned no parseable list; falling back"
         );
         return Ok(TodoUpdate {
-            todo: fallback_dedup(&todo_list, new_followups),
+            todo: fallback_dedup(&todo_list, &batch_followups),
             plan: None,
         });
     };
@@ -773,15 +804,13 @@ fn reconcile_update(
     Reconciled { done, pending }
 }
 
-fn mark_completed_todo(items: &mut [TodoItem], completed_todo_id: Option<&str>) {
-    let Some(completed_id) = completed_todo_id else {
-        return;
-    };
-    if let Some(item) = items
-        .iter_mut()
-        .find(|item| item.id == completed_id || (item.id.is_empty() && item.name == completed_id))
-    {
-        item.status = TodoStatus::Done;
+fn mark_completed_todo(items: &mut [TodoItem], completed_todo_ids: &[&str]) {
+    for completed_id in completed_todo_ids {
+        if let Some(item) = items.iter_mut().find(|item| {
+            item.id == *completed_id || (item.id.is_empty() && item.name == *completed_id)
+        }) {
+            item.status = TodoStatus::Done;
+        }
     }
 }
 
@@ -1170,12 +1199,13 @@ fn build_instructions(has_plan: bool) -> String {
          the coverage sentence described below. This is the ONLY way to \
          complete an item, and coverage is written once: later rounds \
          cannot reword it.\n\
-         - `just_completed` (in the request, when present) is the id of \
-         the item the reaped task was executing. Its row already shows \
-         status done, but its coverage is EMPTY and only you can write \
-         it. You MUST return that id in `newly_done` with a real \
-         coverage sentence drawn from `analysis_summary`. Skipping it \
-         leaves the row permanently uncovered and blinds every later \
+         - `just_completed` (on a `completed` entry, when present) is \
+         the id of the item that task was executing. Its row already \
+         shows status done, but its coverage is EMPTY and only you can \
+         write it. You MUST return EVERY such id in `newly_done` with a \
+         real coverage sentence drawn from that entry's own `analysis` \
+         — one per completed entry, not one for the batch. Skipping any \
+         leaves that row permanently uncovered and blinds every later \
          dedup pass to what the run has already examined.\n\
          - `retired` — pending items you are deliberately abandoning, \
          with the reason. Leaving an item out of `todo` does NOT delete \
@@ -1249,7 +1279,8 @@ fn build_instructions(has_plan: bool) -> String {
         );
     }
     s.push_str(
-        "DEDUP ALGORITHM — run this for EVERY item in new_followups:\n\
+        "DEDUP ALGORITHM — run this for EVERY followup in EVERY \
+         `completed` entry, treating them as one pooled list:\n\
          1. From the followup's name+reason, list the target files, \
          symbols, line ranges, and section refs it would cover.\n\
          2. For each done item in current_todo, read its 'coverage' \
@@ -1260,10 +1291,14 @@ fn build_instructions(has_plan: bool) -> String {
          files and symbols match, it is a duplicate.\n\
          3. For each pending item in current_todo, apply the same \
          check. If the new followup overlaps, DROP it.\n\
-         4. Read the complete 'analysis_summary' to identify which \
-         file:line pairs the most recent analysis touched; use them to \
-         decide which done-item coverage to update.\n\
-         5. Only followups that introduce genuinely new files, \
+         4. Compare each surviving followup against the ones from the \
+         OTHER completed entries in this same round. Parallel tasks \
+         routinely rediscover the same gap; emit one row, not one per \
+         task that noticed it.\n\
+         5. Read every entry's 'analysis' to identify which file:line \
+         pairs this round touched; use them to decide which done-item \
+         coverage to update.\n\
+         6. Only followups that introduce genuinely new files, \
          symbols, or analysis angles survive.\n\
          Emit the dropped followup ids/names nowhere — just omit them.\n\n",
     );
@@ -1446,7 +1481,7 @@ mod tests {
                 TodoStatus::InProgress,
             ),
         ];
-        mark_completed_todo(&mut originals, Some("review-write"));
+        mark_completed_todo(&mut originals, &["review-write"]);
 
         // Mirrors sol4: the model rewrote stable IDs from titles and
         // emitted a duplicate of the completed task.
@@ -1675,12 +1710,7 @@ mod tests {
     /// fields that are byte-identical on the next call belong there.
     #[test]
     fn the_cached_prefix_holds_no_per_reap_field() {
-        for volatile in [
-            "completed_query",
-            "analysis_summary",
-            "new_followups",
-            "current_todo",
-        ] {
+        for volatile in ["completed", "current_todo"] {
             assert!(
                 !UPDATE_TODO_STABLE_FIELDS.contains(&volatile),
                 "`{volatile}` changes every reap and must stay in the delta half"
@@ -1690,17 +1720,19 @@ mod tests {
         assert!(UPDATE_TODO_STABLE_FIELDS.contains(&"plan"));
     }
 
-    /// The split is by key, so the reaped task's name must land in the
-    /// delta document, after the cache breakpoint.
+    /// The split is by key, so the reaped batch — task names, analyses
+    /// and followups alike — must land in the delta document, after
+    /// the cache breakpoint.
     #[test]
-    fn completed_query_is_split_into_the_delta_document() {
+    fn the_completed_batch_is_split_into_the_delta_document() {
         let request = json!({
             "task": "update_todo",
             "instructions": "INSTRUCTIONS",
             "plan": {"steps": []},
-            "completed_query": "[review] Audit __alloc_pages_slowpath",
-            "analysis_summary": "SUMMARY",
-            "new_followups": [],
+            "completed": [{
+                "query": "[review] Audit __alloc_pages_slowpath",
+                "analysis": "SUMMARY",
+            }],
             "current_todo": [],
         });
         let split =
@@ -1711,7 +1743,10 @@ mod tests {
 
         // Two reaps of different tasks must share the same prefix.
         let mut other = request.clone();
-        other["completed_query"] = json!("[review] Audit free_pcppages_bulk");
+        other["completed"] = json!([{
+            "query": "[review] Audit free_pcppages_bulk",
+            "analysis": "OTHER",
+        }]);
         other["current_todo"] = json!([{"id": "x", "name": "x", "status": "pending"}]);
         let split2 =
             crate::prompt::split_request_documents(&other, UPDATE_TODO_STABLE_FIELDS).unwrap();
@@ -1851,11 +1886,46 @@ mod tests {
     /// the 2026-08-06 run kept Rust's placeholder coverage, which is
     /// write-once and therefore permanent.
     #[test]
-    fn the_request_names_the_row_that_just_completed() {
+    fn mark_completed_flips_every_row_in_the_batch() {
+        let mut list = vec![
+            TodoItem {
+                id: "a".into(),
+                ..TodoItem::new("a", "review")
+            },
+            TodoItem {
+                id: "b".into(),
+                ..TodoItem::new("b", "review")
+            },
+            TodoItem {
+                id: "c".into(),
+                ..TodoItem::new("c", "review")
+            },
+        ];
+        mark_completed_todo(&mut list, &["a", "c"]);
+        assert_eq!(list[0].status, TodoStatus::Done);
+        assert_eq!(list[1].status, TodoStatus::Pending);
+        assert_eq!(list[2].status, TodoStatus::Done);
+    }
+
+    #[test]
+    fn the_request_names_every_row_that_just_completed() {
         let body = build_instructions(true);
         assert!(body.contains("just_completed"));
         assert!(body.contains("its coverage is EMPTY"));
-        assert!(body.contains("MUST return that id in `newly_done`"));
+        // A batch completes more than one row, and each needs its own
+        // coverage sentence drawn from its own task's analysis.
+        assert!(body.contains("MUST return EVERY such id in `newly_done`"));
+        assert!(body.contains("one per completed entry, not one for the batch"));
+    }
+
+    /// Parallel tasks rediscover the same gap. Reconciling the batch
+    /// in one round is only worth it if the agent is told to pool the
+    /// followups rather than dedup each entry in isolation.
+    #[test]
+    fn the_dedup_algorithm_pools_followups_across_the_batch() {
+        let body = build_instructions(true);
+        assert!(body.contains("EVERY `completed` entry, treating them as one pooled list"));
+        assert!(body.contains("OTHER completed entries in this same round"));
     }
 
     #[test]
@@ -2219,7 +2289,7 @@ Actual: {"todo":[{"name":"actual","status":"done"}]}"#;
     fn fallback_stamps_coverage_on_the_reaped_item() {
         let mut list = vec![TodoItem::new("Audit alloc path", "review")];
         list[0].id = "audit-alloc".into();
-        mark_completed_todo(&mut list, Some("audit-alloc"));
+        mark_completed_todo(&mut list, &["audit-alloc"]);
         assert!(
             list[0].coverage.is_empty(),
             "empty until the agent writes it"

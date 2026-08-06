@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -132,6 +132,45 @@ impl Default for ReplConfig {
             resume_change_survey: false,
             exit_on_idle: false,
             assisted_by: "kres:claude-sonnet-5".to_string(),
+        }
+    }
+}
+
+/// How deep to rank when concurrency is unbounded. With a cap, the cap
+/// IS the depth: ranking further ahead is output the next refresh
+/// overwrites before anything reads it.
+const UNBOUNDED_RANKING_DEPTH: usize = 10;
+
+/// Who asked for work to continue. `/continue` carries operator
+/// intent that a five-second timeout does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinueSource {
+    Operator,
+    Idle,
+}
+
+/// What one call to the shared dispatch path did.
+///
+/// `refused` distinguishes "nothing was runnable" from "dispatch was
+/// not allowed to run at all" — the operator needs to be told which,
+/// and the reaper needs to know whether to expect a later retry.
+#[derive(Debug, Default)]
+struct DispatchOutcome {
+    dispatched: usize,
+    blocked: usize,
+    remaining: usize,
+    refused: Option<String>,
+}
+
+impl DispatchOutcome {
+    fn refused(reason: &str) -> Self {
+        Self::refused_owned(reason.to_string())
+    }
+
+    fn refused_owned(reason: String) -> Self {
+        Self {
+            refused: Some(reason),
+            ..Self::default()
         }
     }
 }
@@ -302,6 +341,11 @@ pub struct Session {
     /// was still sitting in the todo list — which is NOT what an
     /// operator who just hit Ctrl-C's moral equivalent wants.
     stop_latched: Arc<std::sync::atomic::AtomicBool>,
+    /// Latched by the reaper once `--turns N` is reached. Dispatch
+    /// consults it directly: with the full-drain barrier gone,
+    /// "stop launching new work" can no longer be enforced by the
+    /// idle loop alone, because the reaper now dispatches too.
+    turns_cap_reached: Arc<std::sync::atomic::AtomicBool>,
     /// Woken by `cmd_stop` alongside the `stop_latched` atomic so
     /// an in-flight reaper-side inference call (the promoter today;
     /// the consolidator / todo-agent / merger in principle) can
@@ -494,6 +538,7 @@ impl Session {
                 last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                 persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                turns_cap_reached: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 stop_notify: Arc::new(tokio::sync::Notify::new()),
                 status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 input_ack_tx: tokio::sync::Mutex::new(None),
@@ -529,6 +574,7 @@ impl Session {
             last_prompt: Arc::new(tokio::sync::Mutex::new(None)),
             persist_sig: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            turns_cap_reached: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
             status_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             input_ack_tx: tokio::sync::Mutex::new(None),
@@ -872,8 +918,70 @@ impl Session {
         }
     }
 
-    /// Run the REPL loop.
-    pub async fn run(&self) -> Result<()> {
+    /// Whether a ranking refresh is worth making.
+    ///
+    /// Ranking exists to decide what runs next. When nothing will run
+    /// next it is a slow-agent round-trip — measured at 17.5s and
+    /// 85,578 input tokens, growing with findings — spent on an answer
+    /// no one reads. After `/stop` it also violates the rule that the
+    /// operator's stop skips every inference-heavy reaper post-step.
+    fn ranking_refresh_allowed(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        !self.stop_latched.load(Ordering::Acquire)
+            && !self.turns_cap_reached.load(Ordering::Acquire)
+    }
+
+    /// Refresh the stored ranked order, detached.
+    ///
+    /// Ranking is a property the todo list always has, refreshed
+    /// whenever the list changes — not something a dispatch waits for.
+    /// The call is a slow-agent round-trip (measured at 17.5s against
+    /// 40 ready rows and 14 findings, and it grows with findings), so
+    /// putting it on the dispatch path would idle a slot for its whole
+    /// duration and destroy the batch amortisation that made one
+    /// ranking authorise ten dispatches.
+    ///
+    /// Detaching is safe by construction: `claim_ranked_todos`
+    /// re-validates status and dependencies under the write lock, so
+    /// consuming a slightly stale order can only mean a suboptimal
+    /// pick, never an invalid one.
+    fn spawn_ranking_refresh(self: &Arc<Self>) {
+        if self.prioritize_client.is_none() || !self.ranking_refresh_allowed() {
+            return;
+        }
+        let session = Arc::clone(self);
+        tokio::spawn(async move {
+            // Rank for the slots that will actually exist, which is
+            // the concurrency cap — the same N the old per-wave
+            // dispatch budget used, so the prioritizer's "at most N
+            // ids, best first" contract is unchanged.
+            let limit = match session.mgr.max_parallel() {
+                0 => UNBOUNDED_RANKING_DEPTH,
+                cap => cap,
+            };
+            let ready = session
+                .mgr
+                .ready_pending_snapshot(session.cfg.turns_limit)
+                .await;
+            if ready.items.is_empty() {
+                return;
+            }
+            let ranked = session.rank_ready(&ready.items, limit).await;
+            if ranked.is_empty() {
+                // Failed or skipped. Leave the previous order in
+                // place: a stale preference beats no preference, and
+                // either way dispatch degrades to storage order.
+                return;
+            }
+            session.mgr.set_ranked_order(ranked).await;
+        });
+    }
+
+    /// Run the REPL. Takes `Arc<Self>` because the reaper needs to
+    /// reach back into the session: with the full-drain barrier gone,
+    /// the reaper is what dispatches the next tasks once its batch is
+    /// published, and what refreshes the ranked order.
+    pub async fn run(self: &Arc<Self>) -> Result<()> {
         // Apply the bootstrap synchronously BEFORE anything can
         // submit a prompt, so the first task sees the full
         // previous_findings list. Was previously tokio::spawn-ed in
@@ -1132,7 +1240,7 @@ impl Session {
         let usage_for_reaper = self.usage.clone();
         let interrupted_for_reaper = self.interrupted_prompt.clone();
         let report_path_for_reaper = self.cfg.report_path.clone();
-        let turns_cap_reached = Arc::new(AtomicBool::new(false));
+        let turns_cap_reached = self.turns_cap_reached.clone();
         let turns_cap_reached_for_reaper = turns_cap_reached.clone();
         // Destination for coding-mode file output. Coding tasks emit
         // path-relative files; they land under the workspace (i.e.
@@ -1142,6 +1250,13 @@ impl Session {
         // ~/.kres/sessions/<ts>/code/hello-world.c.
         let code_output_root_for_reaper: PathBuf = self.cfg.workspace.clone();
         let stop_latched_for_reaper = self.stop_latched.clone();
+        // Post-reap refill signal, carrying nothing. Dispatch is no
+        // longer excluded during a reap, so there is no lock to hand
+        // over — this only says "a batch just published, the start
+        // budget is re-armed, come and take the slots it vacated".
+        // Depth 1 — a second batch finishing while a refill is queued
+        // needs no second refill, since the queued one will see both.
+        let (refill_tx, mut refill_rx) = tokio::sync::mpsc::channel::<()>(1);
         let stop_notify_for_reaper = self.stop_notify.clone();
         let turns_limit = self.cfg.turns_limit;
         let follow_followups = self.cfg.follow_followups;
@@ -1203,6 +1318,16 @@ impl Session {
                     _ = ticker.tick() => {}
                 }
                 let reaped = mgr_for_reaper.reap().await;
+                let reaped_count = reaped.len();
+                // Per-task publication happens in the loop below; the
+                // todo and goal agents then run ONCE over this.
+                let mut batch: Vec<ReapedBatchEntry> = Vec::with_capacity(reaped_count);
+                // Set by the consecutive-error watchdog when it decides
+                // to halt the session. The batch pass below is skipped
+                // in that case: root_shutdown is already cancelled, so
+                // its todo and goal calls would abort mid-flight and
+                // the batch's edits would be lost silently.
+                let mut halted = false;
                 for r in reaped {
                     report_reaped(&r);
                     // §22: a task that reaches a terminal state
@@ -1739,18 +1864,6 @@ impl Session {
                             "reason": "[MISSING] Rust preserved Finding objects that remained schema-invalid after one repair attempt; re-emit the same claims with valid typed fields"
                         }));
                     }
-                    let lensed_review = matches!(r.mode, kres_core::TaskMode::Audit)
-                        && !lenses_for_reaper.read().await.is_empty();
-                    let task_todo_client = if lensed_review {
-                        review_todo_client.as_ref()
-                    } else {
-                        todo_client.as_ref()
-                    };
-                    let task_goal_client = if lensed_review {
-                        review_goal_client_for_reaper.clone()
-                    } else {
-                        goal_client_for_reaper.clone()
-                    };
                     // If this task pushed us to/past --turns N, stop
                     // before continuation LLMs. Findings/report/state
                     // above are already published for the completed
@@ -1772,347 +1885,43 @@ impl Session {
                         }
                         continue;
                     }
-                    // Update todo list via todo-agent when one is
-                    // configured. Non-fatal on any failure — the todo
-                    // list is maintained best-effort.
-                    if let Some(tc) = task_todo_client {
-                        let current = mgr_for_reaper.todo_snapshot().await;
-                        let completed_query = r.name.clone();
-                        let completed_todo_id = if matches!(r.state, TaskState::Done) {
-                            r.todo_name.as_deref()
+                    // Defer the todo and goal agents to a single pass
+                    // over the whole batch, below. Running them per
+                    // task cost 46s + 7s of strictly serial time each,
+                    // multiplied by however many tasks a wave reaped,
+                    // and it made the todo agent reconcile siblings one
+                    // at a time — so a followup two parallel tasks both
+                    // emitted could only be deduped after the first had
+                    // already become a row.
+                    //
+                    // Errored tasks reach this path with analysis="".
+                    // Without surfacing the error the todo agent reads
+                    // "no analysis" as "task didn't run, re-queue" and
+                    // we spin (see consecutive_errors above). Inject
+                    // the error so the agent has something concrete to
+                    // react to (skip vs. retry).
+                    let analysis_for_todo = if matches!(r.state, TaskState::Errored) {
+                        format!(
+                            "[task errored: {}]",
+                            r.error.as_deref().unwrap_or("(no error text)")
+                        )
+                    } else {
+                        effective_analysis.clone()
+                    };
+                    batch.push(ReapedBatchEntry {
+                        task_id: r.id,
+                        task_name: r.name.clone(),
+                        todo_id: if matches!(r.state, TaskState::Done) {
+                            r.todo_name.clone()
                         } else {
                             None
-                        };
-                        // Errored tasks reach this path with
-                        // analysis="". Without surfacing the error
-                        // here the todo agent reads "no analysis" as
-                        // "task didn't run, re-queue" and we spin
-                        // (see consecutive_errors comment above).
-                        // Inject the error so the agent has something
-                        // concrete to react to (skip vs. retry).
-                        let analysis = if matches!(r.state, TaskState::Errored) {
-                            format!(
-                                "[task errored: {}]",
-                                r.error.as_deref().unwrap_or("(no error text)")
-                            )
-                        } else {
-                            effective_analysis.clone()
-                        };
-                        // Filter out followups the reaper already
-                        // executed directly (above). Only the rest
-                        // go to the todo agent for promotion to
-                        // pending tasks.
-                        kres_core::async_eprintln!(
-                            "[todo update] before: {} item(s) ({} pending, {} done); {} new followup(s)",
-                            current.len(),
-                            current
-                                .iter()
-                                .filter(|t| t.status == kres_core::TodoStatus::Pending)
-                                .count(),
-                            current
-                                .iter()
-                                .filter(|t| t.status == kres_core::TodoStatus::Done)
-                                .count(),
-                            followups_for_todo.len(),
-                        );
-                        let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
-                        match kres_agents::update_todo_via_agent_with_logger(
-                            tc,
-                            kres_agents::TodoAgentInputs {
-                                completed_query: &completed_query,
-                                completed_todo_id,
-                                analysis_summary: &analysis,
-                                new_followups: &followups_for_todo,
-                                current_todo: &current,
-                                plan: plan_for_todo.as_ref(),
-                            },
-                            logger_for_reaper.clone(),
-                            Some(mgr_for_reaper.root_shutdown().clone()),
-                        )
-                        .await
-                        {
-                            Ok(updated) => {
-                                kres_core::async_eprintln!(
-                                    "[todo update] after:  {} item(s) ({} pending, {} done)",
-                                    updated.todo.len(),
-                                    updated
-                                        .todo
-                                        .iter()
-                                        .filter(|t| t.status == kres_core::TodoStatus::Pending)
-                                        .count(),
-                                    updated
-                                        .todo
-                                        .iter()
-                                        .filter(|t| t.status == kres_core::TodoStatus::Done)
-                                        .count(),
-                                );
-                                if let Some(change) = mgr_for_reaper
-                                    .merge_inferred_state(kres_core::task::InferredTodoUpdate {
-                                        items: updated.todo,
-                                        completed_todo_id: completed_todo_id.map(str::to_string),
-                                        inference_snapshot: current,
-                                        plan_rewrite: updated.plan,
-                                    })
-                                    .await
-                                {
-                                    log_plan_change(
-                                        "todo agent: plan rewrite",
-                                        change.prior.as_ref(),
-                                        &change.current,
-                                    );
-                                }
-                                persist_reaper_tick!();
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "kres_repl",
-                                    "todo-agent update failed: {e}"
-                                );
-                            }
-                        }
-                    }
-                    if matches!(r.mode, kres_core::TaskMode::Audit)
-                        && !lenses_for_reaper.read().await.is_empty()
-                        && !followups_for_todo.is_empty()
-                    {
-                        ensure_review_followups_remain_pending(
-                            &mgr_for_reaper,
-                            &followups_for_todo,
-                        )
-                        .await;
-                    }
-
-                    // §4 goal check: if a goal is set, ask the
-                    // main agent whether the current analyses
-                    // satisfy it. When met, every pending todo
-                    // moves to the deferred list and running tasks
-                    // get cancelled so the operator reclaims the
-                    // prompt.
-                    //
-                    // For coding-mode tasks (fix flow), skip the
-                    // per-task goal check entirely. A "turn" in
-                    // the fix flow is the full fix+compile+review
-                    // cycle, not each individual sub-task (git add,
-                    // git commit, make, etc.). Checking after each
-                    // sub-step wastes tokens and risks a premature
-                    // met=true. The todo list drives iteration;
-                    // check_goal runs only when the list drains
-                    // (no more pending items) or when an
-                    // audit/generic task completes.
-                    if matches!(r.mode, kres_core::TaskMode::Coding) {
-                        kres_core::async_eprintln!(
-                            "[goal check] skipped for coding-mode task — \
-                             goal evaluated when todo list drains"
-                        );
-                        // Still clean up the per-task goal/prompt
-                        // entries so they don't leak.
-                        task_goals_for_reaper.lock().await.remove(&r.id);
-                        task_prompts_for_reaper.lock().await.remove(&r.id);
-                    } else {
-                        // Goal is now per-task: each reaped task carries
-                        // an id, and submit_prompt parked its goal under
-                        // that id in task_goals. Pull it out (removing so
-                        // it doesn't live forever) and evaluate against
-                        // the accumulated analysis.
-                        let per_task_goal = task_goals_for_reaper.lock().await.remove(&r.id);
-                        let per_task_prompt = task_prompts_for_reaper
-                            .lock()
-                            .await
-                            .remove(&r.id)
-                            .unwrap_or_default();
-                        if let (Some(gc), Some(goal)) = (task_goal_client, per_task_goal) {
-                            let entries = accumulated_for_reaper.lock().await.clone();
-                            kres_core::async_eprintln!(
-                            "[goal check] checking against {} accumulated analysis/es ({}k chars)",
-                            entries.len(),
-                            entries.iter().map(|e| e.analysis.len()).sum::<usize>() / 1000,
-                        );
-                            let mut combined = String::new();
-                            for (i, e) in entries.iter().enumerate() {
-                                if i > 0 {
-                                    combined.push_str("\n\n---\n\n");
-                                }
-                                combined.push_str(&format!("## {}\n\n{}", e.task, e.analysis));
-                            }
-                            let recorded_findings = mgr_for_reaper.findings_snapshot().await;
-                            let recorded_findings_context =
-                                recorded_findings_goal_context(&recorded_findings);
-                            if !recorded_findings_context.is_empty() {
-                                combined.push_str("\n\n---\n\n");
-                                combined.push_str(&recorded_findings_context);
-                            }
-                            let plan_for_check = mgr_for_reaper.plan_snapshot().await;
-                            let check = kres_agents::check_goal(
-                                &gc,
-                                &per_task_prompt,
-                                &goal,
-                                &combined,
-                                plan_for_check.as_ref(),
-                                Some(mgr_for_reaper.root_shutdown().clone()),
-                            )
-                            .await;
-                            kres_core::async_eprintln!(
-                                "[goal check] met={} reason={}",
-                                check.met,
-                                truncate(&check.reason, 120)
-                            );
-                            if check.met {
-                                kres_core::async_eprintln!(
-                                    "[goal met: {}]",
-                                    truncate(&check.reason, 200)
-                                );
-                                let pending_or_blocked = mgr_for_reaper
-                                    .todo_snapshot()
-                                    .await
-                                    .iter()
-                                    .filter(|t| {
-                                        matches!(
-                                            t.status,
-                                            kres_core::TodoStatus::Pending
-                                                | kres_core::TodoStatus::Blocked
-                                        )
-                                    })
-                                    .count();
-                                let lensed_review = review_followups_drive_next_turn(
-                                    r.mode,
-                                    !lenses_for_reaper.read().await.is_empty(),
-                                    pending_or_blocked,
-                                    followups_for_todo.len(),
-                                );
-                                if lensed_review {
-                                    kres_core::async_eprintln!(
-                                        "[goal met, review followups remain: keeping {pending_or_blocked} pending/blocked item(s) as next-turn review work]"
-                                    );
-                                } else {
-                                    // Drain pending todos into the deferred
-                                    // ledger so /followup can list them.
-                                    // InProgress rows remain active until
-                                    // their executors finish and are reaped.
-                                    // Done/Skipped items stay on the todo
-                                    // list so their step_id linkage survives
-                                    // — the next sync_plan_from_todo tick
-                                    // can then flip any fully-covered plan
-                                    // step to Done.
-                                    let carry = mgr_for_reaper.defer_pending().await;
-                                    if carry > 0 {
-                                        if follow_followups && turns_limit > 0 {
-                                            // --follow + --turns N: pull the
-                                            // deferred items right back into
-                                            // the todo list so auto-continue
-                                            // dispatches them. Without this,
-                                            // goal-met drains to deferred,
-                                            // followups_drained fires, and
-                                            // the session exits with turns
-                                            // still remaining.
-                                            let (_, pulled) =
-                                                mgr_for_reaper.restore_deferred().await;
-                                            kres_core::async_eprintln!(
-                                                "[goal met, --follow: pulled {pulled} deferred item(s) back into todo list ({} turns remaining)]",
-                                                turns_limit.saturating_sub(mgr_for_reaper.completed_run_count().await)
-                                            );
-                                        } else {
-                                            kres_core::async_eprintln!(
-                                                "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
-                                            );
-                                        }
-                                    }
-                                }
-                                // Per-task goal already removed at the
-                                // top of this branch by .remove(&r.id);
-                                // nothing else to clear.
-                            } else if !check.missing.is_empty() {
-                                kres_core::async_eprintln!(
-                                    "[goal not yet met — missing: {}]",
-                                    check.missing.join(", ")
-                                );
-                                // Spec in CLAUDE.md: "Goal not met → only
-                                // missing items become followups." Previous
-                                // code only printed the list; the items
-                                // were discarded. Match by
-                                // converting each missing item to a
-                                // 'question'-typed followup and funneling
-                                // them through the todo agent so they get
-                                // deduped against existing items and
-                                // appended as new todos.
-                                if !check.missing.is_empty() {
-                                    if let Some(tc) = task_todo_client {
-                                        let reason_prefix =
-                                            format!("goal not met: {}", check.reason);
-                                        let missing_fus: Vec<serde_json::Value> = check
-                                            .missing
-                                            .iter()
-                                            .map(|m| {
-                                                serde_json::json!({
-                                                    "type": "question",
-                                                    "name": m,
-                                                    "reason": reason_prefix,
-                                                })
-                                            })
-                                            .collect();
-                                        let current = mgr_for_reaper.todo_snapshot().await;
-                                        let completed_query = r.name.clone();
-                                        kres_core::async_eprintln!(
-                                    "[goal-not-met → todo update] injecting {} missing item(s) as question followups",
-                                    missing_fus.len()
-                                );
-                                        let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
-                                        match kres_agents::update_todo_via_agent_with_logger(
-                                            tc,
-                                            kres_agents::TodoAgentInputs {
-                                                completed_query: &completed_query,
-                                                completed_todo_id: None,
-                                                analysis_summary: "",
-                                                new_followups: &missing_fus,
-                                                current_todo: &current,
-                                                plan: plan_for_todo.as_ref(),
-                                            },
-                                            logger_for_reaper.clone(),
-                                            Some(mgr_for_reaper.root_shutdown().clone()),
-                                        )
-                                        .await
-                                        {
-                                            Ok(updated) => {
-                                                kres_core::async_eprintln!(
-                                            "[goal-not-met → todo update] after: {} item(s) ({} pending, {} done)",
-                                            updated.todo.len(),
-                                            updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Pending).count(),
-                                            updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Done).count(),
-                                        );
-                                                if let Some(change) = mgr_for_reaper
-                                                    .merge_inferred_state(
-                                                        kres_core::task::InferredTodoUpdate {
-                                                            items: updated.todo,
-                                                            completed_todo_id: None,
-                                                            inference_snapshot: current,
-                                                            plan_rewrite: updated.plan,
-                                                        },
-                                                    )
-                                                    .await
-                                                {
-                                                    log_plan_change(
-                                                        "todo agent: plan rewrite (goal-not-met)",
-                                                        change.prior.as_ref(),
-                                                        &change.current,
-                                                    );
-                                                }
-                                                persist_reaper_tick!();
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    target: "kres_repl",
-                                                    "todo-agent update (missing items) failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    } // else (non-coding goal check)
-                      // Consecutive-error watchdog: surface a busted
-                      // pipeline instead of letting the todo agent
-                      // re-queue the same items forever (see counter
-                      // declaration above for context).
+                        },
+                        analysis: analysis_for_todo,
+                        followups: followups_for_todo,
+                        mode: r.mode,
+                        lensed_review: matches!(r.mode, kres_core::TaskMode::Audit)
+                            && !lenses_for_reaper.read().await.is_empty(),
+                    });
                     match r.state {
                         TaskState::Errored => {
                             consecutive_errors = consecutive_errors.saturating_add(1);
@@ -2139,10 +1948,317 @@ impl Session {
                             );
                         }
                         if exit_on_idle {
+                            // Preserve what the batch would have
+                            // reconciled. The todo agent cannot run
+                            // after the cancel, so record the
+                            // followups deterministically instead of
+                            // dropping them: `--resume` picks them up.
+                            let carried: Vec<serde_json::Value> = batch
+                                .iter()
+                                .flat_map(|e| e.followups.iter().cloned())
+                                .collect();
+                            if !carried.is_empty() {
+                                add_followups_as_pending(
+                                    &mgr_for_reaper,
+                                    &carried,
+                                    "followup emitted by a task reaped in the halting batch",
+                                )
+                                .await;
+                            }
+                            halted = true;
                             persist_reaper_tick!();
                             mgr_for_reaper.root_shutdown().cancel();
                             break;
                         }
+                    }
+                }
+                // --- one todo/goal pass for the whole batch ---------
+                //
+                // Grouped by which client pair the task belongs to. A
+                // lensed review uses the review todo/goal clients and
+                // everything else uses the general ones; a mixed batch
+                // therefore costs two rounds, never N.
+                if !batch.is_empty() && !halted {
+                    for lensed in [false, true] {
+                        let group: Vec<&ReapedBatchEntry> =
+                            batch.iter().filter(|e| e.lensed_review == lensed).collect();
+                        if group.is_empty() {
+                            continue;
+                        }
+                        let group_todo_client = if lensed {
+                            review_todo_client.as_ref()
+                        } else {
+                            todo_client.as_ref()
+                        };
+                        let group_goal_client = if lensed {
+                            review_goal_client_for_reaper.clone()
+                        } else {
+                            goal_client_for_reaper.clone()
+                        };
+                        let group_followups: Vec<serde_json::Value> = group
+                            .iter()
+                            .flat_map(|e| e.followups.iter().cloned())
+                            .collect();
+                        // Update todo list via todo-agent when one is
+                        // configured. Non-fatal on any failure — the
+                        // todo list is maintained best-effort.
+                        if let Some(tc) = group_todo_client {
+                            let current = mgr_for_reaper.todo_snapshot().await;
+                            let completed: Vec<kres_agents::CompletedTask<'_>> = group
+                                .iter()
+                                .map(|e| kres_agents::CompletedTask {
+                                    query: &e.task_name,
+                                    todo_id: e.todo_id.as_deref(),
+                                    analysis: &e.analysis,
+                                    followups: &e.followups,
+                                })
+                                .collect();
+                            kres_core::async_eprintln!(
+                                "[todo update] before: {} item(s) ({} pending, {} done); {} completed task(s), {} new followup(s)",
+                                current.len(),
+                                current
+                                    .iter()
+                                    .filter(|t| t.status == kres_core::TodoStatus::Pending)
+                                    .count(),
+                                current
+                                    .iter()
+                                    .filter(|t| t.status == kres_core::TodoStatus::Done)
+                                    .count(),
+                                completed.len(),
+                                group_followups.len(),
+                            );
+                            let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
+                            match kres_agents::update_todo_via_agent_with_logger(
+                                tc,
+                                kres_agents::TodoAgentInputs {
+                                    completed: &completed,
+                                    current_todo: &current,
+                                    plan: plan_for_todo.as_ref(),
+                                },
+                                logger_for_reaper.clone(),
+                                Some(mgr_for_reaper.root_shutdown().clone()),
+                            )
+                            .await
+                            {
+                                Ok(updated) => {
+                                    kres_core::async_eprintln!(
+                                        "[todo update] after:  {} item(s) ({} pending, {} done)",
+                                        updated.todo.len(),
+                                        updated
+                                            .todo
+                                            .iter()
+                                            .filter(|t| t.status == kres_core::TodoStatus::Pending)
+                                            .count(),
+                                        updated
+                                            .todo
+                                            .iter()
+                                            .filter(|t| t.status == kres_core::TodoStatus::Done)
+                                            .count(),
+                                    );
+                                    if let Some(change) = mgr_for_reaper
+                                        .merge_inferred_state(kres_core::task::InferredTodoUpdate {
+                                            items: updated.todo,
+                                            completed_todo_ids: group
+                                                .iter()
+                                                .filter_map(|e| e.todo_id.clone())
+                                                .collect(),
+                                            inference_snapshot: current,
+                                            plan_rewrite: updated.plan,
+                                        })
+                                        .await
+                                    {
+                                        log_plan_change(
+                                            "todo agent: plan rewrite",
+                                            change.prior.as_ref(),
+                                            &change.current,
+                                        );
+                                    }
+                                    persist_reaper_tick!();
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "kres_repl",
+                                        "todo-agent update failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        if lensed && !group_followups.is_empty() {
+                            ensure_review_followups_remain_pending(
+                                &mgr_for_reaper,
+                                &group_followups,
+                            )
+                            .await;
+                        }
+
+                        // §4 goal check: if a goal is set, ask the
+                        // main agent whether the current analyses
+                        // satisfy it. When met, every pending todo
+                        // moves to the deferred list and running tasks
+                        // get cancelled so the operator reclaims the
+                        // prompt.
+                        //
+                        // For coding-mode tasks (fix flow), skip the
+                        // goal check entirely. A "turn" in the fix flow
+                        // is the full fix+compile+review cycle, not
+                        // each individual sub-task (git add, git
+                        // commit, make, etc.). Checking after each
+                        // sub-step wastes tokens and risks a premature
+                        // met=true. The todo list drives iteration;
+                        // check_goal runs only when the list drains
+                        // (no more pending items) or when an
+                        // audit/generic task completes.
+                        //
+                        // The goal itself is per-task: submit_prompt
+                        // parked one under each task id. Pipeline
+                        // submissions inherit the cached session goal,
+                        // so a batch almost always carries one distinct
+                        // goal — but check each distinct (goal, prompt)
+                        // pair rather than assuming that.
+                        let mut checked: Vec<(String, String)> = Vec::new();
+                        for entry in &group {
+                            let per_task_goal =
+                                task_goals_for_reaper.lock().await.remove(&entry.task_id);
+                            let per_task_prompt = task_prompts_for_reaper
+                                .lock()
+                                .await
+                                .remove(&entry.task_id)
+                                .unwrap_or_default();
+                            if matches!(entry.mode, kres_core::TaskMode::Coding) {
+                                kres_core::async_eprintln!(
+                                    "[goal check] skipped for coding-mode task — \
+                                     goal evaluated when todo list drains"
+                                );
+                                continue;
+                            }
+                            let (Some(gc), Some(goal)) = (group_goal_client.clone(), per_task_goal)
+                            else {
+                                continue;
+                            };
+                            if checked
+                                .iter()
+                                .any(|(g, p)| g == &goal && p == &per_task_prompt)
+                            {
+                                continue;
+                            }
+                            checked.push((goal.clone(), per_task_prompt.clone()));
+                            let outcome = run_batch_goal_check(BatchGoalCheck {
+                                mgr: &mgr_for_reaper,
+                                goal_client: &gc,
+                                goal: &goal,
+                                prompt: &per_task_prompt,
+                                accumulated: &accumulated_for_reaper,
+                                lensed_review: lensed,
+                                followup_count: group_followups.len(),
+                                follow_followups,
+                                turns_limit,
+                            })
+                            .await;
+                            let BatchGoalOutcome { missing } = outcome;
+                            if missing.is_empty() {
+                                continue;
+                            }
+                            // Spec in AGENTS.md: "Goal not met → only
+                            // missing items become followups." Convert
+                            // each to a 'question' followup and funnel
+                            // it through the todo agent so it gets
+                            // deduped against existing items.
+                            let Some(tc) = group_todo_client else {
+                                continue;
+                            };
+                            let reason_prefix = format!("goal not met: {}", missing.join("; "));
+                            let missing_fus: Vec<serde_json::Value> = missing
+                                .iter()
+                                .map(|m| {
+                                    serde_json::json!({
+                                        "type": "question",
+                                        "name": m,
+                                        "reason": reason_prefix,
+                                    })
+                                })
+                                .collect();
+                            let current = mgr_for_reaper.todo_snapshot().await;
+                            kres_core::async_eprintln!(
+                                "[goal-not-met → todo update] injecting {} missing item(s) as question followups",
+                                missing_fus.len()
+                            );
+                            let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
+                            let completed = [kres_agents::CompletedTask {
+                                query: &group[0].task_name,
+                                todo_id: None,
+                                analysis: "",
+                                followups: &missing_fus,
+                            }];
+                            match kres_agents::update_todo_via_agent_with_logger(
+                                tc,
+                                kres_agents::TodoAgentInputs {
+                                    completed: &completed,
+                                    current_todo: &current,
+                                    plan: plan_for_todo.as_ref(),
+                                },
+                                logger_for_reaper.clone(),
+                                Some(mgr_for_reaper.root_shutdown().clone()),
+                            )
+                            .await
+                            {
+                                Ok(updated) => {
+                                    kres_core::async_eprintln!(
+                                        "[goal-not-met → todo update] after: {} item(s) ({} pending, {} done)",
+                                        updated.todo.len(),
+                                        updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Pending).count(),
+                                        updated.todo.iter().filter(|t| t.status == kres_core::TodoStatus::Done).count(),
+                                    );
+                                    if let Some(change) = mgr_for_reaper
+                                        .merge_inferred_state(kres_core::task::InferredTodoUpdate {
+                                            items: updated.todo,
+                                            completed_todo_ids: Vec::new(),
+                                            inference_snapshot: current,
+                                            plan_rewrite: updated.plan,
+                                        })
+                                        .await
+                                    {
+                                        log_plan_change(
+                                            "todo agent: plan rewrite (goal-not-met)",
+                                            change.prior.as_ref(),
+                                            &change.current,
+                                        );
+                                    }
+                                    persist_reaper_tick!();
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "kres_repl",
+                                        "todo-agent update (missing items) failed: {e}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                // The batch is published: findings applied, todo rows
+                // completed, followups merged.
+                if reaped_count > 0 {
+                    // Re-arm the start budget. Dispatch may run during
+                    // a reap, but only up to `max_parallel` starts
+                    // between completions, so this is what lets the
+                    // next wave through.
+                    mgr_for_reaper.note_reap_completed().await;
+                    // Then ask the REPL loop to refill the slots this
+                    // batch vacated. The dispatch runs there rather
+                    // than here because `submit_prompt_inner` reaches
+                    // change-survey closures whose futures rustc
+                    // cannot prove `Send`, and everything inside this
+                    // `tokio::spawn` must be. The REPL loop is not
+                    // spawned, so it has no such bound. The reaper
+                    // still decides WHEN.
+                    if let Err(e) = refill_tx.try_send(()) {
+                        // Loop busy with an operator command, or a
+                        // refill already queued. The idle poll picks
+                        // the work up within its interval.
+                        tracing::debug!(
+                            target: "kres_repl",
+                            "post-reap refill not queued ({e}); idle loop will dispatch"
+                        );
                     }
                 }
                 // --turns N limit: once the slow-agent run count hits
@@ -2441,6 +2557,21 @@ impl Session {
             const AUTO_CONTINUE_IDLE: Duration = Duration::from_secs(5);
             let line = tokio::select! {
                 _ = root_shutdown.cancelled() => break,
+                signal = refill_rx.recv() => {
+                    // A reap batch just published its results. Refill
+                    // the slots it vacated, then re-rank for the next
+                    // dispatch.
+                    if signal.is_none() {
+                        continue;
+                    }
+                    let outcome = self.dispatch_ready(None, "post-reap").await;
+                    if let Some(reason) = outcome.refused {
+                        kres_core::async_eprintln!("[dispatch post-reap] skipped: {reason}");
+                    }
+                    self.spawn_ranking_refresh();
+                    auto_continue_idle_since = None;
+                    continue;
+                }
                 l = rx.recv() => {
                     // Input arrived: reset idle clock.
                     auto_continue_idle_since = None;
@@ -2455,8 +2586,7 @@ impl Session {
                     } else if self.should_auto_continue().await {
                         let since = auto_continue_idle_since.get_or_insert_with(std::time::Instant::now);
                         if since.elapsed() >= AUTO_CONTINUE_IDLE {
-                            kres_core::async_eprintln!("[auto-continue: dispatching next batch (hit enter to cancel)]");
-                            self.cmd_continue().await;
+                            self.auto_continue().await;
                             auto_continue_idle_since = None;
                         }
                     } else {
@@ -3361,71 +3491,147 @@ impl Session {
     }
 
     async fn cmd_continue(&self) {
-        // Operator opted back in — clear the /stop auto-continue latch.
-        self.stop_latched
-            .store(false, std::sync::atomic::Ordering::Release);
+        self.continue_work(ContinueSource::Operator).await
+    }
+
+    /// Auto-continue from the idle loop.
+    ///
+    /// Deliberately NOT `/continue`. Two of that command's side
+    /// effects are statements of operator intent and must not fire on
+    /// a timer: clearing the `/stop` latch, and pulling the deferred
+    /// ledger back into the todo list. The second matters more now
+    /// that dispatch is no longer gated on a full drain — the idle
+    /// loop can fire while tasks are still running, so work the goal
+    /// agent deliberately deferred would be resurrected by a timeout
+    /// rather than by someone asking for it.
+    async fn auto_continue(&self) {
+        self.continue_work(ContinueSource::Idle).await
+    }
+
+    async fn continue_work(&self, source: ContinueSource) {
+        let label = match source {
+            ContinueSource::Operator => "/continue",
+            ContinueSource::Idle => "auto-continue",
+        };
+        if matches!(source, ContinueSource::Operator) {
+            // Operator opted back in — clear the /stop auto-continue latch.
+            self.stop_latched
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         // §22: an interrupted inference wins over batch dispatch.
         // Re-submit the stashed prompt and return — the operator
         // gets their work back before new items start.
         let stashed = self.interrupted_prompt.lock().await.take();
         if let Some(prompt) = stashed {
             kres_core::async_eprintln!(
-                "/continue: resuming interrupted prompt: {}",
+                "{label}: resuming interrupted prompt: {}",
                 truncate(&prompt, 80)
             );
             self.submit_prompt(prompt).await;
             return;
         }
-        // Pull any deferred items (from goal-met or --turns drains)
-        // back into the active todo list as Pending so they get
-        // dispatched here. The "/continue to pursue" message we
-        // print on goal-met implies this will happen; without it
-        // the operator has to re-type every deferred item by hand.
-        let (carry, added) = self.mgr.restore_deferred().await;
-        if carry > 0 {
+        if matches!(source, ContinueSource::Operator) {
+            // Pull any deferred items (from goal-met or --turns drains)
+            // back into the active todo list as Pending so they get
+            // dispatched here. The "/continue to pursue" message we
+            // print on goal-met implies this will happen; without it
+            // the operator has to re-type every deferred item by hand.
+            let (carry, added) = self.mgr.restore_deferred().await;
+            if carry > 0 {
+                kres_core::async_eprintln!(
+                    "/continue: pulled {carry} deferred item(s), added {added} to todo list"
+                );
+            }
+        }
+        let outcome = self.dispatch_ready(None, label).await;
+        if let Some(reason) = outcome.refused {
+            // A refusal is not a dispatch. Saying so plainly matters:
+            // the idle loop polls every five seconds, and phrasing
+            // this as an action made the log read as though batch
+            // after batch was starting when nothing was.
+            kres_core::async_eprintln!("{label}: deferred — {reason}");
+            return;
+        }
+        let mut msg = format!("{label}: dispatched {} item(s)", outcome.dispatched);
+        if outcome.blocked > 0 {
+            msg.push_str(&format!(", {} blocked on unfinished deps", outcome.blocked));
+        }
+        if outcome.remaining > 0 {
+            msg.push_str(&format!(
+                ", {} left — dispatched automatically as slots free up",
+                outcome.remaining
+            ));
+        }
+        kres_core::async_eprintln!("{msg}");
+    }
+
+    /// Claim ready work and start it. This is the ONLY path that
+    /// starts pipeline tasks: `/continue`, `/next` and the post-reap
+    /// refill all come through here.
+    ///
+    /// Dispatch does NOT wait for the reaper. An earlier design made
+    /// it wait for the reap queue to drain, and that serialised every
+    /// new task behind a ~65s publication: half the refill attempts in
+    /// the 2026-08-06 aug6-4 run were refused with "N task(s) waiting
+    /// to be reaped", handing back much of the idle time the whole
+    /// rework had just reclaimed.
+    ///
+    /// Claiming during a reap is safe because the todo list is
+    /// Rust-owned and every mutation takes the manager's write lock.
+    /// The one hazard — a row being claimed while the todo agent's
+    /// round trip is in flight — is already handled by
+    /// `merge_inferred_state`, which restores the live status of any
+    /// row that went InProgress or terminal after its inference
+    /// snapshot was taken.
+    ///
+    /// The bound is a start budget instead: at most `max_parallel`
+    /// tasks may start without a reap completing. Fast tasks cannot
+    /// churn forever while the reaper never gets a turn at the rate
+    /// limiter, and a slow reaper cannot stall dispatch outright.
+    async fn dispatch_ready(&self, limit: Option<usize>, reason: &'static str) -> DispatchOutcome {
+        use std::sync::atomic::Ordering;
+        if self.stop_latched.load(Ordering::Acquire) {
+            return DispatchOutcome::refused("/stop is latched; /continue re-arms dispatch");
+        }
+        if self.turns_cap_reached.load(Ordering::Acquire) {
+            return DispatchOutcome::refused("--turns cap reached; no new work will start");
+        }
+        let free = self.mgr.free_slots().await;
+        if free == 0 {
+            return DispatchOutcome::refused_owned(format!(
+                "all {} slot(s) busy",
+                self.mgr.max_parallel()
+            ));
+        }
+        if self.mgr.start_budget().await == 0 {
+            return DispatchOutcome::refused_owned(format!(
+                "{} task(s) started since the last reap completed; waiting for one to publish",
+                self.mgr.max_parallel()
+            ));
+        }
+        // Every remaining bound — free slots, turn budget, start
+        // budget — is applied inside the claim, under the same lock
+        // that flips the rows, so a concurrent dispatch cannot
+        // double-spend a slot.
+        let claims = self
+            .mgr
+            .claim_ranked_todos(limit.unwrap_or(usize::MAX), self.cfg.turns_limit)
+            .await;
+        let dispatched = claims.items.len();
+        if dispatched > 0 {
+            fn bound(n: usize) -> String {
+                if n == usize::MAX {
+                    "unbounded".to_string()
+                } else {
+                    n.to_string()
+                }
+            }
             kres_core::async_eprintln!(
-                "/continue: pulled {carry} deferred item(s), added {added} to todo list"
+                "[dispatch {reason}] starting {dispatched} task(s); {} slot(s) were free, {} start(s) left before a reap must publish",
+                bound(free),
+                bound(self.mgr.start_budget().await),
             );
         }
-        // §15: cap the batch at 10 items per `/continue`.
-        // Items beyond the cap stay pending so the
-        // operator can re-issue /continue or let the auto-continue
-        // idle loop pick them up.
-        const BATCH_CAP: usize = 10;
-        // Rank BEFORE claiming. The todo list is stable storage with
-        // no ranking in it, so taking the first N in list order would
-        // dispatch by age. The ranking call is an LLM round-trip and
-        // must not run under the manager's write lock, hence the
-        // snapshot/claim split: rows that stop being ready in between
-        // are simply not claimed.
-        let ready = self.mgr.ready_pending_snapshot(self.cfg.turns_limit).await;
-        let limit = BATCH_CAP.min(ready.budget);
-        let selected = self.rank_ready(&ready.items, limit).await;
-        let ranked = if selected.is_empty() {
-            Vec::new()
-        } else {
-            self.mgr
-                .claim_selected_todos(&selected, self.cfg.turns_limit)
-                .await
-        };
-        // Ranking must never be able to stall a wave. If every pick
-        // turned out to be unclaimable — each row taken, gated, or
-        // gone since the snapshot — fall through to the unranked
-        // claim rather than dispatching nothing and letting
-        // auto-continue re-rank the same list every five seconds.
-        let claims = if ranked.is_empty() {
-            self.mgr
-                .claim_ready_todos_with_turn_limit(BATCH_CAP, self.cfg.turns_limit)
-                .await
-        } else {
-            let claimed = ranked.len();
-            kres_core::TodoClaims {
-                items: ranked,
-                blocked: ready.blocked,
-                remaining: ready.items.len().saturating_sub(claimed),
-            }
-        };
-        let dispatched = claims.items.len();
         for item in &claims.items {
             let prompt = if item.reason.is_empty() {
                 format!("[{}] {}", item.kind, item.name)
@@ -3444,70 +3650,30 @@ impl Session {
             };
             self.submit_from_pipeline(prompt, Some(tag), sid).await;
         }
-        let mut msg = format!("/continue: dispatched {dispatched} item(s)");
-        if claims.blocked > 0 {
-            msg.push_str(&format!(", {} blocked on unfinished deps", claims.blocked));
+        DispatchOutcome {
+            dispatched,
+            blocked: claims.blocked,
+            remaining: claims.remaining,
+            refused: None,
         }
-        if claims.remaining > 0 {
-            msg.push_str(&format!(
-                ", {} left — /continue again to process next batch",
-                claims.remaining
-            ));
-        }
-        kres_core::async_eprintln!("{msg}");
     }
 
     async fn cmd_next(&self) {
-        // One slot, so the ranking question is at its sharpest: of
-        // everything runnable, which single item is worth the turn?
-        let ready = self.mgr.ready_pending_snapshot(self.cfg.turns_limit).await;
-        let selected = self.rank_ready(&ready.items, 1.min(ready.budget)).await;
-        let ranked = if selected.is_empty() {
-            Vec::new()
-        } else {
-            self.mgr
-                .claim_selected_todos(&selected, self.cfg.turns_limit)
-                .await
-        };
-        let mut claims = if ranked.is_empty() {
-            self.mgr
-                .claim_ready_todos_with_turn_limit(1, self.cfg.turns_limit)
-                .await
-        } else {
-            kres_core::TodoClaims {
-                items: ranked,
-                blocked: ready.blocked,
-                remaining: 0,
-            }
-        };
-        let Some(item) = claims.items.pop() else {
-            if claims.blocked == 0 {
+        let outcome = self.dispatch_ready(Some(1), "/next").await;
+        if let Some(reason) = outcome.refused {
+            kres_core::async_eprintln!("/next: {reason}");
+            return;
+        }
+        if outcome.dispatched == 0 {
+            if outcome.blocked == 0 {
                 kres_core::async_eprintln!("/next: nothing pending");
             } else {
                 kres_core::async_eprintln!(
                     "/next: {} pending item(s) but all are blocked on unfinished deps",
-                    claims.blocked
+                    outcome.blocked
                 );
             }
-            return;
-        };
-        let prompt = if item.reason.is_empty() {
-            format!("[{}] {}", item.kind, item.name)
-        } else {
-            format!("[{}] {}: {}", item.kind, item.name, item.reason)
-        };
-        let tag = if !item.id.is_empty() {
-            item.id.clone()
-        } else {
-            item.name.clone()
-        };
-        kres_core::async_eprintln!("/next: dispatching {}", truncate(&item.name, 80));
-        let sid = if item.step_id.is_empty() {
-            None
-        } else {
-            Some(item.step_id.clone())
-        };
-        self.submit_from_pipeline(prompt, Some(tag), sid).await;
+        }
     }
 
     async fn cmd_edit(&self) {
@@ -4371,11 +4537,13 @@ impl Session {
         if self.stop_latched.load(std::sync::atomic::Ordering::Acquire) {
             return false;
         }
-        // A terminal task remains publishable until the reaper removes it.
-        // Treating active_count()==0 as idle races the reaper: auto-continue
-        // can otherwise redispatch while the terminal result is still waiting
-        // to update findings, todos, and the interruption stash.
-        if !self.mgr.snapshot().await.is_empty() {
+        // Neither a running task nor an unpublished terminal one is a
+        // reason to hold back work. Requiring the whole task list to
+        // be empty cost 33% of wall-clock time idle; requiring the
+        // reap queue to be empty then serialised each new task behind
+        // a ~65s publication. What bounds dispatch now is the slot cap
+        // and the start budget, both enforced inside the claim.
+        if self.mgr.free_slots().await == 0 || self.mgr.start_budget().await == 0 {
             return false;
         }
         let items = self.mgr.todo_snapshot().await;
@@ -5535,15 +5703,172 @@ fn done_id_set(items: &[kres_core::TodoItem]) -> std::collections::BTreeSet<Stri
         .collect()
 }
 
-fn review_followups_drive_next_turn(
+/// One reaped task, held until the batch's todo/goal pass runs.
+///
+/// Everything per-task — publication, findings, report, promote — has
+/// already happened by the time an entry lands here. What remains is
+/// the part that reasons over the shared todo list, and that is done
+/// once for the whole batch.
+struct ReapedBatchEntry {
+    task_id: kres_core::task::TaskId,
+    task_name: String,
+    /// The row this task was executing, when it completed successfully.
+    /// `None` for an errored task: nothing may be marked done.
+    todo_id: Option<String>,
+    /// What the todo agent reads as this task's result. Carries the
+    /// error text instead of the analysis for an errored task.
+    analysis: String,
+    followups: Vec<serde_json::Value>,
     mode: kres_core::TaskMode,
-    lenses_installed: bool,
+    lensed_review: bool,
+}
+
+struct BatchGoalCheck<'a> {
+    mgr: &'a Arc<kres_core::TaskManager>,
+    goal_client: &'a kres_agents::GoalClient,
+    goal: &'a str,
+    prompt: &'a str,
+    accumulated: &'a Arc<tokio::sync::Mutex<Vec<AccumulatedEntry>>>,
+    lensed_review: bool,
+    followup_count: usize,
+    follow_followups: bool,
+    turns_limit: u32,
+}
+
+struct BatchGoalOutcome {
+    /// Empty when the goal was met, when no goal agent answered, or
+    /// when the agent said "not met" without naming anything concrete.
+    missing: Vec<String>,
+}
+
+/// Ask the goal agent whether the accumulated analyses satisfy the
+/// goal, and act on a met verdict by draining the todo list.
+///
+/// Split out of the reaper loop when the todo/goal pass moved from
+/// per-task to per-batch: the body is unchanged, but it now runs once
+/// per distinct goal in a batch rather than once per reaped task.
+async fn run_batch_goal_check(check_inputs: BatchGoalCheck<'_>) -> BatchGoalOutcome {
+    let BatchGoalCheck {
+        mgr,
+        goal_client,
+        goal,
+        prompt,
+        accumulated,
+        lensed_review,
+        followup_count,
+        follow_followups,
+        turns_limit,
+    } = check_inputs;
+    let entries = accumulated.lock().await.clone();
+    kres_core::async_eprintln!(
+        "[goal check] checking against {} accumulated analysis/es ({}k chars)",
+        entries.len(),
+        entries.iter().map(|e| e.analysis.len()).sum::<usize>() / 1000,
+    );
+    let mut combined = String::new();
+    for (i, e) in entries.iter().enumerate() {
+        if i > 0 {
+            combined.push_str("\n\n---\n\n");
+        }
+        combined.push_str(&format!("## {}\n\n{}", e.task, e.analysis));
+    }
+    let recorded_findings = mgr.findings_snapshot().await;
+    let recorded_findings_context = recorded_findings_goal_context(&recorded_findings);
+    if !recorded_findings_context.is_empty() {
+        combined.push_str("\n\n---\n\n");
+        combined.push_str(&recorded_findings_context);
+    }
+    let plan_for_check = mgr.plan_snapshot().await;
+    let check = kres_agents::check_goal(
+        goal_client,
+        prompt,
+        goal,
+        &combined,
+        plan_for_check.as_ref(),
+        Some(mgr.root_shutdown().clone()),
+    )
+    .await;
+    kres_core::async_eprintln!(
+        "[goal check] met={} reason={}",
+        check.met,
+        truncate(&check.reason, 120)
+    );
+    if !check.met {
+        if !check.missing.is_empty() {
+            kres_core::async_eprintln!(
+                "[goal not yet met — missing: {}]",
+                check.missing.join(", ")
+            );
+        }
+        return BatchGoalOutcome {
+            missing: check.missing,
+        };
+    }
+    kres_core::async_eprintln!("[goal met: {}]", truncate(&check.reason, 200));
+    let pending_or_blocked = mgr
+        .todo_snapshot()
+        .await
+        .iter()
+        .filter(|t| {
+            matches!(
+                t.status,
+                kres_core::TodoStatus::Pending | kres_core::TodoStatus::Blocked
+            )
+        })
+        .count();
+    // A lensed review turns its remaining followups into the next
+    // turn's work instead of draining them.
+    let keep_for_next_turn =
+        review_followups_drive_next_turn(lensed_review, pending_or_blocked, followup_count);
+    if keep_for_next_turn {
+        kres_core::async_eprintln!(
+            "[goal met, review followups remain: keeping {pending_or_blocked} pending/blocked item(s) as next-turn review work]"
+        );
+        return BatchGoalOutcome {
+            missing: Vec::new(),
+        };
+    }
+    // Drain pending todos into the deferred ledger so /followup can
+    // list them. InProgress rows remain active until their executors
+    // finish and are reaped. Done/Skipped items stay on the todo list
+    // so their step_id linkage survives — the next sync_plan_from_todo
+    // tick can then flip any fully-covered plan step to Done.
+    let carry = mgr.defer_pending().await;
+    if carry > 0 {
+        if follow_followups && turns_limit > 0 {
+            // --follow + --turns N: pull the deferred items right back
+            // into the todo list so auto-continue dispatches them.
+            // Without this, goal-met drains to deferred,
+            // followups_drained fires, and the session exits with
+            // turns still remaining.
+            let (_, pulled) = mgr.restore_deferred().await;
+            kres_core::async_eprintln!(
+                "[goal met, --follow: pulled {pulled} deferred item(s) back into todo list ({} turns remaining)]",
+                turns_limit.saturating_sub(mgr.completed_run_count().await)
+            );
+        } else {
+            kres_core::async_eprintln!(
+                "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
+            );
+        }
+    }
+    BatchGoalOutcome {
+        missing: Vec::new(),
+    }
+}
+
+/// Whether a goal-met verdict should keep the remaining work as the
+/// next review turn instead of draining it to /followup.
+///
+/// `lensed_review` is "this batch is an Audit with lenses installed" —
+/// the caller already knows that, so it is passed as the fact it is
+/// rather than reconstructed from a `TaskMode`.
+fn review_followups_drive_next_turn(
+    lensed_review: bool,
     pending_or_blocked: usize,
     new_followups: usize,
 ) -> bool {
-    matches!(mode, kres_core::TaskMode::Audit)
-        && lenses_installed
-        && (pending_or_blocked > 0 || new_followups > 0)
+    lensed_review && (pending_or_blocked > 0 || new_followups > 0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7797,7 +8122,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_continue_waits_for_terminal_task_to_be_reaped() {
+    async fn terminal_unreaped_tasks_no_longer_block_dispatch() {
+        // Superseded contract: this used to assert that a
+        // terminal-but-unreaped task blocked auto-continue. Waiting
+        // for the reap queue to drain serialised every new task behind
+        // a ~65s publication, so the bound is now a start budget
+        // instead — see `dispatch_stops_after_max_parallel_starts`.
         let mgr = TaskManager::new();
         assert!(
             mgr.seed_todo_if_empty(vec![kres_core::TodoItem::new("next", "review")])
@@ -7813,15 +8143,7 @@ mod tests {
         .await;
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if mgr
-                    .snapshot()
-                    .await
-                    .iter()
-                    .all(|task| task.state.is_terminal())
-                {
-                    break;
-                }
+            while mgr.reap_queue_depth().await == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -7830,11 +8152,200 @@ mod tests {
 
         assert_eq!(mgr.active_count().await, 0);
         assert!(
-            !s.should_auto_continue().await,
-            "terminal-but-unreaped task must block auto-continue"
+            s.should_auto_continue().await,
+            "an unpublished terminal task must no longer hold back dispatch"
         );
-        assert_eq!(mgr.reap().await.len(), 1);
-        assert!(s.should_auto_continue().await);
+    }
+
+    #[tokio::test]
+    async fn auto_continue_no_longer_waits_for_running_tasks() {
+        // The point of the rework: a running task is not a reason to
+        // hold back work. Only an unpublished completed one is.
+        let mgr = TaskManager::new();
+        assert!(
+            mgr.seed_todo_if_empty(vec![kres_core::TodoItem::new("next", "review")])
+                .await
+        );
+        let s = Session::new(mgr.clone(), ReplConfig::default()).await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let held = hold.clone();
+        mgr.spawn("still running", None, move |_| async move {
+            held.notified().await;
+            Ok(kres_core::task::TaskOutcome::default())
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while mgr.active_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task should start");
+
+        assert_eq!(mgr.reap_queue_depth().await, 0);
+        assert!(
+            s.should_auto_continue().await,
+            "a running task must not block dispatch once the reap queue is empty"
+        );
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn dispatch_stops_after_max_parallel_starts_without_a_reap() {
+        // Dispatch may run during a reap, but not without limit: the
+        // reaper shares one rate limiter with the tasks, and a stream
+        // of fast tasks would otherwise keep starting work while the
+        // reaper never got a turn to publish any of it.
+        //
+        // A live task is held open for the duration: the budget
+        // deliberately does not block when NO task is tracked, since
+        // nothing could ever re-arm it, and that guard would otherwise
+        // mask what this test is checking.
+        let mgr = TaskManager::with_max_parallel(4);
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let held = hold.clone();
+        mgr.spawn("keeps the task list non-empty", None, move |_| async move {
+            held.notified().await;
+            Ok(kres_core::task::TaskOutcome::default())
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while mgr.active_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("holder should start");
+        mgr.seed_todo_if_empty(
+            (0..9)
+                .map(|i| kres_core::TodoItem::new(format!("row {i}"), "review"))
+                .collect(),
+        )
+        .await;
+        let s = Session::new(mgr.clone(), ReplConfig::default()).await;
+
+        // Cap 4, one slot taken by the holder: 3 free, budget 4.
+        // Claimed rows never spawn (no AgentRunner), so free_slots
+        // stays at 3 and only the budget can stop the sequence.
+        assert_eq!(s.dispatch_ready(None, "test").await.dispatched, 3);
+        assert_eq!(s.dispatch_ready(None, "test").await.dispatched, 1);
+        let blocked = s.dispatch_ready(None, "test").await;
+        assert_eq!(blocked.dispatched, 0);
+        assert!(
+            blocked
+                .refused
+                .as_deref()
+                .is_some_and(|r| r.contains("since the last reap completed")),
+            "expected a start-budget refusal, got {:?}",
+            blocked.refused
+        );
+
+        // A completed reap batch re-arms it, and only that does.
+        mgr.note_reap_completed().await;
+        assert_eq!(s.dispatch_ready(None, "test").await.dispatched, 3);
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn dispatch_is_refused_when_every_slot_is_busy() {
+        // The cap lives on the manager, so the test configures it
+        // there — there is no second copy to disagree with.
+        let mgr = TaskManager::with_max_parallel(1);
+        mgr.seed_todo_if_empty(vec![kres_core::TodoItem::new("work", "review")])
+            .await;
+        let s = Session::new(mgr.clone(), ReplConfig::default()).await;
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let held = hold.clone();
+        mgr.spawn("occupies the only slot", None, move |_| async move {
+            held.notified().await;
+            Ok(kres_core::task::TaskOutcome::default())
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while mgr.active_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("task should start");
+
+        assert_eq!(mgr.free_slots().await, 0);
+        let outcome = s.dispatch_ready(None, "test").await;
+        assert!(
+            outcome
+                .refused
+                .as_deref()
+                .is_some_and(|r| r.contains("slot(s) busy")),
+            "expected a slot refusal, got {:?}",
+            outcome.refused
+        );
+        assert!(
+            !s.should_auto_continue().await,
+            "a full fleet must also stop the idle loop from firing"
+        );
+        hold.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn ranking_refresh_stops_when_no_further_work_will_start() {
+        use std::sync::atomic::Ordering;
+        let s = Session::new(TaskManager::new(), ReplConfig::default()).await;
+        assert!(s.ranking_refresh_allowed());
+        // /stop must skip every inference-heavy reaper post-step, and
+        // the refill signal still fires for a batch reaped just before
+        // the latch — so the guard, not the caller, has to hold.
+        s.stop_latched.store(true, Ordering::Release);
+        assert!(!s.ranking_refresh_allowed());
+        s.stop_latched.store(false, Ordering::Release);
+        assert!(s.ranking_refresh_allowed());
+        // Past the turns cap nothing more will be dispatched, so a
+        // ranking has nothing to order.
+        s.turns_cap_reached.store(true, Ordering::Release);
+        assert!(!s.ranking_refresh_allowed());
+    }
+
+    #[tokio::test]
+    async fn auto_continue_does_not_resurrect_deferred_work() {
+        // /continue pulls the deferred ledger back because the
+        // operator asked. The idle timer has not asked, and it now
+        // fires while tasks are still running, so it must not undo a
+        // goal-met or turn-cap drain on a timeout.
+        let mgr = TaskManager::new();
+        mgr.seed_todo_if_empty(vec![kres_core::TodoItem::new("deferred work", "review")])
+            .await;
+        assert_eq!(mgr.defer_pending().await, 1);
+        assert_eq!(mgr.deferred_snapshot().await.len(), 1);
+        let s = Session::new(mgr.clone(), ReplConfig::default()).await;
+
+        s.auto_continue().await;
+        assert_eq!(
+            mgr.deferred_snapshot().await.len(),
+            1,
+            "idle auto-continue must leave the deferred ledger alone"
+        );
+        assert!(mgr.todo_snapshot().await.is_empty());
+
+        s.cmd_continue().await;
+        assert!(
+            mgr.deferred_snapshot().await.is_empty(),
+            "the operator's /continue still pulls deferred work back"
+        );
+        assert_eq!(mgr.todo_snapshot().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_continue_does_not_clear_the_stop_latch() {
+        use std::sync::atomic::Ordering;
+        let mgr = TaskManager::new();
+        let s = Session::new(mgr, ReplConfig::default()).await;
+        s.stop_latched.store(true, Ordering::Release);
+        s.auto_continue().await;
+        assert!(
+            s.stop_latched.load(Ordering::Acquire),
+            "only the operator re-arms dispatch after /stop"
+        );
+        s.cmd_continue().await;
+        assert!(!s.stop_latched.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -7982,36 +8493,13 @@ mod tests {
 
     #[test]
     fn lensed_review_keeps_pending_followups_after_goal_met() {
-        assert!(review_followups_drive_next_turn(
-            kres_core::TaskMode::Audit,
-            true,
-            1,
-            0
-        ));
-        assert!(review_followups_drive_next_turn(
-            kres_core::TaskMode::Audit,
-            true,
-            0,
-            1
-        ));
-        assert!(!review_followups_drive_next_turn(
-            kres_core::TaskMode::Audit,
-            true,
-            0,
-            0
-        ));
-        assert!(!review_followups_drive_next_turn(
-            kres_core::TaskMode::Generic,
-            true,
-            1,
-            1
-        ));
-        assert!(!review_followups_drive_next_turn(
-            kres_core::TaskMode::Audit,
-            false,
-            1,
-            1
-        ));
+        // Something still to do -> next review turn, not a drain.
+        assert!(review_followups_drive_next_turn(true, 1, 0));
+        assert!(review_followups_drive_next_turn(true, 0, 1));
+        // Genuinely nothing left -> drain.
+        assert!(!review_followups_drive_next_turn(true, 0, 0));
+        // Not a lensed review -> drain regardless of what remains.
+        assert!(!review_followups_drive_next_turn(false, 1, 1));
     }
 
     #[test]

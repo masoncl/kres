@@ -717,6 +717,7 @@ fn reconcile_update(
             .collect()
     });
     let mut restored: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
     let mut pending: Vec<TodoItem> = Vec::new();
     for (idx, item) in state.iter().enumerate() {
         if item.status.is_terminal() || retired.contains(&idx) {
@@ -724,15 +725,31 @@ fn reconcile_update(
         }
         if !emitted.contains(&idx) {
             // A row bound to a step the plan has since finished is
-            // stale by construction, not forgotten.
+            // stale by construction, not forgotten. Dropping it is
+            // correct, but dropping it silently is the failure this
+            // whole function exists to prevent, so say so.
             if let (Some(live), false) = (live_steps.as_ref(), item.step_id.is_empty()) {
                 if !live.contains(item.step_id.as_str()) {
+                    stale.push(format!("{} (step {})", item.id, item.step_id));
                     continue;
                 }
             }
             restored.push(item.id.clone());
         }
         pending.push(item.clone());
+    }
+    if !stale.is_empty() {
+        tracing::info!(
+            target: "kres_agents",
+            "dropped {} unemitted item(s) bound to a finished plan step: {}",
+            stale.len(),
+            stale
+                .iter()
+                .take(5)
+                .map(|entry| truncate(entry, 60))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     pending.extend(appended);
     if !restored.is_empty() {

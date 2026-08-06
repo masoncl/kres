@@ -802,7 +802,11 @@ impl Session {
             // ready row fits. Both make the ranking call pure cost.
             return ready.iter().take(limit).map(|i| i.id.clone()).collect();
         }
-        let findings = self.mgr.findings_snapshot().await;
+        // Redacted, because these bytes ARE the cache head the wave's
+        // lens fan-out will read, and `prepare_lens_fanout` redacts.
+        // Raw findings would differ by the per-task provenance fields
+        // and turn a shared block into two writes of ~166KB.
+        let findings = kres_core::redact_findings_for_agent(&self.mgr.findings_snapshot().await);
         let plan = self.mgr.plan_snapshot().await;
         // The OPERATOR's prompt, not the last thing dispatched.
         // `last_prompt` is overwritten by every pipeline submission
@@ -830,6 +834,13 @@ impl Session {
             ..(**pc).clone()
         };
         let pc = &pc;
+        // The lens path sends `synthesis_skills.common` — the payload
+        // minus the task's grafted `skill_reads`. No gather has run for
+        // the wave being dispatched, so no reads are grafted yet and
+        // the common half is the whole payload. Verified on the
+        // 2026-08-06 run: the lens `common_skills` and this value
+        // hashed identically (2d2852514e77f45bc70c9e598d5dbaf3), each
+        // with exactly one distinct value across the run.
         let skills = self
             .agent_runner
             .as_ref()

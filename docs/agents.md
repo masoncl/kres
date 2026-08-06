@@ -27,7 +27,8 @@ remain available for one-off overrides.
   rows plus typed `newly_done` and `retired` arrays. Done rows, `id`,
   `step_id`, `depends_on`, settled coverage AND ORDER are Rust-owned,
   and a pending row it forgets is restored rather than deleted.
-- **prioritize** — runs on the slow coding agent at dispatch time,
+- **prioritize** — runs on the slow agent, under the session mode's
+  slow system prompt, at dispatch time,
   once per wave. Given the dispatchable rows plus the session
   question, findings, skills and plan, it returns the N most valuable
   ids in rank order and nothing else. Failure falls back to storage

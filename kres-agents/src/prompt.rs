@@ -213,6 +213,44 @@ impl<'a> CodePrompt<'a> {
     }
 }
 
+/// Render the session-scoped cache head: the one block that is
+/// byte-stable across every task of a dispatch wave.
+///
+/// ONE producer on purpose. The lens fan-out and the prioritization
+/// agent both emit this block so they share a cache entry, and a head
+/// that differs by a single byte between them is worse than no
+/// sharing at all — it buys an extra write of the largest payload in
+/// the request with zero reads. Two call sites that happen to agree
+/// today are not good enough; call this.
+///
+/// Callers must pass the SAME values the lens path uses:
+/// `redact_findings_for_agent(...)` output, not raw findings, and the
+/// common (task-independent) half of the skills payload.
+pub fn session_cache_head(
+    common_skills: Option<&Value>,
+    previous_findings: &[Finding],
+) -> serde_json::Result<String> {
+    let mut map = serde_json::Map::new();
+    if let Some(skills) = common_skills {
+        map.insert("common_skills".to_string(), skills.clone());
+    }
+    // Mirror `with_previous_findings`, which omits the field entirely
+    // when the slice is empty rather than emitting `[]`. A caught
+    // drift: emitting `[]` here made the head differ from the lens's
+    // for every task of a run's first wave, which is exactly when
+    // there are no findings yet.
+    if !previous_findings.is_empty() {
+        map.insert(
+            "previous_findings".to_string(),
+            serde_json::to_value(previous_findings)?,
+        );
+    }
+    if map.is_empty() {
+        return Ok(String::new());
+    }
+    stable_document(map)
+}
+
 /// Partition one object into three ordered documents.
 pub fn layer_object(
     value: Value,
@@ -536,6 +574,92 @@ mod tests {
         for d in serde_json::Deserializer::from_str(&r).into_iter::<Value>() {
             assert!(d.expect("each layer is a valid JSON document").is_object());
         }
+    }
+
+    /// The invariant item 3 rests on: what the prioritization agent
+    /// emits as its cached head is byte-identical to what the lens
+    /// fan-out emits, so the two share one cache entry. A head that
+    /// differs by one byte is worse than no sharing — it buys an extra
+    /// write of the largest payload in the request with zero reads.
+    #[test]
+    fn the_session_head_constructor_matches_the_lens_layering() {
+        let skills = json!({"kernel": {"body": "SKILLBODY"}});
+        let findings: Vec<Finding> = vec![];
+        let symbols = vec![json!({"name": "free_one_page"})];
+
+        // What the lens path builds.
+        let lens = CodePrompt::new("a task brief")
+            .with_symbols(&symbols)
+            .with_previous_findings(&findings)
+            .with_common_skills(&skills)
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+
+        // What the prioritizer builds — it has no symbols, no task
+        // brief, and cannot construct a lens CodePrompt at all.
+        let prioritizer = session_cache_head(Some(&skills), &findings).unwrap();
+
+        assert_eq!(prioritizer, lens.session);
+    }
+
+    /// The empty case is the first wave of every run, so it has to
+    /// match too — and `with_previous_findings` omits the key rather
+    /// than emitting `[]`.
+    #[test]
+    fn the_session_head_matches_the_lens_layering_with_findings() {
+        let skills = json!({"kernel": {"body": "SKILLBODY"}});
+        let findings: Vec<Finding> = vec![serde_json::from_value(json!({
+            "id": "f1", "title": "t", "severity": "high", "summary": "s"
+        }))
+        .unwrap()];
+        let symbols = vec![json!({"name": "free_one_page"})];
+
+        let lens = CodePrompt::new("a task brief")
+            .with_symbols(&symbols)
+            .with_previous_findings(&findings)
+            .with_common_skills(&skills)
+            .to_layered_documents(SESSION_KEYS_FOR_TEST, TASK_KEYS_FOR_TEST)
+            .unwrap();
+        let prioritizer = session_cache_head(Some(&skills), &findings).unwrap();
+        assert_eq!(prioritizer, lens.session);
+        assert!(prioritizer.contains("f1"));
+    }
+
+    /// Redaction is part of the contract, not an optimisation: the
+    /// lens path redacts, so a caller passing raw findings silently
+    /// produces a different head.
+    #[test]
+    fn raw_and_redacted_findings_produce_different_heads() {
+        let mut raw: Finding = serde_json::from_value(json!({
+            "id": "f1", "title": "t", "severity": "medium", "summary": "s"
+        }))
+        .unwrap();
+        raw.first_seen_task = Some("task-a".into());
+        let redacted = kres_core::redact_findings_for_agent(std::slice::from_ref(&raw));
+
+        let a = session_cache_head(None, std::slice::from_ref(&raw)).unwrap();
+        let b = session_cache_head(None, &redacted).unwrap();
+        assert_ne!(
+            a, b,
+            "if these ever match, the redaction contract has stopped mattering \
+             and this test should be deleted rather than weakened"
+        );
+    }
+
+    /// Key order is fixed by serde_json's BTreeMap, not by insertion,
+    /// so two callers inserting in different orders still agree.
+    #[test]
+    fn the_head_is_key_ordered_not_insertion_ordered() {
+        let skills = json!({"z": 1, "a": 2});
+        let findings: Vec<Finding> = vec![serde_json::from_value(json!({
+            "id": "f1", "title": "t", "severity": "low", "summary": "s"
+        }))
+        .unwrap()];
+        let head = session_cache_head(Some(&skills), &findings).unwrap();
+        assert!(
+            head.find("common_skills") < head.find("previous_findings"),
+            "head: {head}"
+        );
     }
 
     const SESSION_KEYS_FOR_TEST: &[&str] = &["common_skills", "previous_findings"];

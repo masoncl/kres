@@ -77,8 +77,16 @@ pub struct PrioritizeInputs<'a> {
     /// Everything found so far, in full. A finding that looks
     /// unrelated by filename is exactly the one that makes an
     /// unrelated-looking todo urgent.
+    ///
+    /// MUST already be redacted with
+    /// `kres_core::redact_findings_for_agent`: these bytes form the
+    /// cache head the lens fan-out reads, and the lens path redacts
+    /// (`pipeline.rs`, `prepare_lens_fanout`). Raw findings here would
+    /// differ by the per-task provenance fields and buy an extra write
+    /// of the largest payload in the request.
     pub previous_findings: &'a [Finding],
-    /// Domain skills, as sent to the slow agents.
+    /// The common (task-independent) half of the skills payload, as
+    /// the lens path sends it in `common_skills`.
     pub skills: Option<&'a Value>,
     /// The current plan, so ranking can respect staging.
     pub plan: Option<&'a kres_core::Plan>,
@@ -108,23 +116,22 @@ struct PrioritizeResponse {
 /// Top-level fields the agent may return.
 const PRIORITIZE_RESPONSE_FIELDS: &[&str] = &["selected"];
 
-/// Fields of a `prioritize` request that repeat between dispatch
-/// waves, and therefore belong above the cache breakpoint.
+/// Fields that ride in the request's single uncached document.
 ///
-/// The rule this list exists to obey: a field belongs here only if it
-/// is the SAME BYTES on the next call. The stable half is one cached
-/// prefix, so a single volatile member rewrites the entry for every
-/// other member — and serde_json orders keys (no `preserve_order` in
-/// this workspace), so a volatile key that sorts early poisons
-/// everything after it. `completed_query` and `original_prompt` were
-/// both making exactly that mistake before 4692adc.
+/// There is deliberately no prioritize-specific cached block. One was
+/// tried and measured: on the 2026-08-06 mm/page_alloc.c run the three
+/// prioritize calls were 943s and 783s apart, far outside Anthropic's
+/// 300s ephemeral TTL, so the entry expired every time — 21,886 tokens
+/// of cache_creation per call against zero cache_read. A prefix nothing
+/// will read is the same "write with no reader" trap 6328c9f removed
+/// from the single-lens probe.
 ///
-/// `previous_findings` is deliberately NOT here. It is the largest
-/// input and the most tempting to cache, but in an audit run it grows
-/// on most reaps, so caching it would invalidate the prefix rather
-/// than reuse it. It stays in the delta half and is sent in full every
-/// call.
-const PRIORITIZE_STABLE_FIELDS: &[&str] = &["task", "instructions", "question", "skills", "plan"];
+/// The one block worth caching is the session head, which the lens
+/// fan-out reads seconds later — in that run the prioritize response
+/// and all ten task starts share the timestamp 14:20:17. TTL is not a
+/// factor at that distance, so the head is cached and everything here
+/// is not.
+const PRIORITIZE_INLINE_FIELDS: &[&str] = &["task", "instructions", "question", "plan"];
 
 /// Rank the ready pending items and return the chosen ids, best first.
 ///
@@ -162,15 +169,17 @@ pub async fn prioritize_pending_with_logger(
         })
         .collect();
 
+    // The cached head: byte-identical to what the lens fan-out of the
+    // wave this ranking is about to dispatch will send. `skills` and
+    // `previous_findings` therefore live HERE and must not also appear
+    // below, or the model reads them twice.
+    let session_head = crate::prompt::session_cache_head(inputs.skills, inputs.previous_findings)?;
+
     let mut request = serde_json::Map::new();
     request.insert("task".into(), json!("prioritize_pending"));
     request.insert("question".into(), json!(inputs.question));
     request.insert("ready".into(), json!(ready_payload));
     request.insert("limit".into(), json!(inputs.limit));
-    request.insert("previous_findings".into(), json!(inputs.previous_findings));
-    if let Some(skills) = inputs.skills {
-        request.insert("skills".into(), skills.clone());
-    }
     let has_plan = if let Some(plan) = inputs.plan {
         match serde_json::to_value(plan) {
             Ok(value) => {
@@ -187,9 +196,13 @@ pub async fn prioritize_pending_with_logger(
         json!(build_instructions(has_plan, inputs.limit)),
     );
 
-    let split =
-        crate::prompt::split_request_documents(&Value::Object(request), PRIORITIZE_STABLE_FIELDS)?;
-    let request_text = split.rendered();
+    // One document after the head. Splitting it further would only add
+    // a cache_control slot for a block that expires before the next
+    // ranking; see PRIORITIZE_INLINE_FIELDS.
+    let inline =
+        crate::prompt::split_request_documents(&Value::Object(request), PRIORITIZE_INLINE_FIELDS)?;
+    let delta = inline.rendered();
+    let request_text = format!("{session_head}{delta}");
 
     let mut cfg = CallConfig::defaults_for(pc.model.clone())
         .with_max_tokens(pc.max_tokens)
@@ -203,12 +216,18 @@ pub async fn prioritize_pending_with_logger(
     if let Some(thinking) = pc.thinking {
         cfg = cfg.with_thinking(thinking);
     }
+    // `with_cached_prefixes` drops an empty head. That case is real:
+    // a session with no skills configured has nothing in the head
+    // until the first finding lands, and an empty text block is not
+    // cacheable — it would spend one of Anthropic's four slots on
+    // nothing, or be rejected outright.
     let messages = vec![Message {
         role: "user".into(),
-        content: split.delta.clone(),
+        content: delta,
         cache: false,
-        cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then(|| split.stable.clone())),
-    }];
+        cached_prefixes: Vec::new(),
+    }
+    .with_cached_prefixes([session_head])];
     if let Some(lg) = &logger {
         let meta = cfg.request_meta();
         lg.log_main_with_request(
@@ -485,44 +504,108 @@ mod tests {
         assert!(ready.len() <= 2, "no call is made when everything fits");
     }
 
-    /// The lesson from 4692adc: a field that changes between calls
-    /// must not sit above the cache breakpoint.
+    /// `skills` and `previous_findings` live in the shared session
+    /// head. If they also appear inline the model reads each twice —
+    /// and `previous_findings` is ~166KB, so the duplicate is the
+    /// single largest waste the request could contain.
+    /// A session with no skills and no findings yet has an empty
+    /// head. Sending it as a cached block spends a `cache_control`
+    /// slot on an empty string.
     #[test]
-    fn the_cached_prefix_holds_no_per_wave_field() {
-        for volatile in ["ready", "limit", "previous_findings"] {
-            assert!(
-                !PRIORITIZE_STABLE_FIELDS.contains(&volatile),
-                "`{volatile}` changes between waves and must stay in the delta half"
-            );
+    fn an_empty_session_head_is_not_sent_as_a_cached_block() {
+        let head = crate::prompt::session_cache_head(None, &[]).unwrap();
+        assert!(head.is_empty(), "nothing to cache in a fresh session");
+
+        let message = kres_llm::request::Message {
+            role: "user".into(),
+            content: "DELTA".into(),
+            cache: false,
+            cached_prefixes: Vec::new(),
         }
-        assert!(PRIORITIZE_STABLE_FIELDS.contains(&"question"));
-        assert!(PRIORITIZE_STABLE_FIELDS.contains(&"skills"));
-        assert!(PRIORITIZE_STABLE_FIELDS.contains(&"plan"));
+        .with_cached_prefixes([head]);
+        assert!(message.cached_prefixes.is_empty());
+
+        let wire = serde_json::to_value(&message).unwrap();
+        assert!(
+            wire["content"].is_string(),
+            "with no cacheable head the message is plain content: {}",
+            wire["content"]
+        );
+    }
+
+    /// End-to-end shape of the request the prioritizer actually
+    /// sends: the shared head is the one cached block, and nothing in
+    /// it is repeated below.
+    #[test]
+    fn the_request_carries_one_cached_head_and_no_duplicate_fields() {
+        let skills = json!({"kernel": {"body": "SKILLBODY"}});
+        let findings: Vec<kres_core::findings::Finding> = vec![serde_json::from_value(json!({
+            "id": "already-found", "title": "t", "severity": "high", "summary": "s"
+        }))
+        .unwrap()];
+        let head = crate::prompt::session_cache_head(Some(&skills), &findings).unwrap();
+
+        let mut request = serde_json::Map::new();
+        request.insert("task".into(), json!("prioritize_pending"));
+        request.insert("question".into(), json!("review: mm/page_alloc.c"));
+        request.insert("ready".into(), json!([{"id": "a"}]));
+        request.insert("limit".into(), json!(1));
+        request.insert("instructions".into(), json!("INSTRUCTIONS"));
+        let inline = crate::prompt::split_request_documents(
+            &Value::Object(request),
+            PRIORITIZE_INLINE_FIELDS,
+        )
+        .unwrap();
+        let delta = inline.rendered();
+
+        let message = kres_llm::request::Message {
+            role: "user".into(),
+            content: delta.clone(),
+            cache: false,
+            cached_prefixes: vec![head.clone()],
+        };
+        let wire = serde_json::to_value(&message).unwrap();
+        let blocks = wire["content"].as_array().unwrap();
+        let cached = blocks
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        assert_eq!(cached, 1, "exactly one cached block: the shared head");
+        assert_eq!(blocks[0]["text"], head, "and it must come first");
+
+        assert!(head.contains("SKILLBODY") && head.contains("already-found"));
+        assert!(
+            !delta.contains("SKILLBODY") && !delta.contains("already-found"),
+            "head content must not be repeated in the uncached tail"
+        );
+        assert!(delta.contains("mm/page_alloc.c") && delta.contains("INSTRUCTIONS"));
     }
 
     #[test]
-    fn two_waves_of_the_same_session_share_one_cached_prefix() {
-        let base = json!({
-            "task": "prioritize_pending",
-            "instructions": "INSTRUCTIONS",
-            "question": "review: mm/page_alloc.c",
-            "skills": {"kernel": "..."},
-            "plan": {"steps": []},
-            "previous_findings": [],
-            "limit": 4,
-            "ready": [{"id": "a"}],
-        });
-        let mut later = base.clone();
-        later["ready"] = json!([{"id": "b"}, {"id": "c"}]);
-        later["limit"] = json!(2);
-        later["previous_findings"] = json!([{"id": "found-a-bug"}]);
+    fn head_fields_are_not_repeated_inline() {
+        for in_head in ["skills", "previous_findings", "common_skills"] {
+            assert!(
+                !PRIORITIZE_INLINE_FIELDS.contains(&in_head),
+                "`{in_head}` is in the cached head and must not be sent inline too"
+            );
+        }
+        assert!(PRIORITIZE_INLINE_FIELDS.contains(&"question"));
+        assert!(PRIORITIZE_INLINE_FIELDS.contains(&"plan"));
+    }
 
-        let a = crate::prompt::split_request_documents(&base, PRIORITIZE_STABLE_FIELDS).unwrap();
-        let b = crate::prompt::split_request_documents(&later, PRIORITIZE_STABLE_FIELDS).unwrap();
-        assert_eq!(a.stable, b.stable);
-        assert!(a.stable.contains("mm/page_alloc.c"));
-        assert!(!a.stable.contains("found-a-bug"));
-        assert!(b.delta.contains("found-a-bug"));
+    /// There is no prioritize-specific cached block. One was measured
+    /// on the 2026-08-06 run: calls 943s and 783s apart against a 300s
+    /// TTL meant 21,886 tokens of cache_creation per call and zero
+    /// reads. Only the session head — read by the lens fan-out seconds
+    /// later — is worth a slot.
+    #[test]
+    fn ready_and_limit_stay_out_of_any_cached_block() {
+        for per_wave in ["ready", "limit"] {
+            assert!(
+                !PRIORITIZE_INLINE_FIELDS.contains(&per_wave),
+                "`{per_wave}` must not be in the split key set at all"
+            );
+        }
     }
 
     #[test]

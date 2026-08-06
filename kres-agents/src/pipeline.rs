@@ -2038,10 +2038,40 @@ impl AgentRunner {
         // task. See LENS_SESSION_CACHE_FIELDS for the measurement.
         let layered =
             shared_cp.to_layered_documents(LENS_SESSION_CACHE_FIELDS, LENS_TASK_CACHE_FIELDS)?;
+        // Take the head from the shared constructor rather than from
+        // the layering, so the prioritization agent — which cannot
+        // build a CodePrompt, having no gathered evidence at dispatch
+        // — provably emits the same bytes. A test asserts the two
+        // agree; using the constructor here is what makes that
+        // assertion about one producer instead of two.
+        let session_prefix = crate::prompt::session_cache_head(
+            synthesis_skills.common.as_ref(),
+            &previous_findings,
+        )?;
+        // Not a debug_assert: kres runs in release, and a divergence
+        // here does not merely miss a cache — the lens would send the
+        // constructor's head with the layering's tail, so any field
+        // the layering put in `session` and the constructor did not
+        // emit would vanish from the prompt entirely. Fall back to the
+        // layering, which is the authoritative partition of this
+        // prompt, and say so loudly.
+        let session_prefix = if session_prefix == layered.session {
+            session_prefix
+        } else {
+            tracing::error!(
+                target: "kres_agents",
+                "session head constructor drifted from the lens layering; \
+                 using the layering and losing prioritize cache sharing \
+                 (constructor {} bytes, layering {} bytes)",
+                session_prefix.len(),
+                layered.session.len()
+            );
+            layered.session
+        };
 
         Ok(PreparedLensFanout {
             prompt: prompt.to_string(),
-            session_prefix: layered.session,
+            session_prefix,
             task_prefix: layered.task,
             slow_variants,
             symbols,

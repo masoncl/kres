@@ -205,10 +205,14 @@ whole list and have Rust guess which differences were intentional.
 ### Prioritization Agent
 
 Ranking is its own agent (`kres-agents/src/prioritize.rs`), split out
-of the todo agent. It runs on the **slow coding agent** — same client,
-model and token budget as the slow role, with the slow coding system
-prompt — derived in `Session::with_agent_runner` so the two cannot
-drift apart via separate config.
+of the todo agent. It runs on the **slow agent** — same client, model
+and token budget, derived in `Session::with_agent_runner` so the two
+cannot drift apart via separate config — under the same system prompt
+the session's lenses use, selected per call from `Plan.mode` via
+`AgentRunner::slow_system_for_mode`. A review is `Audit`, which uses
+`slow_system`, NOT `slow_coding_system`. That is not cosmetic: the
+system block is part of the Anthropic cache prefix, so a mismatch
+makes the shared cache block below impossible.
 
 - Input is the ready rows only (`TaskManager::ready_pending_snapshot`):
   nothing done, running, retired, or blocked on an unfinished
@@ -232,6 +236,19 @@ drift apart via separate config.
   Ranking is an optimisation and must never stall a wave.
 - A wave where every ready row fits in the budget skips the call
   entirely — there is nothing to rank.
+- Its ONE cached block is the lens session head
+  (`prompt::session_cache_head`, `{common_skills, previous_findings}`),
+  byte-identical to what the wave's lens fan-out sends and read by it
+  seconds later. Findings must be passed already redacted with
+  `redact_findings_for_agent`, and skills as the common
+  (task-independent) half, or the head diverges and buys an extra
+  write of the largest payload in the request instead of a share.
+  Route both callers through the one constructor; do not add a second.
+- There is deliberately no prioritize-specific cached block. One was
+  measured and removed: calls 943s and 783s apart against a 300s
+  ephemeral TTL meant the entry expired every time — 21,886 tokens of
+  cache creation per call against zero reads. Do not add a cached
+  prefix to a call whose own cadence exceeds the TTL.
 
 Do not put ranking language back into the todo agent prompt. Two
 agents ordering one list is how the list stops being stable storage.

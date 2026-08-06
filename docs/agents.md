@@ -22,12 +22,16 @@ remain available for one-off overrides.
   Explicit `--slow` selection replaces the configured pair; `--compare`
   expands every selected model across every active lens.
 - **todo** — for generic sessions, dedups the slow agent's
-  followups against the current todo list, reprioritises, and
-  may reshape the plan. It edits the list rather than rewriting it:
-  it returns the pending rows in priority order plus typed
-  `newly_done` and `retired` arrays. Done rows, `id`, `step_id`,
-  `depends_on` and settled coverage are Rust-owned, and a pending row
-  it forgets is restored rather than deleted.
+  followups against the current todo list and may reshape the plan.
+  It edits the list rather than rewriting it: it returns the pending
+  rows plus typed `newly_done` and `retired` arrays. Done rows, `id`,
+  `step_id`, `depends_on`, settled coverage AND ORDER are Rust-owned,
+  and a pending row it forgets is restored rather than deleted.
+- **prioritize** — runs on the slow coding agent at dispatch time,
+  once per wave. Given the dispatchable rows plus the session
+  question, findings, skills and plan, it returns the N most valuable
+  ids in rank order and nothing else. Failure falls back to storage
+  order.
 - **consolidator/promoter** — fast-client calls that merge sibling lens
   outputs and recover concrete prose-only bugs. Rust then applies the findings
   delta deterministically; invalidated records remain as negative evidence.
@@ -57,8 +61,9 @@ normal task loop. Review followups are reconciled by dedicated goal/todo clients
 slow model; generic sessions continue to use the configured main/todo roles.
 To work through pending items interactively:
 
-- `/next` runs the first pending item.
-- `/continue` dispatches every unblocked pending item.
+- `/next` runs the single item the prioritize agent rates highest.
+- `/continue` dispatches up to ten unblocked items, chosen and ordered
+  by the prioritize agent.
 - auto-continue fires `/continue` after 5s idle when there are
   pending todos and no active tasks. Typing (including `/stop`)
   cancels the idle.

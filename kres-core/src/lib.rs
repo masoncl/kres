@@ -57,7 +57,7 @@ pub use plan::{
 };
 pub use session_state::{ReviewFileScanState, SessionState, SessionStateError};
 pub use shutdown::Shutdown;
-pub use task::{ReapedTask, Task, TaskId, TaskManager, TaskState};
+pub use task::{ReadyTodos, ReapedTask, Task, TaskId, TaskManager, TaskState, TodoClaims};
 pub use todo::{TodoItem, TodoStatus};
 
 pub mod version {

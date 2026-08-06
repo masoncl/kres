@@ -162,6 +162,43 @@ pub struct TodoClaims {
     pub remaining: usize,
 }
 
+/// Dispatchable rows plus how many were held back, as seen without
+/// claiming. `budget` is how many the caller may actually start given
+/// `--turns` and the tasks already in flight.
+#[derive(Debug, Default, Clone)]
+pub struct ReadyTodos {
+    pub items: Vec<TodoItem>,
+    pub blocked: usize,
+    pub budget: usize,
+}
+
+/// How many new tasks may start: the `--turns` remainder minus what
+/// is already in flight, so a completion racing dispatch cannot open
+/// extra budget. `turns_limit == 0` means unlimited.
+fn turn_budget(inner: &Inner, turns_limit: u32) -> usize {
+    if turns_limit == 0 {
+        return usize::MAX;
+    }
+    let active = inner
+        .tasks
+        .iter()
+        .filter(|entry| !matches!(entry.state, TaskState::Done | TaskState::Errored))
+        .count();
+    turns_limit
+        .saturating_sub(inner.completed_run_count)
+        .saturating_sub(u32::try_from(active).unwrap_or(u32::MAX)) as usize
+}
+
+/// Ids and names of every terminal row — what `depends_on` is
+/// satisfied against.
+fn terminal_identities(todo: &[TodoItem]) -> std::collections::BTreeSet<String> {
+    todo.iter()
+        .filter(|item| item.status == TodoStatus::Done)
+        .flat_map(|item| [item.id.clone(), item.name.clone()])
+        .filter(|identity| !identity.is_empty())
+        .collect()
+}
+
 fn same_todo_item(a: &TodoItem, b: &TodoItem) -> bool {
     if !a.id.is_empty() && !b.id.is_empty() {
         a.id == b.id
@@ -996,26 +1033,8 @@ impl TaskManager {
         turns_limit: u32,
     ) -> TodoClaims {
         let mut g = self.inner.write().await;
-        let active = g
-            .tasks
-            .iter()
-            .filter(|entry| !matches!(entry.state, TaskState::Done | TaskState::Errored))
-            .count();
-        let turn_budget = if turns_limit == 0 {
-            usize::MAX
-        } else {
-            turns_limit
-                .saturating_sub(g.completed_run_count)
-                .saturating_sub(u32::try_from(active).unwrap_or(u32::MAX)) as usize
-        };
-        let claim_limit = limit.min(turn_budget);
-        let done: std::collections::BTreeSet<String> = g
-            .todo
-            .iter()
-            .filter(|item| item.status == TodoStatus::Done)
-            .flat_map(|item| [item.id.clone(), item.name.clone()])
-            .filter(|identity| !identity.is_empty())
-            .collect();
+        let claim_limit = limit.min(turn_budget(&g, turns_limit));
+        let done = terminal_identities(&g.todo);
         let mut result = TodoClaims::default();
         for item in &mut g.todo {
             if item.status != TodoStatus::Pending {
@@ -1037,6 +1056,74 @@ impl TaskManager {
             result.items.push(item.clone());
         }
         result
+    }
+
+    /// Ready pending rows plus the number blocked, without claiming
+    /// anything.
+    ///
+    /// Split out of `claim_ready_todos_with_turn_limit` so the
+    /// prioritization agent can rank the candidates before any row is
+    /// flipped to InProgress. The ranking call is an LLM round-trip
+    /// and must not happen under the write lock; the lock is retaken
+    /// by `claim_selected_todos` once the picks are known. Rows that
+    /// become unready in between are simply not claimed.
+    pub async fn ready_pending_snapshot(&self, turns_limit: u32) -> ReadyTodos {
+        let g = self.inner.read().await;
+        let done = terminal_identities(&g.todo);
+        let mut ready = ReadyTodos {
+            budget: turn_budget(&g, turns_limit),
+            ..ReadyTodos::default()
+        };
+        for item in &g.todo {
+            if item.status != TodoStatus::Pending {
+                continue;
+            }
+            if item
+                .depends_on
+                .iter()
+                .all(|dependency| done.contains(dependency))
+            {
+                ready.items.push(item.clone());
+            } else {
+                ready.blocked += 1;
+            }
+        }
+        ready
+    }
+
+    /// Claim exactly the named rows, in the order given, subject to
+    /// the turn budget. Ids that are no longer Pending or whose
+    /// dependencies are no longer satisfied are skipped.
+    pub async fn claim_selected_todos(&self, ids: &[String], turns_limit: u32) -> Vec<TodoItem> {
+        let mut g = self.inner.write().await;
+        let budget = turn_budget(&g, turns_limit);
+        let done = terminal_identities(&g.todo);
+        let mut claimed = Vec::new();
+        for id in ids {
+            if claimed.len() >= budget {
+                break;
+            }
+            let Some(item) = g
+                .todo
+                .iter_mut()
+                .find(|item| !item.id.is_empty() && item.id == *id)
+            else {
+                continue;
+            };
+            if item.status != TodoStatus::Pending {
+                continue;
+            }
+            if !item
+                .depends_on
+                .iter()
+                .all(|dependency| done.contains(dependency))
+            {
+                continue;
+            }
+            item.status = TodoStatus::InProgress;
+            claimed.push(item.clone());
+        }
+        claimed
     }
 
     pub async fn clear_active_todos(&self) {
@@ -1618,6 +1705,112 @@ mod tests {
         let snapshot = mgr.todo_snapshot().await;
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].status, TodoStatus::InProgress);
+    }
+
+    fn row(id: &str, deps: &[&str]) -> TodoItem {
+        let mut item = TodoItem::new(format!("audit {id}"), "review");
+        item.id = id.to_string();
+        item.depends_on = deps.iter().map(|d| d.to_string()).collect();
+        item
+    }
+
+    /// The snapshot must show exactly what a claim would have taken,
+    /// so the prioritizer ranks the real candidate set — and it must
+    /// not claim anything, since an LLM round-trip happens before the
+    /// picks come back.
+    #[tokio::test]
+    async fn ready_snapshot_sees_dispatchable_rows_without_claiming() {
+        let mgr = TaskManager::new();
+        let mut finished = row("finished", &[]);
+        finished.status = TodoStatus::Done;
+        let mut running = row("running", &[]);
+        running.status = TodoStatus::InProgress;
+        mgr.replace_todo(vec![
+            finished,
+            running,
+            row("ready-a", &[]),
+            row("ready-b", &["finished"]),
+            row("blocked", &["ready-a"]),
+        ])
+        .await;
+
+        let ready = mgr.ready_pending_snapshot(0).await;
+        let ids: Vec<&str> = ready.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["ready-a", "ready-b"]);
+        assert_eq!(ready.blocked, 1);
+        assert_eq!(ready.budget, usize::MAX, "--turns 0 is unlimited");
+
+        for item in mgr.todo_snapshot().await {
+            assert_ne!(
+                (item.id.as_str(), item.status),
+                ("ready-a", TodoStatus::InProgress),
+                "the snapshot must not claim"
+            );
+        }
+    }
+
+    /// The prioritizer returns ids in rank order; the claim must
+    /// honour that order rather than the list's.
+    #[tokio::test]
+    async fn selected_todos_are_claimed_in_the_order_given() {
+        let mgr = TaskManager::new();
+        mgr.replace_todo(vec![row("a", &[]), row("b", &[]), row("c", &[])])
+            .await;
+
+        let claimed = mgr.claim_selected_todos(&["c".into(), "a".into()], 0).await;
+        let ids: Vec<&str> = claimed.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a"]);
+
+        let after = mgr.todo_snapshot().await;
+        let status = |id: &str| after.iter().find(|i| i.id == id).unwrap().status;
+        assert_eq!(status("a"), TodoStatus::InProgress);
+        assert_eq!(status("b"), TodoStatus::Pending, "unpicked stays pending");
+        assert_eq!(status("c"), TodoStatus::InProgress);
+    }
+
+    /// The ranking call happens outside the lock, so a row can stop
+    /// being dispatchable between snapshot and claim. Skip it rather
+    /// than double-dispatching or resurrecting finished work.
+    #[tokio::test]
+    async fn claim_skips_rows_that_stopped_being_ready() {
+        let mgr = TaskManager::new();
+        mgr.replace_todo(vec![
+            row("taken", &[]),
+            row("gated", &["never-done"]),
+            row("fine", &[]),
+        ])
+        .await;
+        mgr.set_todo_status_for_test("taken", TodoStatus::InProgress)
+            .await;
+
+        let claimed = mgr
+            .claim_selected_todos(
+                &[
+                    "taken".into(),
+                    "gated".into(),
+                    "ghost".into(),
+                    "fine".into(),
+                ],
+                0,
+            )
+            .await;
+        let ids: Vec<&str> = claimed.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["fine"]);
+    }
+
+    /// A finite --turns budget bounds the ranked claim exactly as it
+    /// bounds the unranked one; the prioritizer cannot buy extra runs.
+    #[tokio::test]
+    async fn selected_claim_respects_the_turn_budget() {
+        let mgr = TaskManager::new();
+        mgr.replace_todo(vec![row("a", &[]), row("b", &[]), row("c", &[])])
+            .await;
+
+        assert_eq!(mgr.ready_pending_snapshot(2).await.budget, 2);
+        let claimed = mgr
+            .claim_selected_todos(&["a".into(), "b".into(), "c".into()], 2)
+            .await;
+        assert_eq!(claimed.len(), 2);
     }
 
     #[tokio::test]

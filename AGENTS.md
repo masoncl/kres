@@ -180,11 +180,14 @@ User prompt → Task created → Task thread starts
 The todo list is Rust-owned and the agent's reply is a set of edits
 against it, not a rewrite of it (`kres-agents/src/todo_agent.rs`,
 `reconcile_update`). The agent controls prose (`name`, `reason`,
-`type`), priority (the order of `todo`), completion (`newly_done`)
-and retirement (`retired`). It controls nothing else:
+`type`), completion (`newly_done`) and retirement (`retired`). It
+controls nothing else:
 
 - `todo` carries the PENDING list only. Done rows are reconstructed
   from Rust's own copy, so the agent never re-emits them.
+- ORDER is not a channel. The pending list is stable storage:
+  surviving rows keep their position and new rows are appended.
+  Choosing what runs next belongs to the prioritization agent.
 - `id`, `step_id` and `depends_on` on an existing row are restored
   from the original. Do not ask the agent to re-emit fields Rust
   overwrites; that is pure output cost.
@@ -197,6 +200,40 @@ and retirement (`retired`). It controls nothing else:
 Do not widen this contract back out. If the agent needs to change
 something, add a typed channel for it; do not let it restate the
 whole list and have Rust guess which differences were intentional.
+
+### Prioritization Agent
+
+Ranking is its own agent (`kres-agents/src/prioritize.rs`), split out
+of the todo agent. It runs on the **slow coding agent** — same client,
+model and token budget as the slow role, with the slow coding system
+prompt — derived in `Session::with_agent_runner` so the two cannot
+drift apart via separate config.
+
+- Input is the ready rows only (`TaskManager::ready_pending_snapshot`):
+  nothing done, running, retired, or blocked on an unfinished
+  dependency. Plus the session question, the findings so far in full,
+  the skills, and the plan — the same material the slow agents reason
+  over.
+- Output is at most N ids, best first, each with a one-line rationale
+  that is logged and not otherwise consumed. N is the dispatch budget:
+  `BATCH_CAP` (10) for `/continue`, 1 for `/next`, further clamped by
+  the `--turns` remainder.
+- It cannot edit, complete, retire, merge, or invent work. Ids not in
+  the ready set are dropped with a log line; duplicates and
+  over-budget picks are truncated.
+- It runs at DISPATCH time, not in the reap sequence — once per wave
+  rather than once per reaped task — and never under the manager's
+  write lock. `ready_pending_snapshot` then `claim_selected_todos` is
+  the snapshot/claim split that makes that safe; rows that stop being
+  ready in between are skipped.
+- When it is unavailable, fails, or returns nothing usable, dispatch
+  falls back to `claim_ready_todos_with_turn_limit` in storage order.
+  Ranking is an optimisation and must never stall a wave.
+- A wave where every ready row fits in the budget skips the call
+  entirely — there is nothing to rank.
+
+Do not put ranking language back into the todo agent prompt. Two
+agents ordering one list is how the list stops being stable storage.
 
 ### Goal System
 - Before processing, main agent defines a concrete completion goal

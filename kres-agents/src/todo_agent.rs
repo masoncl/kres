@@ -7,10 +7,9 @@
 //!   - the task's analysis text (analysis_summary)
 //!   - the followups the slow agent produced (new_followups)
 //!   - the current todo list
-//!   - optional session-wide lenses
 //!
 //! The module packages that into a JSON request (with
-//! REPRIORITIZE + DEDUP + COVERAGE instructions)
+//! DEDUP + COVERAGE instructions)
 //! and sends it through a dedicated todo-agent inference. The response
 //! is parsed back into a new todo list with:
 //!   - done items the agent dropped preserved (coverage signal)
@@ -28,7 +27,6 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use kres_core::lens::LensSpec;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::todo::{TodoItem, TodoStatus};
 use kres_core::UsageTracker;
@@ -143,7 +141,6 @@ pub struct TodoAgentInputs<'a> {
     pub analysis_summary: &'a str,
     pub new_followups: &'a [Value],
     pub current_todo: &'a [TodoItem],
-    pub lenses: &'a [LensSpec],
     pub plan: Option<&'a kres_core::Plan>,
 }
 
@@ -170,7 +167,6 @@ pub async fn update_todo_via_agent(
 ///
 ///   task              0/50       13 chars
 ///   instructions      0/50    6,522 chars
-///   lenses            0/50    1,242 chars
 ///   plan             10/50   12,592 chars
 ///   completed_query  36/50      831 chars   <- was in here
 ///   analysis_summary 50/50    4,023 chars
@@ -178,15 +174,14 @@ pub async fn update_todo_via_agent(
 ///   current_todo     50/50   46,378 chars
 ///
 /// `completed_query` is the reaped task's name, so it changes on
-/// nearly every call, and it sorts ahead of `instructions`, `lenses`,
-/// `plan` and `task` — it was invalidating the entire prefix from the
-/// front. That run wrote 323,010 cache-creation tokens against
+/// nearly every call, and it sorts ahead of `instructions`, `plan`
+/// and `task` — it was invalidating the entire prefix from the front. That run wrote 323,010 cache-creation tokens against
 /// 154,229 cache reads.
 ///
 /// `plan` stays: it holds at 40 of 50 transitions and is the largest
 /// stable member, so caching it and eating the occasional rewrite
 /// beats never caching it at all.
-const UPDATE_TODO_STABLE_FIELDS: &[&str] = &["task", "instructions", "plan", "lenses"];
+const UPDATE_TODO_STABLE_FIELDS: &[&str] = &["task", "instructions", "plan"];
 
 /// Same as `update_todo_via_agent` but also logs the user+assistant
 /// turns to the provided TurnLogger's `main.jsonl`.
@@ -202,7 +197,6 @@ pub async fn update_todo_via_agent_with_logger(
         analysis_summary,
         new_followups,
         current_todo,
-        lenses,
         plan,
     } = inputs;
     // --- Prepare inputs ------------------------------------------------
@@ -216,26 +210,12 @@ pub async fn update_todo_via_agent_with_logger(
     // afterwards only if it declined.
     let current_payload: Vec<Value> = todo_list.iter().map(todo_to_payload).collect();
 
-    let lens_payload: Vec<Value> = lenses
-        .iter()
-        .map(|l| {
-            json!({
-                "type": l.kind,
-                "name": l.name,
-                "reason": l.reason,
-            })
-        })
-        .collect();
-
     let mut request = serde_json::Map::new();
     request.insert("task".into(), json!("update_todo"));
     request.insert("completed_query".into(), json!(completed_query));
     request.insert("analysis_summary".into(), json!(analysis_summary));
     request.insert("new_followups".into(), json!(new_followups));
     request.insert("current_todo".into(), json!(current_payload));
-    if !lens_payload.is_empty() {
-        request.insert("lenses".into(), json!(lens_payload));
-    }
     // Ship the current plan (if any) so the agent can attach
     // `step_id` to each emitted todo; `build_instructions` flips
     // its plan-linking paragraph on when has_plan is true.
@@ -249,10 +229,7 @@ pub async fn update_todo_via_agent_with_logger(
     } else {
         false
     };
-    request.insert(
-        "instructions".into(),
-        json!(build_instructions(!lens_payload.is_empty(), has_plan)),
-    );
+    request.insert("instructions".into(), json!(build_instructions(has_plan)));
     let split =
         crate::prompt::split_request_documents(&Value::Object(request), UPDATE_TODO_STABLE_FIELDS)?;
     let request_text = split.rendered();
@@ -453,8 +430,8 @@ pub async fn update_todo_via_agent_with_logger(
         );
     }
 
-    // Order: done rows (Rust-owned), then pending in the agent's
-    // priority order.
+    // Order: done rows (Rust-owned), then live rows in stable storage
+    // order. This is not a ranking — see `crate::prioritize`.
     let mut result = Vec::with_capacity(done_final.len() + filtered_pending.len());
     result.extend(done_final);
     result.extend(filtered_pending);
@@ -505,16 +482,20 @@ impl From<TodoUpdateResponse> for ParsedTodoUpdate {
 struct Reconciled {
     /// Every terminal row, in the order it has always had.
     done: Vec<TodoItem>,
-    /// Live rows in the agent's priority order, restored rows last.
+    /// Live rows in stable storage order: surviving rows keep their
+    /// original position, newly created rows are appended.
     pending: Vec<TodoItem>,
 }
 
 /// Fold an agent reply into the caller's list.
 ///
 /// The list is Rust-owned; the reply is a set of edits against it. The
-/// agent controls prose (`name`, `reason`, `type`), priority (the order
-/// of `todo`), completion (`newly_done`) and retirement (`retired`).
-/// It controls nothing else. In particular:
+/// agent controls prose (`name`, `reason`, `type`), completion
+/// (`newly_done`) and retirement (`retired`). It controls nothing
+/// else — in particular it does not control ORDER, which is stable
+/// storage order: existing rows keep their position and new rows are
+/// appended. Choosing what runs next belongs to `crate::prioritize`.
+/// In particular:
 ///
 ///   * `id`, `step_id` and `depends_on` on an existing row are restored
 ///     from the original, so the agent need not re-emit them and cannot
@@ -591,15 +572,20 @@ fn reconcile_update(
         );
     }
 
-    // --- Live rows the agent re-emitted, in its priority order ---------
+    // --- Live rows the agent re-emitted --------------------------------
+    // Prose updates are folded into `state` in place. The emission
+    // ORDER is deliberately discarded: the list is stable storage and
+    // the prioritization agent picks what runs next, so a row that
+    // moves to the top of the reply must not thereby jump the queue.
     let mut emitted: HashSet<usize> = HashSet::new();
-    let mut pending: Vec<TodoItem> = Vec::with_capacity(parsed.todo.len());
+    let mut appended: Vec<TodoItem> = Vec::new();
     let mut new_ids: HashSet<String> = HashSet::new();
     for row in parsed.todo {
         let Some(idx) = resolve(&row.id, &row.name) else {
             // Genuinely new work. The agent owns every field here,
             // including step_id and depends_on, because there is no
-            // prior row to restore them from.
+            // prior row to restore them from. New rows land after the
+            // existing ones, in the order the agent created them.
             let key = if row.id.is_empty() {
                 row.name.to_ascii_lowercase()
             } else {
@@ -608,7 +594,7 @@ fn reconcile_update(
             if !key.is_empty() && !new_ids.insert(key) {
                 continue;
             }
-            pending.push(row);
+            appended.push(row);
             continue;
         };
         if retired.contains(&idx) || !emitted.insert(idx) {
@@ -632,9 +618,6 @@ fn reconcile_update(
                 state[idx].coverage = coverage.to_string();
             }
         }
-        if !state[idx].status.is_terminal() {
-            pending.push(state[idx].clone());
-        }
     }
 
     // --- Rows the agent neither kept, completed, nor retired -----------
@@ -651,20 +634,24 @@ fn reconcile_update(
             .collect()
     });
     let mut restored: Vec<String> = Vec::new();
+    let mut pending: Vec<TodoItem> = Vec::new();
     for (idx, item) in state.iter().enumerate() {
-        if item.status.is_terminal() || retired.contains(&idx) || emitted.contains(&idx) {
+        if item.status.is_terminal() || retired.contains(&idx) {
             continue;
         }
-        // A row bound to a step the plan has since finished is stale
-        // by construction, not forgotten.
-        if let (Some(live), false) = (live_steps.as_ref(), item.step_id.is_empty()) {
-            if !live.contains(item.step_id.as_str()) {
-                continue;
+        if !emitted.contains(&idx) {
+            // A row bound to a step the plan has since finished is
+            // stale by construction, not forgotten.
+            if let (Some(live), false) = (live_steps.as_ref(), item.step_id.is_empty()) {
+                if !live.contains(item.step_id.as_str()) {
+                    continue;
+                }
             }
+            restored.push(item.id.clone());
         }
-        restored.push(item.id.clone());
         pending.push(item.clone());
     }
+    pending.extend(appended);
     if !restored.is_empty() {
         tracing::info!(
             target: "kres_agents",
@@ -1009,7 +996,7 @@ fn followup_to_todo(fu: &Value) -> Result<TodoItem, serde_json::Error> {
     })
 }
 
-fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
+fn build_instructions(has_plan: bool) -> String {
     let mut s = String::from(
         "Update the todo list. Return raw, unfenced JSON only:\n\
          {\n\
@@ -1022,10 +1009,12 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
         "WHAT EACH FIELD IS FOR — the list is owned by the pipeline, \
          and your reply is a set of edits against it, not a rewrite \
          of it:\n\
-         - `todo` — the PENDING items ONLY, in the order you want them \
-         executed. Never put a done item here. The pipeline keeps every \
-         done item itself; re-listing them wastes your output budget \
-         and cannot change them.\n\
+         - `todo` — the PENDING items ONLY. Never put a done item \
+         here. The pipeline keeps every done item itself; re-listing \
+         them wastes your output budget and cannot change them. Order \
+         is NOT a channel: the list is stable storage and a separate \
+         prioritization agent decides what runs next, so do not try to \
+         signal urgency by position.\n\
          - `newly_done` — items that reached Done this round, each with \
          the coverage sentence described below. This is the ONLY way to \
          complete an item, and coverage is written once: later rounds \
@@ -1098,33 +1087,6 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
         );
     }
     s.push_str(
-        "REPRIORITIZE — every call, not just when new items arrive:\n\
-         - Sort all pending items so the one MOST LIKELY to surface a \
-         bug OR most advance the investigation sits first. Subsequent \
-         positions descend in expected payoff.\n\
-         - 'Payoff' means: likelihood of finding an exploitable bug, \
-         resolving an open question from a prior analysis, or unblocking \
-         many downstream items (a shared dependency).\n",
-    );
-    if has_lenses {
-        s.push_str(
-            "- A 'lenses' array is provided — these are the \
-             session-wide analytic frames every task's slow agent \
-             applies in parallel. Rank each pending item by its \
-             payoff across ALL lenses combined, not against just one. \
-             Items that feed multiple lenses outrank items that feed \
-             only one.\n",
-        );
-    }
-    s.push_str(
-        "- Put this reordering in effect by emitting the pending items \
-         in the order you want them executed. The scheduler processes \
-         them top-down.\n\
-         - Tied payoffs: prefer items with fewer dependencies and those \
-         that cite files/symbols still cold (not already in any done \
-         item's 'coverage').\n\n",
-    );
-    s.push_str(
         "DEDUP ALGORITHM — run this for EVERY item in new_followups:\n\
          1. From the followup's name+reason, list the target files, \
          symbols, line ranges, and section refs it would cover.\n\
@@ -1172,9 +1134,11 @@ fn build_instructions(has_lenses: bool, has_plan: bool) -> String {
          - Keep pending items that are still relevant in `todo`\n\
          - Move ONLY no-longer-relevant pending items to `retired`\n\
          - There is no limit on how many items may be pending. Keep \
-         every item that is still worth doing; the scheduler works the \
-         list top-down and drains the remainder to the deferred list \
-         when the session ends. Never retire an item to hit a count.\n\
+         every item that is still worth doing. A separate \
+         prioritization agent chooses which of them run next, and \
+         whatever is left drains to the deferred list when the session \
+         ends, so a long list costs nothing. Never retire an item to \
+         hit a count.\n\
          - PARALLELISM: most items can run in parallel. Only add \
          depends_on when an item truly requires another's results first.\n\
          - FIX-AND-AMEND INVALIDATION: when the analysis shows that \
@@ -1538,7 +1502,6 @@ mod tests {
         let request = json!({
             "task": "update_todo",
             "instructions": "INSTRUCTIONS",
-            "lenses": [],
             "plan": {"steps": []},
             "completed_query": "[review] Audit __alloc_pages_slowpath",
             "analysis_summary": "SUMMARY",
@@ -1560,9 +1523,80 @@ mod tests {
         assert_eq!(split.stable, split2.stable);
     }
 
+    /// Ordering left the todo agent's contract when prioritization
+    /// became its own agent. Reordering the reply must not reorder the
+    /// list, or "stable storage" is a lie and two agents fight over
+    /// the same channel.
+    #[test]
+    fn the_agents_emission_order_does_not_reorder_the_list() {
+        let originals = vec![
+            original("first", "Audit alloc path", "", TodoStatus::Pending),
+            original("second", "Audit free path", "", TodoStatus::Pending),
+            original("third", "Audit pcp path", "", TodoStatus::Pending),
+        ];
+        // The agent replies in the exact reverse order.
+        let out = reconcile_update(
+            &originals,
+            update(vec![
+                pending_row("third", "Audit pcp path"),
+                pending_row("second", "Audit free path"),
+                pending_row("first", "Audit alloc path"),
+            ]),
+            None,
+        );
+        let ids: Vec<&str> = out.pending.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn new_rows_are_appended_after_the_existing_ones() {
+        let originals = vec![original(
+            "existing",
+            "Audit alloc path",
+            "",
+            TodoStatus::Pending,
+        )];
+        let mut fresh = pending_row("", "Audit a newly discovered helper");
+        fresh.reason = "followup from this round".into();
+        // Emitted first, but it is new, so it lands last.
+        let out = reconcile_update(
+            &originals,
+            update(vec![fresh, pending_row("existing", "Audit alloc path")]),
+            None,
+        );
+        let ids: Vec<&str> = out.pending.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], "existing");
+        assert_eq!(out.pending[1].name, "Audit a newly discovered helper");
+    }
+
+    /// Prioritization moved to `crate::prioritize`. Any surviving
+    /// ranking language here would have two agents ordering one list.
+    #[test]
+    fn todo_instructions_contain_no_prioritization_language() {
+        let body = build_instructions(true);
+        for banned in [
+            "REPRIORITIZE",
+            "MOST LIKELY",
+            "expected payoff",
+            "top-down",
+            "in the order you want",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "prioritization language survived: {banned}"
+            );
+        }
+        assert!(
+            body.contains("Order \nis NOT a channel") || body.contains("Order is NOT a channel")
+        );
+        assert!(body.contains("DEDUP ALGORITHM"), "dedup must stay");
+        assert!(body.contains("COVERAGE FIELD"), "completion must stay");
+    }
+
     #[test]
     fn todo_instructions_do_not_cap_the_pending_list() {
-        let body = build_instructions(true, true);
+        let body = build_instructions(true);
         assert!(!body.contains("Max 20"));
         assert!(body.contains("no limit on how many items may be pending"));
         assert!(body.contains("Never retire an item to hit a count"));
@@ -1570,7 +1604,7 @@ mod tests {
 
     #[test]
     fn todo_instructions_state_that_omission_is_not_deletion() {
-        let body = build_instructions(true, true);
+        let body = build_instructions(true);
         assert!(body.contains("does NOT delete"));
         assert!(body.contains("`retired`"));
         assert!(body.contains("Never put a done item here"));
@@ -1732,7 +1766,7 @@ Actual: {"todo":[{"name":"actual","status":"done"}]}"#;
 
     #[test]
     fn todo_instructions_keep_trace_steps_pending_without_evidence() {
-        let body = build_instructions(true, true);
+        let body = build_instructions(true);
         assert!(body.contains("trace unchanged callers, callees"));
         assert!(body.contains("status=done requires concrete cited evidence"));
         assert!(body.contains("Do NOT mark such a step done"));

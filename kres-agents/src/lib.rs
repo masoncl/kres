@@ -21,6 +21,7 @@ pub mod json_repair;
 pub mod main_agent;
 pub mod mcp_fetcher;
 pub mod pipeline;
+pub mod prioritize;
 pub mod promote;
 pub mod prompt;
 pub mod prompt_file;
@@ -49,6 +50,7 @@ pub use mcp_fetcher::{McpFetcher, McpMethodMap};
 pub use pipeline::{
     AgentRunner, ConsolidatorClient, DataFetcher, FetchResult, NullFetcher, RunContext, TaskSummary,
 };
+pub use prioritize::{prioritize_pending_with_logger, PrioritizeClient, PrioritizeInputs};
 pub use prompt_file::{parse as parse_prompt_file, PromptFile};
 pub use response::CodeResponse;
 pub use skills::{InvocationPolicy, Skill, Skills};

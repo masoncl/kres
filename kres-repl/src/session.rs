@@ -221,6 +221,11 @@ pub struct Session {
     workflow_classifier: Option<kres_agents::workflow_runner::AgentEnv>,
     todo_client: Option<Arc<kres_agents::TodoClient>>,
     goal_client: Option<Arc<kres_agents::GoalClient>>,
+    /// Ranks the dispatchable todo rows before each wave. Runs on the
+    /// slow coding agent — the model that has been reading the source
+    /// — and is the only thing that decides execution order now that
+    /// the todo agent stores the list unordered.
+    prioritize_client: Option<Arc<kres_agents::PrioritizeClient>>,
     review_todo_client: Option<Arc<kres_agents::TodoClient>>,
     review_goal_client: Option<Arc<kres_agents::GoalClient>>,
     findings_store: Option<Arc<FindingsStore>>,
@@ -468,6 +473,7 @@ impl Session {
                 workflow_classifier: None,
                 todo_client: None,
                 goal_client: None,
+                prioritize_client: None,
                 review_todo_client: None,
                 review_goal_client: None,
                 findings_store,
@@ -502,6 +508,7 @@ impl Session {
             workflow_classifier: None,
             todo_client: None,
             goal_client: None,
+            prioritize_client: None,
             review_todo_client: None,
             review_goal_client: None,
             findings_store,
@@ -756,8 +763,87 @@ impl Session {
     }
 
     pub fn with_agent_runner(mut self, o: Arc<AgentRunner>) -> Self {
+        // The prioritizer IS the slow coding agent: same client,
+        // model, token budget and thinking config, with the slow
+        // coding system prompt. Deriving it here rather than from a
+        // separate config entry means there is no way to point the
+        // two at different models by accident.
+        self.prioritize_client = Some(Arc::new(kres_agents::PrioritizeClient {
+            client: o.slow_client.clone(),
+            model: o.slow_model.clone(),
+            system: o
+                .slow_coding_system
+                .clone()
+                .or_else(|| o.slow_system.clone()),
+            max_tokens: o.slow_max_tokens,
+            max_input_tokens: o.slow_max_input_tokens,
+            thinking: o.slow_thinking,
+            usage: o.usage.clone(),
+        }));
         self.agent_runner = Some(o);
         self
+    }
+
+    /// Pick the ready rows for the next wave, best first.
+    ///
+    /// Returns the ids to claim. An empty return means "no ranking
+    /// available" and the caller falls back to storage order — the
+    /// prioritizer is an optimisation, and a flaky call must not stall
+    /// dispatch.
+    async fn rank_ready(&self, ready: &[kres_core::TodoItem], limit: usize) -> Vec<String> {
+        let Some(pc) = self.prioritize_client.as_ref() else {
+            return Vec::new();
+        };
+        if limit == 0 || ready.len() <= limit {
+            // Nothing to choose between: either no slots, or every
+            // ready row fits. Both make the ranking call pure cost.
+            return ready.iter().take(limit).map(|i| i.id.clone()).collect();
+        }
+        let findings = self.mgr.findings_snapshot().await;
+        let plan = self.mgr.plan_snapshot().await;
+        // The OPERATOR's prompt, not the last thing dispatched.
+        // `last_prompt` is overwritten by every pipeline submission
+        // (submit_from_pipeline -> submit_prompt_inner), so reading it
+        // here would tell the prioritizer the run is about whichever
+        // todo happened to go last, and would also put a per-wave
+        // value in the cached prefix — the 4692adc bug again.
+        // `Plan.prompt` is documented as the operator's raw prompt and
+        // is stable for as long as the plan is.
+        let question = plan
+            .as_ref()
+            .map(|p| p.prompt.clone())
+            .filter(|p| !p.is_empty())
+            .or_else(|| self.initial_prompt.clone())
+            .unwrap_or_default();
+        let skills = self
+            .agent_runner
+            .as_ref()
+            .and_then(|runner| runner.skills.clone());
+        kres_core::async_eprintln!(
+            "[prioritize] ranking {} ready item(s) for {limit} slot(s)",
+            ready.len()
+        );
+        match kres_agents::prioritize_pending_with_logger(
+            pc,
+            kres_agents::PrioritizeInputs {
+                question: &question,
+                ready,
+                previous_findings: &findings,
+                skills: skills.as_ref(),
+                plan: plan.as_ref(),
+                limit,
+            },
+            self.logger.clone(),
+            Some(self.mgr.root_shutdown().clone()),
+        )
+        .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                kres_core::async_eprintln!("[prioritize] failed ({e}); using storage order");
+                Vec::new()
+            }
+        }
     }
 
     /// Run the REPL loop.
@@ -1704,7 +1790,6 @@ impl Session {
                             followups_for_todo.len(),
                         );
                         let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
-                        let lenses_snapshot = lenses_for_reaper.read().await.clone();
                         match kres_agents::update_todo_via_agent_with_logger(
                             tc,
                             kres_agents::TodoAgentInputs {
@@ -1713,7 +1798,6 @@ impl Session {
                                 analysis_summary: &analysis,
                                 new_followups: &followups_for_todo,
                                 current_todo: &current,
-                                lenses: &lenses_snapshot,
                                 plan: plan_for_todo.as_ref(),
                             },
                             logger_for_reaper.clone(),
@@ -1946,8 +2030,6 @@ impl Session {
                                     missing_fus.len()
                                 );
                                         let plan_for_todo = mgr_for_reaper.plan_snapshot().await;
-                                        let lenses_snapshot =
-                                            lenses_for_reaper.read().await.clone();
                                         match kres_agents::update_todo_via_agent_with_logger(
                                             tc,
                                             kres_agents::TodoAgentInputs {
@@ -1956,7 +2038,6 @@ impl Session {
                                                 analysis_summary: "",
                                                 new_followups: &missing_fus,
                                                 current_todo: &current,
-                                                lenses: &lenses_snapshot,
                                                 plan: plan_for_todo.as_ref(),
                                             },
                                             logger_for_reaper.clone(),
@@ -3285,10 +3366,39 @@ impl Session {
         // operator can re-issue /continue or let the auto-continue
         // idle loop pick them up.
         const BATCH_CAP: usize = 10;
-        let claims = self
-            .mgr
-            .claim_ready_todos_with_turn_limit(BATCH_CAP, self.cfg.turns_limit)
-            .await;
+        // Rank BEFORE claiming. The todo list is stable storage with
+        // no ranking in it, so taking the first N in list order would
+        // dispatch by age. The ranking call is an LLM round-trip and
+        // must not run under the manager's write lock, hence the
+        // snapshot/claim split: rows that stop being ready in between
+        // are simply not claimed.
+        let ready = self.mgr.ready_pending_snapshot(self.cfg.turns_limit).await;
+        let limit = BATCH_CAP.min(ready.budget);
+        let selected = self.rank_ready(&ready.items, limit).await;
+        let ranked = if selected.is_empty() {
+            Vec::new()
+        } else {
+            self.mgr
+                .claim_selected_todos(&selected, self.cfg.turns_limit)
+                .await
+        };
+        // Ranking must never be able to stall a wave. If every pick
+        // turned out to be unclaimable — each row taken, gated, or
+        // gone since the snapshot — fall through to the unranked
+        // claim rather than dispatching nothing and letting
+        // auto-continue re-rank the same list every five seconds.
+        let claims = if ranked.is_empty() {
+            self.mgr
+                .claim_ready_todos_with_turn_limit(BATCH_CAP, self.cfg.turns_limit)
+                .await
+        } else {
+            let claimed = ranked.len();
+            kres_core::TodoClaims {
+                items: ranked,
+                blocked: ready.blocked,
+                remaining: ready.items.len().saturating_sub(claimed),
+            }
+        };
         let dispatched = claims.items.len();
         for item in &claims.items {
             let prompt = if item.reason.is_empty() {
@@ -3322,10 +3432,28 @@ impl Session {
     }
 
     async fn cmd_next(&self) {
-        let mut claims = self
-            .mgr
-            .claim_ready_todos_with_turn_limit(1, self.cfg.turns_limit)
-            .await;
+        // One slot, so the ranking question is at its sharpest: of
+        // everything runnable, which single item is worth the turn?
+        let ready = self.mgr.ready_pending_snapshot(self.cfg.turns_limit).await;
+        let selected = self.rank_ready(&ready.items, 1.min(ready.budget)).await;
+        let ranked = if selected.is_empty() {
+            Vec::new()
+        } else {
+            self.mgr
+                .claim_selected_todos(&selected, self.cfg.turns_limit)
+                .await
+        };
+        let mut claims = if ranked.is_empty() {
+            self.mgr
+                .claim_ready_todos_with_turn_limit(1, self.cfg.turns_limit)
+                .await
+        } else {
+            kres_core::TodoClaims {
+                items: ranked,
+                blocked: ready.blocked,
+                remaining: 0,
+            }
+        };
         let Some(item) = claims.items.pop() else {
             if claims.blocked == 0 {
                 kres_core::async_eprintln!("/next: nothing pending");
@@ -8808,13 +8936,32 @@ mod tests {
         std::fs::remove_dir_all(&ws).ok();
     }
 
+    /// `kres_core::consent::install` sets a `OnceLock`, so every test
+    /// in this binary shares ONE store and `clear()` in one test wipes
+    /// a grant another just made. Cargo runs these on parallel
+    /// threads, so the consent tests must take this lock for their
+    /// whole grant→act→assert window, not just around `install`.
+    /// Tokio's mutex, not std's: the guard is held across the
+    /// `persist_code_output` await, and it does not poison, so a
+    /// panicking test cannot wedge the rest.
+    static CONSENT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Take the consent lock and hand back a store with no grants.
+    async fn exclusive_consent() -> (
+        tokio::sync::MutexGuard<'static, ()>,
+        Arc<kres_core::ConsentStore>,
+    ) {
+        let guard = CONSENT_TEST_LOCK.lock().await;
+        let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
+        let store = kres_core::consent::get().expect("consent installed");
+        store.clear();
+        (guard, store)
+    }
+
     #[tokio::test]
     async fn code_output_absolute_outside_workspace_without_consent_is_rejected() {
         // Fresh consent store with NO grants.
-        let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
-        if let Some(s) = kres_core::consent::get() {
-            s.clear();
-        }
+        let (_consent, _store) = exclusive_consent().await;
         let ws = code_output_tmp_dir("abs-rejected-ws");
         let outside = code_output_tmp_dir("abs-rejected-out");
         let target = outside.join("summary.md");
@@ -8834,9 +8981,7 @@ mod tests {
 
     #[tokio::test]
     async fn code_output_absolute_with_consent_writes_through() {
-        let _ = kres_core::consent::install(Arc::new(kres_core::ConsentStore::new()));
-        let store = kres_core::consent::get().expect("consent installed");
-        store.clear();
+        let (_consent, store) = exclusive_consent().await;
         let ws = code_output_tmp_dir("abs-allowed-ws");
         let bug_dir = code_output_tmp_dir("abs-allowed-bug");
         // Operator-mention equivalent: grant the bug dir.

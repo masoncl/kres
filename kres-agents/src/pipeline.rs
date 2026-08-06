@@ -1579,9 +1579,11 @@ impl AgentRunner {
     /// same gathered symbols/context, then consolidate.
     ///
     /// A lens that fails or returns no usable output is retried once
-    /// on the same gathered context. If it still fails, the whole
-    /// lensed review errors instead of consolidating a partial clean
-    /// result.
+    /// on the same gathered context. If it still fails, the task
+    /// consolidates the lenses that DID run and emits one `[MISSING]`
+    /// followup naming each that did not, so the uncovered bug class
+    /// is re-queued instead of being silently counted as reviewed.
+    /// Only a task where every lens failed is an error.
     pub async fn run_with_lenses(
         &self,
         prompt: &str,
@@ -1612,30 +1614,71 @@ impl AgentRunner {
                 validate_generic_lens_output,
             )
             .await?;
-        if !fanout.failures.is_empty() {
-            return Err(AgentError::Other(format!(
-                "shared lens fan-out failed {} of {} lens call(s): {}",
-                fanout.failures.len(),
-                fanout.attempted,
-                fanout.failure_summary()
-            )));
-        }
         let empty_lenses: Vec<String> = fanout
             .outputs
             .iter()
             .filter_map(|output| validate_generic_lens_output(output).err())
             .collect();
-        if !empty_lenses.is_empty() {
-            return Err(AgentError::Other(format!(
-                "shared lens fan-out produced unusable output for {} lens call(s): {}",
-                empty_lenses.len(),
-                empty_lenses.join("; ")
-            )));
+        // (lens id, why it produced nothing) for the followups below.
+        let mut missing_lenses: Vec<(String, String)> = fanout
+            .failures
+            .iter()
+            .map(|failure| (failure.lens_id.clone(), failure.error.clone()))
+            .collect();
+        missing_lenses.extend(
+            fanout
+                .outputs
+                .iter()
+                .filter(|output| validate_generic_lens_output(output).is_err())
+                .map(|output| {
+                    (
+                        output.lens_id.clone(),
+                        "returned no usable analysis, findings or followups".to_string(),
+                    )
+                }),
+        );
+        // A lens that failed or came back unusable does NOT fail the
+        // task when others succeeded. Discarding four good lenses
+        // because a fifth hit its transport's input cap threw away the
+        // work and, because the reaper counts the task as errored,
+        // three of them in a row halted the session — observed twelve
+        // times on the 2026-08-06 mm/swapfile.c review, where the
+        // `general` lens alone exceeded a 1 MiB JSON-RPC limit.
+        //
+        // What must NOT happen is the surviving lenses' silence being
+        // read as coverage. AGENTS.md: a clean lens means confident,
+        // not "nothing proved from the first gathered context", and
+        // negative coverage claims must be earned. So every lens that
+        // did not run becomes a typed followup, and the next turn
+        // re-covers that bug class.
+        if !fanout.failures.is_empty() || !empty_lenses.is_empty() {
+            let mut missing = fanout.failure_summary();
+            if !empty_lenses.is_empty() {
+                if !missing.is_empty() {
+                    missing.push_str("; ");
+                }
+                missing.push_str(&empty_lenses.join("; "));
+            }
+            let ran = fanout.outputs.len().saturating_sub(empty_lenses.len());
+            if ran == 0 {
+                return Err(AgentError::Other(format!(
+                    "every lens call failed for this task: {missing}"
+                )));
+            }
+            kres_core::async_eprintln!(
+                "[review lenses] {} of {} lens call(s) did not produce output; \
+                 consolidating the {ran} that did and re-queueing the rest: {missing}",
+                fanout.attempted.saturating_sub(ran),
+                fanout.attempted,
+            );
         }
 
         let mut outs: Vec<LensOutput<'_>> = Vec::new();
         let mut all_followups: Vec<Followup> = Vec::new();
         for output in &fanout.outputs {
+            if validate_generic_lens_output(output).is_err() {
+                continue;
+            }
             let parsed = &output.parsed;
             outs.push(LensOutput {
                 lens: &output.lens,
@@ -1678,6 +1721,22 @@ impl AgentRunner {
             consolidated.comparison.clone(),
         );
         merge_followups(&mut all_followups, consolidated.followups);
+        // Re-queue every bug class that had no lens behind it. Without
+        // this the consolidated result reads as a complete review of
+        // the task when one angle was never examined.
+        for (lens_id, error) in &missing_lenses {
+            all_followups.push(Followup {
+                kind: "question".to_string(),
+                name: format!("Re-run the {lens_id} review lens for this task"),
+                reason: format!(
+                    "[MISSING] the {lens_id} lens produced no output for this task ({error}), \
+                     so its bug class is unexamined here and the consolidated result cannot \
+                     be treated as covering it"
+                ),
+                path: None,
+                nice_to_have: false,
+            });
+        }
         Ok(TaskSummary {
             raw_response: consolidated.analysis.clone(),
             analysis: consolidated.analysis,

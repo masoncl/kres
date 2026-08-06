@@ -125,6 +125,25 @@ User prompt → Task created → Task thread starts
   prompt is built, which is why `findings_for_prompt_history` is the
   single entry point for `previous_findings`: it also keeps the
   prioritizer's cached head byte-identical to the lens fan-out's.
+- A lens that fails or returns nothing does not fail the task when
+  others succeeded. `run_with_lenses` consolidates the lenses that
+  ran and emits one `[MISSING]` followup per lens that did not, so
+  the uncovered bug class is re-queued rather than silently counted
+  as reviewed. Only an all-lenses-failed task is an error. Do not
+  restore the all-or-nothing behaviour: discarding four good lenses
+  because a fifth hit a transport limit both wasted the work and,
+  through the consecutive-error watchdog, halted the session.
+- Rust must not infer semantic workflow state from free-form AI prose.
+  Do not add substring/regex classifiers over model `analysis`,
+  `invalid_evidence`, defect text, commit-message prose, or other natural
+  language output to decide cleanliness, routing, invalidation, retry,
+  completion, or followup creation. Use explicit JSON fields, typed
+  arrays, enums, booleans, and workflow expressions. If a legacy/free-form
+  output must be interpreted, add a targeted inference/judge step that
+  returns structured JSON and make Rust consume only that structure.
+  Prose may be preserved for humans and logs, but it must not be a hidden
+  control channel.
+
 ### Lints
 - The pre-commit hook runs `cargo clippy --workspace --all-targets
   -- -D warnings`. Do not silence a clippy diagnostic with

@@ -763,18 +763,21 @@ impl Session {
     }
 
     pub fn with_agent_runner(mut self, o: Arc<AgentRunner>) -> Self {
-        // The prioritizer IS the slow coding agent: same client,
-        // model, token budget and thinking config, with the slow
-        // coding system prompt. Deriving it here rather than from a
-        // separate config entry means there is no way to point the
-        // two at different models by accident.
+        // The prioritizer IS the slow agent: same client, model,
+        // token budget and thinking config. Deriving it here rather
+        // than from a separate config entry means there is no way to
+        // point the two at different models by accident.
+        //
+        // `system` is filled in per call from the session's mode via
+        // `AgentRunner::slow_system_for_mode`, not pinned here. The
+        // system prompt is part of the Anthropic cache prefix, and a
+        // review runs as `Audit`, which uses `slow_system` — pinning
+        // `slow_coding_system` here guaranteed the prioritizer and
+        // the lenses could never share a cached block.
         self.prioritize_client = Some(Arc::new(kres_agents::PrioritizeClient {
             client: o.slow_client.clone(),
             model: o.slow_model.clone(),
-            system: o
-                .slow_coding_system
-                .clone()
-                .or_else(|| o.slow_system.clone()),
+            system: None,
             max_tokens: o.slow_max_tokens,
             max_input_tokens: o.slow_max_input_tokens,
             thinking: o.slow_thinking,
@@ -815,6 +818,18 @@ impl Session {
             .filter(|p| !p.is_empty())
             .or_else(|| self.initial_prompt.clone())
             .unwrap_or_default();
+        // Match the system prompt the slow lenses of this session run
+        // under. Same reason as the model: it is part of the cache
+        // prefix, and a mismatch makes sharing impossible.
+        let mode = plan.as_ref().map(|p| p.mode).unwrap_or_default();
+        let pc = kres_agents::PrioritizeClient {
+            system: self
+                .agent_runner
+                .as_ref()
+                .and_then(|runner| runner.slow_system_for_mode(mode).cloned()),
+            ..(**pc).clone()
+        };
+        let pc = &pc;
         let skills = self
             .agent_runner
             .as_ref()

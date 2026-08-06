@@ -387,6 +387,22 @@ impl DataFetcher for NullFetcher {
 /// separate concept (the LLM-driven routing decision step inside the
 /// fix workflow). This struct is the inference engine; the step is a
 /// JSON-described worker that uses it.
+/// Resolve the slow system prompt for a task mode. A free function so
+/// it can be exercised without standing up an `AgentRunner`; the
+/// method on `AgentRunner` is the only intended caller besides tests.
+pub fn slow_system_for_mode<'a>(
+    mode: kres_core::TaskMode,
+    coding: Option<&'a String>,
+    generic: Option<&'a String>,
+    audit: Option<&'a String>,
+) -> Option<&'a String> {
+    match mode {
+        kres_core::TaskMode::Coding => coding.or(audit),
+        kres_core::TaskMode::Generic => generic.or(audit),
+        kres_core::TaskMode::Audit => audit,
+    }
+}
+
 pub struct AgentRunner {
     pub fast_client: Arc<Client>,
     pub fast_model: Model,
@@ -1218,25 +1234,15 @@ impl AgentRunner {
         } else if use_fast {
             self.fast_system.as_ref()
         } else {
-            match ctx.mode {
-                kres_core::TaskMode::Coding => {
-                    if self.slow_coding_system.is_some() {
-                        self.slow_coding_system.as_ref()
-                    } else {
-                        kres_core::async_eprintln!(
-                            "[{log_phase}] coding-mode task but no slow_coding_system loaded — falling back to audit prompt"
-                        );
-                        self.slow_system.as_ref()
-                    }
+            {
+                if matches!(ctx.mode, kres_core::TaskMode::Coding)
+                    && self.slow_coding_system.is_none()
+                {
+                    kres_core::async_eprintln!(
+                        "[{log_phase}] coding-mode task but no slow_coding_system loaded — falling back to audit prompt"
+                    );
                 }
-                kres_core::TaskMode::Generic => {
-                    if self.slow_generic_system.is_some() {
-                        self.slow_generic_system.as_ref()
-                    } else {
-                        self.slow_system.as_ref()
-                    }
-                }
-                kres_core::TaskMode::Audit => self.slow_system.as_ref(),
+                self.slow_system_for_mode(ctx.mode)
             }
         };
         if let Some(s) = system_for_call {
@@ -2279,6 +2285,23 @@ impl AgentRunner {
         })
     }
 
+    /// The slow system prompt a task of `mode` runs under.
+    ///
+    /// One owner, because two callers depend on the answer being the
+    /// same: the lens fan-out here, and the prioritization agent in
+    /// the REPL. The system prompt is part of the Anthropic cache
+    /// prefix, so if these two ever disagree the two call types can
+    /// never share a cached block — and a review is `Audit`, which
+    /// does NOT use `slow_coding_system`.
+    pub fn slow_system_for_mode(&self, mode: kres_core::TaskMode) -> Option<&String> {
+        slow_system_for_mode(
+            mode,
+            self.slow_coding_system.as_ref(),
+            self.slow_generic_system.as_ref(),
+            self.slow_system.as_ref(),
+        )
+    }
+
     fn effective_slow_variants(&self) -> Vec<SlowAgentVariant> {
         if self.slow_variants.is_empty() {
             vec![SlowAgentVariant {
@@ -2950,6 +2973,48 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prioritization agent and the slow lenses must resolve the
+    /// same system prompt or they can never share a cached prefix:
+    /// the system block is part of it. A review runs as Audit, which
+    /// does NOT use `slow_coding_system` — the prioritizer originally
+    /// pinned that one, so sharing was impossible by construction.
+    #[test]
+    fn audit_mode_uses_the_audit_system_not_the_coding_one() {
+        let coding = "CODING".to_string();
+        let generic = "GENERIC".to_string();
+        let audit = "AUDIT".to_string();
+        let (c, g, a) = (Some(&coding), Some(&generic), Some(&audit));
+
+        assert_eq!(
+            slow_system_for_mode(kres_core::TaskMode::Audit, c, g, a),
+            Some(&audit),
+            "a review must not pick up the coding prompt"
+        );
+        assert_eq!(
+            slow_system_for_mode(kres_core::TaskMode::Coding, c, g, a),
+            Some(&coding)
+        );
+        assert_eq!(
+            slow_system_for_mode(kres_core::TaskMode::Generic, c, g, a),
+            Some(&generic)
+        );
+    }
+
+    #[test]
+    fn a_missing_mode_specific_system_falls_back_to_audit() {
+        let audit = "AUDIT".to_string();
+        for mode in [
+            kres_core::TaskMode::Coding,
+            kres_core::TaskMode::Generic,
+            kres_core::TaskMode::Audit,
+        ] {
+            assert_eq!(
+                slow_system_for_mode(mode, None, None, Some(&audit)),
+                Some(&audit)
+            );
+        }
+    }
 
     #[test]
     fn a_probe_is_only_worth_paying_for_when_a_sibling_reads_it() {

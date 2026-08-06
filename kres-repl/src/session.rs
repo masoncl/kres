@@ -6121,26 +6121,6 @@ fn change_survey_source_hash(target: &Path, source: &str) -> Result<String> {
         .to_string())
 }
 
-fn compact_change_survey_report(report: &ChangeSurveyReport) -> serde_json::Value {
-    let target_function_risks = report
-        .target_function_risks
-        .iter()
-        .map(|risk| {
-            if risk.risk_rating == 0 {
-                serde_json::json!([risk.name, risk.risk_rating])
-            } else {
-                serde_json::json!([risk.name, risk.risk_rating, risk.reason])
-            }
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "baseline": report.baseline,
-        "head": report.head,
-        "target_function_risks": target_function_risks,
-        "external_major_risks": report.external_major_risks,
-    })
-}
-
 async fn run_review_file_scan(
     runner: &Arc<AgentRunner>,
     workspace: &Path,
@@ -6172,19 +6152,20 @@ async fn run_review_file_scan(
         )
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let (inventory, fallback_inventory) = match FileSurveyInventory::from_context(&survey.context) {
-        Some(inventory) => (inventory, None),
+    // semcode is an accelerator, not an authority: when its survey is
+    // missing or unparseable, rebuild the inventory by inference
+    // rather than treating the file as unavailable.
+    let inventory = match FileSurveyInventory::from_context(&survey.context) {
+        Some(inventory) => inventory,
         None => {
-            let inventory = infer_fallback_file_survey_inventory(
+            infer_fallback_file_survey_inventory(
                 runner,
                 workspace,
                 target,
                 &survey.context,
                 shutdown,
             )
-            .await?;
-            let context = inventory.as_context_value(target);
-            (inventory, Some(context))
+            .await?
         }
     };
     let inventory_functions = inventory.function_names();
@@ -6229,104 +6210,66 @@ async fn run_review_file_scan(
     };
     let target_source = std::fs::read_to_string(&target_path)
         .with_context(|| format!("reading whole-file review target {}", target_path.display()))?;
-    let external_interactions = change_report
+    // The whole-file survey is assembled by Rust from the change
+    // survey and the structural inventory. There is no second
+    // inference pass.
+    //
+    // There used to be one: a slow-agent call that combined the two
+    // into a "final" rating per function. It was measured on the
+    // 2026-08-06 mm/page_alloc.c review and did nothing. It received
+    // the change survey's ratings in its prompt and was forbidden from
+    // rating any function below them, so of 236 functions it changed
+    // 12, all upward, only one crossed into the high band, and none of
+    // the 12 produced a finding. Removing it also removes a failure
+    // mode: run standalone, without the change survey's report to
+    // enumerate the function set, it returned 251 functions instead of
+    // 236 and failed validation on two consecutive runs.
+    //
+    // `file_risk_rating` is the highest function rating, which is what
+    // the model was instructed to produce anyway ("must be at least
+    // the highest combined function rating"). Research questions are
+    // the external interactions Rust already established, one per
+    // entry, which is exactly what the model was told to emit.
+    let mut risk_of: std::collections::BTreeMap<&str, u8> = change_report
+        .target_function_risks
+        .iter()
+        .map(|risk| (risk.name.as_str(), risk.risk_rating))
+        .collect();
+    let research_questions: Vec<ReviewResearchQuestion> = change_report
         .external_major_risks
         .iter()
         .filter_map(|risk| {
             inventory
                 .interaction_kind(&risk.name, &target_source)
-                .map(|kind| {
-                    serde_json::json!({
-                        "function": risk.name,
-                        "file": risk.file,
-                        "evidence": kind,
-                    })
+                .map(|kind| ReviewResearchQuestion {
+                    question: format!(
+                        "{} interacts with {target} via {kind}: {}",
+                        risk.name, risk.reason
+                    ),
+                    function: risk.name.clone(),
+                    file: risk.file.clone(),
+                    priority: EXTERNAL_RESEARCH_PRIORITY,
                 })
         })
-        .collect::<Vec<_>>();
-    let change_risks = serde_json::to_string(&compact_change_survey_report(&change_report))
-        .context("serializing whole-file change survey")?;
-    // Exactly one inventory reaches the model. When the semcode survey was
-    // rejected and rebuilt by inference, shipping the rejected copy alongside
-    // the replacement put two contradictory `functions_defined` arrays in the
-    // same prompt with nothing marking which was authoritative.
-    let survey_context_values = match fallback_inventory {
-        Some(fallback_inventory) => vec![fallback_inventory],
-        None => survey.context,
-    };
-    let survey_context = serde_json::to_string(&survey_context_values)
-        .context("serializing whole-file structural survey")?;
-    let external_interactions = serde_json::to_string(&external_interactions)
-        .context("serializing external interaction evidence")?;
-    let prompt = format!(
-        "Complete the whole-file review file survey for {target}. A Rust change survey has assessed one net target-file diff covering the last six months, and Rust has fetched file_survey exactly once. In CHANGE SURVEY REPORT, each target risk tuple is `[function,rating]` or `[function,rating,reason]`; a reason is included only for a nonzero rating.\n\nCHANGE SURVEY REPORT:\n{change_risks}\n\nFILE_SURVEY CONTEXT:\n{survey_context}\n\nEXTERNAL INTERACTIONS ESTABLISHED BY RUST:\n{external_interactions}\n\nReturn exactly one raw compact JSON object with fields in this order: `functions`, `research_questions`, then `file_risk_rating`. `functions` must contain exactly one object per function defined by file_survey: {{\"name\":string,\"risk_rating\":integer 0-100}}. Do not report use counts; Rust owns them. Combine structural survey evidence with the net-change risk into the function's single final risk_rating. A combined function rating must never be lower than its CHANGE SURVEY REPORT rating. Return only that single combined rating per function. Do not score referenced-only functions.\n\nTurn every entry under EXTERNAL INTERACTIONS ESTABLISHED BY RUST into exactly one non-empty research question, and omit every external risk not listed there. Each retained question is {{\"function\":string,\"file\":string,\"question\":string,\"priority\":integer 80-100}}. `file_risk_rating` is one integer 0-100 for the whole target, must be at least the highest combined function rating, and must be the final field. No markdown or prose outside the JSON object."
-    );
-    let mut errors = Vec::new();
-    let mut completed = None;
-    for attempt in 1..=2 {
-        let repair_prompt;
-        let attempt_prompt = if let Some(previous_error) = errors.last() {
-            repair_prompt = format!(
-                "{prompt}\n\nYour previous response failed validation: {previous_error}\nReturn a corrected complete JSON object."
-            );
-            repair_prompt.as_str()
-        } else {
-            prompt.as_str()
-        };
-        let response = runner
-            .run_primary_slow_inference(
-                "You combine a structural file inventory with six-month net-change risks. Follow the requested JSON schema exactly and do not emit markdown or commentary.",
-                attempt_prompt,
-                &format!("file-survey {target} attempt {attempt}"),
-                shutdown,
-            )
-            .await;
-        match response {
-            Ok(response) => {
-                let parsed = serde_json::from_str::<ReviewFileSurvey>(&response)
-                    .context("slow file survey analysis is not a JSON object")
-                    .and_then(|value| {
-                        value.validate(&inventory, &change_report, &target_source)?;
-                        Ok(value)
-                    });
-                match parsed {
-                    Ok(value) => {
-                        completed = Some(value);
-                        break;
-                    }
-                    Err(error) => errors.push(format!("attempt {attempt}: {error}")),
-                }
-            }
-            Err(error) if shutdown.is_cancelled() => {
-                anyhow::bail!("cancelled during final whole-file survey: {error}")
-            }
-            Err(error) => errors.push(format!("attempt {attempt}: {error}")),
-        }
-    }
-    let value = completed.with_context(|| {
-        format!(
-            "final whole-file survey failed after retries: {}",
-            errors.join("; ")
-        )
-    })?;
-    // Join Rust's authoritative spelling counts onto the model's ratings so
-    // the scan the agents receive keeps the same shape it always had.
+        .collect();
+    let functions: Vec<ScanFunctionRisk> = inventory
+        .functions
+        .iter()
+        .map(|(name, uses)| ScanFunctionRisk {
+            name: name.as_str(),
+            uses: *uses,
+            risk_rating: risk_of.remove(name.as_str()).unwrap_or_default(),
+        })
+        .collect();
+    let file_risk_rating = functions
+        .iter()
+        .map(|function| function.risk_rating)
+        .max()
+        .unwrap_or_default();
     let scan = ScanFileSurvey {
-        functions: value
-            .functions
-            .iter()
-            .map(|function| ScanFunctionRisk {
-                name: function.name.as_str(),
-                uses: inventory
-                    .functions
-                    .get(&function.name)
-                    .copied()
-                    .unwrap_or_default(),
-                risk_rating: function.risk_rating,
-            })
-            .collect(),
-        research_questions: &value.research_questions,
-        file_risk_rating: value.file_risk_rating,
+        functions,
+        research_questions: &research_questions,
+        file_risk_rating,
     };
     let serialized = serde_json::to_string(&scan).context("serializing review scan")?;
     // Keep the completed checkpoint beside session.json so the net-diff
@@ -6984,29 +6927,17 @@ async fn infer_change_survey_prompt(
     anyhow::bail!(errors.join("; "))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewFileSurvey {
-    functions: Vec<ReviewFunctionRisk>,
-    research_questions: Vec<ReviewResearchQuestion>,
-    file_risk_rating: u8,
-}
-
-/// One function's final combined risk, as returned by the file-survey model.
+/// Priority stamped on every Rust-derived external research question.
 ///
-/// No `uses` field: Rust holds the authoritative spelling count and joins it
-/// back when the scan is serialized. Asking the model to echo it made a wrong
-/// integer fail the whole survey, and when two inventories disagreed there was
-/// no way for the model to know which column was authoritative.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewFunctionRisk {
-    name: String,
-    risk_rating: u8,
-}
+/// The retired file-survey prompt asked the model for an integer in
+/// 80-100 per question and gave it nothing to discriminate on — every
+/// retained entry had already passed the same Rust interaction filter.
+/// A constant says that plainly instead of dressing it up as judgement.
+const EXTERNAL_RESEARCH_PRIORITY: u8 = 90;
 
 /// Serialized shape of the completed scan. Same fields the agents have always
-/// seen, with `uses` supplied by Rust rather than echoed by the model.
+/// seen, with `uses` and now the ratings supplied by Rust rather than echoed
+/// by the model.
 #[derive(Debug, Serialize)]
 struct ScanFunctionRisk<'a> {
     name: &'a str,
@@ -7121,19 +7052,6 @@ impl FileSurveyInventory {
         Ok(Self {
             functions,
             calls: inferred.calls,
-        })
-    }
-
-    fn as_context_value(&self, target: &str) -> serde_json::Value {
-        serde_json::json!({
-            "source": format!("inference:fallback-file-survey:{target}"),
-            "result": {
-                "file": target,
-                "functions_defined": self.functions.iter().map(|(name, uses)| serde_json::json!([name, uses])).collect::<Vec<_>>(),
-                "calls": self.calls.iter().map(|name| serde_json::json!([name, 0])).collect::<Vec<_>>(),
-                "fallback": true,
-            },
-            "note": "typed slow-agent inventory built from complete source after semcode file_survey was unavailable; local grep evidence remains preserved separately"
         })
     }
 
@@ -7347,141 +7265,6 @@ fn is_character_literal_start(input: &[u8], index: usize) -> bool {
         .take_while(|byte| **byte != b'\n')
         .position(|byte| *byte == b'\'')
         .is_some()
-}
-
-impl ReviewFileSurvey {
-    fn validate(
-        &self,
-        inventory: &FileSurveyInventory,
-        change_report: &ChangeSurveyReport,
-        target_source: &str,
-    ) -> Result<()> {
-        if self.file_risk_rating > 100 {
-            anyhow::bail!("slow file survey file_risk_rating exceeds 100");
-        }
-        if let Some(function) = self
-            .functions
-            .iter()
-            .find(|risk| risk.name.trim().is_empty())
-        {
-            anyhow::bail!(
-                "slow file survey returned an empty function name at risk {}",
-                function.risk_rating
-            );
-        }
-        if let Some(function) = self.functions.iter().find(|risk| risk.risk_rating > 100) {
-            anyhow::bail!("slow file survey risk for {} exceeds 100", function.name);
-        }
-        if let Some(question) = self
-            .research_questions
-            .iter()
-            .find(|question| !(80..=100).contains(&question.priority))
-        {
-            anyhow::bail!(
-                "slow file survey gave non-major external function {} priority {}",
-                question.function,
-                question.priority
-            );
-        }
-        if let Some(question) = self
-            .research_questions
-            .iter()
-            .find(|question| question.question.trim().is_empty())
-        {
-            anyhow::bail!(
-                "slow file survey returned an empty research question for {}",
-                question.function
-            );
-        }
-        let rated: BTreeSet<&str> = self
-            .functions
-            .iter()
-            .map(|function| function.name.as_str())
-            .collect();
-        if rated.len() != self.functions.len()
-            || rated
-                != inventory
-                    .functions
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<BTreeSet<_>>()
-        {
-            anyhow::bail!("slow file survey did not rate every target function exactly once");
-        }
-        for change_risk in &change_report.target_function_risks {
-            let combined = self
-                .functions
-                .iter()
-                .find(|function| function.name == change_risk.name)
-                .context("change survey function is absent from final file survey")?;
-            if combined.risk_rating < change_risk.risk_rating {
-                anyhow::bail!(
-                    "slow file survey lowered change risk for {} from {} to {}",
-                    change_risk.name,
-                    change_risk.risk_rating,
-                    combined.risk_rating
-                );
-            }
-        }
-        if let Some(highest) = self
-            .functions
-            .iter()
-            .map(|function| function.risk_rating)
-            .max()
-        {
-            if self.file_risk_rating < highest {
-                anyhow::bail!(
-                    "slow file survey file risk {} is below function risk {}",
-                    self.file_risk_rating,
-                    highest
-                );
-            }
-        }
-        if let Some(question) = self.research_questions.iter().find(|question| {
-            inventory
-                .interaction_kind(&question.function, target_source)
-                .is_none()
-        }) {
-            anyhow::bail!(
-                "slow file survey prioritized external function {} without a target-file interaction",
-                question.function
-            );
-        }
-        if let Some(question) = self.research_questions.iter().find(|question| {
-            !change_report
-                .external_major_risks
-                .iter()
-                .any(|risk| risk.name == question.function && risk.file == question.file)
-        }) {
-            anyhow::bail!(
-                "slow file survey invented external research for {}",
-                question.function
-            );
-        }
-        let actual_questions: BTreeSet<(&str, &str)> = self
-            .research_questions
-            .iter()
-            .map(|question| (question.function.as_str(), question.file.as_str()))
-            .collect();
-        let expected_questions: BTreeSet<(&str, &str)> = change_report
-            .external_major_risks
-            .iter()
-            .filter(|risk| {
-                inventory
-                    .interaction_kind(&risk.name, target_source)
-                    .is_some()
-            })
-            .map(|risk| (risk.name.as_str(), risk.file.as_str()))
-            .collect();
-        if actual_questions.len() != self.research_questions.len()
-            || actual_questions != expected_questions
-        {
-            anyhow::bail!(
-                "slow file survey did not preserve every interaction-filtered external risk exactly once"
-            );
-        }
-        Ok(())
-    }
 }
 
 async fn ensure_review_followups_remain_pending(
@@ -8587,133 +8370,6 @@ mod tests {
     }
 
     #[test]
-    fn file_survey_serialization_puts_single_file_risk_last() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":84}],"research_questions":[{"function":"folio_put","file":"mm/swap.c","question":"Does the changed release contract affect this call?","priority":90}],"file_risk_rating":84}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: vec!["folio_put".to_string()],
-        };
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: vec![crate::change_survey::FunctionRisk {
-                name: "filemap_fault".into(),
-                risk_rating: 80,
-                reason: "changed".into(),
-            }],
-            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
-                name: "folio_put".into(),
-                file: "mm/swap.c".into(),
-                risk_rating: 90,
-                reason: "release contract".into(),
-            }],
-        };
-        survey.validate(&inventory, &report, "").unwrap();
-        let scan = ScanFileSurvey {
-            functions: survey
-                .functions
-                .iter()
-                .map(|function| ScanFunctionRisk {
-                    name: function.name.as_str(),
-                    uses: inventory
-                        .functions
-                        .get(&function.name)
-                        .copied()
-                        .unwrap_or_default(),
-                    risk_rating: function.risk_rating,
-                })
-                .collect(),
-            research_questions: &survey.research_questions,
-            file_risk_rating: survey.file_risk_rating,
-        };
-        let serialized = serde_json::to_string(&scan).unwrap();
-        assert!(serialized.ends_with(r#""file_risk_rating":84}"#));
-        // Rust supplies the count; the model never sent one.
-        assert!(serialized.contains(r#""name":"filemap_fault","uses":6"#));
-    }
-
-    #[test]
-    fn file_survey_response_may_not_carry_a_use_count() {
-        // The model echoing counts Rust already owns is what aborted the
-        // 2026-08-05 mm/vmscan.c review: two inventories in one prompt
-        // disagreed on 159 of 191 counts, so every attempt failed validation
-        // and the whole run never started. `uses` is no longer accepted.
-        assert!(serde_json::from_str::<ReviewFileSurvey>(
-            r#"{"functions":[{"name":"filemap_fault","uses":6,"risk_rating":84}],"research_questions":[],"file_risk_rating":84}"#,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn file_survey_rejects_per_commit_rating_matrix() {
-        assert!(serde_json::from_str::<ReviewFileSurvey>(
-            r#"{"functions":[{"name":"filemap_fault","change_risks":[{"commit":"abc","risk_rating":80}],"risk_rating":84}],"research_questions":[],"file_risk_rating":84}"#,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn file_survey_cannot_lower_net_change_risk() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":79}],"research_questions":[],"file_risk_rating":79}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: Vec::new(),
-        };
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: vec![crate::change_survey::FunctionRisk {
-                name: "filemap_fault".into(),
-                risk_rating: 80,
-                reason: "changed".into(),
-            }],
-            external_major_risks: Vec::new(),
-        };
-
-        assert!(survey.validate(&inventory, &report, "").is_err());
-    }
-
-    #[test]
-    fn file_survey_file_risk_cannot_be_below_a_function() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":80}],"research_questions":[],"file_risk_rating":79}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: Vec::new(),
-        };
-
-        assert!(survey
-            .validate(&inventory, &ChangeSurveyReport::default(), "")
-            .is_err());
-    }
-
-    #[test]
-    fn compact_change_report_omits_repeated_zero_risk_reasons() {
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: vec![crate::change_survey::FunctionRisk {
-                name: "unchanged".into(),
-                risk_rating: 0,
-                reason: "No net-diff evidence.".into(),
-            }],
-            external_major_risks: Vec::new(),
-        };
-
-        let compact = serde_json::to_string(&compact_change_survey_report(&report)).unwrap();
-        assert!(compact.contains(r#"["unchanged",0]"#));
-        assert!(!compact.contains("No net-diff evidence."));
-    }
-
-    #[test]
     fn independently_large_source_crosses_every_scope_with_every_diff_chunk() {
         let target_source = "x".repeat(1_228_126);
         let expected = (0..191)
@@ -8818,165 +8474,25 @@ mod tests {
             .all(|chunk| chunk.text.len() <= partition_bytes));
     }
 
-    #[test]
-    fn file_survey_rejects_unrelated_external_research_priority() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"unrelated","file":"net/core.c","question":"Investigate it","priority":90}],"file_risk_rating":50}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: vec!["mapping->a_ops->read_folio".to_string()],
-        };
-        assert!(survey
-            .validate(&inventory, &ChangeSurveyReport::default(), "")
-            .is_err());
-    }
-
-    #[test]
-    fn file_survey_requires_every_interacting_external_risk() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":80}],"research_questions":[],"file_risk_rating":80}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: vec!["folio_put".to_string()],
-        };
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: vec![crate::change_survey::FunctionRisk {
-                name: "filemap_fault".into(),
-                risk_rating: 80,
-                reason: "changed".into(),
-            }],
-            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
-                name: "folio_put".into(),
-                file: "mm/swap.c".into(),
-                risk_rating: 90,
-                reason: "release contract".into(),
-            }],
-        };
-
-        assert!(survey.validate(&inventory, &report, "").is_err());
-    }
-
-    #[test]
-    fn file_survey_accepts_external_function_pointer_interaction() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"ops::folio_put","file":"mm/swap.c","question":"Can this callback violate the changed release contract?","priority":90}],"file_risk_rating":50}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: Vec::new(),
-        };
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: Vec::new(),
-            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
-                name: "ops::folio_put".into(),
-                file: "mm/swap.c".into(),
-                risk_rating: 90,
-                reason: "release contract".into(),
-            }],
-        };
-
-        survey
-            .validate(
-                &inventory,
-                &report,
-                "static const struct ops = { .put = folio_put };",
-            )
-            .unwrap();
-    }
-
+    /// A function the target defines itself is not an external
+    /// interaction, however the change survey rated the same name
+    /// elsewhere. The file-survey inference that used to enforce this
+    /// is gone; Rust now builds the research questions directly, so
+    /// the filter is tested where it actually runs.
     #[test]
     fn local_definition_shadows_same_named_external_risk() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"folio_put","risk_rating":20}],"research_questions":[],"file_risk_rating":20}"#,
-        )
-        .unwrap();
         let inventory = FileSurveyInventory {
             functions: BTreeMap::from([("folio_put".to_string(), 2)]),
             calls: vec!["folio_put".to_string()],
         };
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: Vec::new(),
-            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
-                name: "folio_put".into(),
-                file: "mm/swap.c".into(),
-                risk_rating: 90,
-                reason: "different external implementation".into(),
-            }],
-        };
-
-        survey
-            .validate(
-                &inventory,
-                &report,
+        assert_eq!(
+            inventory.interaction_kind(
+                "folio_put",
                 "static void folio_put(void) {}\nvoid use(void) { folio_put(); }",
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn file_survey_ignores_external_names_in_comments_strings_and_declarations() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"folio_put","file":"mm/swap.c","question":"Can this affect the target?","priority":90}],"file_risk_rating":50}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: Vec::new(),
-        };
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: Vec::new(),
-            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
-                name: "folio_put".into(),
-                file: "mm/swap.c".into(),
-                risk_rating: 90,
-                reason: "release contract".into(),
-            }],
-        };
-        let source = r#"
-            /* folio_put is mentioned in documentation. */
-            const char *name = "folio_put";
-            extern void folio_put(void);
-        "#;
-
-        assert!(survey.validate(&inventory, &report, source).is_err());
-    }
-
-    #[test]
-    fn file_survey_rejects_empty_research_question() {
-        let survey: ReviewFileSurvey = serde_json::from_str(
-            r#"{"functions":[{"name":"filemap_fault","risk_rating":50}],"research_questions":[{"function":"folio_put","file":"mm/swap.c","question":"   ","priority":90}],"file_risk_rating":50}"#,
-        )
-        .unwrap();
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("filemap_fault".to_string(), 6)]),
-            calls: vec!["folio_put".to_string()],
-        };
-        let report = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: Vec::new(),
-            external_major_risks: vec![crate::change_survey::ExternalFunctionRisk {
-                name: "folio_put".into(),
-                file: "mm/swap.c".into(),
-                risk_rating: 90,
-                reason: "release contract".into(),
-            }],
-        };
-
-        assert!(survey.validate(&inventory, &report, "").is_err());
+            ),
+            None,
+            "a locally defined function is not an external interaction"
+        );
     }
 
     #[test]
@@ -9062,8 +8578,6 @@ mod tests {
 
         assert_eq!(inventory.functions.get("one").copied(), Some(3));
         assert_eq!(inventory.functions.get("two").copied(), Some(1));
-        let context = inventory.as_context_value("mm/filemap.c");
-        assert_eq!(context["result"]["calls"][0][0], "one");
     }
 
     #[test]

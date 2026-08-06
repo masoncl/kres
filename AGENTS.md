@@ -534,6 +534,35 @@ model-aware default. Use this for models whose API contract requires a
 specific thinking request shape instead of hardcoding private model
 names in source.
 
+The whole-file risk scan that precedes a source-target review is one
+inference call, not two. The six-month change survey rates every
+target function against the net diff; Rust then assembles the scan the
+planner sees — ratings from the change survey, spelling counts and the
+authoritative function list from the semcode `file_survey` fetch,
+`file_risk_rating` as the highest function rating, and one research
+question per external interaction Rust itself established.
+
+There used to be a second slow-agent call, the "file survey", that
+combined the two. It was removed after measurement, and should not be
+reintroduced without new evidence:
+
+- It was shown the change survey's ratings in its prompt and forbidden
+  from rating any function below them. Of 236 functions on the
+  2026-08-06 mm/page_alloc.c review it changed 12, all upward, one
+  crossed into the high band, and none of the 12 produced a finding.
+- Run standalone, without the change survey's report enumerating the
+  function set, it returned 251 functions instead of 236 and failed
+  Rust's `did not rate every target function exactly once` validation
+  on two consecutive runs. Its apparent value included re-typing a
+  list Rust already held and validated against.
+- It cost 19k input tokens and ~78s of serial bootstrap per review.
+
+The semcode `file_survey` FETCH is a different thing and stays, along
+with `infer_fallback_file_survey_inventory`, the inference fallback
+used when semcode is unavailable or unparseable. Deleting that would
+violate the rule that a failed semcode result falls back to local
+evidence rather than being treated as absent.
+
 `--assisted-by TEXT` controls the exact commit-message trailer value
 used by the fix workflow after `Assisted-by:`. When omitted, kres derives
 `kres:<slow-model-id>` from the resolved slow agent model.

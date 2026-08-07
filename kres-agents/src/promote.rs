@@ -70,11 +70,49 @@ pub const PROMOTE_INSTRUCTIONS: &str = include_str!("prompts/promote.txt");
 /// dedicated system adds zero network cost.
 pub const PROMOTE_SYSTEM: &str = include_str!("prompts/promote_system.txt");
 
+/// What the promoter needs to know about an already-recorded finding.
+///
+/// Enough to RECOGNISE a bug, not to act on one. The promoter decides
+/// three things from this list: whether a bug in the prose is already
+/// covered, whether the prose disproves a finding, and whether it
+/// revives an invalidated one. Each of those needs the claim and its
+/// identity; none needs the finding's source bodies, reproducer, fix
+/// sketch or open questions.
+///
+/// `status` is here because the reactivation rule requires spotting
+/// which entries are invalidated. Dropping it would silently retire
+/// that behaviour.
+///
+/// Measured on the 2026-08-07 kernel/sched/fair.c review: a promote
+/// request carrying 134 full findings was 1,350 KB, of which 1,328 KB
+/// was `existing_findings` and 5.6 KB was the prose being audited —
+/// 99.6% context for 0.4% subject. One finding alone was 25 KB, 10 KB
+/// of it verbatim function source. Promote runs once per reaped task
+/// and caches nothing.
+#[derive(Debug, Serialize)]
+struct FindingIdentity<'a> {
+    id: &'a str,
+    title: &'a str,
+    status: kres_core::findings::Status,
+    summary: &'a str,
+}
+
+impl<'a> From<&'a Finding> for FindingIdentity<'a> {
+    fn from(f: &'a Finding) -> Self {
+        Self {
+            id: &f.id,
+            title: &f.title,
+            status: f.status,
+            summary: &f.summary,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct PromoteRequest<'a> {
     task: &'static str,
     task_brief: &'a str,
-    existing_findings: &'a [Finding],
+    existing_findings: Vec<FindingIdentity<'a>>,
     analysis: &'a str,
     instructions: &'a str,
 }
@@ -100,12 +138,13 @@ pub struct PromoteOutcome {
 
 /// Run the promotion pass against a configured fast-agent client.
 ///
-/// - `prose_relevant_existing`: the findings sent to the LLM as
-///   `existing_findings`. Callers should narrow this via
-///   [`kres_core::relevant_subset`] so the prompt doesn't balloon
-///   with findings the audit can't plausibly dedup against. It is
-///   always safe to pass the full store here — you just pay the
-///   tokens.
+/// - `prose_relevant_existing`: the findings the promoter dedups
+///   against. Only `{id, title, status, summary}` of each is sent —
+///   see [`FindingIdentity`] — so passing the full store costs the
+///   claims, not their evidence. Callers may still narrow via
+///   [`kres_core::relevant_subset`]; note that narrowing is close to
+///   a no-op for a whole-file review, where every finding cites the
+///   target file and every task's prose names it.
 /// - `dedup_against`: the universe of known ids used by the
 ///   post-response filter. Callers should pass the FULL store ∪
 ///   delta here, regardless of how aggressively the LLM-bound list
@@ -149,7 +188,10 @@ pub async fn promote_prose_bugs_with_logger(
     let request = PromoteRequest {
         task: "promote_prose_bugs",
         task_brief,
-        existing_findings: prose_relevant_existing,
+        existing_findings: prose_relevant_existing
+            .iter()
+            .map(FindingIdentity::from)
+            .collect(),
         analysis,
         instructions: PROMOTE_INSTRUCTIONS,
     };
@@ -412,6 +454,55 @@ mod tests {
             details: vec![],
             introduced_by: None,
             first_seen_at: None,
+        }
+    }
+
+    /// Promote must recognise bugs, not re-derive them. Sending whole
+    /// findings made one request 1,350 KB of which 99.6% was context
+    /// for 5.6 KB of prose. Note this is NOT the slice `finding_repair`
+    /// sees — that one still gets whole findings, because it hydrates
+    /// fields a malformed delta omitted.
+    #[test]
+    fn the_promoter_sees_claims_not_evidence() {
+        let mut finding = f("preempt_short_skips_delayed_pse");
+        finding.title = "PREEMPT_SHORT bypasses the WF_FORK guard".into();
+        finding.summary = "fair.c:9845 jumps past the guard at fair.c:9857".into();
+        finding.reproducer_sketch = "REPRODUCER THAT MUST NOT BE SENT".into();
+        finding.fix_sketch = Some("FIX THAT MUST NOT BE SENT".into());
+        finding.open_questions = vec!["QUESTION THAT MUST NOT BE SENT".into()];
+        finding.relevant_symbols = vec![kres_core::findings::RelevantSymbol {
+            name: "wakeup_preempt_fair".into(),
+            filename: "kernel/sched/fair.c".into(),
+            line: 9770,
+            definition: "SOURCE THAT MUST NOT BE SENT".into(),
+        }];
+
+        let request = PromoteRequest {
+            task: "promote_prose_bugs",
+            task_brief: "brief",
+            existing_findings: std::slice::from_ref(&finding)
+                .iter()
+                .map(FindingIdentity::from)
+                .collect(),
+            analysis: "prose",
+            instructions: "instructions",
+        };
+        let wire = serde_json::to_string(&request).expect("serializes");
+
+        for kept in [
+            "preempt_short_skips_delayed_pse",
+            "PREEMPT_SHORT bypasses the WF_FORK guard",
+            "fair.c:9845",
+            "active",
+        ] {
+            assert!(wire.contains(kept), "identity lost {kept}");
+        }
+        for dropped in [
+            "MUST NOT BE SENT",
+            "wakeup_preempt_fair",
+            "kernel/sched/fair.c\"",
+        ] {
+            assert!(!wire.contains(dropped), "evidence leaked: {dropped}");
         }
     }
 

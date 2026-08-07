@@ -9,10 +9,15 @@ the findings store matches the task's evidence.
 You receive:
   - task_brief: what the task was about
   - analysis: the prose narrative the task produced
-  - existing_findings: Finding records already emitted for THIS task
-    (possibly empty — a RawText parse fallback or a consolidator that
-    skipped the completeness check can leave this list empty even
-    when the prose describes concrete bugs)
+  - existing_findings: the bugs already recorded, as
+    {id, title, status, summary} only — enough to recognise a bug,
+    not the evidence behind it. Their source, reproducers, fix
+    sketches and open questions are deliberately not sent; you are
+    matching claims, not re-deriving them. Judge coverage from the
+    title and summary, which cite file:line. (Possibly empty — a
+    RawText parse fallback or a consolidator that skipped the
+    completeness check can leave this list empty even when the prose
+    describes concrete bugs.)
 
 For each actionable bug the analysis describes that is NOT covered
 by an existing_findings entry, emit a NEW Finding in the output

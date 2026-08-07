@@ -306,7 +306,20 @@ controls nothing else:
   from the original. Do not ask the agent to re-emit fields Rust
   overwrites; that is pure output cost.
 - Coverage is write-once, at the completion that first marks a row
-  Done. Later rounds cannot paraphrase settled evidence.
+  Done. Later rounds cannot paraphrase settled evidence. Enforced in
+  `merge_inferred_state` as well as the agent path, because the
+  manager owns the list.
+- The placeholder is NOT settled evidence. `mark_todo_done` stamps
+  `PLACEHOLDER_COVERAGE` the moment a task completes, which is before
+  the todo agent is ever asked to describe it, so write-once must test
+  `coverage_is_unwritten` rather than `is_empty()`. Guarding on
+  emptiness meant the placeholder always won: on the 2026-08-07
+  kernel/sched/fair.c review all 74 done rows stored it while the
+  agent had returned real coverage for 35 of them, and the DEDUP step
+  that reads coverage to drop already-covered followups was blind for
+  the whole run. Keep the fallback — a done row with EMPTY coverage
+  drops out of that comparison entirely, which is worse — but never
+  let it outrank the agent's sentence.
 - Omission is not deletion. A pending row the agent neither kept,
   completed, nor retired is restored and the drop is logged.
   Deleting work requires naming it in `retired`.

@@ -59,7 +59,7 @@ pub use plan::{
 pub use session_state::{ReviewFileScanState, SessionState, SessionStateError};
 pub use shutdown::Shutdown;
 pub use task::{ReadyTodos, ReapedTask, Task, TaskId, TaskManager, TaskState, TodoClaims};
-pub use todo::{TodoItem, TodoStatus};
+pub use todo::{coverage_is_unwritten, TodoItem, TodoStatus, PLACEHOLDER_COVERAGE};
 
 pub mod version {
     pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -639,7 +639,7 @@ fn reconcile_update(
         };
         state[idx].status = TodoStatus::Done;
         let coverage = mark.coverage.trim();
-        if state[idx].coverage.is_empty() && !coverage.is_empty() {
+        if kres_core::coverage_is_unwritten(&state[idx].coverage) && !coverage.is_empty() {
             state[idx].coverage = coverage.to_string();
         }
     }
@@ -728,7 +728,7 @@ fn reconcile_update(
             state[idx].status = TodoStatus::Done;
             let coverage = row.coverage.unwrap_or_default();
             let coverage = coverage.trim();
-            if state[idx].coverage.is_empty() && !coverage.is_empty() {
+            if kres_core::coverage_is_unwritten(&state[idx].coverage) && !coverage.is_empty() {
                 state[idx].coverage = coverage.to_string();
             }
         }
@@ -820,8 +820,8 @@ fn mark_completed_todo(items: &mut [TodoItem], completed_todo_ids: &[&str]) {
 /// step of later calls, which is worse than a vague sentence.
 fn stamp_missing_coverage(items: &mut [TodoItem]) {
     for item in items.iter_mut() {
-        if item.status.is_terminal() && item.coverage.is_empty() {
-            item.coverage = "completed by the reaped task".to_string();
+        if item.status.is_terminal() && kres_core::coverage_is_unwritten(&item.coverage) {
+            item.coverage = kres_core::PLACEHOLDER_COVERAGE.to_string();
         }
     }
 }

@@ -846,10 +846,19 @@ impl TaskManager {
         });
         for item in &mut items {
             let live = g.todo.iter().find(|live| same_todo_item(item, live));
+            // Coverage is write-once. Settled evidence beats anything a
+            // later round sends, so a real sentence already on the live
+            // row wins; the placeholder does not, or the agent's first
+            // real answer could never land.
+            if let Some(live) = live {
+                if !crate::coverage_is_unwritten(&live.coverage) {
+                    item.coverage.clone_from(&live.coverage);
+                }
+            }
             if matches_completed(item, completed_todo_ids) {
                 item.status = TodoStatus::Done;
-                if item.coverage.is_empty() {
-                    item.coverage = "completed by the reaped task".to_string();
+                if crate::coverage_is_unwritten(&item.coverage) {
+                    item.coverage = crate::PLACEHOLDER_COVERAGE.to_string();
                 }
             } else if let Some(live) = live {
                 // Dependencies admitted into the live scheduler are
@@ -873,7 +882,9 @@ impl TaskManager {
                 }
                 if live.status == TodoStatus::InProgress || live.status.is_terminal() {
                     item.status = live.status;
-                    if item.coverage.is_empty() && !live.coverage.is_empty() {
+                    if crate::coverage_is_unwritten(&item.coverage)
+                        && !crate::coverage_is_unwritten(&live.coverage)
+                    {
                         item.coverage.clone_from(&live.coverage);
                     }
                 }
@@ -916,8 +927,8 @@ impl TaskManager {
             let mut retained = live.clone();
             if matches_completed(&retained, completed_todo_ids) {
                 retained.status = TodoStatus::Done;
-                if retained.coverage.is_empty() {
-                    retained.coverage = "completed by the reaped task".to_string();
+                if crate::coverage_is_unwritten(&retained.coverage) {
+                    retained.coverage = crate::PLACEHOLDER_COVERAGE.to_string();
                 }
             }
             items.push(retained);
@@ -1086,8 +1097,11 @@ impl TaskManager {
             return false;
         };
         item.status = TodoStatus::Done;
-        if item.coverage.is_empty() {
-            item.coverage = "completed by the reaped task".to_string();
+        // A fallback so the row is never invisible to the agent's
+        // dedup step, NOT an answer: `coverage_is_unwritten` lets the
+        // todo agent's real sentence replace it when it arrives.
+        if crate::coverage_is_unwritten(&item.coverage) {
+            item.coverage = crate::PLACEHOLDER_COVERAGE.to_string();
         }
         sync_plan_locked(&mut g);
         true
@@ -1960,6 +1974,74 @@ mod tests {
             "in-flight tasks must consume the remaining turn budget"
         );
         hold.notify_waiters();
+    }
+
+    /// The reaper marks a row done BEFORE the todo agent is asked to
+    /// describe it, so the placeholder is always in place by the time
+    /// the real sentence arrives. If write-once treats the placeholder
+    /// as settled evidence, the agent's answer is discarded every
+    /// time — 74 of 74 rows on the 2026-08-07 fair.c review — and the
+    /// dedup step that reads coverage goes blind.
+    #[tokio::test]
+    async fn a_real_coverage_sentence_replaces_the_placeholder() {
+        let mgr = TaskManager::new();
+        let mut live = TodoItem::new("audit thing", "review");
+        live.id = "review-audit-thing".into();
+        mgr.replace_todo(vec![live]).await;
+
+        // Reaper publishes the completion first.
+        assert!(mgr.mark_todo_done("review-audit-thing").await);
+        assert_eq!(
+            mgr.todo_snapshot().await[0].coverage,
+            crate::PLACEHOLDER_COVERAGE,
+            "the fallback keeps the row visible to dedup in the meantime"
+        );
+
+        // Then the todo agent returns what the task actually examined.
+        let snapshot = mgr.todo_snapshot().await;
+        let mut described = snapshot[0].clone();
+        described.coverage = "Examined avg_vruntime and place_entity in fair.c".into();
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![described],
+            completed_todo_ids: vec!["review-audit-thing".into()],
+            inference_snapshot: snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+
+        let after = mgr.todo_snapshot().await;
+        assert_eq!(after[0].status, TodoStatus::Done);
+        assert_eq!(
+            after[0].coverage,
+            "Examined avg_vruntime and place_entity in fair.c"
+        );
+    }
+
+    /// Write-once still holds for genuine coverage: a later round may
+    /// not paraphrase settled evidence.
+    #[tokio::test]
+    async fn real_coverage_is_not_overwritten_by_a_later_round() {
+        let mgr = TaskManager::new();
+        let mut live = TodoItem::new("audit thing", "review");
+        live.id = "review-audit-thing".into();
+        live.status = TodoStatus::Done;
+        live.coverage = "First, settled description".into();
+        mgr.replace_todo(vec![live]).await;
+
+        let snapshot = mgr.todo_snapshot().await;
+        let mut reworded = snapshot[0].clone();
+        reworded.coverage = "Second, competing description".into();
+        mgr.merge_inferred_state(InferredTodoUpdate {
+            items: vec![reworded],
+            completed_todo_ids: vec!["review-audit-thing".into()],
+            inference_snapshot: snapshot,
+            plan_rewrite: None,
+        })
+        .await;
+        assert_eq!(
+            mgr.todo_snapshot().await[0].coverage,
+            "First, settled description"
+        );
     }
 
     #[tokio::test]

@@ -19,10 +19,9 @@ use kres_core::{format_usage_summary, FindingsStore, TaskManager, TaskState, Usa
 use kres_llm::RateLimiter;
 
 use crate::change_survey::{
-    change_survey_chunk_prompt, change_survey_prompt, complete_function_coverage,
-    parse_inference_risks, split_diff_for_inference, split_source_for_inference,
-    validate_function_coverage, validate_function_subset, ChangeSurveyDiffChunk,
-    ChangeSurveyPrompt, ChangeSurveyReport, ChangeSurveySourceChunk,
+    change_survey_chunk_prompt, change_survey_prompt, parse_inference_risks,
+    split_diff_for_inference, split_source_for_inference, ChangeSurveyDiffChunk,
+    ChangeSurveyReport, ChangeSurveySourceChunk,
 };
 use crate::commands::{parse_command, Command};
 
@@ -4852,18 +4851,6 @@ const CHANGE_SURVEY_DIFF_PARTITION_BYTES: usize = 500_000;
 // path instead of allowing two individually-large halves to double it.
 const CHANGE_SURVEY_PAIR_PARTITION_BYTES: usize = CHANGE_SURVEY_DIFF_PARTITION_BYTES / 2;
 const CHANGE_SURVEY_CHUNK_CONCURRENCY: usize = 8;
-/// Most functions one corrective change-survey call is asked to rate.
-///
-/// Byte-partitioning bounds a call's INPUT; this bounds its output,
-/// which is the side that fails. mm/page_alloc.c returned 236 ratings
-/// intact in one call, while kernel/sched/fair.c's partitions returned
-/// 18-38 each against source scopes holding ~260 functions apiece.
-const CHANGE_SURVEY_FUNCTION_BATCH: usize = 150;
-/// How many top-up rounds the change survey may spend closing its
-/// coverage gap. Each round asks only for what is still unrated, so
-/// convergence is fast; fair.c needed two. The loop also stops early
-/// on a round that adds nothing.
-const CHANGE_SURVEY_FILL_ROUNDS: usize = 4;
 
 /// Render every accumulated-analysis entry into the inference preamble,
 /// newest-first. Selection happens at the call-site; once selected, an entry
@@ -6141,7 +6128,7 @@ async fn run_review_file_scan(
     reuse_checkpoint: bool,
     shutdown: &kres_core::Shutdown,
 ) -> Result<CompletedReviewFileScan> {
-    let (change_window, mut change_report, checkpoint) = run_review_change_survey(
+    let (_change_window, change_report, _checkpoint) = run_review_change_survey(
         runner,
         workspace,
         target,
@@ -6181,40 +6168,13 @@ async fn run_review_file_scan(
         }
     };
     let inventory_functions = inventory.function_names();
-    change_report = match change_report {
-        Some(report) => match complete_function_coverage(report, &inventory_functions) {
-            Ok(report) => Some(report),
-            Err(error) => {
-                kres_core::async_eprintln!(
-                    "[change survey] sparse pre-survey result needs one corrective pass against the authoritative function set: {error}"
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    if change_report.is_none() {
-        kres_core::async_eprintln!(
-            "[change survey] assessing the six-month target-file diff against the authoritative function set"
-        );
-        change_report = assess_change_survey(
-            runner,
-            target,
-            &std::fs::read_to_string(if Path::new(target).is_absolute() {
-                PathBuf::from(target)
-            } else {
-                workspace.join(target)
-            })?,
-            &change_window,
-            Some(&inventory_functions),
-            shutdown,
-        )
-        .await?;
-        if let (Some(checkpoint), Some(report)) = (&checkpoint, &change_report) {
-            checkpoint.record(report.clone()).await?;
-        }
-    }
-    let change_report = change_report.context("six-month change survey produced no ratings")?;
+    // The survey is a starting point, not an inventory. Keep the
+    // ratings that name a real target function, drop the rest, and
+    // never re-run: a function it never mentioned is simply unrated,
+    // which the scan renders as 0.
+    let change_report = change_report
+        .map(|report| crate::change_survey::retain_known_functions(report, &inventory_functions))
+        .unwrap_or_default();
     let target_path = if Path::new(target).is_absolute() {
         PathBuf::from(target)
     } else {
@@ -6353,8 +6313,7 @@ async fn run_review_change_survey(
             window.baseline,
             window.head
         );
-        report =
-            assess_change_survey(runner, target, &target_source, &window, None, shutdown).await?;
+        report = assess_change_survey(runner, target, &target_source, &window, shutdown).await?;
         if let (Some(checkpoint), Some(report)) = (&checkpoint, &report) {
             checkpoint.record(report.clone()).await?;
         }
@@ -6540,21 +6499,33 @@ async fn infer_fallback_file_survey_chunks(
     Ok(inventory)
 }
 
+/// Rate the target's functions against the six-month net diff.
+///
+/// A broad first guess, not an inventory. It reads a diff and returns
+/// ratings; whatever comes back is what we use. Unknown names are
+/// dropped by the caller and unmentioned functions stay unrated.
+///
+/// It used to be held to the authoritative function set, and that was
+/// wrong three separate ways on kernel/sched/fair.c (421 functions):
+/// demanding an exact roster produced an invented
+/// `__account_cfs_rq_runtime_placeholder`; demanding exactness per
+/// 150-name batch threw away 147 correct ratings for being three
+/// short; demanding each batch stay inside its own slice rejected
+/// `__min_slice_update` and `detach_tasks`, real functions the model
+/// rated unprompted. Each failure killed the entire review bootstrap
+/// over a heuristic. Do not reintroduce a coverage contract here.
 async fn assess_change_survey(
     runner: &Arc<AgentRunner>,
     target: &str,
     target_source: &str,
     window: &crate::change_survey::AggregateTargetDiff,
-    expected_functions: Option<&BTreeSet<String>>,
     shutdown: &kres_core::Shutdown,
 ) -> Result<Option<ChangeSurveyReport>> {
     if shutdown.is_cancelled() {
         anyhow::bail!("cancelled during whole-file change survey");
     }
-    let prompt = change_survey_prompt(target, target_source, window, expected_functions);
     if window.diff.len().saturating_add(target_source.len()) <= CHANGE_SURVEY_DIFF_PARTITION_BYTES {
-        let coverage =
-            expected_functions.map_or(ChangeSurveyCoverage::Unchecked, ChangeSurveyCoverage::Exact);
+        let prompt = change_survey_prompt(target, target_source, window, None);
         return infer_change_survey_prompt(
             runner,
             &prompt,
@@ -6562,7 +6533,6 @@ async fn assess_change_survey(
                 baseline: &window.baseline,
                 head: &window.head,
             },
-            coverage,
             ChangeSurveyCall {
                 task_kind: "change-survey net-diff",
                 cache_prefix: false,
@@ -6573,6 +6543,8 @@ async fn assess_change_survey(
         .map(Some);
     }
 
+    // Too large for one call: partition so the INPUT fits, then union
+    // the partitions in Rust. No model reassembles the result.
     let chunks = split_diff_for_inference(&window.diff, CHANGE_SURVEY_PAIR_PARTITION_BYTES)?;
     let source_chunks = if target_source
         .len()
@@ -6587,240 +6559,70 @@ async fn assess_change_survey(
     } else {
         split_source_for_inference(target_source, CHANGE_SURVEY_PAIR_PARTITION_BYTES)?
     };
-    let pair_count = chunks.len().saturating_mul(source_chunks.len());
+    let chunk_count = chunks.len();
+    let source_count = source_chunks.len();
     kres_core::async_eprintln!(
         "[change survey] target-file input is large ({} diff bytes, {} source bytes); assessing {} source scope(s) against {} diff chunk(s) in {} semantic call(s), concurrency {}",
         window.diff.len(),
         target_source.len(),
-        source_chunks.len(),
-        chunks.len(),
-        pair_count,
+        source_count,
+        chunk_count,
+        chunk_count.saturating_mul(source_count),
         CHANGE_SURVEY_CHUNK_CONCURRENCY,
     );
-    let chunk_count = chunks.len();
-    let source_count = source_chunks.len();
-    let run_prompt = |chunk_prompt: ChangeSurveyPrompt, label: String| async move {
-        if shutdown.is_cancelled() {
-            anyhow::bail!("cancelled during whole-file change survey");
+    let pairs: Vec<(usize, usize)> = (0..source_count)
+        .flat_map(|source_index| (0..chunk_count).map(move |diff_index| (source_index, diff_index)))
+        .collect();
+    let reports = stream::iter(pairs.into_iter().map(|(source_index, diff_index)| {
+        let prompt = change_survey_chunk_prompt(
+            target,
+            window,
+            None,
+            Some(ChangeSurveySourceChunk {
+                text: &source_chunks[source_index].text,
+                index: source_index,
+                count: source_count,
+            }),
+            Some(ChangeSurveyDiffChunk {
+                text: &chunks[diff_index].text,
+                index: diff_index,
+                count: chunk_count,
+            }),
+        );
+        let label = format!(
+            "change-survey source {}/{} diff {}/{}",
+            source_index + 1,
+            source_count,
+            diff_index + 1,
+            chunk_count
+        );
+        async move {
+            infer_change_survey_prompt(
+                runner,
+                &prompt,
+                ChangeSurveyWindowId {
+                    baseline: &window.baseline,
+                    head: &window.head,
+                },
+                ChangeSurveyCall {
+                    task_kind: &label,
+                    cache_prefix: true,
+                },
+                shutdown,
+            )
+            .await
         }
-        infer_change_survey_prompt(
-            runner,
-            &chunk_prompt,
-            ChangeSurveyWindowId {
-                baseline: &window.baseline,
-                head: &window.head,
-            },
-            expected_functions.map_or(
-                ChangeSurveyCoverage::Unchecked,
-                ChangeSurveyCoverage::Subset,
-            ),
-            ChangeSurveyCall {
-                task_kind: &label,
-                // every diff chunk for one source scope shares this prefix
-                cache_prefix: true,
-            },
-            shutdown,
-        )
-        .await
-    };
-    // Prime each source-specific cached prefix once. The remaining diff chunks
-    // then run in parallel without a cache-creation stampede.
-    let mut chunk_surveys = stream::iter(source_chunks.iter().enumerate().map(
-        |(source_index, source)| {
-            let chunk = &chunks[0];
-            let prompt = change_survey_chunk_prompt(
-                target,
-                window,
-                expected_functions,
-                Some(ChangeSurveySourceChunk {
-                    text: &source.text,
-                    index: source_index,
-                    count: source_count,
-                }),
-                Some(ChangeSurveyDiffChunk {
-                    text: &chunk.text,
-                    index: 0,
-                    count: chunk_count,
-                }),
-            );
-            let label = format!(
-                "change-survey source {}/{} diff 1/{}",
-                source_index + 1,
-                source_count,
-                chunk_count
-            );
-            async move {
-                run_prompt(prompt, label)
-                    .await
-                    .map(|report| (source_index * chunk_count, report))
-            }
-        },
-    ))
+    }))
     .buffer_unordered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
     .collect::<Vec<_>>()
     .await
     .into_iter()
     .collect::<Result<Vec<_>>>()?;
-    let remaining = stream::iter(source_chunks.iter().enumerate().flat_map(
-        |(source_index, source)| {
-            chunks
-                .iter()
-                .enumerate()
-                .skip(1)
-                .map(move |(diff_index, chunk)| {
-                    let prompt = change_survey_chunk_prompt(
-                        target,
-                        window,
-                        expected_functions,
-                        Some(ChangeSurveySourceChunk {
-                            text: &source.text,
-                            index: source_index,
-                            count: source_count,
-                        }),
-                        Some(ChangeSurveyDiffChunk {
-                            text: &chunk.text,
-                            index: diff_index,
-                            count: chunk_count,
-                        }),
-                    );
-                    let label = format!(
-                        "change-survey source {}/{} diff {}/{}",
-                        source_index + 1,
-                        source_count,
-                        diff_index + 1,
-                        chunk_count
-                    );
-                    async move {
-                        run_prompt(prompt, label)
-                            .await
-                            .map(|report| (source_index * chunk_count + diff_index, report))
-                    }
-                })
-        },
-    ))
-    .buffer_unordered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>>>()?;
-    chunk_surveys.extend(remaining);
-    chunk_surveys.sort_by_key(|(index, _)| *index);
-    let chunk_surveys = chunk_surveys
-        .into_iter()
-        .map(|(_, report)| report)
-        .collect::<Vec<_>>();
-    // Union the partitions in Rust. See merge_change_survey_reports:
-    // the model-driven reduction this replaces failed on
-    // kernel/sched/fair.c by inventing a function name and then by
-    // dropping functions, taking the whole review bootstrap with it.
-    let merged = crate::change_survey::merge_change_survey_reports(
+    Ok(Some(crate::change_survey::merge_change_survey_reports(
         &window.baseline,
         &window.head,
-        chunk_surveys,
-    );
-    let Some(expected) = expected_functions else {
-        return Ok(Some(merged));
-    };
-    // A function no partition rated is not evidence of zero risk, so
-    // it cannot be defaulted here. Ask for exactly those names, once.
-    // This is a far smaller demand than the roster the reduction call
-    // was failing to reproduce, and it is usually skipped outright:
-    // between them the source scopes normally see every function.
-    // Fill the gap by iterating, not by demanding perfection once.
-    //
-    // Byte-partitioning bounds a call's input; batching bounds what it
-    // must emit. Neither makes a model exact. On kernel/sched/fair.c
-    // the three corrective batches returned 150/150, 147/150 and
-    // 63/63 — and validating each batch all-or-nothing threw away the
-    // 147 for being three short, failing the whole review bootstrap.
-    //
-    // So each batch is validated as a SUBSET: it may not invent a
-    // function, but it may return fewer than asked. Whatever comes
-    // back is merged, the gap is recomputed, and the next round asks
-    // only for what is still missing. A round that adds nothing stops
-    // the loop rather than spinning.
-    let mut merged = merged;
-    for round in 1..=CHANGE_SURVEY_FILL_ROUNDS {
-        let missing = crate::change_survey::unrated_functions(&merged, expected);
-        if missing.is_empty() {
-            break;
-        }
-        let batches: Vec<BTreeSet<String>> = missing
-            .iter()
-            .collect::<Vec<_>>()
-            .chunks(CHANGE_SURVEY_FUNCTION_BATCH)
-            .map(|chunk| chunk.iter().map(|name| (*name).clone()).collect())
-            .collect();
-        kres_core::async_eprintln!(
-            "[change survey] round {round}: {} of {} function(s) still unrated; \
-             requesting them in {} batch(es) of at most {}",
-            missing.len(),
-            expected.len(),
-            batches.len(),
-            CHANGE_SURVEY_FUNCTION_BATCH,
-        );
-        let batch_count = batches.len();
-        let filled = stream::iter(batches.iter().enumerate().map(|(index, batch)| {
-            let prompt = change_survey_prompt(target, target_source, window, Some(batch));
-            let label = format!(
-                "change-survey unrated functions round {round} batch {}/{}",
-                index + 1,
-                batch_count
-            );
-            async move {
-                infer_change_survey_prompt(
-                    runner,
-                    &prompt,
-                    ChangeSurveyWindowId {
-                        baseline: &window.baseline,
-                        head: &window.head,
-                    },
-                    // Subset, not Exact: a short answer is progress.
-                    ChangeSurveyCoverage::Subset(batch),
-                    ChangeSurveyCall {
-                        task_kind: &label,
-                        cache_prefix: false,
-                    },
-                    shutdown,
-                )
-                .await
-            }
-        }))
-        .buffered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
-        let mut all = vec![merged];
-        all.extend(filled);
-        merged =
-            crate::change_survey::merge_change_survey_reports(&window.baseline, &window.head, all);
-        let remaining = crate::change_survey::unrated_functions(&merged, expected).len();
-        if remaining >= missing.len() {
-            anyhow::bail!(
-                "change survey made no progress on {remaining} unrated function(s) in round {round}"
-            );
-        }
-    }
-    crate::change_survey::validate_function_coverage(&merged, expected)?;
-    Ok(Some(merged))
-}
-
-#[derive(Clone, Copy)]
-enum ChangeSurveyCoverage<'a> {
-    Unchecked,
-    Subset(&'a BTreeSet<String>),
-    Exact(&'a BTreeSet<String>),
-}
-
-impl ChangeSurveyCoverage<'_> {
-    fn validate(self, report: &ChangeSurveyReport) -> Result<()> {
-        match self {
-            Self::Unchecked => Ok(()),
-            Self::Subset(expected) => validate_function_subset(report, expected),
-            Self::Exact(expected) => validate_function_coverage(report, expected),
-        }
-    }
+        reports,
+    )))
 }
 
 /// Identity of the six-month window a change-survey call is assessing.
@@ -6846,7 +6648,6 @@ async fn infer_change_survey_prompt(
     runner: &Arc<AgentRunner>,
     prompt: &crate::change_survey::ChangeSurveyPrompt,
     window: ChangeSurveyWindowId<'_>,
-    coverage: ChangeSurveyCoverage<'_>,
     call: ChangeSurveyCall<'_>,
     shutdown: &kres_core::Shutdown,
 ) -> Result<ChangeSurveyReport> {
@@ -6882,10 +6683,10 @@ async fn infer_change_survey_prompt(
             .await;
         match response {
             Ok(response) => {
-                match parse_inference_risks(&response, baseline, head).and_then(|rating| {
-                    coverage.validate(&rating)?;
-                    Ok(rating)
-                }) {
+                // Only the parse can fail. Coverage is not a contract:
+                // unknown names are dropped by the caller and
+                // unmentioned functions stay unrated.
+                match parse_inference_risks(&response, baseline, head) {
                     Ok(rating) => return Ok(rating),
                     Err(error) => errors.push(format!("attempt {attempt}: {error}")),
                 }

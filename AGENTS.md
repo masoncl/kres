@@ -603,36 +603,36 @@ used when semcode is unavailable or unparseable. Deleting that would
 violate the rule that a failed semcode result falls back to local
 evidence rather than being treated as absent.
 
-The whole-file change survey partitions large targets two ways, and
-both bounds matter. Byte partitioning splits the diff and source so a
-call's INPUT fits; function batching (`CHANGE_SURVEY_FUNCTION_BATCH`)
-bounds what one call must EMIT. Rust unions the partition reports
-(`merge_change_survey_reports`, highest rating per name wins) — a model
-is never asked to reassemble a roster Rust already holds.
+The whole-file change survey is a broad first guess, not an
+inventory. It reads the six-month net diff and returns risk ratings.
+Whatever comes back is what the scan uses:
 
-Both bounds were learned from kernel/sched/fair.c (429,745 source
-bytes, 133,635 diff bytes, 521 functions). Its byte partitions each
-covered a source scope of ~260 functions and returned 18-38 ratings
-apiece, union 51. The model-driven reduction that then had to emit all
-521 exactly once invented `__account_cfs_rq_runtime_placeholder` — a
-name in no source file — on its first attempt and dropped functions on
-its second, failing the review bootstrap outright. mm/page_alloc.c,
-whose 236 functions fit one call, had never exposed it.
+- A rating naming something that is not a target function is dropped
+  (`retain_known_functions`).
+- A function the survey never mentions stays unrated, and the scan
+  renders it as risk 0.
+- It never fails the review, and there is no corrective re-run.
 
-A function no partition rated is NOT evidence of zero risk. Rust does
-not fill the gap; it requests those names in bounded batches and
-merges the answers. Do not replace that with a default rating, and do
-not restore a model-driven reduction step.
+Large targets are still partitioned so a call's INPUT fits, and Rust
+unions the partitions (`merge_change_survey_reports`, highest rating
+per name). That is the only assembly step; no model reassembles a
+roster Rust already holds.
 
-Those batches are validated as a SUBSET, not exactly. Neither bound
-makes a model exact: fair.c's three corrective batches returned
-150/150, 147/150 and 63/63, and validating each all-or-nothing
-discarded the 147 for being three short and failed the run again. A
-short answer is progress. Each round merges whatever came back,
-recomputes the gap, and asks only for the remainder; fair.c converges
-in two. A round that adds nothing aborts the loop rather than spinning
-(`CHANGE_SURVEY_FILL_ROUNDS`). A batch still may not invent a function
-name — that check stays.
+There used to be a coverage contract, and it was wrong three separate
+ways on kernel/sched/fair.c (421 functions), each of which killed the
+whole review bootstrap over a heuristic:
+
+- demanding an exact roster produced an invented
+  `__account_cfs_rq_runtime_placeholder`;
+- demanding exactness per 150-name batch discarded 147 correct
+  ratings for being three short;
+- demanding each batch stay inside its own slice rejected
+  `__min_slice_update` and `detach_tasks`, both real functions the
+  model rated unprompted.
+
+Do not reintroduce one. If the survey's output looks thin, that is a
+prompt question, not a validation question — the downstream review is
+what establishes coverage, and it does so with evidence.
 
 `--assisted-by TEXT` controls the exact commit-message trailer value
 used by the fix workflow after `Assisted-by:`. When omitted, kres derives

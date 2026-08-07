@@ -18,14 +18,14 @@ set -euo pipefail
 
 usage() {
   cat <<USAGE
-Usage: $0 --provider {anthropic,openai,claude,codex} [--api-key KEY]
+Usage: $0 --provider {anthropic,openai,claude,codex,meta} [--api-key KEY]
           [--slow MODEL] [--model MODEL]
           [--semcode PATH] [--review-prompts PATH] [--overwrite]
 
 Options:
   --dest DIR             Destination directory (default: \$HOME/.kres)
-  --provider NAME        Required provider: anthropic, openai, claude, or codex
-  --api-key KEY          API key literal. Required for anthropic and openai;
+  --provider NAME        Required provider: anthropic, openai, claude, codex, or meta
+  --api-key KEY          API key literal. Required for anthropic, openai, and meta;
                          rejected for claude and codex, which use CLI auth.
   --slow MODEL           Override the provider's default slow model selector
   --model MODEL          Override the provider's default fast/main/todo selector
@@ -114,14 +114,20 @@ case "${PROVIDER}" in
     : "${SLOW_MODEL:=codex-codes.json:gpt-5.6-sol}"
     CLASSIFIER_MODEL="codex-codes.json:gpt-5.6-sol"
     ;;
+  meta)
+    MODEL_CONFIGS=(meta.json)
+    : "${MODEL:=meta.json:muse-spark-1.2}"
+    : "${SLOW_MODEL:=meta.json:muse-spark-1.2}"
+    CLASSIFIER_MODEL="meta.json:muse-spark-1.2"
+    ;;
   *)
-    echo "error: unsupported provider '${PROVIDER}'; expected anthropic, openai, claude, or codex" >&2
+    echo "error: unsupported provider '${PROVIDER}'; expected anthropic, openai, claude, codex, or meta" >&2
     exit 2
     ;;
 esac
 
 case "${PROVIDER}" in
-  anthropic|openai)
+  anthropic|openai|meta)
     if [[ -z "${API_KEY}" ]]; then
       echo "error: --api-key is required for provider '${PROVIDER}'" >&2
       exit 2

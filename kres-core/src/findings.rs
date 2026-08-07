@@ -155,6 +155,24 @@ pub struct Finding {
     #[schemars(skip)]
     pub details: Vec<FindingDetail>,
 
+    /// Wire-only signal: open questions this delta has SETTLED.
+    ///
+    /// `open_questions` is unioned across deltas, so without an
+    /// explicit close channel a question can never leave a finding.
+    /// Observed on the 2026-08-07 kernel/sched/fair.c review: 1,527
+    /// open questions across 107 findings, one finding carrying 108,
+    /// including entries whose text began "RESOLVED (negative): ..."
+    /// — answers filed in the open list because there was nowhere
+    /// else to put them — and the same question re-appended up to
+    /// eight times as "OPEN:", then "STILL OPEN:".
+    ///
+    /// Each entry must be the question text being closed. Matching is
+    /// exact after trimming: Rust does not classify prose, so a
+    /// paraphrase closes nothing (see AGENTS.md). Never serialized on
+    /// stored records — `merge_into` consumes the signal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_questions: Vec<String>,
+
     /// Wire-only signal: when `true` on an incoming delta AND the
     /// matching-id existing record is `Status::Invalidated`, the
     /// existing record flips back to `Status::Active`. Intended for
@@ -253,6 +271,98 @@ pub fn findings_for_prompt_history(findings: &[Finding]) -> Vec<Finding> {
 }
 
 #[cfg(test)]
+mod open_question_tests {
+    use super::*;
+
+    fn with_questions(id: &str, questions: &[&str]) -> Finding {
+        Finding {
+            id: id.into(),
+            title: "t".into(),
+            severity: Severity::Medium,
+            status: Status::Active,
+            relevant_symbols: vec![],
+            relevant_file_sections: vec![],
+            summary: "s".into(),
+            reproducer_sketch: "r".into(),
+            impact: "i".into(),
+            mechanism_detail: None,
+            fix_sketch: None,
+            open_questions: questions.iter().map(|q| (*q).to_string()).collect(),
+            first_seen_task: None,
+            last_updated_task: None,
+            related_finding_ids: vec![],
+            reactivate: false,
+            resolved_questions: vec![],
+            details: vec![],
+            introduced_by: None,
+            first_seen_at: None,
+        }
+    }
+
+    /// Without a close channel `open_questions` only ever grows: it is
+    /// unioned across deltas, so a settled question stays forever and
+    /// answers get filed as new "RESOLVED ..." entries beside it.
+    #[test]
+    fn a_delta_can_close_an_open_question() {
+        let mut list = vec![with_questions(
+            "f",
+            &["Is PARANOID_AVG default-on?", "Bound on se->slice?"],
+        )];
+        let mut delta = with_questions("f", &[]);
+        delta.resolved_questions = vec!["Is PARANOID_AVG default-on?".into()];
+        let counts = apply_delta_to_list(&mut list, &[delta], Some("task"), None);
+        assert!(counts.changed);
+        assert_eq!(
+            list[0].open_questions,
+            vec!["Bound on se->slice?".to_string()]
+        );
+    }
+
+    #[test]
+    fn closing_matches_exactly_not_by_paraphrase() {
+        // Rust must not decide from prose whether a question is
+        // answered; a near-miss closes nothing.
+        let mut list = vec![with_questions("f", &["Is PARANOID_AVG default-on?"])];
+        let mut delta = with_questions("f", &[]);
+        delta.resolved_questions = vec!["is paranoid_avg default on".into()];
+        apply_delta_to_list(&mut list, &[delta], Some("task"), None);
+        assert_eq!(list[0].open_questions.len(), 1, "paraphrase must not close");
+
+        // Whitespace differences do not count as a paraphrase.
+        let mut delta = with_questions("f", &[]);
+        delta.resolved_questions = vec!["  Is PARANOID_AVG default-on?  ".into()];
+        apply_delta_to_list(&mut list, &[delta], Some("task"), None);
+        assert!(list[0].open_questions.is_empty(), "trimmed match closes");
+    }
+
+    #[test]
+    fn a_delta_can_add_and_close_in_one_turn() {
+        let mut list = vec![with_questions("f", &["old question"])];
+        let mut delta = with_questions("f", &["new question"]);
+        delta.resolved_questions = vec!["old question".into()];
+        apply_delta_to_list(&mut list, &[delta], Some("task"), None);
+        assert_eq!(list[0].open_questions, vec!["new question".to_string()]);
+    }
+
+    #[test]
+    fn the_close_signal_is_never_stored() {
+        // Wire-only, like `reactivate`: a stored record must not carry
+        // it into the next prompt.
+        let mut list: Vec<Finding> = Vec::new();
+        let mut delta = with_questions("fresh", &["q"]);
+        delta.resolved_questions = vec!["something".into()];
+        apply_delta_to_list(&mut list, &[delta], Some("task"), None);
+        assert!(list[0].resolved_questions.is_empty());
+
+        let mut delta = with_questions("fresh", &[]);
+        delta.resolved_questions = vec!["q".into()];
+        apply_delta_to_list(&mut list, &[delta], Some("task"), None);
+        assert!(list[0].resolved_questions.is_empty());
+        assert!(list[0].open_questions.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod redaction_tests {
     use super::*;
 
@@ -284,6 +394,7 @@ mod redaction_tests {
             last_updated_task: Some("task".into()),
             related_finding_ids: vec![],
             reactivate: false,
+            resolved_questions: vec![],
             details: vec![],
             introduced_by: None,
             first_seen_at: None,
@@ -588,6 +699,10 @@ pub fn apply_delta_to_list(
                 // details is a store-local concept, not a wire
                 // contract the agents know about.
                 new_entry.reactivate = false;
+                // A brand-new finding cannot have settled a question
+                // that was never on it; drop the signal rather than
+                // storing it.
+                new_entry.resolved_questions.clear();
                 new_entry.details.clear();
                 if let Some(t) = task_id {
                     if new_entry.first_seen_task.is_none() {
@@ -802,6 +917,9 @@ fn merge_into(existing: &mut Finding, incoming: &Finding, task_id: Option<&str>)
         &incoming.relevant_file_sections,
     );
     changed |= union_strings(&mut existing.open_questions, &incoming.open_questions);
+    // Additions first, then the explicit closes, so one delta can
+    // both raise a new question and settle an old one.
+    changed |= close_questions(&mut existing.open_questions, &incoming.resolved_questions);
     changed |= union_strings(
         &mut existing.related_finding_ids,
         &incoming.related_finding_ids,
@@ -1023,6 +1141,28 @@ fn union_sections(dst: &mut Vec<RelevantFileSection>, src: &[RelevantFileSection
     changed
 }
 
+/// Drop every open question this delta explicitly settled.
+///
+/// Exact match after trimming. Rust does not decide from prose
+/// whether a question is answered — a model says so through
+/// `resolved_questions` or the question stays open.
+fn close_questions(dst: &mut Vec<String>, resolved: &[String]) -> bool {
+    if resolved.is_empty() {
+        return false;
+    }
+    let closing: std::collections::BTreeSet<&str> = resolved
+        .iter()
+        .map(|q| q.trim())
+        .filter(|q| !q.is_empty())
+        .collect();
+    if closing.is_empty() {
+        return false;
+    }
+    let before = dst.len();
+    dst.retain(|q| !closing.contains(q.trim()));
+    before != dst.len()
+}
+
 fn union_strings(dst: &mut Vec<String>, src: &[String]) -> bool {
     let mut changed = false;
     for s in src {
@@ -1172,6 +1312,7 @@ mod tests {
             last_updated_task: None,
             related_finding_ids: vec![],
             reactivate: false,
+            resolved_questions: vec![],
             details: vec![],
             introduced_by: None,
             first_seen_at: None,

@@ -3596,6 +3596,7 @@ mod tests {
                 related_finding_ids: Vec::new(),
                 details: Vec::new(),
                 reactivate: false,
+                resolved_questions: vec![],
                 introduced_by: None,
             }
         }

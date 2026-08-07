@@ -26,6 +26,8 @@ DEDUP ACROSS LENSES:
   MERGE into a single Finding. Extend summary with detail from each
   lens, union relevant_symbols and relevant_file_sections (dedup by
   filename+line), union related_finding_ids, union open_questions.
+  Carry through any resolved_questions the lenses emitted; a question
+  one lens settled is settled for the merged finding.
   Preserve mechanism_detail and fix_sketch from whichever lens
   captured them (concatenate with '; ' if both did and they're
   distinct; otherwise keep the more specific one).

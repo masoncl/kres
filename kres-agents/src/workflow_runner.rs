@@ -9485,6 +9485,7 @@ mod tests {
             last_updated_task: None,
             related_finding_ids: vec![],
             reactivate: false,
+            resolved_questions: vec![],
             details: vec![],
             introduced_by: None,
             first_seen_at: None,

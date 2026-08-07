@@ -1691,6 +1691,7 @@ try_call_and_extract so it is logged."
                 })
                 .collect(),
             reactivate: false,
+            resolved_questions: vec![],
             introduced_by: None,
             first_seen_at: None,
         }

@@ -882,6 +882,7 @@ mod tests {
             last_updated_task: Some("t2".into()),
             related_finding_ids: vec!["rel_a".into()],
             reactivate: false,
+            resolved_questions: vec![],
             details: vec![],
             introduced_by: None,
             first_seen_at: None,

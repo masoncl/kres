@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -154,6 +154,76 @@ pub(crate) fn complete_function_coverage(
 ) -> Result<ChangeSurveyReport> {
     validate_function_coverage(&survey, expected)?;
     Ok(survey)
+}
+
+/// Union the per-partition change-survey reports into one.
+///
+/// Each partition rates the functions it could see in its own source
+/// scope, so the whole-file answer is the union — not something a
+/// model needs to reassemble. It used to be: the partitioned path
+/// ended in a "reduction" inference call that was handed every
+/// partial report and asked to re-emit a complete, exactly-once
+/// roster. On kernel/sched/fair.c (429,745 source bytes, 521
+/// functions) that call failed twice and killed the review bootstrap
+/// — once by inventing `__account_cfs_rq_runtime_placeholder`, a name
+/// that appears nowhere in the file, and once by simply missing
+/// functions. Reassembling a roster Rust already holds is mechanical
+/// work, and a model asked for 521 exact entries will pad or drop.
+///
+/// Highest rating wins per function, with that entry's reason. A
+/// partition that could not see a function does not get to outvote
+/// one that could, and no rating is manufactured here: a function no
+/// partition rated is simply absent, which the caller must resolve
+/// with a corrective pass rather than by assuming zero risk.
+pub(crate) fn merge_change_survey_reports(
+    baseline: &str,
+    head: &str,
+    reports: Vec<ChangeSurveyReport>,
+) -> ChangeSurveyReport {
+    let mut target: BTreeMap<String, FunctionRisk> = BTreeMap::new();
+    let mut external: BTreeMap<(String, String), ExternalFunctionRisk> = BTreeMap::new();
+    for report in reports {
+        for risk in report.target_function_risks {
+            match target.get(&risk.name) {
+                Some(existing) if existing.risk_rating >= risk.risk_rating => {}
+                _ => {
+                    target.insert(risk.name.clone(), risk);
+                }
+            }
+        }
+        for risk in report.external_major_risks {
+            let key = (risk.name.clone(), risk.file.clone());
+            match external.get(&key) {
+                Some(existing) if existing.risk_rating >= risk.risk_rating => {}
+                _ => {
+                    external.insert(key, risk);
+                }
+            }
+        }
+    }
+    ChangeSurveyReport {
+        baseline: baseline.to_string(),
+        head: head.to_string(),
+        target_function_risks: target.into_values().collect(),
+        external_major_risks: external.into_values().collect(),
+    }
+}
+
+/// Authoritative names no partition rated.
+pub(crate) fn unrated_functions(
+    survey: &ChangeSurveyReport,
+    expected: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let rated: BTreeSet<&str> = survey
+        .target_function_risks
+        .iter()
+        .map(|risk| risk.name.as_str())
+        .collect();
+    expected
+        .iter()
+        .filter(|name| !rated.contains(name.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub(crate) fn validate_function_subset(
@@ -831,6 +901,215 @@ fn open_repo_and_target(workspace: &Path, target: &str) -> Result<(gix::Reposito
 
 #[cfg(test)]
 mod tests {
+
+    fn risk(name: &str, rating: u8, reason: &str) -> FunctionRisk {
+        FunctionRisk {
+            name: name.into(),
+            risk_rating: rating,
+            reason: reason.into(),
+        }
+    }
+
+    fn partition(
+        target: Vec<FunctionRisk>,
+        external: Vec<ExternalFunctionRisk>,
+    ) -> ChangeSurveyReport {
+        ChangeSurveyReport {
+            baseline: "base".into(),
+            head: "head".into(),
+            target_function_risks: target,
+            external_major_risks: external,
+        }
+    }
+
+    /// Each partition sees one source scope, so the whole-file answer
+    /// is their union. This replaced a reduction inference call that
+    /// invented a function name on kernel/sched/fair.c and then missed
+    /// functions on the retry, failing the review bootstrap outright.
+    #[test]
+    fn merge_unions_partitions_and_keeps_the_highest_rating() {
+        let merged = merge_change_survey_reports(
+            "base",
+            "head",
+            vec![
+                partition(
+                    vec![risk("a", 10, "saw a little"), risk("b", 40, "b changed")],
+                    vec![],
+                ),
+                partition(
+                    vec![risk("a", 70, "saw the whole rewrite"), risk("c", 5, "c")],
+                    vec![],
+                ),
+            ],
+        );
+        let got: Vec<(&str, u8, &str)> = merged
+            .target_function_risks
+            .iter()
+            .map(|r| (r.name.as_str(), r.risk_rating, r.reason.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a", 70, "saw the whole rewrite"),
+                ("b", 40, "b changed"),
+                ("c", 5, "c"),
+            ],
+            "a partition that could not see a function must not outvote one that could"
+        );
+        assert_eq!(merged.baseline, "base");
+        assert_eq!(merged.head, "head");
+    }
+
+    #[test]
+    fn merge_keys_external_risks_by_name_and_file() {
+        let ext = |name: &str, file: &str, rating: u8| ExternalFunctionRisk {
+            name: name.into(),
+            file: file.into(),
+            risk_rating: rating,
+            reason: "r".into(),
+        };
+        let merged = merge_change_survey_reports(
+            "base",
+            "head",
+            vec![
+                partition(
+                    vec![],
+                    vec![ext("helper", "mm/a.c", 80), ext("helper", "mm/b.c", 90)],
+                ),
+                partition(vec![], vec![ext("helper", "mm/a.c", 95)]),
+            ],
+        );
+        // Static helpers share names across translation units, so the
+        // identity is (name, file) — collapsing on name alone would
+        // silently drop one of them.
+        assert_eq!(merged.external_major_risks.len(), 2);
+        let a = merged
+            .external_major_risks
+            .iter()
+            .find(|r| r.file == "mm/a.c")
+            .unwrap();
+        assert_eq!(a.risk_rating, 95);
+    }
+
+    /// A function no partition rated is NOT evidence of zero risk, so
+    /// the merge must leave it absent rather than manufacturing a
+    /// rating. The caller resolves the gap with a corrective pass.
+    #[test]
+    fn merge_never_manufactures_a_rating_for_an_unrated_function() {
+        let merged = merge_change_survey_reports(
+            "base",
+            "head",
+            vec![partition(vec![risk("a", 10, "a")], vec![])],
+        );
+        assert_eq!(merged.target_function_risks.len(), 1);
+        let expected: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert!(validate_function_coverage(&merged, &expected).is_err());
+        assert_eq!(
+            unrated_functions(&merged, &expected),
+            ["b", "c"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The fair.c shape: partitions under-report badly, so the gap
+    /// must be batched by function count rather than demanded in one
+    /// call. 51 rated of 521 leaves 470, which at 150 per batch is
+    /// four calls — none of them the 470-name roster that failed.
+    #[test]
+    fn a_large_coverage_gap_is_split_into_bounded_batches() {
+        let merged = merge_change_survey_reports(
+            "base",
+            "head",
+            vec![partition(
+                (0..51).map(|i| risk(&format!("f{i}"), 5, "seen")).collect(),
+                vec![],
+            )],
+        );
+        let expected: BTreeSet<String> = (0..521).map(|i| format!("f{i}")).collect();
+        let missing = unrated_functions(&merged, &expected);
+        assert_eq!(missing.len(), 470);
+        let batch = 150;
+        let batches = missing.len().div_ceil(batch);
+        assert_eq!(batches, 4);
+        // Every missing name lands in exactly one batch: the union of
+        // the batches must be the gap, with nothing invented or lost.
+        let chunks: Vec<Vec<&String>> = missing
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(batch)
+            .map(<[&String]>::to_vec)
+            .collect();
+        assert!(chunks.iter().all(|c| c.len() <= batch));
+        let rejoined: BTreeSet<String> = chunks.into_iter().flatten().cloned().collect();
+        assert_eq!(rejoined, missing);
+    }
+
+    /// The fair.c shape end to end. Batches come back SHORT, not
+    /// wrong: 150/150, 147/150, 63/63. Validating each all-or-nothing
+    /// discarded the 147 and failed the run, so the loop must merge
+    /// short answers and re-ask for the remainder.
+    #[test]
+    fn short_batch_answers_are_kept_and_the_remainder_is_re_asked() {
+        let expected: BTreeSet<String> = (0..421).map(|i| format!("f{i}")).collect();
+        // Partitions covered 58; 363 unrated, as the run reported.
+        let mut merged = merge_change_survey_reports(
+            "base",
+            "head",
+            vec![partition(
+                (0..58).map(|i| risk(&format!("f{i}"), 5, "seen")).collect(),
+                vec![],
+            )],
+        );
+        let round1 = unrated_functions(&merged, &expected);
+        assert_eq!(round1.len(), 363);
+
+        // Round 1: three batches returning 150, 147 and 63.
+        let names: Vec<&String> = round1.iter().collect();
+        let mut answered: Vec<FunctionRisk> = Vec::new();
+        for (start, got) in [(0usize, 150usize), (150, 147), (300, 63)] {
+            for name in names.iter().skip(start).take(got) {
+                answered.push(risk(name, 20, "rated"));
+            }
+        }
+        merged =
+            merge_change_survey_reports("base", "head", vec![merged, partition(answered, vec![])]);
+        let round2 = unrated_functions(&merged, &expected);
+        assert_eq!(round2.len(), 3, "only the three dropped names remain");
+        assert!(round2.len() < round1.len(), "the round made progress");
+
+        // Round 2 closes it.
+        merged = merge_change_survey_reports(
+            "base",
+            "head",
+            vec![
+                merged,
+                partition(
+                    round2.iter().map(|n| risk(n, 30, "rated")).collect(),
+                    vec![],
+                ),
+            ],
+        );
+        assert!(unrated_functions(&merged, &expected).is_empty());
+        validate_function_coverage(&merged, &expected).unwrap();
+    }
+
+    #[test]
+    fn merge_reports_no_gap_when_the_partitions_cover_everything() {
+        let merged = merge_change_survey_reports(
+            "base",
+            "head",
+            vec![
+                partition(vec![risk("a", 1, "a")], vec![]),
+                partition(vec![risk("b", 2, "b")], vec![]),
+            ],
+        );
+        let expected: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        assert!(unrated_functions(&merged, &expected).is_empty());
+        assert!(validate_function_coverage(&merged, &expected).is_ok());
+    }
+
     use super::*;
     use std::process::Command;
 

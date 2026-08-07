@@ -4852,6 +4852,18 @@ const CHANGE_SURVEY_DIFF_PARTITION_BYTES: usize = 500_000;
 // path instead of allowing two individually-large halves to double it.
 const CHANGE_SURVEY_PAIR_PARTITION_BYTES: usize = CHANGE_SURVEY_DIFF_PARTITION_BYTES / 2;
 const CHANGE_SURVEY_CHUNK_CONCURRENCY: usize = 8;
+/// Most functions one corrective change-survey call is asked to rate.
+///
+/// Byte-partitioning bounds a call's INPUT; this bounds its output,
+/// which is the side that fails. mm/page_alloc.c returned 236 ratings
+/// intact in one call, while kernel/sched/fair.c's partitions returned
+/// 18-38 each against source scopes holding ~260 functions apiece.
+const CHANGE_SURVEY_FUNCTION_BATCH: usize = 150;
+/// How many top-up rounds the change survey may spend closing its
+/// coverage gap. Each round asks only for what is still unrated, so
+/// convergence is fast; fair.c needed two. The loop also stops early
+/// on a round that adds nothing.
+const CHANGE_SURVEY_FILL_ROUNDS: usize = 4;
 
 /// Render every accumulated-analysis entry into the inference preamble,
 /// newest-first. Selection happens at the call-site; once selected, an entry
@@ -6697,32 +6709,65 @@ async fn assess_change_survey(
         .into_iter()
         .map(|(_, report)| report)
         .collect::<Vec<_>>();
-    let mut partial_reports = chunk_surveys;
-    while serialized_change_survey_reports_len(&partial_reports)?
-        > CHANGE_SURVEY_DIFF_PARTITION_BYTES
-        && partial_reports.len() > 1
-    {
-        let batches =
-            pack_change_survey_reports(partial_reports, CHANGE_SURVEY_DIFF_PARTITION_BYTES)?;
-        if batches.len() >= batches.iter().map(Vec::len).sum::<usize>() {
-            anyhow::bail!(
-                "change-survey reports cannot be reduced without splitting a typed report"
-            );
+    // Union the partitions in Rust. See merge_change_survey_reports:
+    // the model-driven reduction this replaces failed on
+    // kernel/sched/fair.c by inventing a function name and then by
+    // dropping functions, taking the whole review bootstrap with it.
+    let merged = crate::change_survey::merge_change_survey_reports(
+        &window.baseline,
+        &window.head,
+        chunk_surveys,
+    );
+    let Some(expected) = expected_functions else {
+        return Ok(Some(merged));
+    };
+    // A function no partition rated is not evidence of zero risk, so
+    // it cannot be defaulted here. Ask for exactly those names, once.
+    // This is a far smaller demand than the roster the reduction call
+    // was failing to reproduce, and it is usually skipped outright:
+    // between them the source scopes normally see every function.
+    // Fill the gap by iterating, not by demanding perfection once.
+    //
+    // Byte-partitioning bounds a call's input; batching bounds what it
+    // must emit. Neither makes a model exact. On kernel/sched/fair.c
+    // the three corrective batches returned 150/150, 147/150 and
+    // 63/63 — and validating each batch all-or-nothing threw away the
+    // 147 for being three short, failing the whole review bootstrap.
+    //
+    // So each batch is validated as a SUBSET: it may not invent a
+    // function, but it may return fewer than asked. Whatever comes
+    // back is merged, the gap is recomputed, and the next round asks
+    // only for what is still missing. A round that adds nothing stops
+    // the loop rather than spinning.
+    let mut merged = merged;
+    for round in 1..=CHANGE_SURVEY_FILL_ROUNDS {
+        let missing = crate::change_survey::unrated_functions(&merged, expected);
+        if missing.is_empty() {
+            break;
         }
+        let batches: Vec<BTreeSet<String>> = missing
+            .iter()
+            .collect::<Vec<_>>()
+            .chunks(CHANGE_SURVEY_FUNCTION_BATCH)
+            .map(|chunk| chunk.iter().map(|name| (*name).clone()).collect())
+            .collect();
         kres_core::async_eprintln!(
-            "[change survey] reducing oversized report set through {} semantic batch(es)",
-            batches.len()
+            "[change survey] round {round}: {} of {} function(s) still unrated; \
+             requesting them in {} batch(es) of at most {}",
+            missing.len(),
+            expected.len(),
+            batches.len(),
+            CHANGE_SURVEY_FUNCTION_BATCH,
         );
         let batch_count = batches.len();
-        partial_reports = stream::iter(batches.into_iter().enumerate().map(|(index, batch)| {
-            let prompt =
-                change_survey_reduction_prompt(target, window, &batch, expected_functions, false);
+        let filled = stream::iter(batches.iter().enumerate().map(|(index, batch)| {
+            let prompt = change_survey_prompt(target, target_source, window, Some(batch));
+            let label = format!(
+                "change-survey unrated functions round {round} batch {}/{}",
+                index + 1,
+                batch_count
+            );
             async move {
-                let label = format!(
-                    "change-survey report reduction {}/{}",
-                    index + 1,
-                    batch_count
-                );
                 infer_change_survey_prompt(
                     runner,
                     &prompt,
@@ -6730,13 +6775,10 @@ async fn assess_change_survey(
                         baseline: &window.baseline,
                         head: &window.head,
                     },
-                    expected_functions.map_or(
-                        ChangeSurveyCoverage::Unchecked,
-                        ChangeSurveyCoverage::Subset,
-                    ),
+                    // Subset, not Exact: a short answer is progress.
+                    ChangeSurveyCoverage::Subset(batch),
                     ChangeSurveyCall {
                         task_kind: &label,
-                        // each batch builds its own reduction prefix
                         cache_prefix: false,
                     },
                     shutdown,
@@ -6749,89 +6791,19 @@ async fn assess_change_survey(
         .await
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
-    }
-    let reduction_prompt =
-        change_survey_reduction_prompt(target, window, &partial_reports, expected_functions, true);
-    infer_change_survey_prompt(
-        runner,
-        &reduction_prompt,
-        ChangeSurveyWindowId {
-            baseline: &window.baseline,
-            head: &window.head,
-        },
-        expected_functions.map_or(ChangeSurveyCoverage::Unchecked, ChangeSurveyCoverage::Exact),
-        ChangeSurveyCall {
-            task_kind: "change-survey chunk reduction",
-            cache_prefix: false,
-        },
-        shutdown,
-    )
-    .await
-    .map(Some)
-}
-
-fn serialized_change_survey_reports_len(reports: &[ChangeSurveyReport]) -> Result<usize> {
-    serde_json::to_vec(reports)
-        .map(|serialized| serialized.len())
-        .context("serializing change-survey reports")
-}
-
-fn pack_change_survey_reports(
-    reports: Vec<ChangeSurveyReport>,
-    target_bytes: usize,
-) -> Result<Vec<Vec<ChangeSurveyReport>>> {
-    let mut batches = Vec::new();
-    let mut current = Vec::new();
-    for report in reports {
-        current.push(report);
-        if serialized_change_survey_reports_len(&current)? <= target_bytes {
-            continue;
-        }
-        let last = current.pop().expect("report was just pushed");
-        if current.is_empty() {
-            batches.push(vec![last]);
-        } else {
-            batches.push(std::mem::take(&mut current));
-            current.push(last);
+        let mut all = vec![merged];
+        all.extend(filled);
+        merged =
+            crate::change_survey::merge_change_survey_reports(&window.baseline, &window.head, all);
+        let remaining = crate::change_survey::unrated_functions(&merged, expected).len();
+        if remaining >= missing.len() {
+            anyhow::bail!(
+                "change survey made no progress on {remaining} unrated function(s) in round {round}"
+            );
         }
     }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    Ok(batches)
-}
-
-fn change_survey_reduction_prompt(
-    target: &str,
-    window: &crate::change_survey::AggregateTargetDiff,
-    reports: &[ChangeSurveyReport],
-    expected_functions: Option<&BTreeSet<String>>,
-    final_pass: bool,
-) -> ChangeSurveyPrompt {
-    let reports = serde_json::to_string(reports)
-        .expect("serializing validated change-survey reports cannot fail");
-    let function_scope = if final_pass {
-        expected_functions.map_or_else(
-            || {
-                "Emit one final entry for every target-file function named by the reports. This pre-file-survey result may remain sparse; after the structural inventory is available, a corrective inference pass will assess every missing function.".to_string()
-            },
-            |functions| {
-                format!(
-                    "Emit exactly one target_function_risks entry for every authoritative target function and no others: {}.",
-                    serde_json::to_string(functions)
-                        .expect("serializing function names cannot fail")
-                )
-            },
-        )
-    } else {
-        "Emit one entry for every target-file function named by these reports and no function absent from them. This is an intermediate reduction; do not manufacture no-evidence ratings.".to_string()
-    };
-    ChangeSurveyPrompt {
-        cached_prefix: format!(
-            "Reconcile source/diff chunk risk reports into one six-month net-change assessment for {target}. The reports are partial evidence from one logical diff, not independent commits. A high rating in an early chunk must be lowered when another chunk shows the risky change was fixed. {function_scope} Preserve an external risk only when the combined reports still justify major risk (80-100). Return exactly one raw JSON object {{\"target_function_risks\":[{{\"name\":string,\"risk_rating\":integer,\"reason\":string}}],\"external_major_risks\":[{{\"name\":string,\"file\":string,\"risk_rating\":integer,\"reason\":string}}]}}. Keep reasons to at most 12 words. No markdown or prose outside JSON.\n\nCHUNK REPORTS:\n{reports}\n\n",
-        ),
-        tail: format!("BASELINE: {}\nHEAD: {}", window.baseline, window.head),
-    }
+    crate::change_survey::validate_function_coverage(&merged, expected)?;
+    Ok(Some(merged))
 }
 
 #[derive(Clone, Copy)]
@@ -8430,29 +8402,6 @@ mod tests {
         );
         assert!(prompt.cached_prefix.contains(&source_chunks[0].text));
         assert!(prompt.tail.contains(&chunks[0].text));
-    }
-
-    #[test]
-    fn change_survey_report_batches_keep_each_typed_report_whole() {
-        let reports = (0..3)
-            .map(|index| ChangeSurveyReport {
-                baseline: "base".into(),
-                head: "head".into(),
-                target_function_risks: vec![crate::change_survey::FunctionRisk {
-                    name: format!("function_{index}"),
-                    risk_rating: 50,
-                    reason: "complete typed evidence".into(),
-                }],
-                external_major_risks: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let two_report_size = serialized_change_survey_reports_len(&reports[..2]).unwrap();
-        let batches = pack_change_survey_reports(reports.clone(), two_report_size).unwrap();
-
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0], reports[..2]);
-        assert_eq!(batches[1], reports[2..]);
-        assert_eq!(batches.into_iter().flatten().collect::<Vec<_>>(), reports);
     }
 
     #[test]

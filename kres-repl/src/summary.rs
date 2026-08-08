@@ -328,7 +328,13 @@ fn apply_validation_outputs(
         other => return Err(anyhow!("validation returned invalid severity {other:?}")),
     };
     finding.status = match outputs.get("verdict").and_then(|value| value.as_str()) {
-        Some("Invalid") => Status::Invalidated,
+        // `NotADefect` — the behaviour happens but source evidence shows
+        // it is intended — buckets with `Invalid` because `Status` has no
+        // finer distinction and both mean "do not report this". The
+        // reason survives in the finding-directory artifacts
+        // (metadata `status: not_a_defect`, `intentional_design` in
+        // `reject_reasons`) and in the rendered summary.
+        Some("Invalid" | "NotADefect") => Status::Invalidated,
         Some("Fixed") => Status::Fixed,
         Some("Unconfirmed" | "Unknown") => Status::Unconfirmed,
         Some("Plausible" | "ConfirmedLatent") => Status::Active,

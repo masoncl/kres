@@ -11,9 +11,11 @@ A plain-text summary is produced explicitly by `/summary` or standalone via
 automatically. The markdown variant is
 `/summary-markdown` / `kres --summary-markdown --results <dir>`,
 which writes `summary.md`. Both commands require a configured fast agent.
-Standalone `--summary` and `--summary-markdown` use the fast model for both
-validation roles by default; `--slow NAME` selects a different slow validation
-model for that run. That run:
+Standalone `--summary` and `--summary-markdown` resolve their agent roles like
+any other run: the fast role from `models.fast` and the slow role from
+`models.slow`, with `--slow NAME` selecting a different slow validation model.
+They used to substitute the fast model for the slow role, which filtered
+findings through validations run on the cheaper model. That run:
 
 - exports every canonical finding under `<results>/summary-validation/` and
   runs the existing `validate` workflow against the active source workspace;
@@ -27,7 +29,7 @@ model for that run. That run:
   `~/.kres/commands/summary.md`; `--summary-markdown` picks the
   `summary-markdown` variant at
   `~/.kres/commands/summary-markdown.md`);
-- filters findings validation marked Invalid or Fixed, sorts validated
+- filters findings validation marked Invalid, NotADefect or Fixed, sorts validated
   severities high to low, and runs a final render/combine pass; if none remain,
   writes a deterministic no-findings message;
 - renders each bug with the shared kernel problem-description rules from

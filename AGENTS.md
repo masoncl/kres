@@ -63,6 +63,27 @@ User prompt → Task created → Task thread starts
   helpers that still rely on the old contract. Do this generically by
   following the changed contract; do not hardcode subsystem-specific
   rules. Missing unchanged paths are followups, not a clean review.
+- A workflow step's synthesis call must run under a system prompt that
+  matches the step's declared outputs. `agent: fast` defaults to
+  `workflow-synthesis`; `agent: slow`/`code` default to the per-mode
+  slow prompt; a step may name another with `synthesis_system`. Do not
+  route a schema-bearing synthesis call through the fast-gather prompt:
+  that prompt mandates the `ready_for_slow` envelope, and measured over
+  384 validate runs the model obeyed it instead of the schema on 397 of
+  784 calls, each rejection re-running the whole step.
+- A workflow step's call-invariant instruction text (skills, includes)
+  belongs in the prompt envelope's `stable_instructions` field, which
+  gets its own cache block, not concatenated onto `question`. Nothing
+  task-specific may enter that field: a head that varies per call is
+  written once per call and read never, which costs more than not
+  caching it.
+- Reasoning invariants that quantify over a step's typed arrays, or
+  that read across steps, belong in a `builtin` eval, not in prompt
+  text and not in a `field_check` (the expression language has no
+  quantifier). Validate's two — `validate_claims_wellformed` and
+  `validate_verdict_consistency` — exist because the prompt already
+  stated the rule and runs talked themselves out of it by relabelling a
+  load-bearing unresolved claim as a severity question.
 - Prompt/workflow fixes must be bug-agnostic. Do not add guidance that
   names a specific missed regression, subsystem, file, function, helper,
   or one-off mechanism because a recent run failed to find it. Generalize
@@ -652,7 +673,7 @@ used by the fix workflow after `Assisted-by:`. When omitted, kres derives
 | `/summary-markdown [FILE]` | Same as `/summary` but uses the `summary-markdown` template and defaults the filename to `summary.md` |
 | `/review <target>` | Run the embedded `review` workflow for `<target>` — CLI equivalent of `--prompt 'review: <target>'`. The shipped workflow defines the review prompt contract and lenses; execution uses the REPL task/todo loop so followups become next-turn review todos. This is workflow-only; no markdown prompt fallback exists |
 | `/triage <finding-dir>` | Run the embedded `triage` workflow for a kres-exported finding directory. The workflow includes the golden triage template, preserves followups, and validates that `summary.md` was actually written. This is workflow-only; no alternate prompt path exists |
-| `/validate <finding-dir> [source-workspace]` | Run the embedded `validate` workflow for a kres-exported finding directory against source workspace (default `.`). It validates finding claims with the fast coding agent, verifies reachability/non-latency with the slow coding agent, and writes `summary.md` plus severity updates like `/triage`. This is workflow-only; no alternate prompt path exists |
+| `/validate <finding-dir> [source-workspace]` | Run the embedded `validate` workflow for a kres-exported finding directory against source workspace (default `.`). Three steps: the fast coding agent validates the finding's claims with typed provenance, a second fast step tests whether the surviving preconditions can hold simultaneously, and the slow coding agent proves reachability and writes `summary.md` plus severity updates like `/triage`. Both the claim step and the verdict step are gated by Rust-side `builtin` evals, not prompt text — see [docs/workflow.md](docs/workflow.md). This is workflow-only; no alternate prompt path exists |
 | `/fix <target>` | Run the embedded `fix` workflow for `<target>` — CLI equivalent of `--prompt 'fix: <target>'`. `fix` is workflow-only; no slash-command template or alternate prompt path is used. Drives the research → write-patch → write-commit-message → commit → build → triage/review → publish pipeline (see [docs/workflow.md](docs/workflow.md)) |
 | `/report <file>` | Write all findings to markdown file |
 | `/followup` | Show deferred items (identified but skipped when goal met) |

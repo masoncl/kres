@@ -27,6 +27,36 @@ loop:
    response. `agent: fast` uses the fast model for synthesis; `agent: slow` and
    `agent: code` use the slow model.
 
+The gather phase and the synthesis call run under DIFFERENT system
+prompts, and the split is load-bearing. Gather uses
+`fast-code-agent.system.md`, which mandates the
+`{analysis, followups, ready_for_slow}` envelope. Synthesis must satisfy
+the step's `OUTPUT SCHEMA` instead, so it uses the prompt named by the
+step's optional `synthesis_system` field, defaulting to
+`workflow-synthesis` for `agent: fast` and to the per-mode slow prompt
+for `agent: slow` / `agent: code`. Set `routing-agent` on a step that
+only routes over typed inputs and never analyzes code. Do not set
+`fast-gather` on a step that has an OUTPUT SCHEMA: measured across 384
+validate runs, when a fast step's synthesis ran under the gather prompt,
+397 of 784 responses obeyed the system prompt instead of the schema and
+each rejection re-ran the whole step including its gather phase.
+
+A step's call-invariant instruction text — the `--- SKILLS ---` block and
+any `--- INCLUDES ---` bodies — is carried in the prompt envelope's
+`stable_instructions` field rather than concatenated onto `question`, and
+it gets its own `cache_control` block on both the gather and the
+synthesis call. It used to be per-call bytes: on a measured validate run
+that was 30 KB of a 42 KB question re-sent as fresh input every time.
+Anything task-specific must stay out of that field or the head is written
+once per call and read never, which is strictly worse than not caching.
+
+When a step attempt is rejected for a malformed or incomplete response,
+the evidence requests that attempt emitted are carried into the retry's
+gather and dispatched before round 0 (`RunContext::pending_followups`).
+Previously they were dropped and the gather agent re-decided what to
+fetch: across those same 384 runs, 724 of 771 such requests — 401 of them
+`source:` — were never fetched anywhere in the run.
+
 Deterministic workflow steps run in the reaper without an LLM. Reaper
 steps are used for git commits, builds, finding invalidation, and patch
 publication. Reaper actions cannot declare a later eval: successful completion
@@ -1365,29 +1395,76 @@ when supplied, it becomes the workflow runner workspace so local source
 tools, semcode MCP, git, and `skills: ["auto"]` all resolve against the
 codebase being validated rather than the finding export directory.
 
-Validation is intentionally sequential and does not use review lenses:
+Validation is intentionally sequential and does not use review lenses.
+Three steps:
 
 - `validate-claims` runs as a fast coding step. It reads
   `metadata.yaml` and `FINDING.md`, checks factual claims against source,
-  and emits structured `claim_validation` with object entries for
-  supported, contradicted, and unresolved claims. Each claim entry carries
-  a stable `id`, the claim text, and evidence or the exact source still
-  needed. Open-question and false-positive-risk lists remain string
-  summaries.
-- `validate-reachability` runs as a slow coding step. It uses the claim
-  validation report as a checklist, closes bug-existence questions such
-  as return-value and reachability assumptions, determines whether the
-  bug is reachable or latent, and then applies the same triage template
-  used by `/triage`.
+  and emits `claim_validation`: a one-sentence `thesis`, a `claims` array,
+  and a required `design_intent` record. Each claim carries a stable `id`,
+  a `kind` (`mechanism`, `precondition`, `reachability`, `impact`,
+  `design_intent`), a `verdict`, a `gating` boolean, and `evidence`
+  entries whose `provenance` is `fresh` (fetched this session) or
+  `finding_quoted` (only present as text inside the finding).
+- `validate-conjunction` runs as a fast coding step over the claim report
+  with no source of its own. It answers the one question no other step
+  asks: can every supported precondition hold on the SAME execution? It
+  emits pairwise `conflicts` and a `single_execution_witness` — or null,
+  when no configuration makes the finding fire.
+- `validate-reachability` runs as a slow coding step. It uses both prior
+  reports as a checklist, closes bug-existence questions, determines
+  whether the bug is reachable or latent, and applies the same triage
+  template used by `/triage`.
 
-The final validation step writes `summary.md`, updates `metadata.yaml`
-and `FINDING.md` with the selected severity, adds
-`validation_run: true` to `metadata.yaml`, and emits `triage_coding`.
-The same machine-populated checks as `/triage` apply:
-`summary_written` and `severity_written` must be true, and
-`triage_coding.schema_version == 1` with
-`triage_coding.severity == severity`. Incomplete or malformed output is
-retried and then fails the workflow.
+The final step writes `summary.md`, updates `metadata.yaml` and
+`FINDING.md` with the selected severity, adds `validation_run: true` to
+`metadata.yaml`, and emits `triage_coding`.
+
+### Validation is gated by Rust, not by prompt exhortation
+
+Both the fast and the slow step use `builtin` evals rather than
+`field_check` expressions, because the invariants quantify over arrays
+and read across steps.
+
+`validate_claims_wellformed` rejects an attempt when: `schema_version`
+is not 1; `thesis` is empty; `design_intent.checked` is false; a claim
+id is missing or duplicated; a supported/contradicted claim has no
+evidence; an unresolved claim does not say in `source_needed` what would
+settle it; or **a gating claim is supported only by `finding_quoted`
+evidence**. That last one is the point: a validation pass that confirms
+a finding using the finding's own quotations has verified nothing.
+
+`validate_verdict_consistency` keeps the old file-side guarantees —
+`summary_written` and `severity_written` true, `triage_coding`
+`schema_version == 1`, `triage_coding.severity == severity` — and adds
+the verdict/`summary_status` casing map. On top of that, a verdict of
+`Plausible` additionally requires all three of:
+
+1. no `gating: true` claim left `unresolved`, unless the slow step
+   settles it in `gating_override` with file:line evidence;
+2. every pair in the conjunction step's `conflicts` addressed in
+   `conflict_resolution` with evidence;
+3. a non-null `single_execution_witness`.
+
+Any other verdict is free of those three. This exists because the prompt
+already said "do not preserve a finding as Plausible when any
+load-bearing component remains unresolved" and runs preserved findings
+anyway by relabelling the component as a "probability/severity question,
+not an existence question". Prompt text the same model can talk itself
+out of is not a control. Do not replace these evals with prompt text or
+with a `field_check`; the expression language has no array quantifier
+and cannot express any of the three.
+
+### Compile-time and runtime gates are different conditions
+
+`triage_coding.reachability` splits `build_config` (kconfig symbols that
+must be set) from `runtime_state` (static branches, sysctls, scheduler
+features, cgroup settings, topology). `CONFIG_X=y` and `X_enabled()` are
+not the same condition, and merging them is how two contradictory claims
+came to look compatible. `/triage` carries the identical schema; a test
+asserts the two stay byte-identical.
+
+### Status vocabulary
 
 The validation prompt is stricter than triage about false positives. A
 finding should not be kept `Plausible` when a load-bearing component is
@@ -1401,15 +1478,30 @@ source but 100% of it has no current in-tree trigger because every
 required precondition, hook, caller, or state is absent or cannot occur —
 is `Confirmed Latent` (verdict `ConfirmedLatent`,
 `triage_coding.summary_status: confirmed_latent`, metadata
-`status: confirmed_latent`), not `Unconfirmed` and not `Invalid`:
-nothing is left open, but the dormant structure is not a false positive
-either. This status, its decision-tree placement, and its
-`triage_coding` tagging (`latent` impact class, `latent_only` reject
-reason, trigger reachability gates resolved to `no`) are defined once in
-`configs/prompts/triage-template.md`, so `/triage` and `/validate` share
-the same definition. If any component is currently reachable and valid,
-the finding is not latent-only: validation keeps it valid and documents
-that reachable component.
+`status: confirmed_latent`), not `Unconfirmed` and not `Invalid`.
+
+A finding whose behaviour *does* occur but which source evidence shows
+is intended — a leading comment, an enumerated design table, or the
+introducing commit's message — is `NotADefect`
+(`summary_status: not_a_defect`, metadata `status: not_a_defect`,
+`intentional_design` in `reject_reasons`). Without this value the
+decision tree had no reachable cell for "the code is doing what its
+author intended": `Invalid` means the behaviour does not happen and a
+low-severity `Plausible` still says the code is wrong. A validator may
+disagree with a documented design, but it must engage with the
+documentation rather than record the decision as an oversight.
+`kres-repl/src/summary.rs` maps `NotADefect` onto `Status::Invalidated`,
+which filters it out of `/summary` like any other non-defect; the reason
+survives in the finding directory.
+
+These statuses, their decision-tree placement, and their `triage_coding`
+tagging are defined once in `configs/prompts/triage-template.md`, so
+`/triage` and `/validate` share the same definitions. The template also
+carries the assert-side race checklist: before a check-then-use or
+unlocked-read finding may be `Plausible`, it must name the instruction
+that opens the window, **the specific writer that can execute inside
+it**, and why that writer runs concurrently. There was a mandatory
+checklist for dismissing a race and none for asserting one.
 
 ## Summary Flow (`/summary`)
 
@@ -1429,6 +1521,7 @@ causal changelog without proposing a fix. The Markdown variant uses the subject
 as a section heading; the text variant emits raw problem-description blocks.
 The fix workflow composes those same problem rules with the separate kernel fix
 rules in Rust before sending the commit-writing prompt. Standalone `--summary`
-and `--summary-markdown` use the resolved fast model for the workflow's slow
-role unless `--slow` (or another explicit slow-model override) is passed. REPL
-slash commands retain the session's configured fast and slow roles.
+and `--summary-markdown` resolve the workflow's slow role from
+`models.slow` like any other run; `--slow` (or another explicit
+slow-model override) selects a different one. REPL slash commands retain the
+session's configured fast and slow roles.

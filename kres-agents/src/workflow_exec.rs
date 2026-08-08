@@ -42,7 +42,7 @@
 //! are exposed by the resolver alongside whatever outputs the driver
 //! has produced.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -2516,7 +2516,319 @@ fn eval_builtin(
         "fix_research_status" => Ok(eval_fix_research_status(step, ctx)),
         "fix_series_assessment" => Ok(eval_fix_series_assessment(step, ctx)),
         "orchestrator_dispatch" => Ok(eval_orchestrator_dispatch(step, ctx)),
+        "validate_claims_wellformed" => Ok(eval_validate_claims_wellformed(step, ctx)),
+        "validate_verdict_consistency" => Ok(eval_validate_verdict_consistency(step, ctx)),
         other => Err(format!("unknown builtin eval '{other}'")),
+    }
+}
+
+/// Every claim the validation pass emitted, in one flat list.
+fn claim_entries<'a>(ctx: &'a ExecContext<'_>, step_id: &str) -> Option<&'a Vec<Value>> {
+    ctx.steps
+        .get(step_id)?
+        .outputs
+        .get("claim_validation")?
+        .get("claims")?
+        .as_array()
+}
+
+fn claim_field<'a>(claim: &'a Value, key: &str) -> Option<&'a str> {
+    claim.get(key).and_then(Value::as_str)
+}
+
+fn claim_is_gating(claim: &Value) -> bool {
+    claim
+        .get("gating")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Builtin eval for `validate-claims`.
+///
+/// Checks the two things a later model must not be free to reinterpret:
+/// that the claim record is well formed, and that no gating claim is
+/// marked supported on the strength of the finding quoting itself.
+///
+/// The second one is the mechanical form of a rule the pass already
+/// states. A validation that confirms a finding using only text pasted
+/// inside that finding has verified nothing, and the fast agent has been
+/// observed noticing this unprompted ("this body was only supplied via
+/// the finding's own embedded quote") while still filing the claim.
+fn eval_validate_claims_wellformed(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(report) = outputs.get("claim_validation").and_then(Value::as_object) else {
+        return eval_fail("claim_validation must be an object");
+    };
+    if report.get("schema_version").and_then(Value::as_i64) != Some(1) {
+        return eval_fail("claim_validation.schema_version must be 1");
+    }
+    if report
+        .get("thesis")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return eval_fail(
+            "claim_validation.thesis must state in one sentence what the finding claims is broken; \
+             the conjunction step tests the claims against it",
+        );
+    }
+    let Some(design_intent) = report.get("design_intent") else {
+        return eval_fail("claim_validation.design_intent is required");
+    };
+    if design_intent.get("checked").and_then(Value::as_bool) != Some(true) {
+        return eval_fail(
+            "claim_validation.design_intent.checked is false: look for the leading comment, an \
+             enumerated design table, or the introducing commit before treating the behaviour as \
+             a defect, then set checked true with what you found (or null evidence if none)",
+        );
+    }
+    let Some(claims) = report.get("claims").and_then(Value::as_array) else {
+        return eval_fail("claim_validation.claims must be an array");
+    };
+    if claims.is_empty() {
+        return eval_fail("claim_validation.claims is empty: the finding makes at least one claim");
+    }
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut quoted_only: Vec<&str> = Vec::new();
+    let mut missing_need: Vec<&str> = Vec::new();
+    let mut unevidenced: Vec<&str> = Vec::new();
+    for claim in claims {
+        let Some(id) = claim_field(claim, "id").filter(|id| !id.trim().is_empty()) else {
+            return eval_fail("every claim needs a non-empty id");
+        };
+        if !seen.insert(id) {
+            return eval_fail(&format!("duplicate claim id '{id}'"));
+        }
+        let verdict = claim_field(claim, "verdict").unwrap_or_default();
+        let evidence = claim
+            .get("evidence")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        match verdict {
+            "unresolved" => {
+                if claim_field(claim, "source_needed")
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    missing_need.push(id);
+                }
+            }
+            "supported" | "contradicted" => {
+                if evidence.is_empty() {
+                    unevidenced.push(id);
+                } else if claim_is_gating(claim)
+                    && verdict == "supported"
+                    && evidence.iter().all(|e| {
+                        e.get("provenance").and_then(Value::as_str) == Some("finding_quoted")
+                    })
+                {
+                    quoted_only.push(id);
+                }
+            }
+            other => {
+                return eval_fail(&format!(
+                    "claim '{id}' has verdict '{other}'; expected supported, contradicted or unresolved"
+                ))
+            }
+        }
+    }
+    if !unevidenced.is_empty() {
+        return eval_fail(&format!(
+            "claim(s) [{}] are supported or contradicted with no evidence entry",
+            unevidenced.join(", ")
+        ));
+    }
+    if !missing_need.is_empty() {
+        return eval_fail(&format!(
+            "unresolved claim(s) [{}] must name in source_needed exactly what would settle them",
+            missing_need.join(", ")
+        ));
+    }
+    if !quoted_only.is_empty() {
+        return eval_fail(&format!(
+            "gating claim(s) [{}] are supported only by finding_quoted evidence: fetch the \
+             definition, callers or history and re-check, or mark the claim unresolved. \
+             Confirming a finding from the finding's own quotations verifies nothing",
+            quoted_only.join(", ")
+        ));
+    }
+    (true, None)
+}
+
+/// Builtin eval for `validate-reachability`.
+///
+/// Supersedes the old field_check. It keeps that check's file-side
+/// guarantees (summary/severity actually written, triage_coding present
+/// and agreeing with severity) and adds the three reasoning invariants
+/// the prompt could only ask for politely:
+///
+///   1. a gating claim left unresolved caps the verdict below Plausible
+///      unless it is settled here with evidence,
+///   2. a conflicting precondition pair does the same until addressed,
+///   3. Plausible needs one named configuration where the finding fires.
+///
+/// These exist because the prompt already said (1) and runs preserved
+/// findings anyway by relabelling the unresolved component as a
+/// "probability/severity question, not an existence question". Prompt
+/// text the same model can talk itself out of is not a control.
+fn eval_validate_verdict_consistency(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let Some(verdict) = output_str(outputs, "verdict") else {
+        return eval_fail("verdict must be a string");
+    };
+    let Some(severity) = output_str(outputs, "severity") else {
+        return eval_fail("severity must be a string");
+    };
+    if output_bool(outputs, "summary_written") != Some(true) {
+        return eval_fail("summary.md was not written with non-empty content");
+    }
+    if output_bool(outputs, "severity_written") != Some(true) {
+        return eval_fail(
+            "summary.md, metadata.yaml and FINDING.md must all be emitted into the finding \
+             directory carrying the chosen severity",
+        );
+    }
+    let Some(coding) = outputs.get("triage_coding").and_then(Value::as_object) else {
+        return eval_fail("triage_coding must be an object");
+    };
+    if coding.get("schema_version").and_then(Value::as_i64) != Some(1) {
+        return eval_fail("triage_coding.schema_version must be 1");
+    }
+    if coding.get("severity").and_then(Value::as_str) != Some(severity) {
+        return eval_fail("triage_coding.severity must match the severity output");
+    }
+    let expected_status = match verdict {
+        "Fixed" => "fixed",
+        "Plausible" => "plausible",
+        "Unconfirmed" => "unconfirmed",
+        "Unknown" => "unknown",
+        "Invalid" => "invalid",
+        "ConfirmedLatent" => "confirmed_latent",
+        "NotADefect" => "not_a_defect",
+        other => return eval_fail(&format!("unknown verdict '{other}'")),
+    };
+    if coding.get("summary_status").and_then(Value::as_str) != Some(expected_status) {
+        return eval_fail(&format!(
+            "verdict '{verdict}' requires triage_coding.summary_status '{expected_status}'"
+        ));
+    }
+
+    // Everything below constrains Plausible only. A finding the run
+    // could not stand up is allowed to land on any of the other
+    // verdicts without further proof.
+    if verdict != "Plausible" {
+        return (true, None);
+    }
+
+    let settled: BTreeSet<&str> = outputs
+        .get("gating_override")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    !entry
+                        .get("evidence")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                })
+                .filter_map(|entry| entry.get("claim_id").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(claims) = claim_entries(ctx, "validate-claims") {
+        let open: Vec<&str> = claims
+            .iter()
+            .filter(|claim| {
+                claim_is_gating(claim) && claim_field(claim, "verdict") == Some("unresolved")
+            })
+            .filter_map(|claim| claim_field(claim, "id"))
+            .filter(|id| !settled.contains(id))
+            .collect();
+        if !open.is_empty() {
+            return eval_fail(&format!(
+                "gating claim(s) [{}] are still unresolved, so the finding cannot be Plausible. \
+                 Settle each one here with file:line evidence in gating_override, or choose \
+                 Unconfirmed, ConfirmedLatent, NotADefect or Invalid. Recasting a gating claim as \
+                 a probability, frequency or severity question does not settle it",
+                open.join(", ")
+            ));
+        }
+    }
+
+    let conjunction = ctx
+        .steps
+        .get("validate-conjunction")
+        .and_then(|state| state.outputs.get("conjunction"));
+    let Some(conjunction) = conjunction else {
+        // The conjunction step is part of this workflow; if a variant
+        // drops it, do not silently relax the other checks.
+        return (true, None);
+    };
+
+    if let Some(conflicts) = conjunction.get("conflicts").and_then(Value::as_array) {
+        let addressed: BTreeSet<(String, String)> = outputs
+            .get("conflict_resolution")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        !entry
+                            .get("evidence")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .unwrap_or_default()
+                            .is_empty()
+                    })
+                    .filter_map(|entry| {
+                        Some((
+                            entry.get("a_id")?.as_str()?.to_string(),
+                            entry.get("b_id")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let unaddressed: Vec<String> = conflicts
+            .iter()
+            .filter_map(|conflict| {
+                let a = conflict.get("a_id")?.as_str()?.to_string();
+                let b = conflict.get("b_id")?.as_str()?.to_string();
+                let covered = addressed.contains(&(a.clone(), b.clone()))
+                    || addressed.contains(&(b.clone(), a.clone()));
+                (!covered).then(|| format!("{a}/{b}"))
+            })
+            .collect();
+        if !unaddressed.is_empty() {
+            return eval_fail(&format!(
+                "conflicting precondition pair(s) [{}] were reported and not addressed. Two claims \
+                 that cannot hold on one execution make the finding impossible; resolve each pair \
+                 in conflict_resolution with evidence, or pick a verdict below Plausible",
+                unaddressed.join(", ")
+            ));
+        }
+    }
+
+    match conjunction.get("single_execution_witness") {
+        Some(Value::Null) | None => eval_fail(
+            "no single_execution_witness: nobody could name one configuration where every gating \
+             precondition holds and the defect fires. Plausible claims the bad path executes, so \
+             supply the witness or choose ConfirmedLatent, Unconfirmed, NotADefect or Invalid",
+        ),
+        Some(_) => (true, None),
     }
 }
 
@@ -3417,6 +3729,398 @@ mod tests {
             },
         );
         (step, inputs, steps)
+    }
+
+    fn validate_workflow() -> Workflow {
+        parse_workflow(include_str!("../../configs/workflows/validate.json")).unwrap()
+    }
+
+    fn validate_step(id: &str) -> Step {
+        validate_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == id)
+            .unwrap()
+    }
+
+    fn step_state(outputs: Value) -> StepState {
+        StepState {
+            outputs: outputs.as_object().unwrap().clone(),
+            ..StepState::default()
+        }
+    }
+
+    fn fresh_claim(id: &str, gating: bool, verdict: &str) -> Value {
+        json!({
+            "id": id,
+            "claim": "c",
+            "kind": "precondition",
+            "verdict": verdict,
+            "gating": gating,
+            "evidence": [{"location": "kernel/sched/fair.c:1809", "provenance": "fresh"}],
+            "source_needed": "the definition of update_avg_scale"
+        })
+    }
+
+    fn claims_output(claims: Value) -> Value {
+        json!({
+            "claim_validation": {
+                "schema_version": 1,
+                "thesis": "task_cache_work mutates sc_stat without the lock",
+                "claims": claims,
+                "design_intent": {"checked": true, "evidence": null},
+                "open_questions_to_close": [],
+                "false_positive_risks": []
+            }
+        })
+    }
+
+    fn run_claims_eval(outputs: Value) -> (bool, Option<String>) {
+        let step = validate_step("validate-claims");
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(step.id.clone(), step_state(outputs));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_validate_claims_wellformed(&step, &ctx)
+    }
+
+    #[test]
+    fn claims_eval_accepts_a_well_formed_report() {
+        assert_eq!(
+            run_claims_eval(claims_output(json!([fresh_claim("a", true, "supported")]))),
+            (true, None)
+        );
+    }
+
+    /// A validation pass that confirms a gating claim using only text
+    /// the finding pasted into itself has verified nothing. The fast
+    /// agent has been observed noticing this and filing the claim
+    /// anyway, so it is checked here rather than asked for.
+    #[test]
+    fn claims_eval_rejects_a_gating_claim_supported_only_by_the_finding_quoting_itself() {
+        let mut claim = fresh_claim("quoted", true, "supported");
+        claim["evidence"] = json!([{
+            "location": "FINDING.md",
+            "provenance": "finding_quoted"
+        }]);
+        let (passed, reason) = run_claims_eval(claims_output(json!([claim])));
+        assert!(!passed);
+        assert!(reason.unwrap().contains("quoted"));
+
+        // The same evidence on a NON-gating claim is fine: it does not
+        // decide whether the bug exists.
+        let mut claim = fresh_claim("quoted", false, "supported");
+        claim["evidence"] = json!([{
+            "location": "FINDING.md",
+            "provenance": "finding_quoted"
+        }]);
+        assert!(run_claims_eval(claims_output(json!([claim]))).0);
+
+        // And one fresh citation alongside the quote is enough.
+        let mut claim = fresh_claim("mixed", true, "supported");
+        claim["evidence"] = json!([
+            {"location": "FINDING.md", "provenance": "finding_quoted"},
+            {"location": "kernel/sched/fair.c:1809", "provenance": "fresh"}
+        ]);
+        assert!(run_claims_eval(claims_output(json!([claim]))).0);
+    }
+
+    #[test]
+    fn claims_eval_requires_the_intentional_design_check_and_a_thesis() {
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["claim_validation"]["design_intent"] = json!({"checked": false, "evidence": null});
+        let (passed, reason) = run_claims_eval(outputs);
+        assert!(!passed);
+        assert!(reason.unwrap().contains("design_intent"));
+
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["claim_validation"]["thesis"] = json!("   ");
+        assert!(!run_claims_eval(outputs).0);
+    }
+
+    #[test]
+    fn claims_eval_rejects_unevidenced_and_duplicate_and_vague_claims() {
+        let mut claim = fresh_claim("a", false, "supported");
+        claim["evidence"] = json!([]);
+        assert!(!run_claims_eval(claims_output(json!([claim]))).0);
+
+        let mut claim = fresh_claim("a", true, "unresolved");
+        claim["source_needed"] = json!("");
+        let (passed, reason) = run_claims_eval(claims_output(json!([claim])));
+        assert!(!passed);
+        assert!(reason.unwrap().contains("source_needed"));
+
+        let dupe = json!([
+            fresh_claim("same", false, "supported"),
+            fresh_claim("same", false, "supported")
+        ]);
+        assert!(!run_claims_eval(claims_output(dupe)).0);
+    }
+
+    struct VerdictCase {
+        verdict: &'static str,
+        claims: Value,
+        conjunction: Value,
+        extra: Value,
+    }
+
+    impl Default for VerdictCase {
+        fn default() -> Self {
+            Self {
+                verdict: "Plausible",
+                claims: json!([fresh_claim("a", true, "supported")]),
+                conjunction: json!({
+                    "schema_version": 1,
+                    "consistent": true,
+                    "conflicts": [],
+                    "single_execution_witness": {
+                        "build_config": [],
+                        "runtime_state": [],
+                        "call_site": "kernel/sched/fair.c:1900",
+                        "concurrent_writer": "task_tick_cache"
+                    },
+                    "witness_reasoning": "both hold on the tick path"
+                }),
+                extra: json!({}),
+            }
+        }
+    }
+
+    fn run_verdict_eval(case: VerdictCase) -> (bool, Option<String>) {
+        let step = validate_step("validate-reachability");
+        let mut outputs = json!({
+            "verdict": case.verdict,
+            "severity": "medium",
+            "summary_written": true,
+            "severity_written": true,
+            "triage_coding": {
+                "schema_version": 1,
+                "severity": "medium",
+                "summary_status": match case.verdict {
+                    "Plausible" => "plausible",
+                    "Invalid" => "invalid",
+                    "Unconfirmed" => "unconfirmed",
+                    "ConfirmedLatent" => "confirmed_latent",
+                    "NotADefect" => "not_a_defect",
+                    "Fixed" => "fixed",
+                    _ => "unknown",
+                }
+            }
+        });
+        for (k, v) in case.extra.as_object().unwrap() {
+            outputs[k] = v.clone();
+        }
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(step.id.clone(), step_state(outputs));
+        steps.insert(
+            "validate-claims".to_string(),
+            step_state(claims_output(case.claims)),
+        );
+        steps.insert(
+            "validate-conjunction".to_string(),
+            step_state(json!({"conjunction": case.conjunction})),
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_validate_verdict_consistency(&step, &ctx)
+    }
+
+    #[test]
+    fn verdict_eval_accepts_a_plausible_finding_that_stood_up() {
+        assert_eq!(run_verdict_eval(VerdictCase::default()), (true, None));
+    }
+
+    /// The slow prompt already said not to keep a finding Plausible with
+    /// an unresolved load-bearing claim. Runs preserved findings anyway
+    /// by recasting the claim as "a probability/severity question, not
+    /// an existence question". Prompt text the same model can talk
+    /// itself out of is not a control.
+    #[test]
+    fn verdict_eval_caps_plausible_when_a_gating_claim_is_unresolved() {
+        let (passed, reason) = run_verdict_eval(VerdictCase {
+            claims: json!([fresh_claim("gate", true, "unresolved")]),
+            ..Default::default()
+        });
+        assert!(!passed);
+        assert!(reason.unwrap().contains("gate"));
+
+        // Settling it here with evidence is the one way through.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                claims: json!([fresh_claim("gate", true, "unresolved")]),
+                extra: json!({
+                    "gating_override": [
+                        {"claim_id": "gate", "evidence": "kernel/sched/fair.c:1756 takes the lock"}
+                    ]
+                }),
+                ..Default::default()
+            })
+            .0
+        );
+
+        // An override with no evidence is not an override.
+        assert!(
+            !run_verdict_eval(VerdictCase {
+                claims: json!([fresh_claim("gate", true, "unresolved")]),
+                extra: json!({"gating_override": [{"claim_id": "gate", "evidence": "  "}]}),
+                ..Default::default()
+            })
+            .0
+        );
+
+        // A NON-gating unresolved claim never blocked anything.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                claims: json!([fresh_claim("detail", false, "unresolved")]),
+                ..Default::default()
+            })
+            .0
+        );
+
+        // And a verdict below Plausible is always allowed to carry open
+        // questions — that is what those verdicts mean.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                verdict: "Unconfirmed",
+                claims: json!([fresh_claim("gate", true, "unresolved")]),
+                ..Default::default()
+            })
+            .0
+        );
+    }
+
+    /// Two individually-true claims whose conjunction is empty made the
+    /// finding impossible; nothing in the old flow ever put them side by
+    /// side.
+    #[test]
+    fn verdict_eval_caps_plausible_on_an_unaddressed_conflict() {
+        let mut conjunction = VerdictCase::default().conjunction;
+        conjunction["consistent"] = json!(false);
+        conjunction["conflicts"] = json!([{
+            "a_id": "core_off",
+            "b_id": "core_on",
+            "why": "the leak needs core scheduling off and the reader needs it on"
+        }]);
+
+        let (passed, reason) = run_verdict_eval(VerdictCase {
+            conjunction: conjunction.clone(),
+            ..Default::default()
+        });
+        assert!(!passed);
+        assert!(reason.unwrap().contains("core_off/core_on"));
+
+        // Resolving it with evidence clears the block, in either order.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                conjunction: conjunction.clone(),
+                extra: json!({"conflict_resolution": [{
+                    "a_id": "core_on",
+                    "b_id": "core_off",
+                    "resolution": "the reader also runs on the non-core path",
+                    "evidence": "kernel/sched/core.c:190"
+                }]}),
+                ..Default::default()
+            })
+            .0
+        );
+    }
+
+    /// "Plausible" claims the bad path executes. If nobody can name one
+    /// configuration where it does, that claim is unsupported.
+    #[test]
+    fn verdict_eval_requires_a_witness_for_plausible() {
+        let mut conjunction = VerdictCase::default().conjunction;
+        conjunction["single_execution_witness"] = Value::Null;
+
+        let (passed, reason) = run_verdict_eval(VerdictCase {
+            conjunction: conjunction.clone(),
+            ..Default::default()
+        });
+        assert!(!passed);
+        assert!(reason.unwrap().contains("single_execution_witness"));
+
+        // ConfirmedLatent is exactly the verdict for a real structure
+        // with no current trigger, so it is not blocked by this.
+        assert!(
+            run_verdict_eval(VerdictCase {
+                verdict: "ConfirmedLatent",
+                conjunction,
+                ..Default::default()
+            })
+            .0
+        );
+    }
+
+    #[test]
+    fn verdict_eval_keeps_the_file_side_guarantees_and_status_mapping() {
+        let step = validate_step("validate-reachability");
+        let inputs = Map::new();
+
+        for (mutate, expect) in [
+            (json!({"summary_written": false}), "summary.md"),
+            (json!({"severity_written": false}), "FINDING.md"),
+            (
+                json!({"triage_coding": {"schema_version": 2}}),
+                "schema_version",
+            ),
+        ] {
+            let mut outputs = json!({
+                "verdict": "Invalid",
+                "severity": "low",
+                "summary_written": true,
+                "severity_written": true,
+                "triage_coding": {
+                    "schema_version": 1, "severity": "low", "summary_status": "invalid"
+                }
+            });
+            for (k, v) in mutate.as_object().unwrap() {
+                outputs[k] = v.clone();
+            }
+            let mut steps = HashMap::new();
+            steps.insert(step.id.clone(), step_state(outputs));
+            let ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &steps,
+            };
+            let (passed, reason) = eval_validate_verdict_consistency(&step, &ctx);
+            assert!(!passed, "expected failure for {mutate}");
+            assert!(reason.unwrap().contains(expect));
+        }
+
+        // The human verdict and the machine status must agree, including
+        // for the two multi-word values.
+        for (verdict, status, ok) in [
+            ("NotADefect", "not_a_defect", true),
+            ("NotADefect", "invalid", false),
+            ("ConfirmedLatent", "confirmed_latent", true),
+        ] {
+            let outputs = json!({
+                "verdict": verdict,
+                "severity": "low",
+                "summary_written": true,
+                "severity_written": true,
+                "triage_coding": {
+                    "schema_version": 1, "severity": "low", "summary_status": status
+                }
+            });
+            let mut steps = HashMap::new();
+            steps.insert(step.id.clone(), step_state(outputs));
+            let ctx = ExecContext {
+                workflow_inputs: &inputs,
+                steps: &steps,
+            };
+            assert_eq!(
+                eval_validate_verdict_consistency(&step, &ctx).0,
+                ok,
+                "{verdict}/{status}"
+            );
+        }
     }
 
     #[test]

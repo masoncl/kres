@@ -162,6 +162,10 @@ The validate-all.py run will churn through each of the findings and run 20
 parallel kres workers to validate the runs.  If you do future exports into the
 same directory, the validate-all.py script skips anything you've already validated.
 
+Validation runs the slow model from `~/.kres/settings.json` (`models.slow`);
+pass `--slow-model NAME` to validate-all.py to use a different one.  This is a
+false-positive-elimination pass, so it is worth the deep model.
+
 It's usually easiest to ask your favorite agent to read findings-index.py and
 suggest which bugs are most important.
 

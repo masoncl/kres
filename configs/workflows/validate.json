@@ -11,7 +11,7 @@
   },
   "id": "validate",
   "title": "Validate a kres finding against a source workspace",
-  "description": "Research a kres finding with false-positive elimination as the explicit goal, validate the finding's claims against source, prove reachability/non-latency where possible, write summary.md, and synchronize severity in metadata.yaml and FINDING.md.",
+  "description": "Research a kres finding with false-positive elimination as the explicit goal: validate the finding's claims against source with typed provenance, test whether the surviving preconditions can hold simultaneously, prove reachability or non-latency, write summary.md, and synchronize severity in metadata.yaml and FINDING.md.",
   "inputs": {
     "target": {
       "type": "string",
@@ -83,27 +83,42 @@
         "Do not use or simulate parallel lenses. Produce structured outputs only;",
         "do not rely on prose as a hidden control channel.",
         "",
-        "For each material claim, classify it as supported, contradicted, or",
-        "unresolved. If the finding is only valid when a function can return NULL,",
-        "sleep, drop a reference, skip initialization, or otherwise satisfy a",
-        "precondition, explicitly check that precondition or mark it unresolved",
-        "with the exact source still needed.",
+        "State the finding's `thesis` in one sentence: what it claims is broken.",
+        "The next step tests whether your claims can all hold at once against",
+        "that thesis, so write it as the specific defect, not the subsystem.",
         "",
-        "Return JSON with this exact top-level shape. Use integer 1, not string",
-        "\"1\", for schema_version. Use empty arrays when a category has no",
-        "entries:",
-        "{",
-        "  \"analysis\": \"brief narrative\",",
-        "  \"claim_validation\": {",
-        "    \"schema_version\": 1,",
-        "    \"supported\": [{\"id\":\"short_slug\",\"claim\":\"claim text\",\"evidence\":\"file:line evidence\"}],",
-        "    \"contradicted\": [{\"id\":\"short_slug\",\"claim\":\"claim text\",\"evidence\":\"file:line evidence\",\"correction\":\"what the finding should say\"}],",
-        "    \"unresolved\": [{\"id\":\"short_slug\",\"claim\":\"claim text\",\"reason\":\"why unresolved\",\"source_needed\":\"exact source/history still needed\"}],",
-        "    \"open_questions_to_close\": [\"specific remaining question\"],",
-        "    \"false_positive_risks\": [\"specific contradicted or weak assumption\"]",
-        "  },",
-        "  \"followups\": []",
-        "}"
+        "Then emit one `claims` entry per material statement. Four fields decide",
+        "what happens downstream, so get them right:",
+        "",
+        "- `kind`. A `precondition` is a claim of the form \"this only happens",
+        "  when X\" \u2014 a config, a runtime state, a lock being held or not held, a",
+        "  return value, a caller. Those are what the conjunction step compares.",
+        "  `mechanism` is how the defect works, `reachability` is who can reach",
+        "  it, `impact` is what it costs, `design_intent` is evidence the",
+        "  behaviour is deliberate.",
+        "- `verdict`. `supported` needs evidence. `contradicted` needs evidence",
+        "  and a `correction`. `unresolved` needs `source_needed` naming exactly",
+        "  what would settle it. If the finding is only valid when a function can",
+        "  return NULL, sleep, drop a reference, or skip initialization, check",
+        "  that precondition or mark it unresolved.",
+        "- `gating`. True when the bug does not exist if the claim is false.",
+        "  Frequency, severity, fix strategy and \"how bad is it\" are NOT gating.",
+        "  A gating claim left unresolved caps the final verdict; this field is",
+        "  read by Rust, not by a later model.",
+        "- `evidence[].provenance`. `fresh` means you fetched it this session",
+        "  through source/read/grep/callers/git. `finding_quoted` means it is",
+        "  only present as text pasted inside FINDING.md or metadata.yaml. A",
+        "  gating claim supported solely by the finding quoting itself has",
+        "  verified nothing, and this step will be rejected and re-run. Fetch the",
+        "  definition instead.",
+        "",
+        "`design_intent` is required. Before deciding a behaviour is a defect,",
+        "look for evidence its author intended it: the leading comment on the",
+        "function or type, an enumerated design table or rank ordering nearby,",
+        "or the introducing commit's message. Set `checked` true once you have",
+        "looked, and put what you found in `evidence` (with file:line or sha) or",
+        "null if there was none. If a fetched definition arrives with no leading",
+        "comment, read the ~15 lines above it before concluding there is none."
       ],
       "outputs": {
         "analysis": {
@@ -117,9 +132,9 @@
             "additionalProperties": false,
             "required": [
               "schema_version",
-              "supported",
-              "contradicted",
-              "unresolved",
+              "thesis",
+              "claims",
+              "design_intent",
               "open_questions_to_close",
               "false_positive_risks"
             ],
@@ -128,30 +143,11 @@
                 "type": "integer",
                 "const": 1
               },
-              "supported": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": [
-                    "id",
-                    "claim",
-                    "evidence"
-                  ],
-                  "properties": {
-                    "id": {
-                      "type": "string"
-                    },
-                    "claim": {
-                      "type": "string"
-                    },
-                    "evidence": {
-                      "type": "string"
-                    }
-                  }
-                }
+              "thesis": {
+                "type": "string",
+                "description": "One sentence: what the finding claims is broken. The conjunction step tests the claims against this."
               },
-              "contradicted": {
+              "claims": {
                 "type": "array",
                 "items": {
                   "type": "object",
@@ -159,47 +155,99 @@
                   "required": [
                     "id",
                     "claim",
+                    "kind",
+                    "verdict",
+                    "gating",
                     "evidence"
                   ],
                   "properties": {
                     "id": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "Short stable slug, unique within this report."
                     },
                     "claim": {
                       "type": "string"
                     },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "mechanism",
+                        "precondition",
+                        "reachability",
+                        "impact",
+                        "design_intent"
+                      ]
+                    },
+                    "verdict": {
+                      "type": "string",
+                      "enum": [
+                        "supported",
+                        "contradicted",
+                        "unresolved"
+                      ]
+                    },
+                    "gating": {
+                      "type": "boolean",
+                      "description": "True when the bug does not exist if this claim is false. Severity, frequency and fix-strategy claims are not gating."
+                    },
                     "evidence": {
-                      "type": "string"
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "location",
+                          "provenance"
+                        ],
+                        "properties": {
+                          "location": {
+                            "type": "string",
+                            "description": "file:line, commit sha, or search expression the evidence came from."
+                          },
+                          "provenance": {
+                            "type": "string",
+                            "enum": [
+                              "fresh",
+                              "finding_quoted"
+                            ],
+                            "description": "fresh = fetched this session via source/read/grep/callers/git. finding_quoted = only present as text inside FINDING.md or metadata.yaml."
+                          },
+                          "detail": {
+                            "type": "string",
+                            "description": "What the evidence shows."
+                          }
+                        }
+                      }
                     },
                     "correction": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "For contradicted claims: what the finding should say instead."
+                    },
+                    "source_needed": {
+                      "type": "string",
+                      "description": "For unresolved claims: the exact source, history or search that would settle it."
                     }
                   }
                 }
               },
-              "unresolved": {
-                "type": "array",
-                "items": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": [
-                    "id",
-                    "claim",
-                    "reason"
-                  ],
-                  "properties": {
-                    "id": {
-                      "type": "string"
-                    },
-                    "claim": {
-                      "type": "string"
-                    },
-                    "reason": {
-                      "type": "string"
-                    },
-                    "source_needed": {
-                      "type": "string"
-                    }
+              "design_intent": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "checked",
+                  "evidence"
+                ],
+                "properties": {
+                  "checked": {
+                    "type": "boolean",
+                    "description": "True once you have actually looked for evidence that the behaviour is intended."
+                  },
+                  "evidence": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The comment, enumerated design table, or introducing-commit text showing the behaviour is intended, with its file:line or sha. Null when you looked and found none."
                   }
                 }
               },
@@ -225,8 +273,183 @@
         }
       },
       "eval": {
+        "type": "builtin",
+        "name": "validate_claims_wellformed",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 3,
+          "on_exhausted": "exit_failure"
+        }
+      }
+    },
+    {
+      "id": "validate-conjunction",
+      "title": "Can every supported precondition hold at once?",
+      "agent": "fast",
+      "mode": "coding",
+      "depends_on": [
+        "validate-claims"
+      ],
+      "actions": [
+        "read",
+        "source",
+        "grep"
+      ],
+      "prompt": [
+        "Finding thesis: {{validate-claims.claim_validation.thesis}}",
+        "",
+        "Claim report from the validation pass:",
+        "{{validate-claims.claim_validation}}",
+        "",
+        "You have exactly one job. Every claim above was checked on its own.",
+        "Nobody has yet asked whether they can all be true of the SAME",
+        "execution. Ask that.",
+        "",
+        "Findings die here that survive everywhere else. A report can state",
+        "\"this path cannot run when core scheduling is active\" and, four",
+        "entries later, \"the reader of that state exists only when core",
+        "scheduling is compiled in and enabled\" \u2014 each claim correct, the",
+        "conjunction empty, the finding impossible. That is the single largest",
+        "class of false positive this workflow has shipped.",
+        "",
+        "Compare the preconditions pairwise. Emit a `conflicts` entry for each",
+        "pair that cannot hold together, naming both claim ids and why.",
+        "",
+        "Then try to build `single_execution_witness`: ONE configuration under",
+        "which every gating precondition holds simultaneously.",
+        "",
+        "- `build_config` is compile-time only: kconfig symbols that must be",
+        "  set. `runtime_state` is everything else \u2014 a static branch enabled, a",
+        "  sysctl or debugfs value, a scheduler feature, a cgroup setting, a",
+        "  hardware topology, a lock held or not held. These are different",
+        "  conditions and merging them is how contradictory claims start to",
+        "  look compatible: a kernel can have CONFIG_X=y while the runtime gate",
+        "  X_enabled() is false, and in that state the code guarded by the",
+        "  runtime gate is dormant.",
+        "- `call_site` is one concrete file:line where the defect executes with",
+        "  all of the above true.",
+        "- `concurrent_writer` applies when the finding asserts a race. Name the",
+        "  function that writes the racing state inside the window and say how",
+        "  it runs concurrently \u2014 another CPU, an interrupt, a preemption point.",
+        "  \"The window is narrow but real\" is not a writer. If the only writer",
+        "  is the same task executing the window, or every writer is excluded by",
+        "  a lock the window holds, there is no race: set this null.",
+        "",
+        "Set `single_execution_witness` to null when no such configuration",
+        "exists, and say why in `witness_reasoning`. A null witness does not by",
+        "itself invalidate the finding \u2014 the next step decides that \u2014 but",
+        "inventing a witness to avoid emitting null does.",
+        "",
+        "You may fetch source to settle a specific compatibility question. Do",
+        "not re-validate the claims; that already happened."
+      ],
+      "outputs": {
+        "analysis": {
+          "type": "string",
+          "description": "Brief narrative of the satisfiability reasoning."
+        },
+        "conjunction": {
+          "type": "object",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema_version",
+              "consistent",
+              "conflicts",
+              "single_execution_witness",
+              "witness_reasoning"
+            ],
+            "properties": {
+              "schema_version": {
+                "type": "integer",
+                "const": 1
+              },
+              "consistent": {
+                "type": "boolean",
+                "description": "True when every supported precondition can hold simultaneously."
+              },
+              "conflicts": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "a_id",
+                    "b_id",
+                    "why"
+                  ],
+                  "properties": {
+                    "a_id": {
+                      "type": "string"
+                    },
+                    "b_id": {
+                      "type": "string"
+                    },
+                    "why": {
+                      "type": "string",
+                      "description": "Why the two cannot both hold on one execution."
+                    }
+                  }
+                }
+              },
+              "single_execution_witness": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": false,
+                "required": [
+                  "build_config",
+                  "runtime_state",
+                  "call_site",
+                  "concurrent_writer"
+                ],
+                "properties": {
+                  "build_config": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y. Compile-time only."
+                  },
+                  "runtime_state": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Runtime conditions that must hold, e.g. sched_core_enabled(rq) == true, a static branch enabled, a sysctl, a cgroup setting, a topology. NOT kconfig."
+                  },
+                  "call_site": {
+                    "type": "string",
+                    "description": "file:line of one concrete site where the defect executes under the above."
+                  },
+                  "concurrent_writer": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "For a race: the function that writes the racing state, and how it runs concurrently (other CPU, interrupt, preemption). Null for a non-race defect, or when no such writer could be named."
+                  }
+                }
+              },
+              "witness_reasoning": {
+                "type": "string",
+                "description": "How the witness was assembled, or why no witness exists."
+              }
+            }
+          },
+          "description": "Pairwise conflicts and the single-execution witness."
+        },
+        "followups": {
+          "type": "array<Followup>",
+          "optional": true,
+          "description": "Typed requests for source needed to settle a compatibility question."
+        }
+      },
+      "eval": {
         "type": "field_check",
-        "expr": "claim_validation.schema_version == 1",
+        "expr": "conjunction.schema_version == 1",
         "on_fail": {
           "action": "repeat",
           "max_attempts": 3,
@@ -240,7 +463,8 @@
       "agent": "slow",
       "mode": "coding",
       "depends_on": [
-        "validate-claims"
+        "validate-claims",
+        "validate-conjunction"
       ],
       "actions": [
         "read",
@@ -265,13 +489,16 @@
         "header updates, and triage_coding output. This is stricter than ordinary",
         "triage: the explicit goal is to eliminate false positives.",
         "",
-        "The fast claim-validation pass produced this structured report:",
+        "The claim-validation pass produced this structured report:",
         "{{validate-claims.claim_validation}}",
         "",
-        "Use that report as a checklist, then close every material open question",
-        "that gates whether the bug exists. If the finding is only valid when",
-        "function A returns NULL, prove whether function A can return NULL on the",
-        "relevant path. If the finding depends on context, locking, lifetime,",
+        "The conjunction pass produced this satisfiability report:",
+        "{{validate-conjunction.conjunction}}",
+        "",
+        "Use both as a checklist, then close every material open question that",
+        "gates whether the bug exists. If the finding is only valid when function",
+        "A returns NULL, prove whether function A can return NULL on the relevant",
+        "path. If the finding depends on context, locking, lifetime,",
         "configuration, caller reachability, privilege, or a specific return value,",
         "trace the source until that precondition is supported or contradicted.",
         "Use bounded git commands for commit-status questions. If metadata, prior",
@@ -285,22 +512,41 @@
         "",
         "A valid summary must be evidence based, and false-positive elimination is",
         "the explicit goal. Use the status decision tree in the embedded triage",
-        "template (it defines Invalid, Confirmed Latent, Unconfirmed, Plausible,",
-        "Fixed, and Unknown), but apply it more strictly:",
+        "template (it defines Invalid, Not A Defect, Confirmed Latent, Unconfirmed,",
+        "Plausible, Fixed, and Unknown), but apply it more strictly:",
         "- Do not preserve a finding as Plausible when any load-bearing component",
         "  remains unresolved.",
-        "- Unconfirmed is only for a bug-existence gate that is still genuinely open —",
+        "- Unconfirmed is only for a bug-existence gate that is still genuinely open \u2014",
         "  one you could neither prove nor disprove. Do NOT use Unconfirmed for a",
         "  gate you actually resolved negatively.",
         "- If you proved the defect cannot exist as described, that is Invalid. If",
-        "  you proved the defect structure is real but 100% of the finding has no",
-        "  current in-tree trigger, that is Confirmed Latent (verdict",
-        "  `ConfirmedLatent`), not Unconfirmed — follow the template's Confirmed",
-        "  Latent handling for status, reachability, and triage_coding tagging.",
+        "  the behaviour does occur but source evidence shows it is what the author",
+        "  intended, that is NotADefect. If you proved the defect structure is real",
+        "  but 100% of the finding has no current in-tree trigger, that is Confirmed",
+        "  Latent (verdict `ConfirmedLatent`), not Unconfirmed \u2014 follow the",
+        "  template's Confirmed Latent handling for status, reachability, and",
+        "  triage_coding tagging.",
         "A finding is latent-only only when every component lacks a current in-tree",
         "trigger; if ANY component is currently reachable and valid, keep the finding",
         "valid and explain the reachable component instead of downgrading the whole",
         "finding.",
+        "",
+        "Three of those decisions are checked by Rust after you answer, not by",
+        "another model, so answer them in the typed fields rather than in prose:",
+        "",
+        "- A gating claim the first pass left `unresolved` caps this finding below",
+        "  Plausible. To keep it Plausible you must settle the claim here and say",
+        "  so in `gating_override`, with file:line evidence. Re-describing the",
+        "  claim as a probability, frequency, severity or triggerability question",
+        "  is not settling it, and is the specific move this check exists to stop.",
+        "- Every pair in the conjunction step's `conflicts` caps this finding below",
+        "  Plausible until you address it in `conflict_resolution`.",
+        "- A null `single_execution_witness` means nobody could name one",
+        "  configuration where the finding fires. Plausible requires one.",
+        "",
+        "If you cannot supply those, the honest verdict is Invalid, NotADefect,",
+        "ConfirmedLatent or Unconfirmed, and choosing one of those is not a",
+        "failure of the run.",
         "",
         "Do not use or simulate parallel lenses. Emit `summary.md`,",
         "`metadata.yaml`, and `FINDING.md` as absolute-path code_output entries",
@@ -315,8 +561,8 @@
         "",
         "Return a `verdict` field in your structured outputs naming the chosen",
         "human status exactly as one of: Fixed | Plausible | Unconfirmed | Unknown |",
-        "Invalid | ConfirmedLatent. Return a `severity` field exactly as one of:",
-        "high | medium | low.",
+        "Invalid | ConfirmedLatent | NotADefect. Return a `severity` field exactly",
+        "as one of: high | medium | low.",
         "",
         "Also return `triage_coding` as a structured object derived from the same",
         "summary.md content you emit. Do not put this JSON inside summary.md. The",
@@ -324,17 +570,18 @@
         "use different casing: if verdict is `Invalid`, summary_status must be",
         "`invalid`; if verdict is `Unconfirmed`, summary_status must be",
         "`unconfirmed`; if verdict is `ConfirmedLatent`, summary_status must be",
-        "`confirmed_latent`.",
+        "`confirmed_latent`; if verdict is `NotADefect`, summary_status must be",
+        "`not_a_defect`.",
         "",
         "Required `triage_coding` shape:",
         "- schema_version: integer, set to 1",
         "- severity: one of high, medium, low",
-        "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent",
+        "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent, not_a_defect",
         "- summary_subject: short subject string from the summary, or empty string",
         "- impact_classes: array of lowercase strings such as local_dos, remote_dos, memory_corruption, privilege_escalation, info_leak, data_corruption, vm_escape, latent, test_only, unknown",
         "- config_commonness: one of common, niche, debug_or_test_only, unknown",
-        "- reject_reasons: array of lowercase strings for reasons this should not enter a fix queue, such as invalid, unconfirmed, unknown_reachability, latent_only, test_only, niche_config, fixed_already",
-        "- reachability: object with host_access, remote_access, specific_config, root_required, regular_user as yes/no/n/a/unknown strings",
+        "- reject_reasons: array of lowercase strings for reasons this should not enter a fix queue, such as invalid, unconfirmed, unknown_reachability, latent_only, intentional_design, test_only, niche_config, fixed_already",
+        "- reachability: object with host_access, remote_access, root_required, regular_user as yes/no/n/a/unknown strings, plus build_config {required, symbols[]} for compile-time gating and runtime_state {required, conditions[]} for everything that must additionally hold at run time. Keep those two apart: CONFIG_X=y and X_enabled() are different conditions.",
         "- touches: object with files array and subsystems array, populated only from explicit summary text",
         "- actionability: object with fix_queue_eligible boolean and rationale string",
         "- priority: object with tier one of critical, high, medium, low, none, unknown; score integer 0-100; reason string",
@@ -352,7 +599,8 @@
             "Unconfirmed",
             "Unknown",
             "Invalid",
-            "ConfirmedLatent"
+            "ConfirmedLatent",
+            "NotADefect"
           ],
           "description": "Status assigned after validation."
         },
@@ -364,6 +612,65 @@
             "low"
           ],
           "description": "Severity assigned by validation and written to metadata.yaml, FINDING.md, and summary.md."
+        },
+        "conflict_resolution": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "a_id",
+                "b_id",
+                "resolution",
+                "evidence"
+              ],
+              "properties": {
+                "a_id": {
+                  "type": "string"
+                },
+                "b_id": {
+                  "type": "string"
+                },
+                "resolution": {
+                  "type": "string",
+                  "description": "How both can hold on one execution after all, or which of the two is wrong."
+                },
+                "evidence": {
+                  "type": "string",
+                  "description": "file:line or commit evidence for the resolution."
+                }
+              }
+            }
+          },
+          "description": "Required to keep a finding Plausible when the conjunction step reported conflicts: one entry per conflicting pair."
+        },
+        "gating_override": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "claim_id",
+                "evidence"
+              ],
+              "properties": {
+                "claim_id": {
+                  "type": "string"
+                },
+                "evidence": {
+                  "type": "string",
+                  "description": "file:line evidence that settles the claim. Not a re-argument."
+                }
+              }
+            }
+          },
+          "description": "The only way to keep a finding Plausible when a gating claim was left unresolved: settle it here with evidence."
         },
         "summary_written": {
           "type": "boolean",
@@ -422,7 +729,8 @@
                   "unconfirmed",
                   "unknown",
                   "invalid",
-                  "confirmed_latent"
+                  "confirmed_latent",
+                  "not_a_defect"
                 ]
               },
               "summary_subject": {
@@ -455,9 +763,10 @@
                 "required": [
                   "host_access",
                   "remote_access",
-                  "specific_config",
                   "root_required",
-                  "regular_user"
+                  "regular_user",
+                  "build_config",
+                  "runtime_state"
                 ],
                 "properties": {
                   "host_access": {
@@ -470,15 +779,6 @@
                     ]
                   },
                   "remote_access": {
-                    "type": "string",
-                    "enum": [
-                      "yes",
-                      "no",
-                      "n/a",
-                      "unknown"
-                    ]
-                  },
-                  "specific_config": {
                     "type": "string",
                     "enum": [
                       "yes",
@@ -504,6 +804,60 @@
                       "n/a",
                       "unknown"
                     ]
+                  },
+                  "build_config": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "required",
+                      "symbols"
+                    ],
+                    "properties": {
+                      "required": {
+                        "type": "string",
+                        "enum": [
+                          "yes",
+                          "no",
+                          "n/a",
+                          "unknown"
+                        ]
+                      },
+                      "symbols": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y."
+                      }
+                    },
+                    "description": "Compile-time gating only."
+                  },
+                  "runtime_state": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "required",
+                      "conditions"
+                    ],
+                    "properties": {
+                      "required": {
+                        "type": "string",
+                        "enum": [
+                          "yes",
+                          "no",
+                          "n/a",
+                          "unknown"
+                        ]
+                      },
+                      "conditions": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Static branches, sysctls, scheduler features, cgroup settings, topology \u2014 conditions that must hold at run time even when the build config is set."
+                      }
+                    },
+                    "description": "Runtime gating. Distinct from build_config: a kernel can have CONFIG_X=y while X_enabled() is false."
                   }
                 }
               },
@@ -605,8 +959,8 @@
         }
       },
       "eval": {
-        "type": "field_check",
-        "expr": "summary_written == true && severity_written == true && triage_coding.schema_version == 1 && triage_coding.severity == severity",
+        "type": "builtin",
+        "name": "validate_verdict_consistency",
         "on_fail": {
           "action": "repeat",
           "max_attempts": 3,

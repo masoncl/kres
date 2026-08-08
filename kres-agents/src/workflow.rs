@@ -871,7 +871,7 @@ mod tests {
             .expect("triage.json must validate against schema");
         assert_eq!(wf.id, "validate");
         assert_eq!(wf.skills, vec!["auto"]);
-        assert_eq!(wf.steps.len(), 2);
+        assert_eq!(wf.steps.len(), 3);
 
         let fast = &wf.steps[0];
         assert_eq!(fast.id, "validate-claims");
@@ -884,24 +884,47 @@ mod tests {
             .get("claim_validation")
             .and_then(|def| def.get("schema"))
             .expect("claim_validation schema");
+        // One typed claim record, not three untyped buckets. `gating`
+        // and `evidence[].provenance` are read by Rust: the first caps
+        // the final verdict, the second rejects a "validation" that
+        // confirmed the finding from the finding's own quotations.
         assert_eq!(
-            claim_schema.pointer("/properties/supported/items/type"),
+            claim_schema.pointer("/properties/claims/items/type"),
             Some(&serde_json::Value::String("object".to_string())),
-            "supported claim entries must preserve structured evidence"
+            "claim entries must preserve structured evidence"
         );
-        assert_eq!(
-            claim_schema.pointer("/properties/contradicted/items/type"),
-            Some(&serde_json::Value::String("object".to_string())),
-            "contradicted claim entries must preserve structured evidence"
+        for required in ["id", "claim", "kind", "verdict", "gating", "evidence"] {
+            assert!(
+                claim_schema
+                    .pointer("/properties/claims/items/required")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|req| req.iter().any(|v| v.as_str() == Some(required))),
+                "claim entries must require `{required}`"
+            );
+        }
+        assert!(
+            claim_schema
+                .pointer(
+                    "/properties/claims/items/properties/evidence/items/properties/provenance/enum"
+                )
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("finding_quoted"))),
+            "evidence must record whether it was fetched or quoted by the finding"
         );
-        assert_eq!(
-            claim_schema.pointer("/properties/unresolved/items/type"),
-            Some(&serde_json::Value::String("object".to_string())),
-            "unresolved claim entries must preserve structured evidence"
+        assert!(
+            claim_schema.pointer("/properties/design_intent").is_some(),
+            "the intentional-design check is a required output, not an optional consideration"
         );
+        assert!(
+            claim_schema.pointer("/properties/thesis").is_some(),
+            "the conjunction step tests the claims against a stated thesis"
+        );
+        // Rust owns the gating checks now; a field_check expression
+        // cannot quantify over an array.
+        assert_eq!(fast.eval.as_ref().map(|e| e.kind), Some(EvalKind::Builtin));
         assert_eq!(
-            fast.eval.as_ref().and_then(|e| e.expr.as_deref()),
-            Some("claim_validation.schema_version == 1")
+            fast.eval.as_ref().and_then(|e| e.name.as_deref()),
+            Some("validate_claims_wellformed")
         );
         let fast_prompt = fast.prompt.as_deref().expect("validate fast prompt");
         assert!(prompt_contains_phrase(
@@ -913,19 +936,66 @@ mod tests {
             "`git merge-base --is-ancestor <sha> HEAD` to check whether that commit is present"
         ));
 
-        let slow = &wf.steps[1];
+        // The conjunction step is the artifact that was missing: every
+        // claim was checked alone and nothing asked whether they could
+        // all hold on one execution.
+        let conj = &wf.steps[1];
+        assert_eq!(conj.id, "validate-conjunction");
+        assert_eq!(conj.depends_on, vec!["validate-claims"]);
+        assert!(conj.lenses.is_empty(), "validate must not use lenses");
+        let conj_schema = conj
+            .outputs
+            .get("conjunction")
+            .and_then(|def| def.get("schema"))
+            .expect("conjunction schema");
+        for field in ["conflicts", "single_execution_witness"] {
+            assert!(
+                conj_schema
+                    .pointer(&format!("/properties/{field}"))
+                    .is_some(),
+                "conjunction must report `{field}`"
+            );
+        }
+        // Compile-time and runtime gating are different conditions;
+        // merging them is what made contradictory claims look
+        // compatible.
+        for field in ["build_config", "runtime_state", "concurrent_writer"] {
+            assert!(
+                conj_schema
+                    .pointer(&format!(
+                        "/properties/single_execution_witness/properties/{field}"
+                    ))
+                    .is_some(),
+                "the witness must separate `{field}`"
+            );
+        }
+
+        let slow = &wf.steps[2];
         assert_eq!(slow.id, "validate-reachability");
         assert_eq!(slow.agent, Some(Agent::Slow));
         assert_eq!(slow.mode, Some(Mode::Coding));
-        assert_eq!(slow.depends_on, vec!["validate-claims"]);
+        assert_eq!(
+            slow.depends_on,
+            vec!["validate-claims", "validate-conjunction"]
+        );
         assert!(slow.lenses.is_empty(), "validate must not use lenses");
         assert!(slow.include.iter().any(|i| i.contains("triage_rules")));
-        assert!(slow.outputs.contains_key("verdict"));
-        assert!(slow.outputs.contains_key("severity"));
-        assert!(slow.outputs.contains_key("summary_written"));
-        assert!(slow.outputs.contains_key("severity_written"));
-        assert!(slow.outputs.contains_key("code_output"));
-        assert!(slow.outputs.contains_key("triage_coding"));
+        for output in [
+            "verdict",
+            "severity",
+            "summary_written",
+            "severity_written",
+            "code_output",
+            "triage_coding",
+            // The only typed channels by which a gating claim or a
+            // conflicting pair may be cleared. Without these the slow
+            // step can only clear them in prose, which is how three
+            // measured false positives were preserved as Plausible.
+            "gating_override",
+            "conflict_resolution",
+        ] {
+            assert!(slow.outputs.contains_key(output), "missing output {output}");
+        }
         assert_eq!(
             slow.outputs
                 .get("triage_coding")
@@ -936,6 +1006,17 @@ mod tests {
                 .and_then(|def| def.get("schema")),
             "validate must keep the same triage_coding schema as triage"
         );
+        // A behaviour that happens and is intended is neither Invalid
+        // nor a cheap Plausible; without this value the tree has no
+        // reachable cell for it.
+        assert!(
+            slow.outputs
+                .get("verdict")
+                .and_then(|def| def.get("values"))
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("NotADefect"))),
+            "verdict must be able to say the behaviour is intentional"
+        );
         let slow_prompt = slow.prompt.as_deref().expect("validate slow prompt");
         assert!(prompt_contains_phrase(
             slow_prompt,
@@ -943,7 +1024,7 @@ mod tests {
         ));
         assert!(prompt_contains_phrase(
             slow_prompt,
-            "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent"
+            "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent, not_a_defect"
         ));
         assert!(prompt_contains_phrase(
             slow_prompt,
@@ -961,11 +1042,10 @@ mod tests {
             slow_prompt,
             "`git merge-base --is-ancestor <sha> HEAD` to check whether that commit is present"
         ));
+        assert_eq!(slow.eval.as_ref().map(|e| e.kind), Some(EvalKind::Builtin));
         assert_eq!(
-            slow.eval.as_ref().and_then(|e| e.expr.as_deref()),
-            Some(
-                "summary_written == true && severity_written == true && triage_coding.schema_version == 1 && triage_coding.severity == severity"
-            )
+            slow.eval.as_ref().and_then(|e| e.name.as_deref()),
+            Some("validate_verdict_consistency")
         );
     }
 

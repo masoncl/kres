@@ -34,7 +34,7 @@
     "target": {
       "type": "string",
       "required": true,
-      "description": "Absolute path to a kres finding directory (the kres --export shape — must contain FINDING.md and metadata.yaml)."
+      "description": "Absolute path to a kres finding directory (the kres --export shape \u2014 must contain FINDING.md and metadata.yaml)."
     }
   },
   "skills": [],
@@ -83,9 +83,9 @@
         "that directory. Also update status/subsystem in those files when the template requires it.",
         "",
         "Return a `verdict` field in your structured outputs naming the chosen status (one of:",
-        "Fixed | Plausible | Unconfirmed | Unknown | Invalid | ConfirmedLatent). The machine",
+        "Fixed | Plausible | Unconfirmed | Unknown | Invalid | NotADefect | ConfirmedLatent). The machine",
         "`triage_coding.summary_status` is the lowercased verdict for the single-word",
-        "statuses; the one exception is `ConfirmedLatent`, which maps to `confirmed_latent`.",
+        "statuses; the exceptions are `ConfirmedLatent` -> `confirmed_latent` and `NotADefect` -> `not_a_defect`.",
         "Return a `severity` field in your structured outputs naming the chosen severity",
         "(one of: high | medium | low).",
         "",
@@ -93,12 +93,12 @@
         "content you emit. Do not put this JSON inside summary.md. Shape:",
         "- schema_version: integer, set to 1",
         "- severity: one of high, medium, low",
-        "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent",
+        "- summary_status: one of fixed, plausible, unconfirmed, unknown, invalid, confirmed_latent, not_a_defect",
         "- summary_subject: short subject string from the summary, or empty string",
         "- impact_classes: array of lowercase strings such as local_dos, remote_dos, memory_corruption, privilege_escalation, info_leak, data_corruption, vm_escape, latent, test_only, unknown",
         "- config_commonness: one of common, niche, debug_or_test_only, unknown",
-        "- reject_reasons: array of lowercase strings for reasons this should not enter a fix queue, such as invalid, unconfirmed, unknown_reachability, latent_only, test_only, niche_config, fixed_already",
-        "- reachability: object with host_access, remote_access, specific_config, root_required, regular_user as yes/no/n/a/unknown strings",
+        "- reject_reasons: array of lowercase strings for reasons this should not enter a fix queue, such as invalid, unconfirmed, unknown_reachability, latent_only, intentional_design, test_only, niche_config, fixed_already",
+        "- reachability: object with host_access, remote_access, root_required, regular_user as yes/no/n/a/unknown strings, plus build_config {required, symbols[]} for compile-time gating and runtime_state {required, conditions[]} for everything that must additionally hold at run time. Keep those two apart: CONFIG_X=y and X_enabled() are different conditions.",
         "- touches: object with files array and subsystems array, populated only from explicit summary text",
         "- actionability: object with fix_queue_eligible boolean and rationale string",
         "- priority: object with tier one of critical, high, medium, low, none, unknown; score integer 0-100; reason string",
@@ -113,7 +113,8 @@
             "Unconfirmed",
             "Unknown",
             "Invalid",
-            "ConfirmedLatent"
+            "ConfirmedLatent",
+            "NotADefect"
           ],
           "description": "Status the agent assigned to the finding."
         },
@@ -183,7 +184,8 @@
                   "unconfirmed",
                   "unknown",
                   "invalid",
-                  "confirmed_latent"
+                  "confirmed_latent",
+                  "not_a_defect"
                 ]
               },
               "summary_subject": {
@@ -216,9 +218,10 @@
                 "required": [
                   "host_access",
                   "remote_access",
-                  "specific_config",
                   "root_required",
-                  "regular_user"
+                  "regular_user",
+                  "build_config",
+                  "runtime_state"
                 ],
                 "properties": {
                   "host_access": {
@@ -231,15 +234,6 @@
                     ]
                   },
                   "remote_access": {
-                    "type": "string",
-                    "enum": [
-                      "yes",
-                      "no",
-                      "n/a",
-                      "unknown"
-                    ]
-                  },
-                  "specific_config": {
                     "type": "string",
                     "enum": [
                       "yes",
@@ -265,6 +259,60 @@
                       "n/a",
                       "unknown"
                     ]
+                  },
+                  "build_config": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "required",
+                      "symbols"
+                    ],
+                    "properties": {
+                      "required": {
+                        "type": "string",
+                        "enum": [
+                          "yes",
+                          "no",
+                          "n/a",
+                          "unknown"
+                        ]
+                      },
+                      "symbols": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y."
+                      }
+                    },
+                    "description": "Compile-time gating only."
+                  },
+                  "runtime_state": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "required",
+                      "conditions"
+                    ],
+                    "properties": {
+                      "required": {
+                        "type": "string",
+                        "enum": [
+                          "yes",
+                          "no",
+                          "n/a",
+                          "unknown"
+                        ]
+                      },
+                      "conditions": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Static branches, sysctls, scheduler features, cgroup settings, topology \u2014 conditions that must hold at run time even when the build config is set."
+                      }
+                    },
+                    "description": "Runtime gating. Distinct from build_config: a kernel can have CONFIG_X=y while X_enabled() is false."
                   }
                 }
               },

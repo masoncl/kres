@@ -846,13 +846,6 @@ fn review_comparison_path(
     (compare && slow_model_count > 1).then(|| results_dir.join("comparison.json"))
 }
 
-fn summary_defaults_slow_to_fast(args: &ReplArgs) -> bool {
-    (args.summary || args.summary_markdown)
-        && args.slow.is_empty()
-        && args.slow_agent.is_none()
-        && args.slow_model.is_none()
-}
-
 async fn run_repl(args: ReplArgs) -> Result<()> {
     use kres_agents::WorkspaceFetcher;
     use kres_core::TaskManager;
@@ -880,39 +873,33 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         settings.model_for(kres_repl::ModelRole::Fast),
     )?;
 
-    let summary_defaults_slow_to_fast = summary_defaults_slow_to_fast(&args);
-    let mut slow_agent_specs: Vec<(PathBuf, Option<String>)> = if let Some(p) =
-        args.slow_agent.clone()
-    {
-        let selector = args
-            .slow_model
-            .as_deref()
-            .or_else(|| settings.model_for(kres_repl::ModelRole::Slow));
-        vec![(
-            resolve_agent_for_model(Some(&p), selector)?.expect("explicit path resolves"),
-            selector.map(ToOwned::to_owned),
-        )]
-    } else if summary_defaults_slow_to_fast {
-        fast_agent
-            .clone()
-            .map(|path| {
-                let model =
-                    resolved_agent_model_label(Some(&path), kres_repl::ModelRole::Fast, &settings);
-                vec![(path, Some(model))]
-            })
-            .unwrap_or_default()
-    } else if args.slow.is_empty() {
-        resolve_agent_for_model(None, settings.model_for(kres_repl::ModelRole::Slow))?
-            .map(|p| vec![(p, args.slow_model.clone())])
-            .unwrap_or_default()
-    } else {
-        let dirs = kres_config_dirs();
-        args.slow
-            .iter()
-            .map(|selector| resolve_slow_selector_in_dirs(selector, &settings, &dirs))
-            .collect::<Result<Vec<_>>>()?
-    };
-    if args.slow.is_empty() && !summary_defaults_slow_to_fast {
+    // `--summary` validates every finding through the `validate`
+    // workflow, so its slow role is a real false-positive-elimination
+    // pass and gets the configured slow model like any other. It used to
+    // default to the fast model here, which meant a summary built from
+    // opus findings was filtered by sonnet validations.
+    let mut slow_agent_specs: Vec<(PathBuf, Option<String>)> =
+        if let Some(p) = args.slow_agent.clone() {
+            let selector = args
+                .slow_model
+                .as_deref()
+                .or_else(|| settings.model_for(kres_repl::ModelRole::Slow));
+            vec![(
+                resolve_agent_for_model(Some(&p), selector)?.expect("explicit path resolves"),
+                selector.map(ToOwned::to_owned),
+            )]
+        } else if args.slow.is_empty() {
+            resolve_agent_for_model(None, settings.model_for(kres_repl::ModelRole::Slow))?
+                .map(|p| vec![(p, args.slow_model.clone())])
+                .unwrap_or_default()
+        } else {
+            let dirs = kres_config_dirs();
+            args.slow
+                .iter()
+                .map(|selector| resolve_slow_selector_in_dirs(selector, &settings, &dirs))
+                .collect::<Result<Vec<_>>>()?
+        };
+    if args.slow.is_empty() {
         append_configured_secondary_slow(&mut slow_agent_specs, &settings, &kres_config_dirs())?;
     }
     if let Some(spec) = slow_agent_specs.first() {
@@ -1013,7 +1000,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         };
         let slow_cfg_path = slow_agent.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "--summary requires a model config for validation (configure the fast model or pass --slow)"
+                "--summary requires a slow model config for validation (configure models.slow or pass --slow)"
             )
         })?;
         let validation_workspace =
@@ -2551,33 +2538,38 @@ mod tests {
         assert!(c.repl.slow.is_empty());
     }
 
+    /// `--summary` runs the `validate` workflow over every finding, so
+    /// its slow role must resolve like any other run: from
+    /// settings.json's `models.slow`, or an explicit `--slow`. It used
+    /// to substitute the fast model, which filtered opus findings
+    /// through sonnet validations.
     #[test]
-    fn standalone_summary_defaults_slow_role_to_fast_model() {
+    fn standalone_summary_does_not_substitute_the_fast_model() {
         for flag in ["--summary", "--summary-markdown"] {
             let cli = Cli::try_parse_from(["kres", flag]).unwrap();
-            assert!(summary_defaults_slow_to_fast(&cli.repl));
+            assert!(
+                cli.repl.slow.is_empty()
+                    && cli.repl.slow_agent.is_none()
+                    && cli.repl.slow_model.is_none(),
+                "no slow override is parsed, so role resolution must fall through \
+                 to settings.json models.slow"
+            );
         }
     }
 
     #[test]
-    fn standalone_summary_explicit_slow_selection_wins() {
+    fn standalone_summary_explicit_slow_selection_is_parsed() {
         let tagged = Cli::try_parse_from(["kres", "--summary", "--slow", "opus"]).unwrap();
-        assert!(!summary_defaults_slow_to_fast(&tagged.repl));
+        assert_eq!(tagged.repl.slow, vec!["opus".to_string()]);
 
         let model =
             Cli::try_parse_from(["kres", "--summary-markdown", "--slow-model", "slow-test"])
                 .unwrap();
-        assert!(!summary_defaults_slow_to_fast(&model.repl));
+        assert_eq!(model.repl.slow_model.as_deref(), Some("slow-test"));
 
         let provider =
             Cli::try_parse_from(["kres", "--summary", "--slow-agent", "/tmp/slow.json"]).unwrap();
-        assert!(!summary_defaults_slow_to_fast(&provider.repl));
-    }
-
-    #[test]
-    fn normal_repl_keeps_configured_slow_model() {
-        let cli = Cli::try_parse_from(["kres"]).unwrap();
-        assert!(!summary_defaults_slow_to_fast(&cli.repl));
+        assert!(provider.repl.slow_agent.is_some());
     }
 
     #[test]

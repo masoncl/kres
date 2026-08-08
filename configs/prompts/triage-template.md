@@ -71,7 +71,7 @@ order. Every section is required.
 
 # Status
 
-<Fixed | Plausible | Unconfirmed | Unknown | Invalid | Confirmed Latent>
+<Fixed | Plausible | Unconfirmed | Unknown | Invalid | Not A Defect | Confirmed Latent>
 
 # Severity
 
@@ -133,12 +133,40 @@ real, do not stop here — let the tree reach `Confirmed Latent`
 (real but no current trigger) or `Plausible` (real and
 reachable).
 
-### 2. `Fixed`
+### 2. `Not A Defect`
+
+The described behaviour **does** occur — you did not disprove it — but
+source evidence shows it is what the author intended. Use this when one
+of the following says so, and cite it:
+
+- the leading comment on the function, type, or the specific branch,
+- an enumerated design table, rank ordering, or documented policy in the
+  same file that lists the behaviour as a case,
+- the introducing commit's message describing the behaviour as the
+  change's purpose, especially with a measured justification or reviewer
+  sign-off.
+
+This is distinct from `Invalid`, where the behaviour does not happen at
+all, and from `Plausible` with low severity, which says the code is
+wrong but cheap. `Not A Defect` says the code is right.
+
+You are allowed to disagree with the design — a policy can be
+deliberate and still be wrong at the edges. If you do, say so in
+`# Impact`, name the case the author's rationale does not cover, and
+keep the finding valid. What you may not do is record a documented,
+reviewed decision as an oversight without engaging with the
+documentation.
+
+When you pick `Not A Defect`, set metadata `status: not_a_defect`, add
+`intentional_design` to `reject_reasons`, and quote the intent evidence
+in `triage_coding.evidence.status`.
+
+### 3. `Fixed`
 
 FINDING.md or metadata cite an upstream commit that resolves the
 issue.
 
-### 3. `Unconfirmed`
+### 4. `Unconfirmed`
 
 The finding's own narrative admits the bug is contingent on
 something the analysis did not verify. This is the default for
@@ -185,7 +213,7 @@ Worked examples:
   `dst->anon_vma`". One unverified callee gates the whole bug.
   → `Unconfirmed`, NOT `Unknown`.
 
-### 4. `Confirmed Latent`
+### 5. `Confirmed Latent`
 
 The defect pattern **genuinely exists** in source — you verified
 the code shape is real — but 100% of the finding has no current
@@ -216,7 +244,7 @@ State in `# Impact` that the pattern exists in source but is
 unreachable in this tree, and what future change would make it
 reachable.
 
-### 5. `Plausible`
+### 6. `Plausible`
 
 The defect path is **demonstrated** by FINDING.md evidence —
 concrete code citations showing the bad path actually executes.
@@ -224,7 +252,29 @@ No crash / repro / upstream fix has been observed. Open
 questions may exist around severity or triggerability, but they
 do not gate whether the bug is real.
 
-### 6. `Unknown`
+#### Asserting a race or a check-then-use window
+
+There is a mandatory checklist for *dismissing* a race. This is the one
+for asserting it. Before a finding whose defect is "these two things can
+interleave" may be `Plausible`, name all three:
+
+1. the exact instruction or statement that opens the window,
+2. **the specific writer — by function name — that can execute inside
+   it**, and
+3. why that writer can run concurrently: a different CPU, an interrupt,
+   a preemption point, a work item on another queue.
+
+Point 2 is the one that gets skipped. "The window is narrow but real",
+"essentially closed", "only a handful of instructions", and "in theory
+another thread could" are not writers; they are the analysis stopping
+one step early. If every writer of the state is the same task executing
+the window, or is excluded by a lock the window already holds, there is
+no race — that is `Invalid`, not a small `Plausible`.
+
+The same applies to an unlocked read: name who writes the value
+concurrently, or the finding is about a value nothing else changes.
+
+### 7. `Unknown`
 
 Narrow fallback for when FINDING.md is too thin or contradictory
 to classify at all (empty narrative, symbols don't match the
@@ -248,6 +298,7 @@ edits are permitted.
    | Plausible        | active            |
    | Unconfirmed      | unconfirmed       |
    | Invalid          | invalidated       |
+   | Not A Defect     | not_a_defect      |
    | Confirmed Latent | confirmed_latent  |
    | Unknown          | leave as-is       |
 
@@ -290,11 +341,12 @@ latent defect with a credible path to becoming reachable.
 
 ### `low`
 
-Use `low` for invalidated findings, fixed issues that only need
-historical bookkeeping, test/debug-only paths, niche configurations
-with weak impact, protocol-correctness issues without memory or data
-integrity consequences, and latent-only defects with no current
-in-tree trigger.
+Use `low` for invalidated findings, behaviour that turned out to be
+intentional, fixed issues that only need historical bookkeeping,
+test/debug-only paths, niche configurations with weak impact,
+protocol-correctness issues without memory or data integrity
+consequences, and latent-only defects with no current in-tree
+trigger.
 
 ## FINDING.md status/severity header
 

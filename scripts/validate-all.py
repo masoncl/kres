@@ -42,16 +42,22 @@ signal_received = False
 SEVERITIES = {"high", "medium", "low"}
 
 
-def configured_fast_model():
-    """Read the fast-role model selector from ~/.kres/settings.json."""
+def configured_slow_model():
+    """Read the slow-role model selector from ~/.kres/settings.json.
+
+    Validation is a false-positive-elimination pass, so the reachability
+    step gets the slow model the operator configured, not a cheaper
+    stand-in. This used to read models.fast and pass it as --slow-model,
+    which silently ran every validation's deep pass on the fast model.
+    """
     settings_path = Path.home() / ".kres" / "settings.json"
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot read {settings_path}: {exc}") from exc
-    model = settings.get("models", {}).get("fast")
+    model = settings.get("models", {}).get("slow")
     if not isinstance(model, str) or not model.strip():
-        raise RuntimeError(f"{settings_path} has no non-empty models.fast setting")
+        raise RuntimeError(f"{settings_path} has no non-empty models.slow setting")
     return model.strip()
 
 
@@ -286,9 +292,12 @@ def validate_one(kres_bin, slow_model, workspace, bug_dir, timeout):
     # Sharing a single --results across the parallel batch races on
     # session.json / findings.json / report.md / prompt.md and crashes
     # the Rust side with exit 101.
+    # `--slow` rather than `--slow-model`: a non-empty --slow selection
+    # also suppresses settings.json's models.slow_secondary, so a batch
+    # validation runs exactly one slow model per finding.
     cmd = [
         kres_bin,
-        "--slow-model", slow_model,
+        "--slow", slow_model,
         "--prompt", f"validate: {bug_dir} {workspace}",
         "--stdio",
         "--one",
@@ -392,6 +401,11 @@ Examples:
         help="number of parallel validate runs (default: 20)",
     )
     parser.add_argument(
+        "--slow-model",
+        help="slow-agent model selector passed to kres as --slow "
+             "(default: models.slow from ~/.kres/settings.json)",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         help="per-finding timeout in seconds",
@@ -415,11 +429,14 @@ Examples:
     )
     args = parser.parse_args()
 
-    try:
-        slow_model = configured_fast_model()
-    except RuntimeError as exc:
-        print(f"model configuration error: {exc}", file=sys.stderr)
-        return 1
+    if args.slow_model:
+        slow_model = args.slow_model
+    else:
+        try:
+            slow_model = configured_slow_model()
+        except RuntimeError as exc:
+            print(f"model configuration error: {exc}", file=sys.stderr)
+            return 1
 
     # Validate paths.
     if not args.kres_bin or not os.access(args.kres_bin, os.X_OK):

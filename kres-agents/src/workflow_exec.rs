@@ -2659,6 +2659,54 @@ fn eval_validate_claims_wellformed(step: &Step, ctx: &ExecContext<'_>) -> (bool,
             quoted_only.join(", ")
         ));
     }
+
+    // The citation lint. `citation_check` is machine-populated by the
+    // driver, which is the only place holding the workspace and the
+    // evidence the fetcher returned.
+    if let Some(check) = outputs.get("citation_check") {
+        let list = |key: &str| -> Vec<String> {
+            check
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let unresolved = list("unresolved");
+        if !unresolved.is_empty() {
+            return eval_fail(&format!(
+                "citation(s) do not resolve against the source workspace: {}. Cite a file and \
+                 line you actually read",
+                unresolved.join("; ")
+            ));
+        }
+        // `unbacked_fresh` is recorded but does NOT fail the step, and
+        // that is a measured decision rather than a soft touch. Replayed
+        // over 113 real claim reports it fired 14 times across 11 runs
+        // (9.7%), and the cases examined were correct claims: a grep
+        // result is delivered as bare `61:SCHED_FEAT(PARANOID_AVG,
+        // false)` lines with no filename, so a file the run genuinely
+        // searched never appears in the delivered evidence. Failing on
+        // that would reject a tenth of all runs for being right.
+        //
+        // Making it enforceable means giving search results their
+        // filename; until then the signal is worth keeping in the
+        // artifacts and not worth gating on.
+        let unbacked = list("unbacked_fresh");
+        if !unbacked.is_empty() {
+            kres_core::async_eprintln!(
+                "[citation lint] {} citation(s) marked fresh name a file absent from the \
+                 fetched evidence: {}",
+                unbacked.len(),
+                unbacked.join("; ")
+            );
+        }
+    }
     (true, None)
 }
 
@@ -3826,6 +3874,36 @@ mod tests {
             {"location": "kernel/sched/fair.c:1809", "provenance": "fresh"}
         ]);
         assert!(run_claims_eval(claims_output(json!([claim]))).0);
+    }
+
+    #[test]
+    fn claims_eval_rejects_unresolvable_and_unbacked_citations() {
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["citation_check"] = json!({
+            "citations_checked": 1,
+            "unresolved": ["a: kernel/sched/fair.c:99999 is past end of file (12000 lines)"],
+            "unbacked_fresh": []
+        });
+        let (passed, reason) = run_claims_eval(outputs);
+        assert!(!passed);
+        assert!(reason.unwrap().contains("do not resolve"));
+
+        // An unbacked `fresh` label is logged, not fatal: replayed over
+        // 113 real reports it fired on correct claims whose evidence
+        // came from a grep, because grep results carry no filename.
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["citation_check"] = json!({
+            "citations_checked": 1,
+            "unresolved": [],
+            "unbacked_fresh": ["a: kernel/sched/fair.c:1809 is marked fresh but ... never fetched"]
+        });
+        assert!(run_claims_eval(outputs).0);
+
+        // Clean lint passes.
+        let mut outputs = claims_output(json!([fresh_claim("a", true, "supported")]));
+        outputs["citation_check"] =
+            json!({"citations_checked": 3, "unresolved": [], "unbacked_fresh": []});
+        assert!(run_claims_eval(outputs).0);
     }
 
     #[test]

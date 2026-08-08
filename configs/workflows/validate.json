@@ -267,6 +267,10 @@
           },
           "description": "Structured validation of finding claims."
         },
+        "citation_check": {
+          "type": "object",
+          "description": "Machine-populated. Resolves each file:line citation against the workspace and confirms every `fresh` citation names a file the fetcher actually delivered. Not emitted by the model."
+        },
         "followups": {
           "type": "array<Followup>",
           "description": "Typed source/history/context requests needed before the slow validation pass."

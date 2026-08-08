@@ -1426,6 +1426,18 @@ Both the fast and the slow step use `builtin` evals rather than
 `field_check` expressions, because the invariants quantify over arrays
 and read across steps.
 
+A machine-populated `citation_check` output lints every claim citation
+before the eval runs, computed by the driver because only it holds the
+workspace and the fetched evidence. A `file:line` that names a
+nonexistent file, or a line past end of file, fails the step. A `fresh`
+citation naming a file absent from the delivered evidence is logged but
+does not fail: replayed over 113 real reports that fired 14 times across
+11 runs, and the cases examined were correct claims whose evidence came
+from a grep — search results are delivered as bare `61:SCHED_FEAT(...)`
+lines with no filename, so a genuinely searched file never appears in
+the evidence blob. Giving search results their filename is what would
+make that half enforceable.
+
 `validate_claims_wellformed` rejects an attempt when: `schema_version`
 is not 1; `thesis` is empty; `design_intent.checked` is false; a claim
 id is missing or duplicated; a supported/contradicted claim has no

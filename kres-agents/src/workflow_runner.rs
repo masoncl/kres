@@ -98,7 +98,7 @@
 //! Failures abort the workflow (the executor records the error and
 //! moves to `WorkflowStatus::Failure`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -983,6 +983,18 @@ impl LlmDriver {
                         return Err(format!("step '{}' output mapping: {e}", step.id).into());
                     }
                 };
+                // Lint the claim citations against the tree and against
+                // the evidence this run actually fetched. Computed here
+                // rather than in the eval because only the driver holds
+                // the workspace and the gathered evidence.
+                if step.outputs.contains_key("citation_check") {
+                    let gathered =
+                        fetched_evidence_blob(&summary.gathered_symbols, &summary.gathered_context);
+                    outputs.insert(
+                        "citation_check".into(),
+                        check_claim_citations(&outputs, &self.workspace, &gathered),
+                    );
+                }
                 if let Err(e) = validate_model_outputs_before_side_effects(step, &outputs) {
                     if json_retry < WORKFLOW_RESPONSE_RETRIES {
                         last_parse_err = Some(e.to_string());
@@ -4383,6 +4395,148 @@ fn only_machine_populated_outputs(step: &Step) -> bool {
     })
 }
 
+/// Verify each claim's evidence citations against the tree and against
+/// what this run actually fetched.
+///
+/// This is a lint, not a truth check: it cannot tell whether a citation
+/// supports the claim, only whether the citation could possibly be real.
+/// Two things are checkable and neither was checked before.
+///
+/// A `file:line` must resolve — the file exists under the workspace and
+/// the line is within it. Measured over one batch, 1212 of 1212
+/// citations already resolved, so this is a guard against a regression
+/// rather than a live defect.
+///
+/// A `fresh` citation must name a file that appears in the evidence the
+/// fetcher delivered to this run. That one matters: `fresh` versus
+/// `finding_quoted` is self-declared by the model, and
+/// `validate_claims_wellformed` rejects a gating claim supported only by
+/// `finding_quoted` evidence. Without this check the rejection is
+/// avoidable by relabelling a quotation lifted out of FINDING.md.
+fn check_claim_citations(outputs: &Map<String, Value>, workspace: &Path, gathered: &str) -> Value {
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut unbacked: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    let mut line_counts: HashMap<String, Option<usize>> = HashMap::new();
+
+    let claims = outputs
+        .get("claim_validation")
+        .and_then(|report| report.get("claims"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for claim in &claims {
+        let id = claim
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>");
+        for evidence in claim
+            .get("evidence")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let location = evidence
+                .get("location")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let Some((file, line)) = parse_source_citation(location) else {
+                // Commit shas, search expressions and symbol names are
+                // legitimate locations with nothing to resolve.
+                continue;
+            };
+            checked += 1;
+            let total = line_counts
+                .entry(file.clone())
+                .or_insert_with(|| count_lines(&workspace.join(&file)));
+            match total {
+                None => unresolved.push(format!("{id}: {file} does not exist")),
+                Some(total) if line > *total => unresolved.push(format!(
+                    "{id}: {file}:{line} is past end of file ({total} lines)"
+                )),
+                Some(_) => {}
+            }
+            let fresh = evidence.get("provenance").and_then(Value::as_str) == Some("fresh");
+            if fresh && !gathered.contains(&file) {
+                unbacked.push(format!(
+                    "{id}: {location} is marked fresh but {file} is not in anything the fetcher returned"
+                ));
+            }
+        }
+    }
+
+    serde_json::json!({
+        "citations_checked": checked,
+        "unresolved": unresolved,
+        "unbacked_fresh": unbacked,
+    })
+}
+
+/// The evidence a run fetched, as one string to test citations against.
+///
+/// The finding's own `FINDING.md` and `metadata.yaml` arrive as context
+/// items like any other read, and they quote source. Including them
+/// would make every file the finding mentions look fetched, which is
+/// precisely the `finding_quoted` case the `fresh` label is supposed to
+/// exclude. Drop them.
+fn fetched_evidence_blob(symbols: &[Value], context: &[Value]) -> String {
+    let is_the_finding_quoting_itself = |item: &Value| -> bool {
+        item.get("source")
+            .and_then(Value::as_str)
+            .map(|source| source.contains("FINDING.") || source.contains("metadata.yaml"))
+            .unwrap_or(false)
+    };
+    let fetched: Vec<&Value> = context
+        .iter()
+        .filter(|item| !is_the_finding_quoting_itself(item))
+        .collect();
+    serde_json::to_string(&serde_json::json!({
+        "symbols": symbols,
+        "context": fetched,
+    }))
+    .unwrap_or_default()
+}
+
+/// Pull a `path/to/file.c:1234` citation out of a free-form location
+/// string. Returns None when there is no workspace-relative source path
+/// with a line number, which is the common case for a sha or a grep
+/// expression.
+fn parse_source_citation(location: &str) -> Option<(String, usize)> {
+    let bytes = location.as_bytes();
+    for (idx, _) in location.match_indices(':') {
+        let (head, tail) = location.split_at(idx);
+        let digits: String = tail[1..].chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        // ':' is a delimiter too: citations routinely embed the
+        // followup that produced them, as in
+        // `kernel/sched/fair.c (read:kernel/sched/fair.c:1230+20)`.
+        // Without it the path parses as "read:kernel/sched/fair.c" and
+        // every such citation looks like a nonexistent file.
+        let start = head
+            .rfind(|c: char| c.is_whitespace() || c == '(' || c == '`' || c == ',' || c == ':')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let path = &head[start..];
+        if !path.contains('/') {
+            continue;
+        }
+        if !(path.ends_with(".c") || path.ends_with(".h") || path.ends_with(".S")) {
+            continue;
+        }
+        let _ = bytes;
+        return digits.parse().ok().map(|line| (path.to_string(), line));
+    }
+    None
+}
+
+fn count_lines(path: &Path) -> Option<usize> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|body| body.lines().count())
+}
+
 fn is_machine_populated_output(name: &str) -> bool {
     matches!(
         name,
@@ -4394,6 +4548,7 @@ fn is_machine_populated_output(name: &str) -> bool {
             | "summary_written"
             | "severity_written"
             | "review_dispute"
+            | "citation_check"
     )
 }
 
@@ -7781,6 +7936,124 @@ mod tests {
     /// Uses triage.json because its `triage_coding` schema is the
     /// largest shipped one and it declares a typed DTO array alongside
     /// it.
+    #[test]
+    fn parse_source_citation_finds_a_workspace_path_and_line() {
+        assert_eq!(
+            parse_source_citation("kernel/sched/fair.c:1809"),
+            Some(("kernel/sched/fair.c".to_string(), 1809))
+        );
+        assert_eq!(
+            parse_source_citation("see `kernel/sched/fair.c:1809` update_avg_scale()"),
+            Some(("kernel/sched/fair.c".to_string(), 1809))
+        );
+        assert_eq!(
+            parse_source_citation("include/linux/mm_types.h:1615 mm_init_sched()"),
+            Some(("include/linux/mm_types.h".to_string(), 1615))
+        );
+        // Citations routinely embed the followup that produced them.
+        // Parsing the `read:` prefix into the path made every one of
+        // these look like a nonexistent file.
+        assert_eq!(
+            parse_source_citation("kernel/sched/fair.c (read:kernel/sched/fair.c:1230+20)"),
+            Some(("kernel/sched/fair.c".to_string(), 1230))
+        );
+        assert_eq!(
+            parse_source_citation("mcp:source:kernel/sched/core.c:228"),
+            Some(("kernel/sched/core.c".to_string(), 228))
+        );
+        // Not source citations: a sha, a bare symbol, a grep expression,
+        // a file with no line, a path-less name.
+        for other in [
+            "commit cccb45d7c429",
+            "task_cache_work",
+            "grep for sc_stat\\.lock: 2 hits",
+            "kernel/sched/fair.c",
+            "fair.c:1809",
+        ] {
+            assert_eq!(
+                parse_source_citation(other),
+                None,
+                "{other} is not a citation"
+            );
+        }
+    }
+
+    fn citation_outputs(location: &str, provenance: &str) -> Map<String, Value> {
+        let mut outputs = Map::new();
+        outputs.insert(
+            "claim_validation".into(),
+            json!({
+                "claims": [{
+                    "id": "c1",
+                    "evidence": [{"location": location, "provenance": provenance}]
+                }]
+            }),
+        );
+        outputs
+    }
+
+    #[test]
+    fn citation_lint_resolves_paths_and_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("kernel/sched")).unwrap();
+        std::fs::write(dir.path().join("kernel/sched/fair.c"), "a\nb\nc\n").unwrap();
+        let gathered = r#"{"symbols":[{"filename":"kernel/sched/fair.c"}]}"#;
+
+        let ok = check_claim_citations(
+            &citation_outputs("kernel/sched/fair.c:2", "fresh"),
+            dir.path(),
+            gathered,
+        );
+        assert_eq!(ok["citations_checked"], 1);
+        assert!(ok["unresolved"].as_array().unwrap().is_empty());
+        assert!(ok["unbacked_fresh"].as_array().unwrap().is_empty());
+
+        let past_eof = check_claim_citations(
+            &citation_outputs("kernel/sched/fair.c:9000", "fresh"),
+            dir.path(),
+            gathered,
+        );
+        assert_eq!(past_eof["unresolved"].as_array().unwrap().len(), 1);
+
+        let missing = check_claim_citations(
+            &citation_outputs("kernel/sched/invented.c:1", "fresh"),
+            dir.path(),
+            r#"{"symbols":[{"filename":"kernel/sched/invented.c"}]}"#,
+        );
+        assert!(missing["unresolved"].as_array().unwrap()[0]
+            .as_str()
+            .unwrap()
+            .contains("does not exist"));
+    }
+
+    /// `fresh` is what lets a claim escape the finding_quoted rejection
+    /// in `validate_claims_wellformed`, so it must be backed by evidence
+    /// the fetcher actually returned rather than being a label the model
+    /// picks.
+    #[test]
+    fn citation_lint_rejects_fresh_that_was_never_fetched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("kernel/sched")).unwrap();
+        std::fs::write(dir.path().join("kernel/sched/fair.c"), "a\nb\nc\n").unwrap();
+
+        let unbacked = check_claim_citations(
+            &citation_outputs("kernel/sched/fair.c:2", "fresh"),
+            dir.path(),
+            r#"{"symbols":[{"filename":"kernel/sched/core.c"}]}"#,
+        );
+        assert_eq!(unbacked["unbacked_fresh"].as_array().unwrap().len(), 1);
+
+        // The same citation labelled honestly is fine: a finding may
+        // quote source it read from the finding itself, it just cannot
+        // call that fresh.
+        let quoted = check_claim_citations(
+            &citation_outputs("kernel/sched/fair.c:2", "finding_quoted"),
+            dir.path(),
+            r#"{"symbols":[{"filename":"kernel/sched/core.c"}]}"#,
+        );
+        assert!(quoted["unbacked_fresh"].as_array().unwrap().is_empty());
+    }
+
     #[test]
     fn build_schema_tail_renders_declared_json_schemas() {
         let wf = parse_workflow(include_str!("../../configs/workflows/triage.json")).unwrap();

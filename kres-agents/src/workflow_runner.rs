@@ -941,6 +941,7 @@ impl LlmDriver {
                         synthesis_use_fast,
                         synthesis_system,
                         stable_instructions: prompt_texts.stable_instructions.clone(),
+                        slow_variant_index: step.slow_variant.map(|v| v.index()),
                         pending_followups: std::mem::take(&mut pending_followups),
                         seed_symbols: run_seed_symbols,
                         seed_context: run_seed_context,
@@ -5123,6 +5124,48 @@ async fn git_paths_have_changes(workspace: &Path, files: &[String]) -> Result<bo
     Ok(!out.stdout.is_empty())
 }
 
+/// Reproduce successful refutations for the step they branched back to.
+///
+/// A refutation step runs after the verdict, so the verdict step cannot
+/// interpolate it: on the first pass there is nothing there, and an
+/// unresolvable `{{...}}` is an error rather than an empty string. On
+/// the branch-back the outputs do exist, and the step has to see what it
+/// is answering.
+fn prior_refutations_block(step: &Step, ctx: &ExecContext<'_>) -> Option<String> {
+    const REFUTERS: [&str; 2] = ["validate-refute", "validate-refute-secondary"];
+    if step.id != "validate-reachability" {
+        return None;
+    }
+    let broken: Vec<String> = REFUTERS
+        .iter()
+        .filter_map(|id| {
+            let refutation = ctx.steps.get(*id)?.outputs.get("refutation")?;
+            refutation
+                .get("refuted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                .then(|| {
+                    format!(
+                        "--- REFUTATION from {id} ---\n{}",
+                        serde_json::to_string_pretty(refutation)
+                            .unwrap_or_else(|_| refutation.to_string())
+                    )
+                })
+        })
+        .collect();
+    if broken.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\n--- PRIOR REFUTATIONS ---\n\
+         Your previous verdict was sent to independent attempts to break it, and \
+         {} succeeded. Answer each one in `refutation_rebuttal` with evidence, or \
+         choose a verdict below Plausible.\n\n{}\n",
+        if broken.len() == 1 { "one" } else { "both" },
+        broken.join("\n\n")
+    ))
+}
+
 async fn correction_context_for_step(
     workspace: &Path,
     step: &Step,
@@ -5141,6 +5184,9 @@ async fn correction_context_for_step(
             &previous_review,
             &dispute,
         ));
+    }
+    if let Some(block) = prior_refutations_block(step, ctx) {
+        return Ok(block);
     }
     if commit_message_is_being_corrected(step, ctx) {
         let message = git_head_commit_message(workspace).await?;
@@ -10443,6 +10489,7 @@ mod tests {
             agent: Some(AgentRole::Fast),
             mode: None,
             synthesis_system: Some(SynthesisSystem::RoutingAgent),
+            slow_variant: None,
             actions: None,
             depends_on: Vec::new(),
             run_if: None,

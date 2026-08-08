@@ -22,6 +22,11 @@
       "type": "string",
       "required": true,
       "description": "Source workspace used for source, grep, git, semcode, and auto skill selection. The /validate command defaults this to the active workspace."
+    },
+    "slow_secondary_available": {
+      "type": "boolean",
+      "required": false,
+      "description": "Machine-populated. True when the session has a second slow model configured (settings.models.slow_secondary, or a second --slow selection). Guards the secondary refutation step: without it that step would re-run the primary model and call it independent."
     }
   },
   "skills": [
@@ -592,7 +597,13 @@
         "- evidence: object with status, impact, reachability, and actionability strings quoting or summarizing the summary text that supports the classification",
         "",
         "Rust must be able to consume the JSON fields directly; do not hide routing,",
-        "status, or severity decisions in prose."
+        "status, or severity decisions in prose.",
+        "",
+        "If this step is running again after a refutation, the refutations are",
+        "reproduced above under PRIOR REFUTATIONS. A refutation you do not",
+        "answer stands: either drop below Plausible, or answer it in",
+        "`refutation_rebuttal` with evidence. Restating the original claim more",
+        "firmly is not an answer."
       ],
       "outputs": {
         "verdict": {
@@ -675,6 +686,41 @@
             }
           },
           "description": "The only way to keep a finding Plausible when a gating claim was left unresolved: settle it here with evidence."
+        },
+        "refutation_rebuttal": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "refuter",
+                "rebuttal",
+                "evidence"
+              ],
+              "properties": {
+                "refuter": {
+                  "type": "string",
+                  "enum": [
+                    "validate-refute",
+                    "validate-refute-secondary"
+                  ],
+                  "description": "Which refutation this answers."
+                },
+                "rebuttal": {
+                  "type": "string",
+                  "description": "Why the refutation does not hold."
+                },
+                "evidence": {
+                  "type": "string",
+                  "description": "file:line, commit or search evidence for the rebuttal. Not a re-argument of the original claim."
+                }
+              }
+            }
+          },
+          "description": "Required to keep a finding Plausible after a refutation step broke it: one entry per successful refutation, each with evidence."
         },
         "summary_written": {
           "type": "boolean",
@@ -971,6 +1017,239 @@
           "on_exhausted": "exit_failure"
         }
       }
+    },
+    {
+      "id": "validate-refute",
+      "title": "Try to break the finding (primary model)",
+      "agent": "slow",
+      "mode": "coding",
+      "depends_on": [
+        "validate-reachability"
+      ],
+      "run_if": "validate-reachability.verdict == 'Plausible'",
+      "actions": [],
+      "prompt": [
+        "Finding directory: {{workflow.target}}",
+        "Source workspace: {{workflow.source_workspace}}",
+        "",
+        "A validation pass concluded this finding is a real, currently",
+        "reachable bug. Your job is to break it. You are not asked for a",
+        "balanced assessment and you are not the one who has to be fair to",
+        "the finding; the pass that just ran already made its case.",
+        "",
+        "Verdict reached: {{validate-reachability.verdict}}",
+        "",
+        "The summary it wrote:",
+        "{{validate-reachability.triage_coding}}",
+        "",
+        "The claim report behind it:",
+        "{{validate-claims.claim_validation}}",
+        "",
+        "The satisfiability report and the execution witness:",
+        "{{validate-conjunction.conjunction}}",
+        "",
+        "Everything the run gathered is attached: the fetched symbols and",
+        "context are in this request. Work from those. Do not request more",
+        "source; nothing will fetch it, and the question is whether the",
+        "evidence already in hand actually supports the conclusion.",
+        "",
+        "Six of eight false positives in a hand audit of a previous export",
+        "had the disproving fact already in the context you are being given,",
+        "and three had it written down as a supported claim. So read the",
+        "claims against each other and against the witness rather than",
+        "looking for something new:",
+        "",
+        "- Can every precondition really hold at once, on one execution? A",
+        "  compile-time gate and a runtime gate are different conditions.",
+        "- Does the witness describe a state the kernel can actually be in,",
+        "  or is it a list of requirements nobody checked for compatibility?",
+        "- For a race: is the named concurrent writer real, and can it run",
+        "  in the window? A writer that is the same task, or one excluded by",
+        "  a lock the window already holds, is not a race.",
+        "- Is the behaviour intentional? A comment, a design table, or the",
+        "  introducing commit saying so makes this not a defect.",
+        "- Does the impact follow, or does the mechanism stop short of it?",
+        "",
+        "Set `refuted` true only when you can point at the thing that breaks",
+        "it, and put that in `decisive_evidence`. \"I am not convinced\" is",
+        "not a refutation: if the finding survives, say so and name the",
+        "claim it most depends on in `weakest_link`. A refutation you cannot",
+        "evidence sends the finding back for another expensive pass, so do",
+        "not bluff."
+      ],
+      "outputs": {
+        "analysis": {
+          "type": "string",
+          "description": "Brief narrative of the attempt to break the finding."
+        },
+        "refutation": {
+          "type": "object",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema_version",
+              "refuted",
+              "reasoning"
+            ],
+            "properties": {
+              "schema_version": {
+                "type": "integer",
+                "const": 1
+              },
+              "refuted": {
+                "type": "boolean",
+                "description": "True when you can show the finding does not hold as written."
+              },
+              "reasoning": {
+                "type": "string",
+                "description": "The strongest case against the finding, whether or not it succeeded."
+              },
+              "decisive_evidence": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "When refuted: the file:line, commit or search result that breaks it. Null otherwise."
+              },
+              "weakest_link": {
+                "type": "string",
+                "description": "The claim id or precondition the finding most depends on, even when you could not break it."
+              }
+            }
+          },
+          "description": "Whether the finding survives an attempt to break it."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "refutation.refuted == false",
+        "on_fail": {
+          "action": "branch_to",
+          "branch_to": "validate-reachability",
+          "max_attempts": 3,
+          "on_exhausted": "continue"
+        }
+      }
+    },
+    {
+      "id": "validate-refute-secondary",
+      "title": "Try to break the finding (second model)",
+      "agent": "slow",
+      "mode": "coding",
+      "depends_on": [
+        "validate-reachability"
+      ],
+      "run_if": "validate-reachability.verdict == 'Plausible' && slow_secondary_available == true",
+      "actions": [],
+      "prompt": [
+        "Finding directory: {{workflow.target}}",
+        "Source workspace: {{workflow.source_workspace}}",
+        "",
+        "A validation pass concluded this finding is a real, currently",
+        "reachable bug. Your job is to break it. You are not asked for a",
+        "balanced assessment and you are not the one who has to be fair to",
+        "the finding; the pass that just ran already made its case.",
+        "",
+        "Verdict reached: {{validate-reachability.verdict}}",
+        "",
+        "The summary it wrote:",
+        "{{validate-reachability.triage_coding}}",
+        "",
+        "The claim report behind it:",
+        "{{validate-claims.claim_validation}}",
+        "",
+        "The satisfiability report and the execution witness:",
+        "{{validate-conjunction.conjunction}}",
+        "",
+        "Everything the run gathered is attached: the fetched symbols and",
+        "context are in this request. Work from those. Do not request more",
+        "source; nothing will fetch it, and the question is whether the",
+        "evidence already in hand actually supports the conclusion.",
+        "",
+        "Six of eight false positives in a hand audit of a previous export",
+        "had the disproving fact already in the context you are being given,",
+        "and three had it written down as a supported claim. So read the",
+        "claims against each other and against the witness rather than",
+        "looking for something new:",
+        "",
+        "- Can every precondition really hold at once, on one execution? A",
+        "  compile-time gate and a runtime gate are different conditions.",
+        "- Does the witness describe a state the kernel can actually be in,",
+        "  or is it a list of requirements nobody checked for compatibility?",
+        "- For a race: is the named concurrent writer real, and can it run",
+        "  in the window? A writer that is the same task, or one excluded by",
+        "  a lock the window already holds, is not a race.",
+        "- Is the behaviour intentional? A comment, a design table, or the",
+        "  introducing commit saying so makes this not a defect.",
+        "- Does the impact follow, or does the mechanism stop short of it?",
+        "",
+        "Set `refuted` true only when you can point at the thing that breaks",
+        "it, and put that in `decisive_evidence`. \"I am not convinced\" is",
+        "not a refutation: if the finding survives, say so and name the",
+        "claim it most depends on in `weakest_link`. A refutation you cannot",
+        "evidence sends the finding back for another expensive pass, so do",
+        "not bluff.",
+        "",
+        "You are a different model from the one that produced the verdict.",
+        "That is the point of asking you: agreement between two families is",
+        "worth more than one model re-reading its own reasoning."
+      ],
+      "outputs": {
+        "analysis": {
+          "type": "string",
+          "description": "Brief narrative of the attempt to break the finding."
+        },
+        "refutation": {
+          "type": "object",
+          "schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "schema_version",
+              "refuted",
+              "reasoning"
+            ],
+            "properties": {
+              "schema_version": {
+                "type": "integer",
+                "const": 1
+              },
+              "refuted": {
+                "type": "boolean",
+                "description": "True when you can show the finding does not hold as written."
+              },
+              "reasoning": {
+                "type": "string",
+                "description": "The strongest case against the finding, whether or not it succeeded."
+              },
+              "decisive_evidence": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "When refuted: the file:line, commit or search result that breaks it. Null otherwise."
+              },
+              "weakest_link": {
+                "type": "string",
+                "description": "The claim id or precondition the finding most depends on, even when you could not break it."
+              }
+            }
+          },
+          "description": "Whether the finding survives an attempt to break it."
+        }
+      },
+      "eval": {
+        "type": "field_check",
+        "expr": "refutation.refuted == false",
+        "on_fail": {
+          "action": "branch_to",
+          "branch_to": "validate-reachability",
+          "max_attempts": 3,
+          "on_exhausted": "continue"
+        }
+      },
+      "slow_variant": "secondary"
     }
   ]
 }

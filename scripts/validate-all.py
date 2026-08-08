@@ -42,23 +42,35 @@ signal_received = False
 SEVERITIES = {"high", "medium", "low"}
 
 
-def configured_slow_model():
-    """Read the slow-role model selector from ~/.kres/settings.json.
+def configured_slow_models():
+    """Read the slow-role model selectors from ~/.kres/settings.json.
+
+    Returns [models.slow] plus models.slow_secondary when it is set.
 
     Validation is a false-positive-elimination pass, so the reachability
     step gets the slow model the operator configured, not a cheaper
     stand-in. This used to read models.fast and pass it as --slow-model,
     which silently ran every validation's deep pass on the fast model.
+
+    The secondary matters for a different reason: the workflow asks a
+    second model to try to break a surviving finding, and that step is
+    skipped unless a second model is actually configured. Two families
+    disagreeing is worth more than one model re-reading itself.
     """
     settings_path = Path.home() / ".kres" / "settings.json"
     try:
         settings = json.loads(settings_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot read {settings_path}: {exc}") from exc
-    model = settings.get("models", {}).get("slow")
-    if not isinstance(model, str) or not model.strip():
+    models = settings.get("models", {})
+    primary = models.get("slow")
+    if not isinstance(primary, str) or not primary.strip():
         raise RuntimeError(f"{settings_path} has no non-empty models.slow setting")
-    return model.strip()
+    selectors = [primary.strip()]
+    secondary = models.get("slow_secondary")
+    if isinstance(secondary, str) and secondary.strip():
+        selectors.append(secondary.strip())
+    return selectors
 
 
 def signal_handler(signum, frame):
@@ -280,7 +292,7 @@ def mark_successful_validation_if_needed(bug_dir):
     return validate_state(bug_dir)
 
 
-def validate_one(kres_bin, slow_model, workspace, bug_dir, timeout):
+def validate_one(kres_bin, slow_models, workspace, bug_dir, timeout):
     """Run kres --prompt 'validate: <bug_dir> <workspace>' with cwd = workspace.
 
     Returns (bug_dir, returncode, combined_output).
@@ -293,11 +305,14 @@ def validate_one(kres_bin, slow_model, workspace, bug_dir, timeout):
     # session.json / findings.json / report.md / prompt.md and crashes
     # the Rust side with exit 101.
     # `--slow` rather than `--slow-model`: a non-empty --slow selection
-    # also suppresses settings.json's models.slow_secondary, so a batch
-    # validation runs exactly one slow model per finding.
-    cmd = [
-        kres_bin,
-        "--slow", slow_model,
+    # replaces the configured slow pair outright, so every model the
+    # workflow may use has to be named here. The second one answers the
+    # workflow's second-opinion refutation step and is skipped when
+    # absent.
+    cmd = [kres_bin]
+    for selector in slow_models:
+        cmd += ["--slow", selector]
+    cmd += [
         "--prompt", f"validate: {bug_dir} {workspace}",
         "--stdio",
         "--one",
@@ -402,8 +417,10 @@ Examples:
     )
     parser.add_argument(
         "--slow-model",
-        help="slow-agent model selector passed to kres as --slow "
-             "(default: models.slow from ~/.kres/settings.json)",
+        help="comma-separated slow-agent model selectors, each passed to kres "
+             "as --slow (default: models.slow plus models.slow_secondary from "
+             "~/.kres/settings.json). The second selection answers the "
+             "workflow's second-opinion refutation step",
     )
     parser.add_argument(
         "--timeout",
@@ -430,13 +447,19 @@ Examples:
     args = parser.parse_args()
 
     if args.slow_model:
-        slow_model = args.slow_model
+        slow_models = [m.strip() for m in args.slow_model.split(",") if m.strip()]
     else:
         try:
-            slow_model = configured_slow_model()
+            slow_models = configured_slow_models()
         except RuntimeError as exc:
             print(f"model configuration error: {exc}", file=sys.stderr)
             return 1
+    if len(slow_models) < 2:
+        print(
+            "note: only one slow model selected; the workflow's second-opinion "
+            "refutation step will be skipped",
+            file=sys.stderr,
+        )
 
     # Validate paths.
     if not args.kres_bin or not os.access(args.kres_bin, os.X_OK):
@@ -534,7 +557,7 @@ Examples:
                 executor.submit(
                     validate_one,
                     args.kres_bin,
-                    slow_model,
+                    slow_models,
                     workspace,
                     d,
                     args.timeout,

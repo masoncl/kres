@@ -84,6 +84,18 @@ User prompt → Task created → Task thread starts
   `validate_verdict_consistency` — exist because the prompt already
   stated the rule and runs talked themselves out of it by relabelling a
   load-bearing unresolved claim as a severity question.
+- A second opinion must come from a different model. A workflow step
+  that checks another step's conclusion names `slow_variant:
+  "secondary"` and is guarded on the `slow_secondary_available` input;
+  a step that silently fell back to the primary would be the first
+  opinion repeated. Either of validate's two refuters succeeding blocks
+  `Plausible`: they are asked to break the finding, not to vote, and a
+  refutation carries evidence while a survival does not. They run on
+  `Plausible` alone — the only verdict claiming a bug exists and is
+  reachable today. Do not extend them to a verdict already established
+  as not-a-bug (`ConfirmedLatent`, `NotADefect`, `Invalid`, `Fixed`);
+  there is nothing downstream to protect and the refutation costs two
+  slow calls.
 - Prompt/workflow fixes must be bug-agnostic. Do not add guidance that
   names a specific missed regression, subsystem, file, function, helper,
   or one-off mechanism because a recent run failed to find it. Generalize

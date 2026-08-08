@@ -2870,6 +2870,50 @@ fn eval_validate_verdict_consistency(step: &Step, ctx: &ExecContext<'_>) -> (boo
         }
     }
 
+    // A refutation that nobody answered stands. Either refuter is
+    // enough: they are asked to break the finding, not to vote, and a
+    // refutation carries evidence while a survival does not. Biasing
+    // toward the refuter is the point of a false-positive-elimination
+    // pass.
+    let answered: BTreeSet<&str> = outputs
+        .get("refutation_rebuttal")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    !entry
+                        .get("evidence")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or_default()
+                        .is_empty()
+                })
+                .filter_map(|entry| entry.get("refuter").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+    let unanswered: Vec<&str> = ["validate-refute", "validate-refute-secondary"]
+        .into_iter()
+        .filter(|id| {
+            ctx.steps
+                .get(*id)
+                .and_then(|state| state.outputs.get("refutation"))
+                .and_then(|refutation| refutation.get("refuted"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter(|id| !answered.contains(id))
+        .collect();
+    if !unanswered.is_empty() {
+        return eval_fail(&format!(
+            "refutation(s) from [{}] were not answered. A finding an independent pass could \
+             break is not Plausible: answer each in refutation_rebuttal with evidence, or take \
+             a verdict below Plausible",
+            unanswered.join(", ")
+        ));
+    }
+
     match conjunction.get("single_execution_witness") {
         Some(Value::Null) | None => eval_fail(
             "no single_execution_witness: nobody could name one configuration where every gating \
@@ -4131,6 +4175,224 @@ mod tests {
                 conjunction,
                 ..Default::default()
             })
+            .0
+        );
+    }
+
+    fn refuted(id: &str, refuted: bool) -> (String, StepState) {
+        (
+            id.to_string(),
+            step_state(json!({
+                "refutation": {
+                    "schema_version": 1,
+                    "refuted": refuted,
+                    "reasoning": "r",
+                    "weakest_link": "gate"
+                }
+            })),
+        )
+    }
+
+    fn run_verdict_eval_with(
+        case: VerdictCase,
+        refuters: Vec<(String, StepState)>,
+        rebuttals: Value,
+    ) -> (bool, Option<String>) {
+        let step = validate_step("validate-reachability");
+        let mut outputs = json!({
+            "verdict": case.verdict,
+            "severity": "medium",
+            "summary_written": true,
+            "severity_written": true,
+            "triage_coding": {
+                "schema_version": 1, "severity": "medium",
+                "summary_status": if case.verdict == "Plausible" { "plausible" } else { "unconfirmed" }
+            }
+        });
+        if !rebuttals.is_null() {
+            outputs["refutation_rebuttal"] = rebuttals;
+        }
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(step.id.clone(), step_state(outputs));
+        steps.insert(
+            "validate-claims".to_string(),
+            step_state(claims_output(case.claims)),
+        );
+        steps.insert(
+            "validate-conjunction".to_string(),
+            step_state(json!({"conjunction": case.conjunction})),
+        );
+        steps.extend(refuters);
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_validate_verdict_consistency(&step, &ctx)
+    }
+
+    /// Either refuter breaking the finding is enough to block Plausible.
+    /// They are asked to break it, not to vote: a refutation carries
+    /// evidence and a survival does not, so a single successful one is
+    /// the stronger signal.
+    /// `&&` binds tighter than `||`, so a guard appended to an
+    /// alternation only covers its last branch. The secondary refuter's
+    /// run_if was written that way and the availability guard silently
+    /// applied to ConfirmedLatent only, letting the step run with no
+    /// second model configured -- which routes it back to the primary
+    /// and makes the second opinion the first one repeated.
+    #[test]
+    fn an_availability_guard_must_bind_over_the_whole_alternation() {
+        let mut steps = HashMap::new();
+        steps.insert("v".to_string(), step_state(json!({"verdict": "Plausible"})));
+        let mut inputs = Map::new();
+        inputs.insert("avail".into(), Value::Bool(false));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+
+        let unparenthesised = "v.verdict == 'Plausible' || v.verdict == 'Latent' && avail == true";
+        assert_eq!(
+            expr::eval(unparenthesised, &ctx, None),
+            Ok(true),
+            "precedence makes the guard apply to the second branch only"
+        );
+
+        let parenthesised = "(v.verdict == 'Plausible' || v.verdict == 'Latent') && avail == true";
+        assert_eq!(
+            expr::eval(parenthesised, &ctx, None),
+            Ok(false),
+            "the guard must gate every branch"
+        );
+
+        // And the shipped workflow must use the parenthesised form.
+        let wf = parse_workflow(include_str!("../../configs/workflows/validate.json")).unwrap();
+        let secondary = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "validate-refute-secondary")
+            .unwrap();
+        let run_if = secondary.run_if.as_deref().unwrap();
+        let mut real = HashMap::new();
+        real.insert(
+            "validate-reachability".to_string(),
+            step_state(json!({"verdict": "Plausible"})),
+        );
+        let mut no_secondary = Map::new();
+        no_secondary.insert("slow_secondary_available".into(), Value::Bool(false));
+        let without = ExecContext {
+            workflow_inputs: &no_secondary,
+            steps: &real,
+        };
+        assert_eq!(
+            expr::eval(run_if, &without, None),
+            Ok(false),
+            "a Plausible verdict with no secondary model must not run the step: {run_if}"
+        );
+
+        let mut has_secondary = Map::new();
+        has_secondary.insert("slow_secondary_available".into(), Value::Bool(true));
+        let with = ExecContext {
+            workflow_inputs: &has_secondary,
+            steps: &real,
+        };
+        assert_eq!(expr::eval(run_if, &with, None), Ok(true));
+    }
+
+    #[test]
+    fn verdict_eval_blocks_plausible_on_an_unanswered_refutation() {
+        // Both refuters ran and neither broke it.
+        assert!(
+            run_verdict_eval_with(
+                VerdictCase::default(),
+                vec![
+                    refuted("validate-refute", false),
+                    refuted("validate-refute-secondary", false)
+                ],
+                Value::Null,
+            )
+            .0
+        );
+
+        // Only the secondary broke it -- still blocked.
+        let (passed, reason) = run_verdict_eval_with(
+            VerdictCase::default(),
+            vec![
+                refuted("validate-refute", false),
+                refuted("validate-refute-secondary", true),
+            ],
+            Value::Null,
+        );
+        assert!(!passed);
+        assert!(reason.unwrap().contains("validate-refute-secondary"));
+
+        // Only the primary broke it -- also blocked.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase::default(),
+                vec![
+                    refuted("validate-refute", true),
+                    refuted("validate-refute-secondary", false)
+                ],
+                Value::Null,
+            )
+            .0
+        );
+    }
+
+    #[test]
+    fn a_refutation_is_cleared_only_by_an_evidenced_rebuttal() {
+        let refuters = || vec![refuted("validate-refute", true)];
+
+        assert!(
+            run_verdict_eval_with(
+                VerdictCase::default(),
+                refuters(),
+                json!([{
+                    "refuter": "validate-refute",
+                    "rebuttal": "the writer does run on another CPU",
+                    "evidence": "kernel/sched/fair.c:1756"
+                }]),
+            )
+            .0
+        );
+
+        // An empty-evidence rebuttal is not a rebuttal.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase::default(),
+                refuters(),
+                json!([{"refuter": "validate-refute", "rebuttal": "no", "evidence": "  "}]),
+            )
+            .0
+        );
+
+        // Answering the other refuter does not clear this one.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase::default(),
+                refuters(),
+                json!([{
+                    "refuter": "validate-refute-secondary",
+                    "rebuttal": "x",
+                    "evidence": "kernel/sched/fair.c:1"
+                }]),
+            )
+            .0
+        );
+
+        // And a verdict below Plausible never needed a rebuttal: the
+        // refuters do not even run for those.
+        assert!(
+            run_verdict_eval_with(
+                VerdictCase {
+                    verdict: "Unconfirmed",
+                    ..Default::default()
+                },
+                refuters(),
+                Value::Null,
+            )
             .0
         );
     }

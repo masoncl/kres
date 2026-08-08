@@ -4232,6 +4232,17 @@ impl Session {
             &mut inputs,
             self.cfg.results_dir.as_deref(),
         );
+        if workflow.inputs.contains_key("slow_secondary_available") {
+            let has_secondary = self
+                .agent_runner
+                .as_ref()
+                .map(|runner| runner.slow_variants.len() > 1)
+                .unwrap_or(false);
+            inputs.insert(
+                "slow_secondary_available".into(),
+                serde_json::Value::Bool(has_secondary),
+            );
+        }
         if workflow.inputs.contains_key("assisted_by") {
             inputs.insert(
                 "assisted_by".into(),

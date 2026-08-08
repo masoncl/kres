@@ -650,6 +650,13 @@ pub struct RunContext {
     /// cached block on both the gather and the synthesis call. Empty
     /// for the REPL task path, which has no workflow prelude.
     pub stable_instructions: String,
+    /// Run the synthesis call on this entry of the runner's slow-variant
+    /// list instead of the primary slow client. `None` is the primary.
+    /// Out of range means the session has no such model configured and
+    /// the caller is expected to skip the step rather than silently fall
+    /// back to the primary, which would turn a second opinion into the
+    /// first one repeated.
+    pub slow_variant_index: Option<usize>,
     /// Evidence requests a previous, rejected attempt at this same step
     /// emitted from its synthesis call. They are dispatched to the
     /// fetcher once, before round 0, so the retry starts with the
@@ -1287,6 +1294,25 @@ impl AgentRunner {
         // synthesis_use_fast lets fix.json's `agent: fast` actually
         // mean fast.
         let use_fast = ctx.synthesis_use_fast;
+        let variants = self.effective_slow_variants();
+        let slow_variant = ctx
+            .slow_variant_index
+            .filter(|_| !use_fast)
+            .and_then(|index| variants.get(index).cloned());
+        // Asking for a variant this session does not have is a caller
+        // bug, not something to paper over. The point of a second
+        // variant is that a different model answers; quietly running the
+        // primary would return the first opinion wearing the second
+        // one's label, which is worse than having no second opinion
+        // because nothing downstream can tell.
+        if let Some(index) = ctx.slow_variant_index.filter(|_| !use_fast) {
+            if slow_variant.is_none() {
+                return Err(AgentError::Other(format!(
+                    "step requested slow model variant {index} but only {} configured;                      guard the step on slow_secondary_available instead of falling back                      to the primary",
+                    variants.len()
+                )));
+            }
+        }
         let log_phase = if use_fast { "fast-synth" } else { "slow" };
         let (
             synth_client,
@@ -1303,6 +1329,15 @@ impl AgentRunner {
                 self.fast_max_input_tokens,
                 self.fast_thinking,
                 "fast-synth",
+            )
+        } else if let Some(variant) = slow_variant.as_ref() {
+            (
+                &variant.client,
+                variant.model.clone(),
+                variant.max_tokens,
+                variant.max_input_tokens,
+                variant.thinking,
+                "slow",
             )
         } else {
             (
@@ -1353,7 +1388,10 @@ impl AgentRunner {
                 self.routing_system.as_ref().or(self.fast_system.as_ref())
             }
             Some(crate::workflow::SynthesisSystem::FastGather) => self.fast_system.as_ref(),
-            Some(crate::workflow::SynthesisSystem::SlowForMode) => slow_for_mode(),
+            Some(crate::workflow::SynthesisSystem::SlowForMode) => slow_variant
+                .as_ref()
+                .and_then(|variant| variant.system.as_ref())
+                .or_else(slow_for_mode),
             None if use_fast => self.fast_system.as_ref(),
             None => slow_for_mode(),
         };

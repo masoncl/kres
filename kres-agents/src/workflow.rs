@@ -113,6 +113,16 @@ pub struct Step {
     /// never looks at code.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub synthesis_system: Option<SynthesisSystem>,
+    /// Which configured slow model runs this step's synthesis call.
+    ///
+    /// Absent means the primary. `secondary` selects
+    /// `settings.models.slow_secondary` (or the second `--slow`
+    /// selection) so a step can be answered by a different model family
+    /// than the one that produced the work it is checking. A step that
+    /// asks for a variant the session does not have is skipped, and the
+    /// skip is logged rather than silently passing.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub slow_variant: Option<SlowVariant>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub actions: Option<Vec<ActionType>>,
     #[serde(default)]
@@ -240,6 +250,27 @@ pub enum Mode {
     Coding,
     Review,
     Generic,
+}
+
+/// Which of the session's configured slow models answers a step.
+///
+/// A second opinion is only worth having if it is genuinely independent,
+/// and the strongest independence available is a different model family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlowVariant {
+    Primary,
+    Secondary,
+}
+
+impl SlowVariant {
+    /// Index into the runner's slow-variant list.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Primary => 0,
+            Self::Secondary => 1,
+        }
+    }
 }
 
 /// Which system prompt drives a step's synthesis call.
@@ -871,7 +902,7 @@ mod tests {
             .expect("triage.json must validate against schema");
         assert_eq!(wf.id, "validate");
         assert_eq!(wf.skills, vec!["auto"]);
-        assert_eq!(wf.steps.len(), 3);
+        assert_eq!(wf.steps.len(), 5);
 
         let fast = &wf.steps[0];
         assert_eq!(fast.id, "validate-claims");
@@ -1047,6 +1078,74 @@ mod tests {
             slow.eval.as_ref().and_then(|e| e.name.as_deref()),
             Some("validate_verdict_consistency")
         );
+
+        // Two independent attempts to break a surviving finding, one of
+        // them on a different model family. Six of eight false positives
+        // in a hand audit had the disproving fact already in context, so
+        // the second opinion is about who reads it, not about fetching
+        // more.
+        let refuters: Vec<&Step> = wf
+            .steps
+            .iter()
+            .filter(|s| s.id.starts_with("validate-refute"))
+            .collect();
+        assert_eq!(refuters.len(), 2);
+        for refuter in &refuters {
+            assert_eq!(refuter.agent, Some(Agent::Slow));
+            assert_eq!(refuter.depends_on, vec!["validate-reachability"]);
+            assert!(
+                refuter
+                    .actions
+                    .as_ref()
+                    .is_some_and(|actions| actions.is_empty()),
+                "a refuter reasons over what the run already gathered and fetches nothing"
+            );
+            // Plausible is the only verdict claiming the bug exists and
+            // is reachable today. Every other verdict has already been
+            // established as not-a-bug (ConfirmedLatent, NotADefect,
+            // Invalid, Fixed) or as an open question nobody has turned
+            // into a claim (Unconfirmed, Unknown). Attacking those buys
+            // nothing and costs two slow calls.
+            let run_if = refuter.run_if.as_deref().unwrap_or_default();
+            assert!(run_if.contains("verdict == 'Plausible'"));
+            for already_settled in [
+                "ConfirmedLatent",
+                "NotADefect",
+                "Invalid",
+                "Fixed",
+                "Unconfirmed",
+                "Unknown",
+            ] {
+                assert!(
+                    !run_if.contains(already_settled),
+                    "{} must not refute a {already_settled} finding",
+                    refuter.id
+                );
+            }
+            // A refutation sends the verdict back to be answered.
+            let on_fail = refuter.eval.as_ref().map(|e| &e.on_fail);
+            assert_eq!(
+                on_fail.and_then(|f| f.branch_to.as_deref()),
+                Some("validate-reachability")
+            );
+        }
+        let secondary = refuters
+            .iter()
+            .find(|s| s.id == "validate-refute-secondary")
+            .expect("a second-model refuter");
+        assert_eq!(secondary.slow_variant, Some(SlowVariant::Secondary));
+        // Falling back to the primary would make the second opinion the
+        // first one repeated, so the step is guarded on the model
+        // actually being configured.
+        assert!(secondary
+            .run_if
+            .as_deref()
+            .unwrap_or_default()
+            .contains("slow_secondary_available"));
+        assert!(wf.inputs.contains_key("slow_secondary_available"));
+
+        // The verdict step needs a typed channel to answer a refutation.
+        assert!(slow.outputs.contains_key("refutation_rebuttal"));
     }
 
     #[test]

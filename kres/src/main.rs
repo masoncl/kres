@@ -1947,6 +1947,16 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
     let classifier_path = classifier_model_cfg.unwrap_or_else(|| fast_path.clone());
 
     let mut inputs_raw = parse_input_kvs(&args.input)?;
+    // A workflow step that wants a genuinely independent second opinion
+    // has to know whether this session actually has a second model. A
+    // step that silently fell back to the primary would be the first
+    // opinion repeated, so the workflow guards on this input instead.
+    if workflow.inputs.contains_key("slow_secondary_available") {
+        inputs_raw.insert(
+            "slow_secondary_available".into(),
+            serde_json::Value::Bool(slow_agent_specs.len() > 1),
+        );
+    }
     if workflow.inputs.contains_key("assisted_by") {
         if let Some(value) = args
             .assisted_by

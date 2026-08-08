@@ -1411,6 +1411,8 @@ Three steps:
   asks: can every supported precondition hold on the SAME execution? It
   emits pairwise `conflicts` and a `single_execution_witness` — or null,
   when no configuration makes the finding fire.
+- `validate-refute` and `validate-refute-secondary` run after the
+  verdict, on two different models, and try to break it.
 - `validate-reachability` runs as a slow coding step. It uses both prior
   reports as a checklist, closes bug-existence questions, determines
   whether the bug is reachable or latent, and applies the same triage
@@ -1456,7 +1458,9 @@ the verdict/`summary_status` casing map. On top of that, a verdict of
    settles it in `gating_override` with file:line evidence;
 2. every pair in the conjunction step's `conflicts` addressed in
    `conflict_resolution` with evidence;
-3. a non-null `single_execution_witness`.
+3. every successful refutation answered in `refutation_rebuttal` with
+   evidence (see below);
+4. a non-null `single_execution_witness`.
 
 Any other verdict is free of those three. This exists because the prompt
 already said "do not preserve a finding as Plausible when any
@@ -1466,6 +1470,54 @@ not an existence question". Prompt text the same model can talk itself
 out of is not a control. Do not replace these evals with prompt text or
 with a `field_check`; the expression language has no array quantifier
 and cannot express any of the three.
+
+### Two independent attempts to break a surviving finding
+
+`validate-refute` and `validate-refute-secondary` run after the verdict,
+and only when it is `Plausible`. That is the only verdict claiming the
+bug exists and is reachable today:
+
+| verdict | metadata `status:` | is it a bug? | refuters |
+|---|---|---|---|
+| `Plausible` | `active` | yes — claimed real | **run** |
+| `ConfirmedLatent` | `confirmed_latent` | no — every trigger proven closed | skip |
+| `NotADefect` | `not_a_defect` | no — proven intentional | skip |
+| `Invalid` | `invalidated` | no — disproven | skip |
+| `Fixed` | `fixed` | no — already resolved upstream | skip |
+| `Unconfirmed` | `unconfirmed` | unknown — gate still open | skip |
+| `Unknown` | unchanged | unknown — finding too thin | skip |
+
+The four settled non-bug verdicts are not worth two slow calls: nothing
+downstream acts on them. The two unknown ones make no claim to break —
+what they need is the open gate answered, which is
+`validate-reachability`'s job and `gating_override`'s channel, not a
+refutation.
+
+Both refuters are told to break
+the finding rather than assess it, and both are given everything the run
+gathered with `actions: []` so they fetch nothing: the failure mode this
+targets is not missing evidence. In a hand audit of eight surviving
+false positives, six had the disproving fact already in the slow agent's
+context and three had written it into a supported claim.
+
+The second one carries `slow_variant: "secondary"`, which routes its
+synthesis call to `settings.models.slow_secondary` (or the second
+`--slow` selection). Agreement between two model families is worth more
+than one model re-reading its own reasoning. It is guarded by the
+`slow_secondary_available` workflow input, injected by both dispatch
+paths: silently falling back to the primary would make the second
+opinion the first one repeated. `scripts/validate-all.py` passes both
+configured selectors and warns when only one is available.
+
+Either refuter succeeding blocks `Plausible`. They are asked to break
+the finding, not to vote — a refutation carries `decisive_evidence` and
+a survival does not — so one is the stronger signal. A successful
+refutation branches control back to `validate-reachability`, whose
+prompt then carries a `PRIOR REFUTATIONS` block (built by
+`prior_refutations_block`, because a step that runs before the refuters
+cannot interpolate their output). `validate_verdict_consistency` then
+requires a `refutation_rebuttal` entry naming the refuter and carrying
+evidence, or a verdict below `Plausible`.
 
 ### Compile-time and runtime gates are different conditions
 

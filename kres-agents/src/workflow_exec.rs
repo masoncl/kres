@@ -72,6 +72,14 @@ pub struct StepState {
     pub status: StepStatus,
     pub attempt: u32,
     pub eval_failures: u32,
+    /// Why the previous attempt's eval rejected this step, if it did.
+    ///
+    /// Fed back into the next attempt's prompt. Without it a retry was
+    /// told only `attempt: 2` and had to guess what to change: on the
+    /// 2026-08-08 batch eight runs burned all three attempts repeating
+    /// one omission the eval had named precisely each time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_eval_reason: Option<String>,
     pub outputs: Map<String, Value>,
     /// Exact driver effect payload accepted for this attempt. Present only
     /// while `status == EffectsPending`; persisted so resume replays the
@@ -2124,6 +2132,9 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     attempt,
                 },
             );
+            if let Some(accepted) = state.get_mut(&step.id) {
+                accepted.last_eval_reason = None;
+            }
             if let Err(error) =
                 update_accepted_review_ledger(driver, step, attempt, &inputs, &mut state).await
             {
@@ -2170,6 +2181,10 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         driver.discard_attempt(step, attempt).await;
         let st = state.get_mut(&step.id).unwrap();
         st.eval_failures += 1;
+        // Hand the rejection back to the next attempt. The eval already
+        // states precisely what was wrong; the retry used to be told
+        // only its attempt number.
+        st.last_eval_reason = eval_reason.clone();
         let eval_failures = st.eval_failures;
         let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
         let exhausted = attempt >= max;

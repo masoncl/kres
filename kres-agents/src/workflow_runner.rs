@@ -5186,14 +5186,41 @@ async fn correction_context_for_step(
         ));
     }
     if let Some(block) = prior_refutations_block(step, ctx) {
-        return Ok(block);
+        return Ok(format!("{}{block}", previous_rejection_block(step, ctx)));
     }
     if commit_message_is_being_corrected(step, ctx) {
         let message = git_head_commit_message(workspace).await?;
         let diff = git_diff_head_parent(workspace).await?;
         return Ok(render_commit_message_correction_block(&message, &diff));
     }
-    Ok(String::new())
+    Ok(previous_rejection_block(step, ctx))
+}
+
+/// Tell a retry why the last attempt was rejected.
+///
+/// The eval already produces a precise reason, and it went only to the
+/// trace and the operator's console; the model was handed a fresh
+/// prompt whose only hint was a bumped `attempt` counter. On the
+/// 2026-08-08 /validate batch eight runs exhausted all three attempts
+/// re-making one omission — emitting `summary.md` without the
+/// `metadata.yaml` and `FINDING.md` carrying the same verdict — which
+/// the eval had named precisely every time.
+fn previous_rejection_block(step: &Step, ctx: &ExecContext<'_>) -> String {
+    let Some(reason) = ctx
+        .steps
+        .get(&step.id)
+        .and_then(|state| state.last_eval_reason.as_deref())
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+    else {
+        return String::new();
+    };
+    format!(
+        "\n\n--- PREVIOUS ATTEMPT REJECTED ---\n\
+         Your last response for this step was not accepted:\n\n  {reason}\n\n\
+         Fix exactly that. The rest of the response was not at fault, so do not \
+         drop outputs you emitted last time in order to shorten this one.\n"
+    )
 }
 
 fn write_patch_is_being_corrected(step: &Step, ctx: &ExecContext<'_>) -> bool {
@@ -7982,6 +8009,52 @@ mod tests {
     /// Uses triage.json because its `triage_coding` schema is the
     /// largest shipped one and it declares a typed DTO array alongside
     /// it.
+    /// A rejected attempt has to be told what was rejected. Without
+    /// this the retry sees a bumped `attempt` counter and nothing else,
+    /// and on the 2026-08-08 /validate batch eight runs spent all three
+    /// attempts re-making the same omission the eval had named each
+    /// time.
+    #[test]
+    fn a_retry_is_told_why_the_last_attempt_was_rejected() {
+        let step = crate::workflow::parse_workflow(
+            r#"{"$schema_version":1,"id":"w","steps":[{"id":"s","agent":"slow","prompt":"p"}]}"#,
+        )
+        .unwrap()
+        .steps
+        .remove(0);
+
+        let mut steps = HashMap::new();
+        let inputs = Map::new();
+        steps.insert(
+            "s".to_string(),
+            crate::workflow_exec::StepState {
+                attempt: 1,
+                last_eval_reason: Some(
+                    "summary.md, metadata.yaml and FINDING.md must all be emitted".into(),
+                ),
+                ..Default::default()
+            },
+        );
+        let ctx = crate::workflow_exec::ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let block = previous_rejection_block(&step, &ctx);
+        assert!(block.contains("PREVIOUS ATTEMPT REJECTED"));
+        assert!(block.contains("metadata.yaml and FINDING.md must all be emitted"));
+        // Shortening the next response by dropping outputs is the exact
+        // failure this feedback exists to stop.
+        assert!(block.contains("do not \n         drop outputs") || block.contains("drop outputs"));
+
+        // A first attempt, or one whose eval passed, says nothing.
+        steps.get_mut("s").unwrap().last_eval_reason = None;
+        let ctx = crate::workflow_exec::ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert!(previous_rejection_block(&step, &ctx).is_empty());
+    }
+
     #[test]
     fn parse_source_citation_finds_a_workspace_path_and_line() {
         assert_eq!(

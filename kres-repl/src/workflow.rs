@@ -963,7 +963,19 @@ pub async fn run_workflow_driver(
         results_dir,
         observer,
     } = options;
-    let fallback_state_dir = driver.workspace().join(".kres/workflow-state");
+    // Per process, not per workspace. The fallback is what a run gets
+    // when the operator named neither a state dir nor a results dir,
+    // which is exactly how scripts/validate-all.py runs 50 kres
+    // processes at once -- deliberately, because a shared --results
+    // races on findings.json and session.json. They all then wrote one
+    // `workflow-validate.json`: two runs died renaming a scratch file
+    // another process had already renamed away, and every survivor
+    // silently overwrote the others' resume state, which made the
+    // snapshot describe whichever finding happened to finish last.
+    let fallback_state_dir = driver
+        .workspace()
+        .join(".kres/workflow-state")
+        .join(std::process::id().to_string());
     let default_state_dir = state_dir
         .clone()
         .or_else(|| results_dir.clone())

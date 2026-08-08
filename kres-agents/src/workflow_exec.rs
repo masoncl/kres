@@ -212,7 +212,22 @@ impl WorkflowSnapshot {
 
         std::fs::create_dir_all(dir)?;
         let target = dir.join(format!("workflow-{}.json", self.workflow_id));
-        let tmp = dir.join(format!("workflow-{}.json.tmp", self.workflow_id));
+        // The scratch name carries the pid. Without it two concurrent
+        // runs of the same workflow id pointed at one directory write
+        // the same `.tmp`, and the second rename fails with ENOENT
+        // because the first already renamed that path away. Observed on
+        // a 50-way parallel /validate batch, which shares the fallback
+        // state directory: two runs died with "persist workflow effect
+        // boundary: No such file or directory".
+        //
+        // This makes the write atomic per process. It does NOT make a
+        // shared target safe -- see the per-run fallback directory in
+        // kres-repl::workflow.
+        let tmp = dir.join(format!(
+            "workflow-{}.json.{}.tmp",
+            self.workflow_id,
+            std::process::id()
+        ));
         let body = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         let mut file = std::fs::OpenOptions::new()
             .create(true)

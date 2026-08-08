@@ -3302,7 +3302,10 @@ impl Session {
                     plan: plan_for_ctx,
                     allow_plan_rewrite,
                     synthesis_use_fast: false,
-                    synthesis_use_routing_prompt: false,
+                    // The REPL task path is not a workflow step: no
+                    // OUTPUT SCHEMA tail, so the historical per-mode
+                    // slow prompt selection applies.
+                    synthesis_system: None,
                     // The REPL task path uses TaskManager's own
                     // symbol/context cache, not the workflow per-step
                     // gather seed.
@@ -4350,6 +4353,7 @@ impl Session {
             slow_coding_system: base.slow_coding_system.clone(),
             slow_generic_system: base.slow_generic_system.clone(),
             routing_system: base.routing_system.clone(),
+            workflow_synthesis_system: base.workflow_synthesis_system.clone(),
             fetcher,
             max_fast_rounds: base.max_fast_rounds,
             // The base runner's skills were auto-selected for the
@@ -4913,6 +4917,10 @@ fn load_routing_system() -> Option<String> {
     load_prompt_disk_then_embedded("routing-agent.system.md")
 }
 
+fn load_workflow_synthesis_system() -> Option<String> {
+    load_prompt_disk_then_embedded("workflow-synthesis.system.md")
+}
+
 /// Convenience: build an AgentRunner from paths to agent configs and
 /// a workspace directory. The DataFetcher is a WorkspaceFetcher over
 /// the given workspace; MCP integration is a Phase 8 add-on.
@@ -5125,6 +5133,7 @@ pub async fn build_agent_runner(
     let slow_coding_system = load_slow_coding_system();
     let slow_generic_system = load_slow_generic_system();
     let routing_system = load_routing_system();
+    let workflow_synthesis_system = load_workflow_synthesis_system();
     let agent_runner = Arc::new(AgentRunner {
         fast_client,
         fast_model: fast_model.clone(),
@@ -5144,6 +5153,7 @@ pub async fn build_agent_runner(
         slow_coding_system,
         slow_generic_system,
         routing_system,
+        workflow_synthesis_system,
         fetcher,
         max_fast_rounds: gather_turns,
         skills,

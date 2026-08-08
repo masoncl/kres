@@ -322,6 +322,10 @@
         "title": {"type": "string"},
         "agent": {"$ref": "#/$defs/agent_value"},
         "mode": {"$ref": "#/$defs/mode_value"},
+        "synthesis_system": {
+          "enum": ["workflow-synthesis", "routing-agent", "fast-gather", "slow-for-mode"],
+          "description": "System prompt for this step's synthesis call — the one that must satisfy the declared outputs. Defaults to workflow-synthesis for agent:fast and slow-for-mode for agent:slow/code. Set routing-agent for a step that only routes over typed inputs and never analyzes code. Never set fast-gather unless the step genuinely wants the gather envelope as its output: that prompt mandates ready_for_slow and followups, which contradicts an OUTPUT SCHEMA tail."
+        },
         "actions": {"$ref": "#/$defs/action_list"},
         "depends_on": {
           "type": "array",

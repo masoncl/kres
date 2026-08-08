@@ -21,6 +21,19 @@ use kres_core::findings::Finding;
 // means prompt-cache hits don't shift between the two runtimes.
 #[derive(Debug, Serialize)]
 pub struct CodePrompt<'a> {
+    /// Instruction text that is identical for every call of a given
+    /// workflow step, and usually across steps and across concurrent
+    /// runs: the `--- SKILLS ---` block and any `--- INCLUDES ---`
+    /// bodies. Declared FIRST so it serializes at the head of the
+    /// envelope and can be split off into its own cached block.
+    ///
+    /// It used to be concatenated onto the front of `question`, which
+    /// made it per-call bytes and therefore uncacheable. On a measured
+    /// validate run this was 30 KB of a 42 KB question — a 17 KB skills
+    /// block plus the 13 KB triage template — re-sent as fresh input on
+    /// every synthesis and slow call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_instructions: Option<&'a str>,
     pub question: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbols: Option<&'a [Value]>,
@@ -55,6 +68,7 @@ pub struct CodePrompt<'a> {
 impl<'a> CodePrompt<'a> {
     pub fn new(question: &'a str) -> Self {
         Self {
+            stable_instructions: None,
             question,
             symbols: None,
             context: None,
@@ -66,6 +80,16 @@ impl<'a> CodePrompt<'a> {
             plan: None,
             plan_rewrite_allowed: None,
         }
+    }
+
+    /// Attach the call-invariant instruction prelude. Empty input is
+    /// ignored so the field never serializes as `""`, which would make
+    /// the cached head differ from a call that has no prelude at all.
+    pub fn with_stable_instructions(mut self, text: &'a str) -> Self {
+        if !text.is_empty() {
+            self.stable_instructions = Some(text);
+        }
+        self
     }
 
     pub fn with_plan(mut self, plan: &'a kres_core::Plan, active_step_id: Option<&'a str>) -> Self {
@@ -1098,6 +1122,53 @@ mod tests {
         assert!(!r1_split.rendered().contains("_empty_tail"));
         assert!(r2_split.delta.contains("\"symbols\""));
         assert_eq!(merged(&r1_split).len(), 2);
+    }
+
+    /// The whole point of `stable_instructions` is that two calls which
+    /// differ in everything else still present identical cached bytes.
+    /// If a per-call value ever leaks into the head, the head is written
+    /// once per call and read never — strictly worse than not caching.
+    #[test]
+    fn stable_instructions_head_is_identical_across_unrelated_calls() {
+        let prelude = "--- SKILLS ---\nkernel stuff\n--- INCLUDES ---\ntriage template\n";
+        let sym_a = vec![json!({"name": "a"})];
+        let sym_b = vec![json!({"name": "b"})];
+        let a = CodePrompt::new("validate finding one\nattempt: 1")
+            .with_stable_instructions(prelude)
+            .with_symbols(&sym_a);
+        let b = CodePrompt::new("validate finding two\nattempt: 3")
+            .with_stable_instructions(prelude)
+            .with_symbols(&sym_b);
+
+        let split_a = a.to_split_documents(&["stable_instructions"]).unwrap();
+        let split_b = b.to_split_documents(&["stable_instructions"]).unwrap();
+
+        assert_eq!(split_a.stable, split_b.stable);
+        assert!(split_a.stable.contains("triage template"));
+        assert_ne!(split_a.delta, split_b.delta);
+        // The head must not carry anything task-specific.
+        for leaked in ["finding one", "attempt", "\"name\""] {
+            assert!(
+                !split_a.stable.contains(leaked),
+                "cached head leaked per-call text: {leaked}"
+            );
+        }
+        // Both halves parse alone, and together they carry every field
+        // of the unsplit prompt.
+        serde_json::from_str::<serde_json::Value>(&split_a.stable).unwrap();
+        serde_json::from_str::<serde_json::Value>(&split_a.delta).unwrap();
+        let whole: serde_json::Value = serde_json::from_str(&a.to_json_string().unwrap()).unwrap();
+        assert_eq!(serde_json::Value::Object(merged(&split_a)), whole);
+    }
+
+    /// A step with no skills and no includes must send one block, not an
+    /// empty cached block that spends a `cache_control` slot for nothing.
+    #[test]
+    fn empty_stable_instructions_produce_no_cached_head() {
+        let p = CodePrompt::new("question").with_stable_instructions("");
+        let split = p.to_split_documents(&["stable_instructions"]).unwrap();
+        assert!(split.stable.is_empty());
+        assert_eq!(split.delta, p.to_json_string().unwrap());
     }
 
     #[test]

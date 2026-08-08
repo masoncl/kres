@@ -103,6 +103,16 @@ pub struct Step {
     pub agent: Option<Agent>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub mode: Option<Mode>,
+    /// System prompt for this step's SYNTHESIS call — the one that has to
+    /// satisfy the step's declared outputs. The gather phase always uses
+    /// the fast-gather prompt regardless of this field.
+    ///
+    /// Defaults per [`SynthesisSystem::default_for`]. Set it explicitly
+    /// only when a step needs something the default does not give it,
+    /// such as a pure-routing step that reasons over typed inputs and
+    /// never looks at code.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub synthesis_system: Option<SynthesisSystem>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub actions: Option<Vec<ActionType>>,
     #[serde(default)]
@@ -230,6 +240,41 @@ pub enum Mode {
     Coding,
     Review,
     Generic,
+}
+
+/// Which system prompt drives a step's synthesis call.
+///
+/// This exists because the gather prompt and a workflow step's OUTPUT
+/// SCHEMA give the model contradictory instructions. `fast-code-agent`
+/// mandates the gather envelope (`analysis` / `followups` /
+/// `ready_for_slow`); a workflow step needs its own declared outputs.
+/// When a fast step's synthesis ran under the gather prompt, half the
+/// responses obeyed the system prompt and were rejected — measured at
+/// 397 of 784 `validate-claims` synthesis calls, each rejection costing
+/// a full step re-run including its gather phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SynthesisSystem {
+    /// Analyze the gathered evidence and emit the step's declared
+    /// outputs. Default for `agent: fast` steps.
+    WorkflowSynthesis,
+    /// Pure routing over typed inputs, no code analysis.
+    RoutingAgent,
+    /// The fast-gather prompt. Only for a step that genuinely wants the
+    /// gather envelope as its output.
+    FastGather,
+    /// The per-mode slow system prompt. Default for slow/code steps.
+    SlowForMode,
+}
+
+impl SynthesisSystem {
+    /// The prompt a step gets when it does not name one.
+    pub fn default_for(agent: Agent) -> Self {
+        match agent {
+            Agent::Fast | Agent::Classifier => Self::WorkflowSynthesis,
+            Agent::Slow | Agent::Code | Agent::Reaper => Self::SlowForMode,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -189,7 +189,20 @@ fn validate_fast_gather_response(response: &CodeResponse) -> Result<(), Vec<Stri
 /// only on selected synthesis calls.
 // Gather sends one `skills` payload; the common/task split happens only at
 // synthesis, so `common_skills` deliberately does not appear here.
-const CACHED_PREFIX_FIELDS: &[&str] = &["question", "previous_findings", "skills", "plan"];
+const CACHED_PREFIX_FIELDS: &[&str] = &[
+    "stable_instructions",
+    "question",
+    "previous_findings",
+    "skills",
+    "plan",
+];
+
+/// Cached head for a synthesis call. Narrower than
+/// [`CACHED_PREFIX_FIELDS`] on purpose: a synthesis prompt is sent once,
+/// so the only bytes worth a cache block are the ones another call will
+/// present identically. `question` is per-finding and per-attempt, so it
+/// stays in the uncached delta.
+const SYNTHESIS_CACHED_PREFIX_FIELDS: &[&str] = &["stable_instructions"];
 const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
     "question",
     "symbols",
@@ -501,6 +514,17 @@ pub struct AgentRunner {
     /// `fast_system`.
     pub routing_system: Option<String>,
 
+    /// System prompt for workflow synthesis calls: "the gather phase is
+    /// over, emit the step's declared schema". This is the default for
+    /// `agent: fast` workflow steps.
+    ///
+    /// It exists because `fast_system` is written for the gather role and
+    /// mandates the `ready_for_slow` envelope, which contradicts the
+    /// OUTPUT SCHEMA tail the workflow appends. Measured on 384 validate
+    /// runs, 397 of 784 fast synthesis calls obeyed the system prompt and
+    /// were rejected. When `None`, falls back to `fast_system`.
+    pub workflow_synthesis_system: Option<String>,
+
     pub fetcher: Arc<dyn DataFetcher>,
 
     /// Max rounds of fast↔main before forcing the slow agent.
@@ -609,16 +633,34 @@ pub struct RunContext {
     /// decision Sonnet can make. When false (default), the slow
     /// client runs the synthesis call as before.
     pub synthesis_use_fast: bool,
-    /// Use the dedicated routing-agent system prompt for this
-    /// synthesis call. ONLY for the orchestrator workflow step in
-    /// fix.json — that step is pure routing over typed inputs, with
-    /// no code analysis or context gathering, and the routing prompt
-    /// matches that shape. Other fast-tagged steps (research,
-    /// lore-search, fixes-tag-search, compile-triage) DO analyze
-    /// gathered code/history and keep the fast-gather system prompt
-    /// at synthesis time. Default false preserves the existing
-    /// fast_system / slow_system selection.
-    pub synthesis_use_routing_prompt: bool,
+    /// Which system prompt drives the synthesis call. `None` means the
+    /// caller is not a workflow step and the per-mode slow prompt (or
+    /// `fast_system` when `synthesis_use_fast`) applies, which is the
+    /// REPL task path.
+    ///
+    /// Workflow steps always set this, defaulting per
+    /// [`crate::workflow::SynthesisSystem::default_for`]. A synthesis
+    /// call must never run under the gather prompt by accident: that
+    /// prompt tells the model to emit `ready_for_slow` and followups,
+    /// which is not what the step's OUTPUT SCHEMA asks for, and the
+    /// model obeys the system prompt about half the time.
+    pub synthesis_system: Option<crate::workflow::SynthesisSystem>,
+    /// Call-invariant instruction text (skills block + workflow
+    /// includes) carried outside `question` so it can occupy its own
+    /// cached block on both the gather and the synthesis call. Empty
+    /// for the REPL task path, which has no workflow prelude.
+    pub stable_instructions: String,
+    /// Evidence requests a previous, rejected attempt at this same step
+    /// emitted from its synthesis call. They are dispatched to the
+    /// fetcher once, before round 0, so the retry starts with the
+    /// evidence the last attempt said it was missing.
+    ///
+    /// Without this they were dropped: measured across 384 validate
+    /// runs, rejected attempts emitted 771 typed followups and 724 of
+    /// them (401 `source:`) were never fetched anywhere in the run,
+    /// because the retry restarts the gather phase and the gather agent
+    /// re-decides what to ask for.
+    pub pending_followups: Vec<crate::followup::Followup>,
     /// Symbols already gathered by an earlier workflow step that this
     /// run should start from instead of re-fetching. The gather loop
     /// seeds its `symbols` accumulator with these so round 0 ships
@@ -1196,6 +1238,7 @@ impl AgentRunner {
         // Review paths that actually benefit from a shared context
         // prefix go through run_with_lenses below.
         let mut slow_cp = CodePrompt::new(prompt)
+            .with_stable_instructions(&ctx.stable_instructions)
             .with_symbols(&symbols)
             .with_context(&context)
             .with_previous_findings(&previous_findings);
@@ -1215,12 +1258,25 @@ impl AgentRunner {
         if ctx.allow_plan_rewrite {
             slow_cp = slow_cp.with_plan_rewrite_allowed(true);
         }
-        let slow_logged = slow_cp.to_json_string()?;
+        // Split the call-invariant prelude into its own cached block.
+        // Only that block: the rest of a synthesis prompt (question,
+        // symbols, context) is per-finding bytes that nothing re-reads,
+        // and a cache_control marker on those buys a write with no read.
+        //
+        // The head deliberately holds nothing task-specific, so every
+        // step of a run — and every concurrent run of the same workflow
+        // against the same workspace — presents identical bytes.
+        let split = slow_cp.to_split_documents(SYNTHESIS_CACHED_PREFIX_FIELDS)?;
+        let slow_logged = split.rendered();
         let messages = vec![Message {
             role: "user".into(),
-            content: slow_logged.clone(),
+            content: split.delta,
             cache: false,
-            cached_prefixes: Vec::new(),
+            cached_prefixes: if split.stable.is_empty() {
+                Vec::new()
+            } else {
+                vec![split.stable]
+            },
         }];
         // Route the synthesis call to the fast client when the
         // caller (typically a workflow step declared `agent: fast`)
@@ -1269,32 +1325,37 @@ impl AgentRunner {
         if let Some(thinking) = synth_thinking {
             cfg = cfg.with_thinking(thinking);
         }
-        // System prompt selection:
-        // - synthesis_use_routing_prompt (orchestrator step only, independent of client):
-        //   use the dedicated routing-agent system prompt. That step
-        //   is pure routing over typed inputs and the routing prompt
-        //   matches that shape.
-        // - else use_fast (other fast-tagged steps): use the
-        //   fast-gather system prompt. Those steps (research,
-        //   lore-search, fixes-tag-search, compile-triage) DO
-        //   analyze gathered code/history and the fast-gather prompt
-        //   is the operator's chosen system prompt for `agent: fast`.
-        // - else: per-mode slow system prompt (coding/generic/audit).
-        let system_for_call = if ctx.synthesis_use_routing_prompt {
-            self.routing_system.as_ref().or(self.fast_system.as_ref())
-        } else if use_fast {
-            self.fast_system.as_ref()
-        } else {
+        // System prompt selection. A workflow step names the prompt it
+        // needs (`synthesis_system`); everything else — the REPL task
+        // path — keeps the historical fast/slow split.
+        //
+        // This is a contract, not a preference. The gather prompt tells
+        // the model to emit `{analysis, followups, ready_for_slow}`; a
+        // workflow step's OUTPUT SCHEMA asks for typed fields. Run the
+        // synthesis call under the gather prompt and the model resolves
+        // that contradiction in the system prompt's favour about half
+        // the time, and the whole step re-runs.
+        let slow_for_mode = || {
+            if matches!(ctx.mode, kres_core::TaskMode::Coding) && self.slow_coding_system.is_none()
             {
-                if matches!(ctx.mode, kres_core::TaskMode::Coding)
-                    && self.slow_coding_system.is_none()
-                {
-                    kres_core::async_eprintln!(
-                        "[{log_phase}] coding-mode task but no slow_coding_system loaded — falling back to audit prompt"
-                    );
-                }
-                self.slow_system_for_mode(ctx.mode)
+                kres_core::async_eprintln!(
+                    "[{log_phase}] coding-mode task but no slow_coding_system loaded — falling back to audit prompt"
+                );
             }
+            self.slow_system_for_mode(ctx.mode)
+        };
+        let system_for_call = match ctx.synthesis_system {
+            Some(crate::workflow::SynthesisSystem::WorkflowSynthesis) => self
+                .workflow_synthesis_system
+                .as_ref()
+                .or(self.fast_system.as_ref()),
+            Some(crate::workflow::SynthesisSystem::RoutingAgent) => {
+                self.routing_system.as_ref().or(self.fast_system.as_ref())
+            }
+            Some(crate::workflow::SynthesisSystem::FastGather) => self.fast_system.as_ref(),
+            Some(crate::workflow::SynthesisSystem::SlowForMode) => slow_for_mode(),
+            None if use_fast => self.fast_system.as_ref(),
+            None => slow_for_mode(),
         };
         if let Some(s) = system_for_call {
             cfg = cfg.with_system(s.clone());
@@ -2485,6 +2546,33 @@ impl AgentRunner {
         } else {
             self.skills.clone()
         };
+        // Serve the previous rejected attempt's unmet evidence requests
+        // before asking the model anything. They were already reasoned
+        // for; making the gather agent rediscover them is how they got
+        // dropped in the first place.
+        if !ctx.pending_followups.is_empty() {
+            let novel = pending_prefetch_targets(&ctx.pending_followups, &mut fetched_keys);
+            if !novel.is_empty() {
+                kres_core::async_eprintln!(
+                    "[fast gather] pre-fetching {} unmet request(s) from the previous attempt",
+                    novel.len(),
+                );
+                let fetched = tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        return Err(AgentError::Other("cancelled during pending fetch".into()))
+                    }
+                    f = self.fetcher.fetch(&novel, ctx.plan.as_ref()) => f?,
+                };
+                let (fetched_symbols, fetched_context) =
+                    crate::symbol::canonicalize_prompt_evidence(&fetched.symbols, &fetched.context);
+                for symbol in fetched_symbols {
+                    crate::symbol::append_prompt_evidence(&mut symbols, symbol);
+                }
+                for item in fetched_context {
+                    crate::symbol::append_prompt_evidence(&mut context, item);
+                }
+            }
+        }
         let mut round_symbols = symbols.clone();
         let mut round_context = context.clone();
         let mut round_skills = live_skills.clone();
@@ -2507,6 +2595,12 @@ impl AgentRunner {
             let mut cp = CodePrompt::new(round_question)
                 .with_symbols(&round_symbols)
                 .with_context(&round_context);
+            // Round 0 carries the workflow prelude; later rounds retain
+            // it through conversation history, exactly like the plan and
+            // prior findings below.
+            if round == 0 {
+                cp = cp.with_stable_instructions(&ctx.stable_instructions);
+            }
             // Prior findings ride the round-0 cached prefix. Later rounds
             // retain them through conversation history.
             let fast_previous_findings = (round == 0)
@@ -2768,6 +2862,23 @@ impl AgentRunner {
         let (symbols, context) = crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
         Ok((symbols, context, fast_rounds, live_skills, task_skill_paths))
     }
+}
+
+/// Which of a rejected attempt's unmet requests are worth dispatching
+/// before the retry's first gather round.
+///
+/// Drops `question` followups (the fetcher cannot answer one) and
+/// anything already served, marking the rest as served so the gather
+/// loop does not re-request them.
+fn pending_prefetch_targets(
+    pending: &[Followup],
+    fetched_keys: &mut HashSet<String>,
+) -> Vec<Followup> {
+    pending
+        .iter()
+        .filter(|fu| fu.kind != "question" && fetched_keys.insert(fu.cache_key()))
+        .cloned()
+        .collect()
 }
 
 fn lens_run_key(output: &LensRunOutput) -> (String, Option<String>) {
@@ -3871,5 +3982,48 @@ mod tests {
         let _ = std::fs::remove_dir(&a);
         let _ = std::fs::remove_dir(&b);
         let _ = std::fs::remove_dir(&root);
+    }
+
+    fn followup(kind: &str, name: &str) -> Followup {
+        Followup {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            reason: String::new(),
+            path: None,
+            nice_to_have: false,
+        }
+    }
+
+    /// A rejected attempt's evidence requests are the most specific
+    /// statement anyone in the run has made about what is missing.
+    /// Measured over 384 validate runs, 724 of 771 such requests were
+    /// never fetched because the retry restarted the gather phase and
+    /// the gather agent re-decided what to ask for.
+    #[test]
+    fn pending_requests_are_prefetched_once_and_marked_served() {
+        let mut fetched = HashSet::new();
+        let pending = vec![
+            followup("source", "update_avg_scale"),
+            followup("source", "task_tick_cache"),
+            // The fetcher cannot answer an operator question.
+            followup("question", "is llc_epoch_period tunable?"),
+        ];
+
+        let targets = pending_prefetch_targets(&pending, &mut fetched);
+        let names: Vec<&str> = targets.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["update_avg_scale", "task_tick_cache"]);
+
+        // The gather loop dedups against the same set, so a round-1
+        // re-request of the same symbol is now a no-op rather than a
+        // second fetch.
+        assert!(fetched.contains(&pending[0].cache_key()));
+        assert!(pending_prefetch_targets(&pending, &mut fetched).is_empty());
+    }
+
+    #[test]
+    fn no_pending_requests_means_no_prefetch() {
+        let mut fetched = HashSet::new();
+        assert!(pending_prefetch_targets(&[], &mut fetched).is_empty());
+        assert!(fetched.is_empty());
     }
 }

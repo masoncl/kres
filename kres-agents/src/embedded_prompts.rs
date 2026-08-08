@@ -35,6 +35,10 @@ const TABLE: &[(&str, &str)] = &[
         include_str!("../../configs/prompts/routing-agent.system.md"),
     ),
     (
+        "workflow-synthesis.system.md",
+        include_str!("../../configs/prompts/workflow-synthesis.system.md"),
+    ),
+    (
         "main-agent.system.md",
         include_str!("../../configs/prompts/main-agent.system.md"),
     ),

@@ -1492,6 +1492,7 @@
       ],
       "run_if": "research.research_status == 'confirmed' && ((write-patch.code_changes_emitted == false && write-patch.review_dispute == '') || write-commit-message.commit_message_written == false || review.clean == false || build.result == 'failed')",
       "agent": "slow",
+      "synthesis_system": "routing-agent",
       "mode": "audit",
       "actions": [
         "read",

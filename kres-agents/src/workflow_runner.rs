@@ -164,6 +164,11 @@ type StructuredLensOutputs = Vec<(String, Map<String, Value>)>;
 type GatheredData = (Vec<Value>, Vec<Value>);
 
 struct StepPromptTexts {
+    /// Call-invariant instruction text: the `--- SKILLS ---` block and
+    /// any `--- INCLUDES ---` bodies. Kept out of the two bases so it
+    /// can ride its own cached block instead of being re-sent as fresh
+    /// input on every call. See `CodePrompt::stable_instructions`.
+    stable_instructions: String,
     user_text_base: String,
     gather_user_text_base: String,
 }
@@ -798,18 +803,25 @@ impl LlmDriver {
             format!("--- INCLUDES ---\n{includes_block}\n\n")
         };
         let correction_context = correction_context_for_step(&self.workspace, step, ctx).await?;
+        // The prelude is the same bytes for every call of this step,
+        // and for every concurrent run of the same workflow against the
+        // same workspace. It is carried separately so it can be its own
+        // cached block; `attempt` and the schema tail stay in the
+        // volatile base, where they belong.
+        let stable_instructions = format!("{skills_prelude}{includes_prelude}");
         let user_text_base = format!(
-            "{skills_prelude}{includes_prelude}{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n--- {SCHEMA_HEADER} ---\n{schema_tail}",
+            "{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n--- {SCHEMA_HEADER} ---\n{schema_tail}",
             sid = step.id,
             SCHEMA_HEADER = "OUTPUT SCHEMA"
         );
         let gather_contract =
             fast_gather_contract(gather_disallowed_fields, !self.workflow.skills.is_empty());
         let gather_user_text_base = format!(
-            "{skills_prelude}{includes_prelude}{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n{gather_contract}",
+            "{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n{gather_contract}",
             sid = step.id,
         );
         Ok(StepPromptTexts {
+            stable_instructions,
             user_text_base,
             gather_user_text_base,
         })
@@ -858,6 +870,10 @@ impl LlmDriver {
             // Preserve validated gather results across full synthesis retries
             // so a successful attempt can seed dependent steps.
             let mut captured_gathered: Option<(Vec<Value>, Vec<Value>)> = None;
+            // Evidence the previous rejected attempt asked for and did
+            // not get. Carried into the retry's gather instead of being
+            // discarded — see RunContext::pending_followups.
+            let mut pending_followups: Vec<crate::followup::Followup> = Vec::new();
             for json_retry in 0..=WORKFLOW_RESPONSE_RETRIES {
                 let allowed = effective_actions(step, &self.workflow);
                 let runner = agent_runner_with_gated_fetcher(runner_base, allowed);
@@ -879,8 +895,10 @@ impl LlmDriver {
                 // Opus output time. `agent: slow` and `agent: code`
                 // keep the historical slow-client synthesis.
                 let synthesis_use_fast = matches!(role, AgentRole::Fast);
-                let synthesis_use_routing_prompt =
-                    use_routing_prompt_for_synth(&step.id, synthesis_use_fast);
+                let synthesis_system = Some(
+                    step.synthesis_system
+                        .unwrap_or_else(|| crate::workflow::SynthesisSystem::default_for(role)),
+                );
 
                 let summary = {
                     let user_text = build_retry_user_text(
@@ -921,7 +939,9 @@ impl LlmDriver {
                         gather_prompt: Some(gather_prompt),
                         disable_skill_reads: self.workflow.skills.is_empty(),
                         synthesis_use_fast,
-                        synthesis_use_routing_prompt,
+                        synthesis_system,
+                        stable_instructions: prompt_texts.stable_instructions.clone(),
+                        pending_followups: std::mem::take(&mut pending_followups),
                         seed_symbols: run_seed_symbols,
                         seed_context: run_seed_context,
                         ..crate::pipeline::RunContext::default()
@@ -956,6 +976,7 @@ impl LlmDriver {
                     Ok(outputs) => outputs,
                     Err(e) if json_retry < WORKFLOW_RESPONSE_RETRIES => {
                         last_parse_err = Some(e.to_string());
+                        pending_followups = summary.followups.clone();
                         continue;
                     }
                     Err(e) => {
@@ -965,6 +986,7 @@ impl LlmDriver {
                 if let Err(e) = validate_model_outputs_before_side_effects(step, &outputs) {
                     if json_retry < WORKFLOW_RESPONSE_RETRIES {
                         last_parse_err = Some(e.to_string());
+                        pending_followups = summary.followups.clone();
                         continue;
                     }
                     return Err(format!("step '{}' model output validation: {e}", step.id).into());
@@ -1038,6 +1060,10 @@ impl LlmDriver {
                 &mut last_apply_err,
                 &mut last_parse_err,
             );
+            // The direct AgentEnv path sends one plain message, so the
+            // prelude the orchestrator path carries as a separate cached
+            // block is concatenated back on here. Same bytes, no cache.
+            let user_text = format!("{}{user_text}", prompt_texts.stable_instructions);
             let messages = vec![Message::plain("user", user_text.clone())];
             if let Some(lg) = &self.logger {
                 let label = match lens {
@@ -2016,6 +2042,11 @@ impl Driver for LlmDriver {
             allowed_response_extensions: step.outputs.keys().cloned().collect(),
             gather_prompt: Some(prompt_texts.gather_user_text_base),
             disable_skill_reads: self.workflow.skills.is_empty(),
+            synthesis_system: Some(
+                step.synthesis_system
+                    .unwrap_or(crate::workflow::SynthesisSystem::SlowForMode),
+            ),
+            stable_instructions: prompt_texts.stable_instructions.clone(),
             ..crate::pipeline::RunContext::default()
         };
         if uses_structured_review_outputs(step) {
@@ -2600,6 +2631,30 @@ fn value_to_string(v: &Value) -> String {
     }
 }
 
+/// The element schema for a workflow output declared as one of the
+/// typed DTO arrays.
+///
+/// These DTOs deserialize with `deny_unknown_fields`, so an invented key
+/// costs a repair inference — and the tail used to name the type
+/// (`followups: array<Followup>`) without ever showing its shape. On the
+/// 2026-08-08 batch that was 40 of 45 repair calls, all of them
+/// `unknown field` on a followup: `target` (40), `description` (22),
+/// `detail` (15).
+///
+/// `Finding` is deliberately absent: its schema is far larger than the
+/// others and review steps already carry the shape in their prompts.
+fn typed_output_item_schema(output_type: &str) -> Option<String> {
+    let schema = match output_type {
+        "array<Followup>" => schemars::schema_for!(crate::followup::Followup),
+        "array<CodeFile>" => schemars::schema_for!(kres_core::CodeFile),
+        "array<CodeEdit>" => schemars::schema_for!(kres_core::CodeEdit),
+        _ => return None,
+    };
+    serde_json::to_string(&schema)
+        .ok()
+        .map(|body| format!("array of {body}"))
+}
+
 /// Build the OUTPUT SCHEMA tail block telling the LLM which fields
 /// to emit. Empty when the step has no declared outputs (no eval =
 /// no required JSON).
@@ -2612,6 +2667,7 @@ fn build_output_schema_tail(step: &Step) -> String {
          including analysis, findings, followups, code_edits, and code_output. \
          The same JSON object must also contain these workflow output keys:\n\n",
     );
+    let mut schemas: Vec<(&String, String)> = Vec::new();
     for (k, v) in &step.outputs {
         let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("any");
         let optional = v.get("optional").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -2622,6 +2678,34 @@ fn build_output_schema_tail(step: &Step) -> String {
             .map(|r| format!(" (required when {r})"))
             .unwrap_or_default();
         s.push_str(&format!("- {k}: {ty}{opt}{rw} — {desc}\n"));
+        if let Some(schema) = v.get("schema") {
+            if let Ok(rendered) = serde_json::to_string(schema) {
+                schemas.push((k, rendered));
+            }
+        } else if let Some(rendered) = typed_output_item_schema(ty) {
+            schemas.push((k, rendered));
+        }
+    }
+    // A declared `schema` is validated against the response, so the
+    // model has to be shown it. Without this the tail said only
+    // "claim_validation: object — Structured validation of finding
+    // claims" while Rust rejected the reply for a missing nested
+    // `evidence[].location`, and the step burned its whole retry budget
+    // guessing. Every shipped workflow used to work around that by
+    // hand-copying the shape into its prompt, which is two sources of
+    // truth for one contract.
+    //
+    // Minified, not pretty-printed: this rides in the per-call delta,
+    // and the largest shipped schema is a few KB rather than tens.
+    if !schemas.is_empty() {
+        s.push_str(
+            "\nThese keys are validated against a JSON Schema. \
+             `additionalProperties: false` means exactly those keys and no others; \
+             every name under `required` must be present:\n\n",
+        );
+        for (name, schema) in schemas {
+            s.push_str(&format!("{name}: {schema}\n"));
+        }
     }
     s.push_str(
         "\nReturn only that one JSON object. Put any prose in its `analysis` field. \
@@ -5192,26 +5276,6 @@ fn is_mutating_git_followup(command: &str) -> bool {
 /// one wrapped in a [`GatingFetcher`] gated by `allowed`. All other
 /// fields cloned (mostly Arc-bumps). Per-step so the gather loop
 /// sees the right per-step allowlist when dispatching followups.
-/// True iff this step's fast-routed synthesis should use the
-/// dedicated routing-agent system prompt (vs the fast-gather
-/// system prompt that other fast-tagged steps want).
-///
-/// The routing-agent prompt is narrow: "you are a workflow
-/// routing/decision agent; the user message is authoritative;
-/// emit only the JSON it specifies." That fits the orchestrator
-/// step (pure routing over already-typed inputs) and only that
-/// step. Client selection is independent: the fix orchestrator now
-/// uses the primary slow model while retaining the routing system
-/// contract. Other fast steps analyze gathered code or history and
-/// need the fast-gather system prompt at synthesis time.
-///
-/// Hardcoded by step id because today the orchestrator is the
-/// only pure-routing step. If more arrive, replace this with a
-/// typed step field (e.g. `synthesis_system: "routing-agent"`).
-fn use_routing_prompt_for_synth(step_id: &str, _synthesis_use_fast: bool) -> bool {
-    step_id == "orchestrator"
-}
-
 fn agent_runner_with_gated_fetcher(
     base: &Arc<crate::pipeline::AgentRunner>,
     allowed: Vec<crate::workflow::ActionType>,
@@ -5237,6 +5301,7 @@ fn agent_runner_with_gated_fetcher(
         slow_coding_system: base.slow_coding_system.clone(),
         slow_generic_system: base.slow_generic_system.clone(),
         routing_system: base.routing_system.clone(),
+        workflow_synthesis_system: base.workflow_synthesis_system.clone(),
         fetcher: gated,
         max_fast_rounds: base.max_fast_rounds,
         skills: base.skills.clone(),
@@ -7707,6 +7772,51 @@ mod tests {
         assert!(m.is_empty());
     }
 
+    /// A declared JSON Schema is validated against the reply, so the
+    /// model must be shown it. It was not: the tail named the key and
+    /// its type while Rust rejected replies for missing nested
+    /// properties, and every shipped workflow worked around that by
+    /// hand-copying the shape into its prompt.
+    ///
+    /// Uses triage.json because its `triage_coding` schema is the
+    /// largest shipped one and it declares a typed DTO array alongside
+    /// it.
+    #[test]
+    fn build_schema_tail_renders_declared_json_schemas() {
+        let wf = parse_workflow(include_str!("../../configs/workflows/triage.json")).unwrap();
+        let step = &wf.steps[0];
+        let tail = build_output_schema_tail(step);
+
+        // Nested requirements no prose description conveys.
+        for needle in [
+            "summary_status",
+            "schema_version",
+            "impact_classes",
+            "fix_queue_eligible",
+        ] {
+            assert!(tail.contains(needle), "schema tail must contain {needle}");
+        }
+        // And the two structural rules that decide accept/reject.
+        assert!(tail.contains("additionalProperties"));
+        assert!(tail.contains("every name under `required` must be present"));
+
+        // Typed DTO arrays deserialize with deny_unknown_fields, so
+        // their shape has to be shown too. `followups` used to be named
+        // without one and the model invented `target`/`description`/
+        // `detail`, costing a repair inference each time.
+        assert!(tail.contains("array of "), "typed DTO arrays need a shape");
+        for needle in ["\"nice_to_have\"", "\"reason\""] {
+            assert!(
+                tail.contains(needle),
+                "followup shape must contain {needle}"
+            );
+        }
+        assert!(
+            !tail.contains("\"target\""),
+            "the followup DTO has no `target` field; showing one would invite it"
+        );
+    }
+
     #[test]
     fn build_schema_tail_lists_every_declared_key() {
         let wf = fix_workflow();
@@ -10030,44 +10140,62 @@ mod tests {
     }
 
     #[test]
-    fn routing_prompt_selection_is_orchestrator_only() {
-        // The dedicated routing-agent system prompt is scoped to the
-        // orchestrator workflow step. Every other fast-tagged step
-        // (research, lore-search, fixes-tag-search, compile-triage)
-        // analyzes gathered code/history and keeps the fast-gather
-        // system prompt. abe81d9 widened this incorrectly to all
-        // agent=fast steps; f5f2951 narrowed it back. This test
-        // pins the predicate so a future widening regression has to
-        // delete an assertion.
+    fn synthesis_system_defaults_by_agent_role_and_step_override_wins() {
+        use crate::workflow::SynthesisSystem;
 
-        // Orchestrator routed to fast → routing prompt.
-        assert!(use_routing_prompt_for_synth("orchestrator", true));
-
-        // Orchestrator routed to slow (shouldn't happen given
-        // fix.json declares agent:fast, but the predicate is honest
-        // about the precondition) → no routing prompt because the
-        // routing prompt is paired with the fast client.
-        assert!(use_routing_prompt_for_synth("orchestrator", false));
-
-        // Other fast-tagged workflow steps → no routing prompt.
-        for other_step in [
-            "research",
-            "lore-search",
-            "fixes-tag-search",
-            "compile-triage",
-            "write-patch",
-            "write-commit-message",
-            "review",
-            "publish",
-        ] {
-            assert!(
-                !use_routing_prompt_for_synth(other_step, true),
-                "step '{other_step}' must not get the routing prompt"
-            );
-            assert!(
-                !use_routing_prompt_for_synth(other_step, false),
-                "step '{other_step}' must not get the routing prompt"
+        // A fast step's synthesis must NOT run under the fast-gather
+        // prompt: that prompt mandates the `ready_for_slow` envelope
+        // while the step's OUTPUT SCHEMA asks for typed fields, and the
+        // model resolved that contradiction in the system prompt's
+        // favour on 397 of 784 measured validate-claims synthesis calls.
+        assert_eq!(
+            SynthesisSystem::default_for(AgentRole::Fast),
+            SynthesisSystem::WorkflowSynthesis
+        );
+        // Slow/code steps keep the per-mode slow prompt.
+        for role in [AgentRole::Slow, AgentRole::Code] {
+            assert_eq!(
+                SynthesisSystem::default_for(role),
+                SynthesisSystem::SlowForMode
             );
         }
+
+        // The routing prompt is opt-in per step, not inferred from an
+        // id. abe81d9 widened an id-based predicate to all agent=fast
+        // steps and f5f2951 narrowed it back; a typed field cannot
+        // drift that way.
+        let mut step = crate::workflow::Step {
+            id: "orchestrator".into(),
+            title: None,
+            agent: Some(AgentRole::Fast),
+            mode: None,
+            synthesis_system: Some(SynthesisSystem::RoutingAgent),
+            actions: None,
+            depends_on: Vec::new(),
+            run_if: None,
+            skip_if: None,
+            preserve_outputs_on_skip: false,
+            include: Vec::new(),
+            prompt: None,
+            inputs: Default::default(),
+            outputs: Default::default(),
+            eval: None,
+            action: None,
+            terminal_on_success: false,
+            lenses: Vec::new(),
+            aggregate: None,
+            consolidate: None,
+        };
+        assert_eq!(
+            step.synthesis_system
+                .unwrap_or_else(|| SynthesisSystem::default_for(AgentRole::Fast)),
+            SynthesisSystem::RoutingAgent
+        );
+        step.synthesis_system = None;
+        assert_eq!(
+            step.synthesis_system
+                .unwrap_or_else(|| SynthesisSystem::default_for(AgentRole::Fast)),
+            SynthesisSystem::WorkflowSynthesis
+        );
     }
 }

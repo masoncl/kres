@@ -549,9 +549,11 @@
         "  is not settling it, and is the specific move this check exists to stop.",
         "- Every pair in the conjunction step's `conflicts` caps this finding below",
         "  Plausible until you address it in `conflict_resolution`.",
-        "- A null `single_execution_witness` means nobody could name one",
-        "  configuration where the finding fires. Plausible requires one.",
-        "",
+        "- A null `single_execution_witness` means the conjunction step could not",
+        "  name one configuration where the finding fires. Plausible requires one,",
+        "  so either establish it yourself in `execution_witness` \u2014 you have source",
+        "  the conjunction step did not \u2014 or take a verdict below Plausible. Those",
+        "  are the only two moves; there is no third.",
         "If you cannot supply those, the honest verdict is Invalid, NotADefect,",
         "ConfirmedLatent or Unconfirmed, and choosing one of those is not a",
         "failure of the run.",
@@ -666,6 +668,52 @@
             }
           },
           "description": "Required to keep a finding Plausible when the conjunction step reported conflicts: one entry per conflicting pair."
+        },
+        "execution_witness": {
+          "type": "object",
+          "optional": true,
+          "schema": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "build_config",
+              "runtime_state",
+              "call_site",
+              "concurrent_writer"
+            ],
+            "properties": {
+              "build_config": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y. Compile-time only."
+              },
+              "runtime_state": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Runtime conditions that must hold, e.g. sched_core_enabled(rq) == true, a static branch enabled, a sysctl, a cgroup setting, a topology. NOT kconfig."
+              },
+              "call_site": {
+                "type": "string",
+                "description": "file:line of one concrete site where the defect executes under the above."
+              },
+              "concurrent_writer": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "For a race: the function that writes the racing state, and how it runs concurrently (other CPU, interrupt, preemption). Null for a non-race defect, or when no such writer could be named."
+              }
+            },
+            "description": "One configuration under which every gating precondition holds and the defect fires, established by this step. Required to keep a finding Plausible when the conjunction step could not name one."
+          },
+          "description": "The witness this step established, when the conjunction step returned null. Same shape as validate-conjunction.single_execution_witness."
         },
         "gating_override": {
           "type": "array<object>",

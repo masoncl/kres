@@ -2949,14 +2949,24 @@ fn eval_validate_verdict_consistency(step: &Step, ctx: &ExecContext<'_>) -> (boo
         ));
     }
 
-    match conjunction.get("single_execution_witness") {
-        Some(Value::Null) | None => eval_fail(
-            "no single_execution_witness: nobody could name one configuration where every gating \
-             precondition holds and the defect fires. Plausible claims the bad path executes, so \
-             supply the witness or choose ConfirmedLatent, Unconfirmed, NotADefect or Invalid",
-        ),
-        Some(_) => (true, None),
+    // Either step may supply the witness. The conjunction step reasons
+    // over the claim report alone; this one has fetched source and can
+    // establish a configuration the earlier pass could not see. Without
+    // its own channel the eval asked for something the step had no field
+    // to emit, and a run that had resolved both conflicts spent all
+    // three attempts re-asserting Plausible before dying.
+    let witnessed = |value: Option<&Value>| matches!(value, Some(v) if !v.is_null());
+    if witnessed(conjunction.get("single_execution_witness"))
+        || witnessed(outputs.get("execution_witness"))
+    {
+        return (true, None);
     }
+    eval_fail(
+        "no execution witness: nobody has named one configuration where every gating \
+         precondition holds and the defect fires. Plausible claims the bad path executes, so \
+         either establish the witness yourself in execution_witness, or choose ConfirmedLatent, \
+         Unconfirmed, NotADefect or Invalid",
+    )
 }
 
 fn eval_fix_series_assessment(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
@@ -4200,7 +4210,64 @@ mod tests {
             ..Default::default()
         });
         assert!(!passed);
-        assert!(reason.unwrap().contains("single_execution_witness"));
+        assert!(reason.unwrap().contains("no execution witness"));
+
+        // The verdict step has fetched source the conjunction step did
+        // not, so it may establish the witness itself. Without this
+        // channel the eval demanded something the step had no field to
+        // emit: one run resolved both conflicts, was told three times to
+        // "supply the witness", and died with no way to comply.
+        assert!(
+            !run_verdict_eval_with(
+                VerdictCase {
+                    conjunction: conjunction.clone(),
+                    ..Default::default()
+                },
+                Vec::new(),
+                Value::Null,
+            )
+            .0
+        );
+        let step = validate_step("validate-reachability");
+        assert!(
+            step.outputs.contains_key("execution_witness"),
+            "the verdict step needs a channel to supply a witness"
+        );
+
+        // Supplying it clears the block.
+        let mut steps = HashMap::new();
+        let inputs = Map::new();
+        steps.insert(
+            step.id.clone(),
+            step_state(json!({
+                "verdict": "Plausible",
+                "severity": "medium",
+                "summary_written": true,
+                "severity_written": true,
+                "execution_witness": {
+                    "build_config": [],
+                    "runtime_state": ["cpuset_mutex not held on the setscheduler arm"],
+                    "call_site": "kernel/sched/syscalls.c:800",
+                    "concurrent_writer": "cpuset_write_resmask"
+                },
+                "triage_coding": {
+                    "schema_version": 1, "severity": "medium", "summary_status": "plausible"
+                }
+            })),
+        );
+        steps.insert(
+            "validate-claims".to_string(),
+            step_state(claims_output(json!([fresh_claim("a", true, "supported")]))),
+        );
+        steps.insert(
+            "validate-conjunction".to_string(),
+            step_state(json!({"conjunction": conjunction})),
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert_eq!(eval_validate_verdict_consistency(&step, &ctx), (true, None));
 
         // ConfirmedLatent is exactly the verdict for a real structure
         // with no current trigger, so it is not blocked by this.

@@ -1,0 +1,14 @@
+{
+  "provider": "openai",
+  "host": "hsot.azure-api.net",
+  "api_key": "@API_KEY@",
+  "api_version": "2025-04-01-preview",
+  "models": {
+    "gpt-5.5": {
+      "max_tokens": 128000,
+      "max_input_tokens": 900000,
+      "rate_limit": 900000,
+      "thinking": {"type": "adaptive", "effort": "medium"}
+    }
+  }
+}

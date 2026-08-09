@@ -4,3 +4,13 @@
 /.semcode.db/
 /.claude/
 /review/
+
+# Editor and interpreter caches.
+/.ropeproject/
+__pycache__/
+
+# Semcode index built inside a crate directory rather than the repo root.
+.semcode.db/
+
+# Output of a workflow run that used the repo as its results directory.
+/fix3/

@@ -1,0 +1,24 @@
+{
+  "provider": "anthropic",
+  "api_key": "@API_KEY@",
+  "models": {
+    "claude-haiku-4-5": {
+      "max_tokens": 64000,
+      "max_input_tokens": 200000,
+      "rate_limit": 800000,
+      "thinking": {"type": "disabled"}
+    },
+    "claude-sonnet-5": {
+      "max_tokens": 64000,
+      "max_input_tokens": 900000,
+      "rate_limit": 800000,
+      "thinking": {"type": "adaptive", "effort": "medium"}
+    },
+    "claude-opus-4-8": {
+      "max_tokens": 128000,
+      "max_input_tokens": 900000,
+      "rate_limit": 800000,
+      "thinking": {"type": "adaptive", "effort": "medium"}
+    }
+  }
+}

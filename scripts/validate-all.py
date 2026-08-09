@@ -21,7 +21,6 @@ SIGKILL).
 """
 
 import argparse
-import json
 import os
 import re
 import shutil
@@ -40,37 +39,6 @@ active_processes: list[subprocess.Popen] = []
 processes_lock = Lock()
 signal_received = False
 SEVERITIES = {"high", "medium", "low"}
-
-
-def configured_slow_models():
-    """Read the slow-role model selectors from ~/.kres/settings.json.
-
-    Returns [models.slow] plus models.slow_secondary when it is set.
-
-    Validation is a false-positive-elimination pass, so the reachability
-    step gets the slow model the operator configured, not a cheaper
-    stand-in. This used to read models.fast and pass it as --slow-model,
-    which silently ran every validation's deep pass on the fast model.
-
-    The secondary matters for a different reason: the workflow asks a
-    second model to try to break a surviving finding, and that step is
-    skipped unless a second model is actually configured. Two families
-    disagreeing is worth more than one model re-reading itself.
-    """
-    settings_path = Path.home() / ".kres" / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"cannot read {settings_path}: {exc}") from exc
-    models = settings.get("models", {})
-    primary = models.get("slow")
-    if not isinstance(primary, str) or not primary.strip():
-        raise RuntimeError(f"{settings_path} has no non-empty models.slow setting")
-    selectors = [primary.strip()]
-    secondary = models.get("slow_secondary")
-    if isinstance(secondary, str) and secondary.strip():
-        selectors.append(secondary.strip())
-    return selectors
 
 
 def signal_handler(signum, frame):
@@ -304,11 +272,14 @@ def validate_one(kres_bin, slow_models, workspace, bug_dir, timeout):
     # Sharing a single --results across the parallel batch races on
     # session.json / findings.json / report.md / prompt.md and crashes
     # the Rust side with exit 101.
-    # `--slow` rather than `--slow-model`: a non-empty --slow selection
-    # replaces the configured slow pair outright, so every model the
-    # workflow may use has to be named here. The second one answers the
-    # workflow's second-opinion refutation step and is skipped when
-    # absent.
+    # No model flags. ~/.kres/settings.json already says which models to
+    # use, and kres reads it: models.slow for the deep pass plus
+    # models.slow_secondary for the workflow's second-opinion refutation
+    # step. Naming a model here would re-derive that same config one
+    # layer up and get it wrong -- a non-empty --slow selection replaces
+    # the configured pair outright, which silently suppressed the
+    # secondary and left the refutation running one model against its
+    # own verdict.
     cmd = [kres_bin]
     for selector in slow_models:
         cmd += ["--slow", selector]
@@ -417,10 +388,11 @@ Examples:
     )
     parser.add_argument(
         "--slow-model",
-        help="comma-separated slow-agent model selectors, each passed to kres "
-             "as --slow (default: models.slow plus models.slow_secondary from "
-             "~/.kres/settings.json). The second selection answers the "
-             "workflow's second-opinion refutation step",
+        help="override the slow models with a comma-separated list, each "
+             "passed to kres as --slow. Default is to pass nothing and let "
+             "~/.kres/settings.json decide (models.slow, plus "
+             "models.slow_secondary for the second-opinion refutation step). "
+             "Naming models here replaces that pair outright",
     )
     parser.add_argument(
         "--timeout",
@@ -446,18 +418,13 @@ Examples:
     )
     args = parser.parse_args()
 
-    if args.slow_model:
-        slow_models = [m.strip() for m in args.slow_model.split(",") if m.strip()]
-    else:
-        try:
-            slow_models = configured_slow_models()
-        except RuntimeError as exc:
-            print(f"model configuration error: {exc}", file=sys.stderr)
-            return 1
-    if len(slow_models) < 2:
+    # Empty unless the operator overrides, so settings.json governs.
+    slow_models = [m.strip() for m in (args.slow_model or "").split(",") if m.strip()]
+    if slow_models:
         print(
-            "note: only one slow model selected; the workflow's second-opinion "
-            "refutation step will be skipped",
+            f"note: overriding settings.json with --slow {' --slow '.join(slow_models)}; "
+            "this replaces the configured slow pair, so the second-opinion "
+            "refutation step runs only if you name a second model here",
             file=sys.stderr,
         )
 

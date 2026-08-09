@@ -34,6 +34,11 @@ pub struct CodePrompt<'a> {
     /// every synthesis and slow call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stable_instructions: Option<&'a str>,
+    /// The step's declared output contract. Second stable document: it
+    /// varies by step but not by call, so it caches across a step's
+    /// attempts and across concurrent runs of the same workflow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<&'a str>,
     pub question: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbols: Option<&'a [Value]>,
@@ -69,6 +74,7 @@ impl<'a> CodePrompt<'a> {
     pub fn new(question: &'a str) -> Self {
         Self {
             stable_instructions: None,
+            output_schema: None,
             question,
             symbols: None,
             context: None,
@@ -88,6 +94,15 @@ impl<'a> CodePrompt<'a> {
     pub fn with_stable_instructions(mut self, text: &'a str) -> Self {
         if !text.is_empty() {
             self.stable_instructions = Some(text);
+        }
+        self
+    }
+
+    /// Attach the step's output contract. Empty input is ignored so the
+    /// field never serializes as `""`.
+    pub fn with_output_schema(mut self, text: &'a str) -> Self {
+        if !text.is_empty() {
+            self.output_schema = Some(text);
         }
         self
     }
@@ -1159,6 +1174,48 @@ mod tests {
         serde_json::from_str::<serde_json::Value>(&split_a.delta).unwrap();
         let whole: serde_json::Value = serde_json::from_str(&a.to_json_string().unwrap()).unwrap();
         assert_eq!(serde_json::Value::Object(merged(&split_a)), whole);
+    }
+
+    /// The two cached layers have different sharing scopes and must stay
+    /// separate documents. `stable_instructions` (skills, includes) is
+    /// identical for every step of every concurrent run; `output_schema`
+    /// varies by step. Merging them would make the larger block
+    /// per-step and throw the wider share away.
+    #[test]
+    fn the_instruction_and_schema_layers_cache_independently() {
+        let prelude = "--- SKILLS ---\nkernel\n--- INCLUDES ---\ntriage template\n";
+        let a = CodePrompt::new("finding one")
+            .with_stable_instructions(prelude)
+            .with_output_schema("--- OUTPUT SCHEMA ---\nclaim_validation: {...}");
+        let b = CodePrompt::new("finding two")
+            .with_stable_instructions(prelude)
+            .with_output_schema("--- OUTPUT SCHEMA ---\ntriage_coding: {...}");
+
+        let la = a
+            .to_layered_documents(&["stable_instructions"], &["output_schema"])
+            .unwrap();
+        let lb = b
+            .to_layered_documents(&["stable_instructions"], &["output_schema"])
+            .unwrap();
+
+        // Different steps still share the big one.
+        assert_eq!(la.session, lb.session);
+        assert!(la.session.contains("triage template"));
+        // And keep their own contracts.
+        assert_ne!(la.task, lb.task);
+        assert!(la.task.contains("claim_validation"));
+        // Nothing per-call leaks into either cached layer.
+        for layer in [&la.session, &la.task] {
+            assert!(
+                !layer.contains("finding one"),
+                "cached layer leaked the question"
+            );
+        }
+        assert!(la.delta.contains("finding one"));
+        assert_eq!(
+            la.rendered(),
+            format!("{}{}{}", la.session, la.task, la.delta)
+        );
     }
 
     /// A step with no skills and no includes must send one block, not an

@@ -197,12 +197,19 @@ const CACHED_PREFIX_FIELDS: &[&str] = &[
     "plan",
 ];
 
-/// Cached head for a synthesis call. Narrower than
-/// [`CACHED_PREFIX_FIELDS`] on purpose: a synthesis prompt is sent once,
-/// so the only bytes worth a cache block are the ones another call will
-/// present identically. `question` is per-finding and per-attempt, so it
-/// stays in the uncached delta.
-const SYNTHESIS_CACHED_PREFIX_FIELDS: &[&str] = &["stable_instructions"];
+/// Cached layers for a synthesis call, outermost first.
+///
+/// Two blocks, not one, because they have different sharing scopes.
+/// `stable_instructions` (skills, workflow includes) is identical for
+/// every step of every concurrent run against this workspace;
+/// `output_schema` varies by step but not by call. Merging them into
+/// one document would make the 33 KB skills block per-step and throw
+/// away the wider share.
+///
+/// `question` is per-finding and per-attempt, so it stays in the
+/// uncached delta.
+const SYNTHESIS_SESSION_LAYER: &[&str] = &["stable_instructions"];
+const SYNTHESIS_TASK_LAYER: &[&str] = &["output_schema"];
 const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
     "question",
     "symbols",
@@ -650,6 +657,9 @@ pub struct RunContext {
     /// cached block on both the gather and the synthesis call. Empty
     /// for the REPL task path, which has no workflow prelude.
     pub stable_instructions: String,
+    /// The step's OUTPUT SCHEMA block. Invariant for the step, so it
+    /// gets its own cached block rather than riding the per-call tail.
+    pub output_schema: String,
     /// Run the synthesis call on this entry of the runner's slow-variant
     /// list instead of the primary slow client. `None` is the primary.
     /// Out of range means the session has no such model configured and
@@ -1246,6 +1256,7 @@ impl AgentRunner {
         // prefix go through run_with_lenses below.
         let mut slow_cp = CodePrompt::new(prompt)
             .with_stable_instructions(&ctx.stable_instructions)
+            .with_output_schema(&ctx.output_schema)
             .with_symbols(&symbols)
             .with_context(&context)
             .with_previous_findings(&previous_findings);
@@ -1273,17 +1284,17 @@ impl AgentRunner {
         // The head deliberately holds nothing task-specific, so every
         // step of a run — and every concurrent run of the same workflow
         // against the same workspace — presents identical bytes.
-        let split = slow_cp.to_split_documents(SYNTHESIS_CACHED_PREFIX_FIELDS)?;
-        let slow_logged = split.rendered();
+        let layered =
+            slow_cp.to_layered_documents(SYNTHESIS_SESSION_LAYER, SYNTHESIS_TASK_LAYER)?;
+        let slow_logged = layered.rendered();
         let messages = vec![Message {
             role: "user".into(),
-            content: split.delta,
+            content: layered.delta,
             cache: false,
-            cached_prefixes: if split.stable.is_empty() {
-                Vec::new()
-            } else {
-                vec![split.stable]
-            },
+            cached_prefixes: [layered.session, layered.task]
+                .into_iter()
+                .filter(|layer| !layer.is_empty())
+                .collect(),
         }];
         // Route the synthesis call to the fast client when the
         // caller (typically a workflow step declared `agent: fast`)

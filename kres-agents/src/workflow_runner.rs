@@ -169,6 +169,11 @@ struct StepPromptTexts {
     /// can ride its own cached block instead of being re-sent as fresh
     /// input on every call. See `CodePrompt::stable_instructions`.
     stable_instructions: String,
+    /// The step's `OUTPUT SCHEMA` block. Invariant for the step, so it
+    /// rides its own cached block instead of the per-call tail.
+    /// Gather-phase prompts do not carry it: that phase answers a
+    /// different contract.
+    schema_block: String,
     user_text_base: String,
     gather_user_text_base: String,
 }
@@ -809,10 +814,20 @@ impl LlmDriver {
         // cached block; `attempt` and the schema tail stay in the
         // volatile base, where they belong.
         let stable_instructions = format!("{skills_prelude}{includes_prelude}");
-        let user_text_base = format!(
-            "{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}\n--- {SCHEMA_HEADER} ---\n{schema_tail}",
-            sid = step.id,
+        // The schema tail is derived from step.outputs alone, so it is
+        // the same bytes on every call of this step -- across attempts,
+        // across findings, across concurrent runs. It joins the cached
+        // instructions rather than the per-call tail: rendering declared
+        // schemas made it 9 KB on the verdict step, and re-sending it
+        // fresh cost 2.5M characters (~633K tokens) over one 113-finding
+        // batch.
+        let schema_block = format!(
+            "--- {SCHEMA_HEADER} ---\n{schema_tail}",
             SCHEMA_HEADER = "OUTPUT SCHEMA"
+        );
+        let user_text_base = format!(
+            "{prompt}{correction_context}\n\n--- WORKFLOW CONTEXT ---\nstep: {sid}\nattempt: {attempt}{lens_tag}",
+            sid = step.id,
         );
         let gather_contract =
             fast_gather_contract(gather_disallowed_fields, !self.workflow.skills.is_empty());
@@ -822,6 +837,7 @@ impl LlmDriver {
         );
         Ok(StepPromptTexts {
             stable_instructions,
+            schema_block,
             user_text_base,
             gather_user_text_base,
         })
@@ -941,6 +957,7 @@ impl LlmDriver {
                         synthesis_use_fast,
                         synthesis_system,
                         stable_instructions: prompt_texts.stable_instructions.clone(),
+                        output_schema: prompt_texts.schema_block.clone(),
                         slow_variant_index: step.slow_variant.map(|v| v.index()),
                         pending_followups: std::mem::take(&mut pending_followups),
                         seed_symbols: run_seed_symbols,
@@ -1076,7 +1093,10 @@ impl LlmDriver {
             // The direct AgentEnv path sends one plain message, so the
             // prelude the orchestrator path carries as a separate cached
             // block is concatenated back on here. Same bytes, no cache.
-            let user_text = format!("{}{user_text}", prompt_texts.stable_instructions);
+            let user_text = format!(
+                "{}{user_text}\n{}",
+                prompt_texts.stable_instructions, prompt_texts.schema_block
+            );
             let messages = vec![Message::plain("user", user_text.clone())];
             if let Some(lg) = &self.logger {
                 let label = match lens {
@@ -2060,6 +2080,7 @@ impl Driver for LlmDriver {
                     .unwrap_or(crate::workflow::SynthesisSystem::SlowForMode),
             ),
             stable_instructions: prompt_texts.stable_instructions.clone(),
+            output_schema: prompt_texts.schema_block.clone(),
             ..crate::pipeline::RunContext::default()
         };
         if uses_structured_review_outputs(step) {

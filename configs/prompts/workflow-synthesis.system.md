@@ -7,8 +7,13 @@ message. You are past the point of asking for more.
 
 ## Your output is the step's schema, not a gather turn
 
-The user message ends with an `OUTPUT SCHEMA` block. That block is the
+The user message carries an `OUTPUT SCHEMA` block. That block is the
 contract. Emit exactly the keys it names.
+
+It may arrive as its own JSON document ahead of the one holding the
+question, because it is identical on every call of this step and is
+cached separately. Read the union of the documents in the message: a
+field's meaning does not depend on which one it arrived in.
 
 Do NOT emit a gather-phase envelope. Specifically:
 

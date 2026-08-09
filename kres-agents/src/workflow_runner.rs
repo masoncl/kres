@@ -2703,6 +2703,16 @@ fn build_output_schema_tail(step: &Step) -> String {
     );
     let mut schemas: Vec<(&String, String)> = Vec::new();
     for (k, v) in &step.outputs {
+        // Machine-populated outputs are derived by the driver from the
+        // step's side effects and overwritten after the model answers.
+        // Asking for them invites a guess: over one 113-finding batch
+        // the model emitted 391 of them -- summary_written,
+        // severity_written, citation_check -- every one discarded, and
+        // citation_check came back as a fabricated zero count that
+        // looked like a real measurement in the log.
+        if is_driver_overwritten_output(k) {
+            continue;
+        }
         let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("any");
         let optional = v.get("optional").and_then(|x| x.as_bool()).unwrap_or(false);
         let req_when = v.get("required_when").and_then(|x| x.as_str());
@@ -4557,6 +4567,30 @@ fn count_lines(path: &Path) -> Option<usize> {
     std::fs::read_to_string(path)
         .ok()
         .map(|body| body.lines().count())
+}
+
+/// Outputs the driver computes unconditionally and writes over whatever
+/// the model said.
+///
+/// A subset of [`is_machine_populated_output`]: `build_target` and
+/// `review_dispute` are only *defaulted* when the model omits them, so
+/// the model may legitimately supply those and the schema tail still
+/// names them. The rest are derived from the step's side effects after
+/// the fact, and asking for them invites a guess -- over one
+/// 113-finding batch the model emitted 391 of these, all discarded, and
+/// `citation_check` came back as a fabricated zero count that read like
+/// a real measurement in the log.
+fn is_driver_overwritten_output(name: &str) -> bool {
+    matches!(
+        name,
+        "changed_files"
+            | "code_changes_emitted"
+            | "commit_message_written"
+            | "affected_files_changed"
+            | "summary_written"
+            | "severity_written"
+            | "citation_check"
+    )
 }
 
 fn is_machine_populated_output(name: &str) -> bool {
@@ -8203,6 +8237,50 @@ mod tests {
             r#"{"symbols":[{"filename":"kernel/sched/core.c"}]}"#,
         );
         assert!(quoted["unbacked_fresh"].as_array().unwrap().is_empty());
+    }
+
+    /// The tail must not ask for outputs the driver overwrites. It used
+    /// to name every declared output, so the model dutifully emitted
+    /// summary_written, severity_written and citation_check -- 391 of
+    /// them over one 113-finding batch, every one discarded. The
+    /// citation_check guesses were worse than waste: they were zeroed
+    /// counts that read like a real lint result in the log.
+    ///
+    /// build_target and review_dispute stay: those are defaulted only
+    /// when the model omits them, so it may legitimately supply one.
+    #[test]
+    fn build_schema_tail_omits_outputs_the_driver_overwrites() {
+        let wf = parse_workflow(include_str!("../../configs/workflows/validate.json")).unwrap();
+        let claims = wf.steps.iter().find(|s| s.id == "validate-claims").unwrap();
+        let tail = build_output_schema_tail(claims);
+        assert!(claims.outputs.contains_key("citation_check"));
+        assert!(
+            !tail.contains("citation_check"),
+            "the lint result is computed from the workspace, not answered by the model"
+        );
+        assert!(tail.contains("claim_validation"));
+
+        let verdict = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "validate-reachability")
+            .unwrap();
+        let tail = build_output_schema_tail(verdict);
+        for derived in ["summary_written", "severity_written"] {
+            assert!(
+                !tail.contains(derived),
+                "{derived} is derived after the fact"
+            );
+        }
+        assert!(tail.contains("verdict") && tail.contains("execution_witness"));
+
+        // A defaulted-if-absent output is still the model's to give.
+        let write_patch = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|s| s.id == "write-patch")
+            .unwrap();
+        assert!(build_output_schema_tail(&write_patch).contains("build_target"));
     }
 
     #[test]

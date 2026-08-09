@@ -691,7 +691,17 @@ impl Client {
                 // otherwise fail the whole task).
                 let assembled = consume_stream(resp, stream_guard.as_ref()).await;
                 match assembled {
-                    Ok(resp) => return Ok(resp),
+                    // Not every provider names the model in its SSE
+                    // message_start, so fall back to the one we asked
+                    // for. A log record without it cannot say which
+                    // model answered, which is precisely the question
+                    // when a workflow deliberately runs two.
+                    Ok(mut resp) => {
+                        if resp.model.is_none() {
+                            resp.model = Some(cfg.model.id.clone());
+                        }
+                        return Ok(resp);
+                    }
                     Err(e) if is_mid_stream_retryable(&e) && attempt < MAX_RETRIES => {
                         let wait = backoff_duration(attempt);
                         kres_core::async_eprintln!(

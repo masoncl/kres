@@ -466,6 +466,25 @@ impl TurnLogger {
         thinking: Option<&str>,
         request: Option<&RequestMeta>,
     ) {
+        self.log_code_labeled_with_request_and_model(
+            role, label, content, usage, thinking, request, None,
+        )
+    }
+
+    /// As above, recording which model answered. An assistant record
+    /// without that cannot say who produced it, which is the whole
+    /// question when a workflow deliberately runs two models.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_code_labeled_with_request_and_model(
+        &self,
+        role: &str,
+        label: Option<&str>,
+        content: &str,
+        usage: Option<LoggedUsage>,
+        thinking: Option<&str>,
+        request: Option<&RequestMeta>,
+        response_model: Option<&str>,
+    ) {
         let context_stats =
             (role == "user").then(|| ContextStats::from_user_content_and_request(content, request));
         let entry = LogEntry {
@@ -477,7 +496,7 @@ impl TurnLogger {
             usage,
             thinking,
             request,
-            response_model: None,
+            response_model,
             context_stats: context_stats.as_ref(),
         };
         if let Err(e) = self.write(true, &entry) {
@@ -550,6 +569,23 @@ impl TurnLogger {
         thinking: Option<&str>,
         request: Option<&RequestMeta>,
     ) {
+        self.log_main_with_request_and_model(role, label, content, usage, thinking, request, None)
+    }
+
+    /// As above, recording which model answered. An assistant record
+    /// without that cannot say who produced it, which is the whole
+    /// question when a workflow deliberately runs two models.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_main_with_request_and_model(
+        &self,
+        role: &str,
+        label: Option<&str>,
+        content: &str,
+        usage: Option<LoggedUsage>,
+        thinking: Option<&str>,
+        request: Option<&RequestMeta>,
+        response_model: Option<&str>,
+    ) {
         let context_stats =
             (role == "user").then(|| ContextStats::from_user_content_and_request(content, request));
         let entry = LogEntry {
@@ -561,7 +597,7 @@ impl TurnLogger {
             usage,
             thinking,
             request,
-            response_model: None,
+            response_model,
             context_stats: context_stats.as_ref(),
         };
         if let Err(e) = self.write(false, &entry) {

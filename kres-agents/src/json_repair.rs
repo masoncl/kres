@@ -328,7 +328,7 @@ pub async fn repair_json_response(
         cache_creation: response.usage.cache_creation_input_tokens,
         cache_read: response.usage.cache_read_input_tokens,
     };
-    log_turn(
+    log_turn_with_model(
         &call.logger,
         call.log_kind,
         "assistant",
@@ -336,6 +336,7 @@ pub async fn repair_json_response(
         &text,
         Some(usage),
         None,
+        response.model.as_deref(),
     );
     Ok(JsonRepairResult {
         text,
@@ -352,14 +353,66 @@ fn log_turn(
     usage: Option<LoggedUsage>,
     request: Option<&kres_core::RequestMeta>,
 ) {
+    log_turn_with_model(logger, kind, role, label, text, usage, request, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_turn_with_model(
+    logger: &Option<Arc<TurnLogger>>,
+    kind: RepairLogKind,
+    role: &str,
+    label: &str,
+    text: &str,
+    usage: Option<LoggedUsage>,
+    request: Option<&kres_core::RequestMeta>,
+    response_model: Option<&str>,
+) {
     let Some(logger) = logger else { return };
     match kind {
-        RepairLogKind::Code => {
-            logger.log_code_labeled_with_request(role, Some(label), text, usage, None, request)
-        }
-        RepairLogKind::Main => {
-            logger.log_main_with_request(role, Some(label), text, usage, None, request)
-        }
+        RepairLogKind::Code => logger.log_code_labeled_with_request_and_model(
+            role,
+            Some(label),
+            text,
+            usage,
+            None,
+            request,
+            response_model,
+        ),
+        RepairLogKind::Main => logger.log_main_with_request_and_model(
+            role,
+            Some(label),
+            text,
+            usage,
+            None,
+            request,
+            response_model,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod model_logging_tests {
+    /// Every assistant record says which model produced it. The repair
+    /// path logged through a helper that had no such parameter, so 19
+    /// of the assistant records in a 113-finding batch could not be
+    /// attributed -- the only ones that could not.
+    #[test]
+    fn the_repair_logger_can_carry_a_response_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = kres_core::log::TurnLogger::new(dir.path()).unwrap();
+        logger.log_code_labeled_with_request_and_model(
+            "assistant",
+            Some("json-repair contract=probe"),
+            "{}",
+            None,
+            None,
+            None,
+            Some("gpt-5.6-sol"),
+        );
+        let body = std::fs::read_to_string(logger.session_dir().join("code.jsonl")).unwrap();
+        let row: serde_json::Value = serde_json::from_str(body.lines().last().unwrap()).unwrap();
+        assert_eq!(row["response_model"], "gpt-5.6-sol");
+        assert_eq!(row["label"], "json-repair contract=probe");
     }
 }
 

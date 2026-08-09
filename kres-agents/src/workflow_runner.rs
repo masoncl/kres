@@ -5508,6 +5508,17 @@ fn agent_runner_with_gated_fetcher(
     base: &Arc<crate::pipeline::AgentRunner>,
     allowed: Vec<crate::workflow::ActionType>,
 ) -> Arc<crate::pipeline::AgentRunner> {
+    // A step that allows no actions has nothing a gather round can do,
+    // so it gets none. It still ran two: one where the agent asked to
+    // load a skill file and one where it said it was ready, 52s apiece
+    // on a step whose evidence was already seeded by its dependencies.
+    // Across a 113-finding batch that was 99 model calls spent deciding
+    // not to fetch anything.
+    let max_fast_rounds = if allowed.is_empty() {
+        0
+    } else {
+        base.max_fast_rounds
+    };
     let inner = base.fetcher.clone();
     let gated: Arc<dyn crate::pipeline::DataFetcher> = Arc::new(GatingFetcher { inner, allowed });
     Arc::new(crate::pipeline::AgentRunner {
@@ -5531,7 +5542,7 @@ fn agent_runner_with_gated_fetcher(
         routing_system: base.routing_system.clone(),
         workflow_synthesis_system: base.workflow_synthesis_system.clone(),
         fetcher: gated,
-        max_fast_rounds: base.max_fast_rounds,
+        max_fast_rounds,
         skills: base.skills.clone(),
         usage: base.usage.clone(),
         logger: base.logger.clone(),

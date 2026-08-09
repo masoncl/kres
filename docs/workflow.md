@@ -1517,6 +1517,16 @@ paths: silently falling back to the primary would make the second
 opinion the first one repeated. `scripts/validate-all.py` passes both
 configured selectors and warns when only one is available.
 
+A refutation is kept. Both `repeat` and a re-entry snapshot a rejected
+attempt into `prior_attempts`, and the cascade covers steps downstream
+of a branch target — but the branch *source* was exempted and then
+skipped on the next pass, so the one record that a model broke the
+finding was discarded. Six successful refutations in a 113-finding
+batch survived nowhere but the raw JSONL. The `BranchTo` arm now
+snapshots the branching step's outputs first, and the verdict step is
+told to record in `summary.md` which pass broke the finding and what
+changed.
+
 Either refuter succeeding blocks `Plausible`. They are asked to break
 the finding, not to vote — a refutation carries `decisive_evidence` and
 a survival does not — so one is the stronger signal. A successful

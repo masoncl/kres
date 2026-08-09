@@ -2190,6 +2190,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         // states precisely what was wrong; the retry used to be told
         // only its attempt number.
         st.last_eval_reason = eval_reason.clone();
+
         let eval_failures = st.eval_failures;
         let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
         let exhausted = attempt >= max;
@@ -2343,6 +2344,25 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                         to: target.clone(),
                     },
                 );
+                // Keep what the branching step said. Repeat and
+                // reset_for_reentry both snapshot a rejected attempt
+                // into prior_attempts, and the cascade does it for
+                // steps downstream of the target -- but the branch
+                // source is explicitly exempted just below, and on the
+                // next pass its run_if usually skips it, so its outputs
+                // were the one rejected attempt nothing kept.
+                //
+                // That is exactly the record worth keeping. validate's
+                // refutation steps branch precisely when a model broke
+                // the finding: six did so in a 113-finding batch and
+                // left no trace in the snapshot, recoverable only from
+                // the raw JSONL.
+                if let Some(source) = state.get_mut(&step.id) {
+                    if !source.outputs.is_empty() {
+                        let rejected = source.outputs.clone();
+                        source.prior_attempts.push(rejected);
+                    }
+                }
                 reset_for_reentry(&mut state, &target);
                 reset_dependents_preserving(workflow, &mut state, &target, Some(&step.id));
                 // The branching step itself needs to be re-runnable
@@ -4404,6 +4424,64 @@ mod tests {
         );
         let body = std::fs::read_to_string(path.join("workflow-validate.json")).unwrap();
         serde_json::from_str::<WorkflowSnapshot>(&body).expect("target is a whole document");
+    }
+
+    /// A step that branches away keeps a record of what it said.
+    ///
+    /// Repeat and reset_for_reentry both snapshot a rejected attempt,
+    /// and the cascade covers steps downstream of the branch target,
+    /// but the branch SOURCE was exempted and then usually skipped on
+    /// the next pass. For validate that erased the only durable record
+    /// that a refuter broke the finding: six successful refutations in
+    /// a 113-finding batch survived nowhere but the raw JSONL.
+    #[test]
+    fn a_branching_step_keeps_its_rejected_attempt() {
+        let workflow = parse_workflow(
+            r#"{"$schema_version":1,"id":"w","steps":[
+                 {"id":"verdict","agent":"slow","prompt":"p",
+                  "outputs":{"analysis":{"type":"string"}}},
+                 {"id":"refute","agent":"slow","prompt":"p","depends_on":["verdict"],
+                  "outputs":{"refuted":{"type":"boolean"}},
+                  "eval":{"type":"field_check","expr":"refuted == false",
+                          "on_fail":{"action":"branch_to","branch_to":"verdict",
+                                     "max_attempts":2,"on_exhausted":"continue"}}}]}"#,
+        )
+        .unwrap();
+        let mut state: HashMap<String, StepState> = workflow
+            .steps
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    StepState {
+                        id: s.id.clone(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        // The refuter broke it.
+        let refute = state.get_mut("refute").unwrap();
+        refute.outputs.insert("refuted".into(), Value::Bool(true));
+        refute.status = StepStatus::Done;
+
+        // What the BranchTo arm now does before resetting.
+        if let Some(source) = state.get_mut("refute") {
+            if !source.outputs.is_empty() {
+                let rejected = source.outputs.clone();
+                source.prior_attempts.push(rejected);
+            }
+        }
+        reset_for_reentry(&mut state, "verdict");
+        reset_dependents_preserving(&workflow, &mut state, "verdict", Some("refute"));
+
+        let refute = &state["refute"];
+        assert_eq!(
+            refute.prior_attempts.len(),
+            1,
+            "the refutation must survive the branch it caused"
+        );
+        assert_eq!(refute.prior_attempts[0]["refuted"], Value::Bool(true));
     }
 
     #[test]

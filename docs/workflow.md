@@ -1517,6 +1517,15 @@ paths: silently falling back to the primary would make the second
 opinion the first one repeated. `scripts/validate-all.py` passes both
 configured selectors and warns when only one is available.
 
+The two do not run as independent samples. Both depend on
+`validate-reachability`, and a refutation branches immediately, so the
+secondary is reached only when the primary let the finding stand. That
+ordering is deliberate and matches the goal — the question the second
+model answers is "what did the first one miss" — but it means a wrong
+refutation by the primary is never contradicted by the secondary, and
+the two catch rates are not comparable. On the measured batch the
+primary refuted 2 and the secondary 4, of 54, with no overlap.
+
 A refutation is kept. Both `repeat` and a re-entry snapshot a rejected
 attempt into `prior_attempts`, and the cascade covers steps downstream
 of a branch target — but the branch *source* was exempted and then

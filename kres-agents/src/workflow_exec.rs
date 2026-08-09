@@ -2357,10 +2357,18 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 // the finding: six did so in a 113-finding batch and
                 // left no trace in the snapshot, recoverable only from
                 // the raw JSONL.
-                if let Some(source) = state.get_mut(&step.id) {
-                    if !source.outputs.is_empty() {
-                        let rejected = source.outputs.clone();
-                        source.prior_attempts.push(rejected);
+                //
+                // Skipped when the branch points back at this same step
+                // -- `branch_to_output` resolves its target from these
+                // very outputs, so a step can name itself -- because
+                // reset_for_reentry below snapshots the target and would
+                // otherwise record the attempt twice.
+                if target != step.id {
+                    if let Some(source) = state.get_mut(&step.id) {
+                        if !source.outputs.is_empty() {
+                            let rejected = source.outputs.clone();
+                            source.prior_attempts.push(rejected);
+                        }
                     }
                 }
                 reset_for_reentry(&mut state, &target);
@@ -2975,7 +2983,21 @@ fn eval_validate_verdict_consistency(step: &Step, ctx: &ExecContext<'_>) -> (boo
     // its own channel the eval asked for something the step had no field
     // to emit, and a run that had resolved both conflicts spent all
     // three attempts re-asserting Plausible before dying.
-    let witnessed = |value: Option<&Value>| matches!(value, Some(v) if !v.is_null());
+    // A witness is a named place the defect fires. Structural validity
+    // is not enough: the schema permits `call_site: ""`, and a witness
+    // with no site is the same "nobody could name one" the check exists
+    // to catch, wearing an object.
+    let witnessed = |value: Option<&Value>| {
+        value.is_some_and(|w| {
+            !w.is_null()
+                && !w
+                    .get("call_site")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+        })
+    };
     if witnessed(conjunction.get("single_execution_witness"))
         || witnessed(outputs.get("execution_witness"))
     {
@@ -4254,6 +4276,19 @@ mod tests {
             "the verdict step needs a channel to supply a witness"
         );
 
+        // A witness with no call site is not a witness. The schema
+        // permits an empty string, and "nobody could name a place this
+        // fires" is exactly what the check exists to catch.
+        let mut siteless = VerdictCase::default().conjunction;
+        siteless["single_execution_witness"]["call_site"] = json!("  ");
+        assert!(
+            !run_verdict_eval(VerdictCase {
+                conjunction: siteless,
+                ..Default::default()
+            })
+            .0
+        );
+
         // Supplying it clears the block.
         let mut steps = HashMap::new();
         let inputs = Map::new();
@@ -4424,6 +4459,34 @@ mod tests {
         );
         let body = std::fs::read_to_string(path.join("workflow-validate.json")).unwrap();
         serde_json::from_str::<WorkflowSnapshot>(&body).expect("target is a whole document");
+    }
+
+    /// A step whose branch points back at itself must not record the
+    /// attempt twice. `branch_to_output` resolves its target from the
+    /// step's own outputs, so naming itself is reachable, and
+    /// reset_for_reentry already snapshots the target.
+    #[test]
+    fn a_self_branch_records_one_attempt_not_two() {
+        let mut state: HashMap<String, StepState> = HashMap::new();
+        state.insert(
+            "s".into(),
+            StepState {
+                id: "s".into(),
+                status: StepStatus::Done,
+                outputs: json!({"next_step": "s"}).as_object().unwrap().clone(),
+                ..Default::default()
+            },
+        );
+        // The guard in the BranchTo arm: skip when target == step.id.
+        let target = "s";
+        let step_id = "s";
+        if target != step_id {
+            let src = state.get_mut(step_id).unwrap();
+            let rejected = src.outputs.clone();
+            src.prior_attempts.push(rejected);
+        }
+        reset_for_reentry(&mut state, target);
+        assert_eq!(state["s"].prior_attempts.len(), 1);
     }
 
     /// A step that branches away keeps a record of what it said.

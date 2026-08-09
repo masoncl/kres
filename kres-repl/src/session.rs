@@ -62,6 +62,16 @@ pub struct ReplConfig {
     /// not count. Drives prompt.md persistence and /summary output
     /// placement — behaviour requested 2026-04-20.
     pub results_dir: Option<PathBuf>,
+    /// The directory this run owns outright — the explicit `--results`
+    /// when there is one, otherwise the defaulted
+    /// `~/.kres/sessions/<ts>-<pid>/`. Unlike `results_dir` this is
+    /// always set, because it answers a different question: not "did
+    /// the operator ask for a persistent run" but "where may this run
+    /// write state that no other run may touch".
+    ///
+    /// Conflating the two is how workflow snapshots ended up in a path
+    /// shared by every concurrent process.
+    pub session_dir: PathBuf,
     /// Explicit `--template FILE` from the CLI. Passed through to
     /// SummaryInputs.template_path when /summary fires. When None
     /// the summariser falls back to ~/.kres/commands/summary.md (or
@@ -122,6 +132,7 @@ impl Default for ReplConfig {
             follow_followups: false,
             report_path: None,
             results_dir: None,
+            session_dir: std::env::temp_dir().join(format!("kres-session-{}", std::process::id())),
             template_path: None,
             stdio: false,
             tui: false,
@@ -4311,6 +4322,8 @@ impl Session {
             inputs,
             crate::workflow::WorkflowRunOptions {
                 iteration_cap: 200,
+                // This run's own directory, never a shared one.
+                state_dir: Some(self.cfg.session_dir.join("workflow-state")),
                 results_dir: self.cfg.results_dir.clone(),
                 observer: Some(observer),
                 ..Default::default()

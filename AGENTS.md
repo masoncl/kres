@@ -84,6 +84,13 @@ User prompt → Task created → Task thread starts
   `validate_verdict_consistency` — exist because the prompt already
   stated the rule and runs talked themselves out of it by relabelling a
   load-bearing unresolved claim as a severity question.
+- Parallel runs never share a directory. Every kres run owns its
+  artifacts — findings, report, session state, workflow snapshots —
+  under `--results` when given and `~/.kres/sessions/<ts>-<pid>/`
+  otherwise. Two runs are working on different inputs, so a file they
+  both write is one of them destroying the other's record. Do not add a
+  shared-path default for a run that arrives without a directory: that
+  is a caller bug and it must fail rather than be papered over.
 - A second opinion must come from a different model. A workflow step
   that checks another step's conclusion names `slow_variant:
   "secondary"` and is guarded on the `slow_secondary_available` input;

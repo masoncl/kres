@@ -838,6 +838,24 @@ fn apply_workflow_model_overrides(settings: &mut kres_repl::Settings, args: &Run
     );
 }
 
+/// A results directory this run owns outright.
+///
+/// Every artifact a run writes — findings.json, report.md, session.json,
+/// workflow snapshots — belongs under one directory that no other run
+/// touches. Parallel kres processes must never share: they are working
+/// on different inputs, so anything they both write is one of them
+/// destroying the other's record of what it did.
+///
+/// The id is a UTC timestamp plus the pid. The timestamp alone was not
+/// enough — chrono's seconds resolution is identical for every process
+/// in a bulk launch.
+fn private_session_dir() -> PathBuf {
+    let base = kres_dir().unwrap_or_else(|| PathBuf::from("."));
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    base.join("sessions")
+        .join(format!("{ts}-{}", std::process::id()))
+}
+
 fn review_comparison_path(
     results_dir: &Path,
     slow_model_count: usize,
@@ -948,12 +966,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
     let results_dir = match (args.results.clone(), standalone) {
         (Some(d), _) => d,
         (None, true) => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        (None, false) => {
-            let base = kres_dir().unwrap_or_else(|| PathBuf::from("."));
-            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
-            let session_id = format!("{ts}-{}", std::process::id());
-            base.join("sessions").join(session_id)
-        }
+        (None, false) => private_session_dir(),
     };
     let findings_base = Some(
         args.findings
@@ -1238,6 +1251,9 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         // ~/.kres/sessions/<ts>/ dir should not trigger prompt.md
         // persistence.
         results_dir: args.results.clone(),
+        // Always set, unlike results_dir above: this is where the run
+        // may write state no other run may touch.
+        session_dir: results_dir.clone(),
         template_path: args.template.clone(),
         stdio: args.stdio || !std::io::IsTerminal::is_terminal(&std::io::stdout()),
         // TUI is now the default on a TTY. Precedence:
@@ -2198,6 +2214,12 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
         args.iteration_cap
     );
 
+    // `--prompt 'validate: ...'` and friends reach here instead of the
+    // REPL, and used to run with no results directory at all, which
+    // left the workflow snapshot falling back to a path shared by every
+    // concurrent run. Give them the same private directory the REPL
+    // computes.
+    let workflow_results = args.results.clone().or_else(|| Some(private_session_dir()));
     let run = kres_repl::run_workflow_driver(
         &workflow,
         &mut driver,
@@ -2206,7 +2228,7 @@ async fn run_workflow(args: RunWorkflowArgs) -> Result<()> {
             iteration_cap: args.iteration_cap,
             state_dir: args.state_dir.clone(),
             resume: args.resume,
-            results_dir: args.results.clone(),
+            results_dir: workflow_results,
             observer: None,
         },
     )
@@ -2580,6 +2602,27 @@ mod tests {
         let provider =
             Cli::try_parse_from(["kres", "--summary", "--slow-agent", "/tmp/slow.json"]).unwrap();
         assert!(provider.repl.slow_agent.is_some());
+    }
+
+    /// Parallel runs must not share a results directory. Two kres
+    /// processes are working on different findings, so any file they
+    /// both write is one destroying the other's record -- which is what
+    /// happened to the workflow snapshot when the one-shot `--prompt`
+    /// path ran with no results directory at all.
+    #[test]
+    fn every_run_gets_a_results_directory_of_its_own() {
+        let a = private_session_dir();
+        assert!(a.starts_with(kres_dir().unwrap_or_else(|| PathBuf::from("."))));
+        assert!(a.to_string_lossy().contains("sessions"));
+        // The pid is in the name because a bulk launch produces an
+        // identical seconds-resolution timestamp for every process.
+        assert!(
+            a.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&format!("-{}", std::process::id())),
+            "{a:?} must be unique per process"
+        );
     }
 
     #[test]

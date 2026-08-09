@@ -232,9 +232,10 @@ impl WorkflowSnapshot {
         // shared target safe -- see the per-run fallback directory in
         // kres-repl::workflow.
         let tmp = dir.join(format!(
-            "workflow-{}.json.{}.tmp",
+            "workflow-{}.json.{}.{}.tmp",
             self.workflow_id,
-            std::process::id()
+            std::process::id(),
+            SNAPSHOT_WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let body = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         let mut file = std::fs::OpenOptions::new()
@@ -249,6 +250,10 @@ impl WorkflowSnapshot {
         Ok(())
     }
 }
+
+/// Serial number for snapshot scratch files, so no two `save()` calls in
+/// one process can pick the same temporary path.
+static SNAPSHOT_WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4271,6 +4276,69 @@ mod tests {
     /// applied to ConfirmedLatent only, letting the step run with no
     /// second model configured -- which routes it back to the primary
     /// and makes the second opinion the first one repeated.
+    /// Concurrent snapshot writes to one directory must not destroy
+    /// each other's scratch file.
+    ///
+    /// scripts/validate-all.py runs 50 kres processes with no
+    /// --results, so all of them fell back to one
+    /// <workspace>/.kres/workflow-state and wrote the same
+    /// workflow-validate.json.tmp. One renamed it away while another
+    /// was mid-write and the loser died with ENOENT -- twice in a
+    /// 113-finding batch. The scratch name is now unique per call, so
+    /// the failure is impossible rather than unlikely.
+    #[test]
+    fn concurrent_snapshot_saves_to_one_directory_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        let errors: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|i| {
+                    let path = path.clone();
+                    scope.spawn(move || {
+                        let snap = WorkflowSnapshot {
+                            schema_version: WorkflowSnapshot::SCHEMA_VERSION,
+                            // Same id on purpose: that is what made the
+                            // target and the scratch file collide.
+                            workflow_id: "validate".to_string(),
+                            inputs: Map::new(),
+                            steps: vec![StepState {
+                                id: format!("step-{i}"),
+                                ..Default::default()
+                            }],
+                            events_count: i,
+                        };
+                        // Several writes each, to widen the window.
+                        (0..8)
+                            .filter_map(|_| snap.save(&path).err().map(|e| e.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert!(errors.is_empty(), "concurrent saves failed: {errors:?}");
+
+        // No scratch files survive, and the target is one valid
+        // document rather than two interleaved ones.
+        let leftovers: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch files left behind: {leftovers:?}"
+        );
+        let body = std::fs::read_to_string(path.join("workflow-validate.json")).unwrap();
+        serde_json::from_str::<WorkflowSnapshot>(&body).expect("target is a whole document");
+    }
+
     #[test]
     fn an_availability_guard_must_bind_over_the_whole_alternation() {
         let mut steps = HashMap::new();

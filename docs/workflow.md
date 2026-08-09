@@ -233,10 +233,18 @@ ledger inference, serializes the exact staged effect, and persists the step as
 and persists `done`. Resume from `effects_pending` replays the recorded effect
 without calling the model or eval again. Deterministic commands are separate
 reaper steps; the former `post_actions` mechanism has been removed.
-Production dispatch always supplies persistence: an explicit state directory
-wins, then the results directory, with `<workspace>/.kres/workflow-state` as
-the fallback. Live observers do not disable snapshots. Fix-series planning and
-each todo revision use separate subdirectories under `workflow-state`.
+Every run writes its snapshot into a directory it owns: an explicit state
+directory wins, then the results directory. There is no fallback — a caller
+supplying neither is an error, not a default. A snapshot is the run's private
+record of what it has already done, so a directory shared with another run is
+not a lesser answer but a way to lose that record: 50 concurrent `/validate`
+processes writing one `<workspace>/.kres/workflow-state/workflow-validate.json`
+killed two runs on a scratch-file rename and left every survivor's resume state
+describing whichever finding finished last. `--results` is honoured when given;
+otherwise a run gets `~/.kres/sessions/<ts>-<pid>/`, which the REPL and the
+one-shot `--prompt` path both compute. Live observers do not disable snapshots.
+Fix-series planning and each todo revision use separate subdirectories under
+`workflow-state`.
 Failing eval follows
 `eval.on_fail.action`: `repeat` reruns the step, `branch_to` moves
 control back to a named step and invalidates dependent work, `continue`

@@ -963,23 +963,25 @@ pub async fn run_workflow_driver(
         results_dir,
         observer,
     } = options;
-    // Per process, not per workspace. The fallback is what a run gets
-    // when the operator named neither a state dir nor a results dir,
-    // which is exactly how scripts/validate-all.py runs 50 kres
-    // processes at once -- deliberately, because a shared --results
-    // races on findings.json and session.json. They all then wrote one
-    // `workflow-validate.json`: two runs died renaming a scratch file
-    // another process had already renamed away, and every survivor
-    // silently overwrote the others' resume state, which made the
-    // snapshot describe whichever finding happened to finish last.
-    let fallback_state_dir = driver
-        .workspace()
-        .join(".kres/workflow-state")
-        .join(std::process::id().to_string());
-    let default_state_dir = state_dir
-        .clone()
-        .or_else(|| results_dir.clone())
-        .unwrap_or(fallback_state_dir);
+    // No fallback. A workflow snapshot is a run's private record of
+    // what it has already done, so a directory shared with another run
+    // is not a lesser version of the right answer, it is a way to lose
+    // the record: 50 concurrent /validate processes writing one
+    // <workspace>/.kres/workflow-state/workflow-validate.json killed two
+    // runs outright and left the survivors' resume state describing
+    // whichever finding finished last.
+    //
+    // Every entry point owns a directory -- the explicit --results, the
+    // defaulted ~/.kres/sessions/<ts>-<pid>/, or a per-item state dir --
+    // so a caller arriving here with neither has a bug that a default
+    // would hide.
+    let Some(default_state_dir) = state_dir.clone().or_else(|| results_dir.clone()) else {
+        anyhow::bail!(
+            "workflow '{}' was dispatched with no state directory and no results \
+             directory; give the run a directory it owns rather than sharing one",
+            workflow.id
+        );
+    };
 
     if workflow.id == "fix"
         && !inputs.contains_key("current_fix_todo")
@@ -2801,5 +2803,45 @@ mod tests {
         assert!(report.contains("repl-results-test"));
         assert!(report.contains("one leak"));
         let _ = std::fs::remove_dir_all(results);
+    }
+}
+
+#[cfg(test)]
+mod private_state_dir_tests {
+    use super::*;
+
+    /// A run must be handed a directory it owns. There used to be a
+    /// fallback to <workspace>/.kres/workflow-state, which every
+    /// concurrent process shared: two runs in a 50-way /validate batch
+    /// died renaming a scratch file another had already renamed away,
+    /// and the survivors overwrote each other's resume state. A default
+    /// here would hide the caller's bug rather than fix it.
+    #[tokio::test]
+    async fn dispatching_with_no_directory_is_an_error_not_a_shared_path() {
+        let workflow = kres_agents::workflow::parse_workflow(
+            r#"{"$schema_version":1,"id":"probe","steps":[{"id":"s","agent":"fast","prompt":"p"}]}"#,
+        )
+        .unwrap();
+        let mut driver =
+            kres_agents::workflow_runner::LlmDriver::new(std::env::temp_dir(), workflow.clone());
+        let outcome = run_workflow_driver(
+            &workflow,
+            &mut driver,
+            Map::new(),
+            WorkflowRunOptions {
+                iteration_cap: 1,
+                state_dir: None,
+                results_dir: None,
+                ..Default::default()
+            },
+        )
+        .await;
+        let err = match outcome {
+            Ok(_) => panic!("a run with nowhere private to write must not proceed"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("no state directory"), "{msg}");
+        assert!(msg.contains("a directory it owns"), "{msg}");
     }
 }

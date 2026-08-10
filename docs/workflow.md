@@ -287,6 +287,14 @@ Two consequences follow, and both are load-bearing:
   fresh run starts from its dependencies alone, so a driver reused
   across runs cannot leak one run's gather into the next.
 
+Note the scope: seeding applies to the non-lensed step path, which
+builds a `RunContext` carrying `seed_symbols`/`seed_context`. The
+lensed fan-out path does not set those fields, so a re-entered LENSED
+step (`review`) still re-gathers. What the lensed path now does do is
+`store_gathered` its shared gather, which is what lets a dependent
+step — `reconcile-review` — seed from it. Making `review` itself reuse
+across cycles is a separate change and has not been made.
+
 Do not restore a blanket "any staged file invalidates" rule or force
 `reuse_gathered_context` off on re-entry. Measured on the 2026-08-10
 linux.nfs fix run, the two together made every commit-message rewrite

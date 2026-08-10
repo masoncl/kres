@@ -1091,6 +1091,17 @@ impl LlmDriver {
                     return Err(format!("step '{}' model output validation: {e}", step.id).into());
                 }
 
+                if let Err(e) = refuse_code_changes_from_actionless_step(
+                    step,
+                    &summary.code_output,
+                    &summary.code_edits,
+                ) {
+                    if json_retry < WORKFLOW_RESPONSE_RETRIES {
+                        last_parse_err = Some(e);
+                        continue;
+                    }
+                    return Err(format!("step '{}' emitted code changes: {e}", step.id).into());
+                }
                 let staged_changes = match stage_code_changes(
                     &self.workspace,
                     &summary.code_output,
@@ -1301,6 +1312,17 @@ impl LlmDriver {
                 return Err(format!("step '{}' model output validation: {e}", step.id).into());
             }
 
+            if let Err(e) = refuse_code_changes_from_actionless_step(
+                step,
+                &code_response.code_output,
+                &code_response.code_edits,
+            ) {
+                if json_retry < WORKFLOW_RESPONSE_RETRIES {
+                    last_parse_err = Some(e);
+                    continue;
+                }
+                return Err(format!("step '{}' emitted code changes: {e}", step.id).into());
+            }
             let staged_changes = match stage_code_changes(
                 &self.workspace,
                 &code_response.code_output,
@@ -2229,6 +2251,7 @@ impl Driver for LlmDriver {
         validate_model_outputs_before_side_effects(step, &outputs)
             .map_err(|e| format!("step '{}' model output validation: {e}", step.id))?;
 
+        refuse_code_changes_from_actionless_step(step, &summary.code_output, &summary.code_edits)?;
         let staged = stage_code_changes(&self.workspace, &summary.code_output, &summary.code_edits)
             .map_err(|e| format!("step '{}' code changes stage: {e}", step.id))?;
         self.stage_attempt(step, attempt, staged)?;
@@ -6010,6 +6033,44 @@ pub fn apply_code_changes(
     edits: &[kres_core::CodeEdit],
 ) -> Result<Vec<PathBuf>> {
     commit_staged_files(workspace, stage_code_changes(workspace, files, edits)?)
+}
+
+/// A step that explicitly declares `actions: []` has said it performs
+/// no workspace operations, so a `code_edits`/`code_output` block in
+/// its reply is a contract violation, not an instruction.
+///
+/// `stage_code_changes` does not consult the action allowlist — it
+/// writes whatever the reply carried. The allowlist gated followups
+/// only, so the three actionless steps in the shipped workflows
+/// (`reconcile-review` and validate's two refuters) could each have
+/// rewritten source while their prompts told them not to. Prompt text
+/// is not an enforcement mechanism.
+///
+/// No shipped run has been observed doing this. It is refused rather
+/// than dropped so the model gets the reason through the same repair
+/// loop as any other contract violation, instead of a silent discard.
+fn refuse_code_changes_from_actionless_step(
+    step: &Step,
+    files: &[kres_core::CodeFile],
+    edits: &[kres_core::CodeEdit],
+) -> std::result::Result<(), String> {
+    // Only an EXPLICIT `actions: []` means "this step performs no
+    // workspace operations". A step that merely omits `actions` is
+    // governed by the workflow defaults and is not making that claim.
+    if !step.actions.as_ref().is_some_and(|list| list.is_empty()) {
+        return Ok(());
+    }
+    let mut paths: Vec<&str> = files.iter().map(|file| file.path.trim()).collect();
+    paths.extend(edits.iter().map(|edit| edit.file_path.trim()));
+    if paths.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "step '{}' declares `actions: []` and must not change the workspace, but the reply \
+         carried code changes for {paths:?}. Re-send the same answer with no `code_edits` and \
+         no `code_output`; this step reports, it does not edit.",
+        step.id
+    ))
 }
 
 fn stage_code_changes(

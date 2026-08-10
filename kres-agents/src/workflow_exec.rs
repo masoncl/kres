@@ -2783,6 +2783,8 @@ fn eval_reconcile_covers_every_defect(
     }
 
     let mut covered: BTreeSet<i64> = BTreeSet::new();
+    let mut instructed: BTreeSet<i64> = BTreeSet::new();
+    let mut abandoned: BTreeSet<i64> = BTreeSet::new();
     let mut out_of_range: Vec<i64> = Vec::new();
     for (label, entries) in [("instructions", instructions), ("dropped", dropped)] {
         for (position, entry) in entries.iter().enumerate() {
@@ -2809,9 +2811,23 @@ fn eval_reconcile_covers_every_defect(
                     out_of_range.push(index);
                 } else {
                     covered.insert(index);
+                    if label == "instructions" {
+                        instructed.insert(index);
+                    } else {
+                        abandoned.insert(index);
+                    }
                 }
             }
         }
+    }
+    // Instructed AND dropped is not a merge, it is a contradiction:
+    // the worker would act on a defect the record says was abandoned.
+    let both: Vec<i64> = instructed.intersection(&abandoned).copied().collect();
+    if !both.is_empty() {
+        return eval_fail(&format!(
+            "defect index {both:?} appears in both instructions[].covers and \
+             dropped[].covers; a defect is either carried forward or dropped, not both"
+        ));
     }
     if !out_of_range.is_empty() {
         return eval_fail(&format!(
@@ -4289,6 +4305,25 @@ mod tests {
             "must name the abandoned defect: {reason}"
         );
         assert!(reason.contains("neither instructions[].covers nor dropped[].covers"));
+    }
+
+    /// The prompt tells the model each defect appears in exactly one
+    /// of the two arrays. Instructing on a defect AND recording it as
+    /// dropped is a contradiction, not a merge.
+    #[test]
+    fn reconcile_eval_rejects_a_defect_that_is_both_instructed_and_dropped() {
+        let (ok, reason) = run_reconcile_eval(
+            2,
+            json!({"instructions": [instruction(vec![0, 1])],
+                   "dropped": [{"covers": [1], "reason": "disproved at a.c:9"}]}),
+        );
+        assert!(!ok);
+        let reason = reason.unwrap();
+        assert!(
+            reason.contains("[1]"),
+            "must name the contradictory index: {reason}"
+        );
+        assert!(reason.contains("not both"));
     }
 
     #[test]

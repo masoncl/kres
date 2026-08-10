@@ -1600,3 +1600,66 @@ async fn reconcile_style_step_repairs_malformed_json_through_the_shared_loop() {
         "the repair prompt did not carry the validator error naming the missing output"
     );
 }
+
+/// A step that declares `actions: []` says it performs no workspace
+/// operations, so a `code_edits` block in its reply must be refused
+/// rather than written. `stage_code_changes` does not consult the
+/// action allowlist, so without this guard the shipped actionless
+/// steps -- `reconcile-review` and validate's two refuters -- could
+/// each rewrite source while their prompts told them not to.
+#[tokio::test]
+async fn actionless_step_may_not_edit_the_workspace() {
+    let workflow = parse_workflow(
+        &json!({
+            "$schema_version": 1,
+            "id": "actionless-edit",
+            "steps": [{
+                "id": "reconcile-review",
+                "agent": "code",
+                "mode": "review",
+                "actions": [],
+                "prompt": "Reconcile the lenses.",
+                "outputs": {"instructions": {"type": "array<object>"}}
+            }]
+        })
+        .to_string(),
+    )
+    .expect("test workflow must validate");
+
+    let mut responses = VecDeque::new();
+    // Reply carries a source edit this step has no authority to make.
+    responses.push_back(fake_messages_response(
+        "{\"instructions\": [], \
+          \"code_edits\": [{\"file_path\": \"a.c\", \
+          \"old_string\": \"int x = 1;\\n\", \"new_string\": \"int x = 99;\\n\"}]}",
+    ));
+    // The repair loop re-prompts; this time it reports without editing.
+    responses.push_back(fake_messages_response(
+        "{\"instructions\": [{\"covers\": [0], \"target\": \"source\", \
+          \"where\": \"a.c:1\", \"do\": \"fix it\", \"why\": \"a.c:1 is wrong\"}]}",
+    ));
+    let (port, requests) = spawn_recording_mock(responses).await;
+
+    let inputs = derive_inputs(&workflow, Map::new());
+    let (_guard, workspace) = fresh_git_repo();
+    let mut driver = LlmDriver::new(workspace.clone(), workflow.clone())
+        .with_fast(fast_env_pointing_at(port))
+        .with_slow(slow_env_pointing_at(port))
+        .with_code(slow_env_pointing_at(port));
+
+    let trace = run(&workflow, &mut driver, inputs).await;
+    eprintln!("{}", trace.pretty());
+    assert_eq!(trace.status, WorkflowStatus::Success);
+
+    // The refused edit never reached the file.
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.c")).unwrap(),
+        "int x = 1;\n",
+        "an actionless step's code_edits were applied to the workspace"
+    );
+    let requests = requests.lock().await.join("\n---REQUEST---\n");
+    assert!(
+        requests.contains("declares `actions: []` and must not change the workspace"),
+        "the step was not told why its code changes were refused"
+    );
+}

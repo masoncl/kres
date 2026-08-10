@@ -1699,14 +1699,25 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 Ok(o) => o,
                 Err(e) => {
                     driver.discard_attempt(step, attempt).await;
-                    if retry_driver_error(
-                        &mut state,
-                        &mut events,
-                        &observer,
-                        step,
-                        attempt,
-                        &format!("driver error: {e}"),
-                    ) {
+                    let retried = match self_correctable_driver_detail(&e) {
+                        Some(detail) => retry_self_correctable_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            &detail,
+                        ),
+                        None => retry_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            &format!("driver error: {e}"),
+                        ),
+                    };
+                    if retried {
                         continue;
                     }
                     return finish_failure(
@@ -1794,6 +1805,11 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     Ok(LensFanOutConsolidate::Unsupported) => {}
                     Err(e) => {
                         driver.discard_attempt(step, attempt).await;
+                        // This path reports a String rather than a
+                        // DriverError, so the over-capability case
+                        // cannot be recognised without parsing our own
+                        // Display output. Lens steps declare an eval,
+                        // so they already have a retry budget here.
                         if retry_driver_error(
                             &mut state,
                             &mut events,
@@ -1907,14 +1923,26 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 per_lens.sort_by_key(|(id, _)| *lens_order.get(id.as_str()).unwrap_or(&usize::MAX));
                 if let Some((lens_id, e)) = first_err {
                     driver.discard_attempt(step, attempt).await;
-                    if retry_driver_error(
-                        &mut state,
-                        &mut events,
-                        &observer,
-                        step,
-                        attempt,
-                        &format!("lens '{lens_id}' driver error: {e}"),
-                    ) {
+                    let detail = self_correctable_driver_detail(&e);
+                    let retried = match &detail {
+                        Some(detail) => retry_self_correctable_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            detail,
+                        ),
+                        None => retry_driver_error(
+                            &mut state,
+                            &mut events,
+                            &observer,
+                            step,
+                            attempt,
+                            &format!("lens '{lens_id}' driver error: {e}"),
+                        ),
+                    };
+                    if retried {
                         snapshot_save(&state, events.len());
                         continue;
                     }
@@ -1956,14 +1984,26 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                                 // attempt gets fresh lens contexts instead of
                                 // replaying the same inconsistent maps.
                                 state.get_mut(&step.id).unwrap().lens_outputs.clear();
-                                if retry_driver_error(
-                                    &mut state,
-                                    &mut events,
-                                    &observer,
-                                    step,
-                                    attempt,
-                                    &format!("consolidate error: {e}"),
-                                ) {
+                                let detail = self_correctable_driver_detail(&e);
+                                let retried = match &detail {
+                                    Some(detail) => retry_self_correctable_driver_error(
+                                        &mut state,
+                                        &mut events,
+                                        &observer,
+                                        step,
+                                        attempt,
+                                        detail,
+                                    ),
+                                    None => retry_driver_error(
+                                        &mut state,
+                                        &mut events,
+                                        &observer,
+                                        step,
+                                        attempt,
+                                        &format!("consolidate error: {e}"),
+                                    ),
+                                };
+                                if retried {
                                     snapshot_save(&state, events.len());
                                     continue;
                                 }
@@ -2521,6 +2561,42 @@ fn resolve_branch_target(
     Ok(target.to_string())
 }
 
+/// Attempts allowed for a driver error that the agent can itself
+/// resolve, on a step with no eval block of its own.
+///
+/// An over-capability request is the case: the agent asked for more
+/// evidence than the model can read, and the only thing that fixes it
+/// is the agent asking for less. Without this a step without an eval
+/// had no retry budget at all, so one oversized followup killed the
+/// whole workflow -- a fix run died on a patch-bearing git log over a
+/// whole file that was 3.4 MB by itself.
+const SELF_CORRECTABLE_DRIVER_ATTEMPTS: u32 = 3;
+
+/// Whether the next attempt can plausibly avoid this error by asking
+/// for different evidence, and what to tell it if so.
+///
+/// Only over-capability qualifies today. Nothing is trimmed to recover:
+/// the request that did not fit is abandoned whole and the agent is
+/// told the size it overshot, so the evidence it gathers next is its
+/// own smaller choice rather than a silent truncation of this one.
+fn self_correctable_driver_detail(error: &DriverError) -> Option<String> {
+    match error {
+        DriverError::OverInputLimit {
+            actual,
+            limit,
+            step,
+        } => Some(format!(
+            "the evidence gathered for step '{step}' came to {actual} tokens against a \
+             {limit}-token model input capability, so the request was never sent. Nothing \
+             was truncated. Gather the same conclusion from less: ask for the specific \
+             functions, line ranges or commits you need rather than whole files or whole \
+             histories, and prefer a listing that identifies what you want over one that \
+             includes its full contents."
+        )),
+        _ => None,
+    }
+}
+
 fn retry_driver_error(
     state: &mut HashMap<String, StepState>,
     events: &mut Vec<TraceEvent>,
@@ -2529,12 +2605,68 @@ fn retry_driver_error(
     attempt: u32,
     detail: &str,
 ) -> bool {
+    retry_driver_error_inner(state, events, observer, step, attempt, detail, false)
+}
+
+/// As above, for an error the next attempt can avoid by asking
+/// differently. Grants a budget even when the step declares no eval,
+/// and hands the reason to that attempt so it knows what to change.
+fn retry_self_correctable_driver_error(
+    state: &mut HashMap<String, StepState>,
+    events: &mut Vec<TraceEvent>,
+    observer: &Option<EventObserver>,
+    step: &Step,
+    attempt: u32,
+    detail: &str,
+) -> bool {
+    retry_driver_error_inner(state, events, observer, step, attempt, detail, true)
+}
+
+fn retry_driver_error_inner(
+    state: &mut HashMap<String, StepState>,
+    events: &mut Vec<TraceEvent>,
+    observer: &Option<EventObserver>,
+    step: &Step,
+    attempt: u32,
+    detail: &str,
+    self_correctable: bool,
+) -> bool {
+    // Every retry is told what went wrong. Re-running a step blind
+    // reproduces whatever the agent did the first time, which for an
+    // over-capability request means asking for the same oversized
+    // evidence again.
+    if let Some(st) = state.get_mut(&step.id) {
+        st.last_eval_reason = Some(detail.to_string());
+    }
     let Some(eval) = &step.eval else {
-        if let Some(st) = state.get_mut(&step.id) {
-            st.reuse_gathered_context = false;
-            st.status = StepStatus::Pending;
+        if !self_correctable {
+            if let Some(st) = state.get_mut(&step.id) {
+                st.reuse_gathered_context = false;
+                st.status = StepStatus::Pending;
+            }
+            return false;
         }
-        return false;
+        let st = state.get_mut(&step.id).unwrap();
+        st.eval_failures += 1;
+        st.reuse_gathered_context = false;
+        let exhausted = attempt >= SELF_CORRECTABLE_DRIVER_ATTEMPTS;
+        st.status = if exhausted {
+            StepStatus::TerminalFailure
+        } else {
+            StepStatus::Pending
+        };
+        let eval_failures = st.eval_failures;
+        record(
+            events,
+            observer,
+            TraceEvent::EvalFailed {
+                id: step.id.clone(),
+                attempt,
+                action: format!("Repeat ({detail})"),
+                eval_failures,
+            },
+        );
+        return !exhausted;
     };
     let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
     let st = state.get_mut(&step.id).unwrap();
@@ -8563,6 +8695,69 @@ mod tests {
         assert!(expr::eval("write-patch.attempt <= 5", &ctx, None).unwrap());
     }
 
+    /// A step with no eval block must survive an over-capability
+    /// request and be able to recover from it.
+    ///
+    /// fix.json's lore-search, fixes-tag-search and compile-triage
+    /// declare no eval, so retry_driver_error refused them any budget
+    /// and one oversized followup ended the workflow: a run died on
+    /// `OverInputLimit actual=924140 limit=900000`, of which a single
+    /// patch-bearing git log over a whole file was 3.4 MB.
+    #[tokio::test]
+    async fn a_step_without_an_eval_recovers_from_an_over_limit_request() {
+        let wf = parse_workflow(
+            r#"{"$schema_version":1,"id":"w","steps":[{"id":"searcher","agent":"fast",
+                 "prompt":"p","outputs":{"analysis":{"type":"string"}}}]}"#,
+        )
+        .unwrap();
+
+        /// Refuses once for being too large, then succeeds -- what an
+        /// agent that narrows its request looks like.
+        struct OverLimitThenFits {
+            calls: std::sync::Arc<std::sync::Mutex<u32>>,
+        }
+        #[async_trait]
+        impl Driver for OverLimitThenFits {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut n = self.calls.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    return Err(DriverError::OverInputLimit {
+                        step: step.id.clone(),
+                        actual: 924_140,
+                        limit: 900_000,
+                    });
+                }
+                let mut out = Map::new();
+                out.insert("analysis".into(), Value::String("narrowed".into()));
+                Ok(out)
+            }
+        }
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let mut driver = OverLimitThenFits {
+            calls: calls.clone(),
+        };
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert!(
+            matches!(trace.status, WorkflowStatus::Success),
+            "the run must survive an over-limit request: {:?}",
+            trace.status
+        );
+        assert_eq!(*calls.lock().unwrap(), 2, "one refusal, one narrowed retry");
+        assert_eq!(
+            trace.final_state["searcher"].outputs["analysis"],
+            Value::String("narrowed".into())
+        );
+    }
+
     #[tokio::test]
     async fn over_input_limit_never_mutates_prior_attempts() {
         let wf_json = json!({
@@ -8626,11 +8821,30 @@ mod tests {
         };
         let trace = crate::workflow_exec::run_resume(&wf, &mut driver, snapshot, None, 50).await;
 
+        // An over-capability request is recoverable: the agent asked
+        // for more evidence than the model can read, and the fix is to
+        // ask for less. The retry is not byte-identical -- the reason
+        // is put in the next attempt's prompt and reuse_gathered_context
+        // is cleared, so it re-gathers rather than replaying the
+        // oversized evidence. This driver refuses regardless, so the
+        // budget is spent and the run still fails; what must not happen
+        // is failing on the first refusal, which killed a whole fix run
+        // over one 3.4 MB git log.
         assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
         let final_calls = *calls.lock().unwrap();
         assert_eq!(
-            final_calls, 1,
-            "a byte-identical retry cannot make progress"
+            final_calls, SELF_CORRECTABLE_DRIVER_ATTEMPTS,
+            "an over-limit step retries within a bounded budget, even with no eval block"
+        );
+        let writer = trace.final_state.get("writer").expect("step state");
+        assert_eq!(writer.status, StepStatus::TerminalFailure);
+        assert!(
+            writer
+                .last_eval_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("token") && r.contains("Nothing was truncated")),
+            "the retry has to be told what overflowed and that nothing was cut: {:?}",
+            writer.last_eval_reason
         );
         let st = trace.final_state.get("writer").expect("step state");
         assert_eq!(st.prior_attempts.len(), 2, "no entries dropped");

@@ -254,6 +254,19 @@ errors that occur before usable outputs are produced use the step's eval
 retry budget when the step has an eval block; otherwise they fail unless
 that driver has a specific recovery path.
 
+Over-capability is one such path. When the gathered evidence exceeds the
+model's input capability the request is never sent, and the step retries
+within a bounded budget — three attempts — even when it declares no eval
+block, with the reason handed to the next attempt. Nothing is trimmed to
+recover: the request that did not fit is abandoned whole, the agent is
+told the size it overshot and that nothing was cut, and
+`reuse_gathered_context` is cleared so it re-gathers rather than
+replaying the oversized evidence. Without this, `fix.json`'s
+`lore-search`, `fixes-tag-search` and `compile-triage` had no budget at
+all and one oversized followup ended the run: a fix died on
+`OverInputLimit actual=924140 limit=900000`, of which a single
+patch-bearing git log over a whole file was 3.4 MB.
+
 ## Fix Flow (`/fix`)
 
 `/fix <target>` in the REPL and `--prompt "fix: <target>"` on the CLI

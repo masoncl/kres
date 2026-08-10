@@ -192,7 +192,7 @@
         "{{research.prior_attempts || ''}}",
         "If non-empty, each entry is a previous slow-agent JSON output for this same step that",
         "failed the eval. For ambiguous bugs with several plausible fix shapes, do not propose a",
-        "fourth different shape every retry — that is fix-shape thrashing, not progress.",
+        "fourth different shape every retry \u2014 that is fix-shape thrashing, not progress.",
         "Read the prior fix_plan and prior research_decision; commit to one of the proposed",
         "shapes by gathering the specific evidence that would prove its fix_contract, OR",
         "explicitly justify in analysis why a new shape is now correct (cite concrete source",
@@ -249,7 +249,7 @@
         "It is informational, not authoritative. The authoritative source of truth is current",
         "code at workspace HEAD plus reachable in-tree history. If you verify the alleged bug",
         "is present in the source at workspace HEAD, set research_status=confirmed and proceed",
-        "with the fix even when metadata.yaml says `invalidated` — the publish step rewrites",
+        "with the fix even when metadata.yaml says `invalidated` \u2014 the publish step rewrites",
         "metadata.yaml when the patch lands, so the yaml will end up reflecting the new",
         "reality. Only set research_status=invalid when source or commit evidence (not the yaml",
         "status field) proves the bug does not exist. Cite the specific file:line or commit SHA",
@@ -343,7 +343,7 @@
         "or false) is a request for another gather round. Emitting one fails this step's eval",
         "regardless of status, and the runner re-runs research with the gathered evidence; that",
         "is how you ask for more rounds. A nice-to-have followup (`nice_to_have: true`) is a",
-        "deferred audit suggestion that does not block the eval — use this for the \"would be",
+        "deferred audit suggestion that does not block the eval \u2014 use this for the \"would be",
         "nice to double-check later\" notes you would otherwise hide in analysis prose, and",
         "ship them alongside any terminal status. Reach a terminal status only when you have",
         "no blocking followups left.",
@@ -415,10 +415,18 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["id", "description"],
+              "required": [
+                "id",
+                "description"
+              ],
               "properties": {
-                "id": {"type": "string", "minLength": 1},
-                "description": {"type": "string"}
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -430,9 +438,14 @@
           "schema": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["expected_revision", "operations"],
+            "required": [
+              "expected_revision",
+              "operations"
+            ],
             "properties": {
-              "expected_revision": {"type": "integer"},
+              "expected_revision": {
+                "type": "integer"
+              },
               "operations": {
                 "type": "array",
                 "items": {
@@ -440,46 +453,90 @@
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["op", "todo"],
+                      "required": [
+                        "op",
+                        "todo"
+                      ],
                       "properties": {
-                        "op": {"const": "replace_current"},
-                        "todo": {"type": "object"}
+                        "op": {
+                          "const": "replace_current"
+                        },
+                        "todo": {
+                          "type": "object"
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["op", "todos"],
+                      "required": [
+                        "op",
+                        "todos"
+                      ],
                       "properties": {
-                        "op": {"const": "split_current"},
-                        "todos": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+                        "op": {
+                          "const": "split_current"
+                        },
+                        "todos": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "type": "object"
+                          }
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["op", "todos"],
+                      "required": [
+                        "op",
+                        "todos"
+                      ],
                       "properties": {
-                        "op": {"const": "append_after_current"},
-                        "todos": {"type": "array", "minItems": 1, "items": {"type": "object"}}
+                        "op": {
+                          "const": "append_after_current"
+                        },
+                        "todos": {
+                          "type": "array",
+                          "minItems": 1,
+                          "items": {
+                            "type": "object"
+                          }
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["op", "todo"],
+                      "required": [
+                        "op",
+                        "todo"
+                      ],
                       "properties": {
-                        "op": {"const": "revise_pending"},
-                        "todo": {"type": "object"}
+                        "op": {
+                          "const": "revise_pending"
+                        },
+                        "todo": {
+                          "type": "object"
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["op", "id"],
+                      "required": [
+                        "op",
+                        "id"
+                      ],
                       "properties": {
-                        "op": {"const": "remove_pending"},
-                        "id": {"type": "string", "minLength": 1}
+                        "op": {
+                          "const": "remove_pending"
+                        },
+                        "id": {
+                          "type": "string",
+                          "minLength": 1
+                        }
                       }
                     }
                   ]
@@ -494,12 +551,25 @@
           "schema": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["bug_proven", "fix_contract_proven", "invalidity_proven", "needs_more_audit"],
+            "required": [
+              "bug_proven",
+              "fix_contract_proven",
+              "invalidity_proven",
+              "needs_more_audit"
+            ],
             "properties": {
-              "bug_proven": {"type": "boolean"},
-              "fix_contract_proven": {"type": "boolean"},
-              "invalidity_proven": {"type": "boolean"},
-              "needs_more_audit": {"type": "boolean"}
+              "bug_proven": {
+                "type": "boolean"
+              },
+              "fix_contract_proven": {
+                "type": "boolean"
+              },
+              "invalidity_proven": {
+                "type": "boolean"
+              },
+              "needs_more_audit": {
+                "type": "boolean"
+              }
             }
           },
           "description": "Structured routing rationale. Must agree with research_status and valid; do not rely on analysis prose for routing."
@@ -670,8 +740,8 @@
         "query is passed as a regex body pattern; plain identifiers and short phrases",
         "match themselves, but escape regex metacharacters (`.`, `(`, `[`, `+`, `?`)",
         "if you want them literal. Issue each query as a `lore` followup. Inspect the",
-        "returned threads — read the patch hunks via `read`",
-        "or `git` followups if needed — and decide whether any thread proposes the same",
+        "returned threads \u2014 read the patch hunks via `read`",
+        "or `git` followups if needed \u2014 and decide whether any thread proposes the same",
         "fix this run is about to write.",
         "",
         "Return an analysis paragraph describing what queries you ran, what threads you",
@@ -679,7 +749,7 @@
         "with one entry per plausible match. duplicate_proven=true ONLY when a posted",
         "patch addresses the same code site with the same semantic change and is plainly",
         "intended to fix this bug (not a related one); cite a msgid + subject so a human",
-        "can verify. Do not block the workflow on uncertain matches — set",
+        "can verify. Do not block the workflow on uncertain matches \u2014 set",
         "duplicate_proven=false and put the candidate(s) in existing_patches[] with a",
         "relevance score so write-patch can still see them.",
         "Do not treat a matching SHA or subject as sufficient on its own; an existing-patch",
@@ -699,12 +769,25 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["msgid", "subject", "url", "relevance"],
+              "required": [
+                "msgid",
+                "subject",
+                "url",
+                "relevance"
+              ],
               "properties": {
-                "msgid": {"type": "string"},
-                "subject": {"type": "string"},
-                "url": {"type": "string"},
-                "relevance": {"type": "string"}
+                "msgid": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "relevance": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -713,7 +796,7 @@
         "duplicate_proven": {
           "type": "boolean",
           "optional": true,
-          "description": "True only when a posted upstream patch demonstrably proposes the same fix at the same site. Triggers a `duplicate` outcome entry in metadata.yaml.results, but does NOT block the workflow — write-patch still runs."
+          "description": "True only when a posted upstream patch demonstrably proposes the same fix at the same site. Triggers a `duplicate` outcome entry in metadata.yaml.results, but does NOT block the workflow \u2014 write-patch still runs."
         },
         "analysis": {
           "type": "string",
@@ -747,14 +830,14 @@
       "prompt": [
         "Step 2: WRITE PATCH ONLY.",
         "",
-        "ORCHESTRATOR INSTRUCTION (if non-empty, follow it verbatim — the orchestrator routed back to write-patch with this guidance):",
+        "ORCHESTRATOR INSTRUCTION (if non-empty, follow it verbatim \u2014 the orchestrator routed back to write-patch with this guidance):",
         "{{orchestrator.instruction || ''}}",
         "",
-        "GATHER REQUIREMENT FOR ORCHESTRATOR-NAMED SYMBOLS — read before deciding ready_for_slow:",
+        "GATHER REQUIREMENT FOR ORCHESTRATOR-NAMED SYMBOLS \u2014 read before deciding ready_for_slow:",
         "When the ORCHESTRATOR INSTRUCTION above names specific functions, helpers, structs, fields, or file:line callsites, the fast-gather phase MUST have the verbatim source of those symbols in its accumulated context before setting `ready_for_slow=true`. The orchestrator can only PROSE-describe what a function does or what a struct contains; that description is unverifiable from the slow-agent's seat without the actual code. Without source in context, the slow agent guesses at lifetime, refcount, locking, ordering, or ABI semantics and emits kerneldoc/comment/changelog claims that look plausible but are factually wrong. Each such wrong claim costs a full review fan-out + orchestrator cycle to catch and re-route; repeated misses can exhaust the orchestrator's attempt budget on a single defect.",
         "",
         "Concretely, for every distinct symbol the instruction names:",
-        "1. Check the complete accumulated `symbols` and `context` first — if the body is already present, you're done for that symbol.",
+        "1. Check the complete accumulated `symbols` and `context` first \u2014 if the body is already present, you're done for that symbol.",
         "2. Otherwise emit `source:<symbol>` (or `type:<name>` for a struct/union/typedef). If semcode returns nothing, fall back to `read:<file>:<line>+<lines>` using a file path the instruction gave you (or the affected_files list).",
         "3. Do NOT set `ready_for_slow=true` until the current symbols/context cover every symbol the instruction named.",
         "Trust the orchestrator's prose for routing intent (which defect to fix, what shape the fix should take); verify its factual claims about a symbol's body by fetching that body.",
@@ -786,7 +869,7 @@
         "If non-empty, each entry is a previous slow-agent output for this same step that the",
         "workflow rejected (eval failure, build failure, or review-driven branch back). Read",
         "what was tried and why it was rejected; do not propose a structurally different patch",
-        "shape on every retry — that is fix-shape thrashing, not progress. Address the latest",
+        "shape on every retry \u2014 that is fix-shape thrashing, not progress. Address the latest",
         "concrete defect rather than abandoning the prior approach. If a fundamentally new shape",
         "is genuinely needed, explicitly justify it in analysis with cited source or review",
         "evidence that rules the prior shape out.",
@@ -857,7 +940,7 @@
         },
         "analysis": {
           "type": "string",
-          "description": "Slow agent's own narrative for this attempt. Carried into prior_attempts so the next retry can recognize the prior shape it tried. The orchestrator reads this on a failed attempt to understand WHY the worker produced nothing — without it, an eval-fail looks like silence."
+          "description": "Slow agent's own narrative for this attempt. Carried into prior_attempts so the next retry can recognize the prior shape it tried. The orchestrator reads this on a failed attempt to understand WHY the worker produced nothing \u2014 without it, an eval-fail looks like silence."
         },
         "code_edits": {
           "type": "array<object>",
@@ -942,6 +1025,7 @@
         "- Run blame for the affected lines, but treat blame results as candidates only.",
         "- Inspect candidate diffs with `git show`.",
         "- Follow moved or renamed code with `git log --follow -- <path>` where useful.",
+        "- Bound every history request. A patch-bearing log over a whole file (`git log -p -- <path>`, with or without --follow) returns every patch ever applied to it; on a long-lived file that is megabytes and can exceed the model's entire input budget by itself, failing the step. Ask for what identifies a commit -- `--oneline` to list, `-S`/`-G` to find it, `-n` to bound the count -- and read one patch body with `git show <sha>` once you know which commit you want.",
         "- Use pickaxe searches (`git log -S` / `git log -G`) for the affected function names, helper calls, field names, missing cleanup call, and distinctive surrounding code.",
         "- For each plausible candidate, prove the invariant changed across that commit: the preimage must lack the bug or lack the affected path, and the postimage must contain the buggy state.",
         "- If multiple functions have different introducing commits, choose the earliest commit that introduced a real instance fixed by this patch and explain why.",
@@ -1003,7 +1087,7 @@
       "prompt": [
         "Step 4: WRITE COMMIT MESSAGE ONLY.",
         "",
-        "ORCHESTRATOR INSTRUCTION (if non-empty, follow it verbatim — the orchestrator routed back to write-commit-message with this guidance):",
+        "ORCHESTRATOR INSTRUCTION (if non-empty, follow it verbatim \u2014 the orchestrator routed back to write-commit-message with this guidance):",
         "{{orchestrator.instruction || ''}}",
         "",
         "Use readonly git diff/show/log followups if you need to inspect the patch. Write",
@@ -1048,7 +1132,7 @@
         "  rewording:",
         "    `Note: This fixes a latent bug with no known triggers in the kernel today.`",
         "  A blank line follows that paragraph, then the regular body continues. The",
-        "  subject line itself is the normal kernel subject — do not put the notice on",
+        "  subject line itself is the normal kernel subject \u2014 do not put the notice on",
         "  line 1, because git treats line 1 as the subject and `git log --oneline`,",
         "  `git format-patch`, and lore archives would then show the notice instead of",
         "  the actual fix.",
@@ -1087,7 +1171,7 @@
         "analysis": {
           "type": "string",
           "optional": true,
-          "description": "Slow agent's narrative for this attempt. Surfaced to the orchestrator on a failed attempt so it can see WHY no commit message was written — empty bool + empty analysis really is silence, but a populated analysis often names the missing piece."
+          "description": "Slow agent's narrative for this attempt. Surfaced to the orchestrator on a failed attempt so it can see WHY no commit message was written \u2014 empty bool + empty analysis really is silence, but a populated analysis often names the missing piece."
         },
         "followups": {
           "type": "array<Followup>",
@@ -1299,7 +1383,7 @@
         "evidence, either run it down in this lens with cited source or emit an entry in",
         "`unresolved_risks[]` with `where`, `what`, and `evidence_needed`. `clean=true` is",
         "inconsistent with a non-empty `unresolved_risks[]`. Analysis prose is preserved for",
-        "humans but is not a routing signal — the post-review orchestrator reads the typed",
+        "humans but is not a routing signal \u2014 the post-review orchestrator reads the typed",
         "buckets and decides the next step.",
         "",
         "When classifying defects, put each source/build/behavior/documentation/test defect in",
@@ -1389,13 +1473,13 @@
           "Treat the maintainer lens as a hard quality gate: regression risk, missing",
           "justification, behavior changes, incomplete error-path/lifetime/locking proof, stale",
           "documentation for a changed contract, or unmet publication requirements are real",
-          "defects, not style notes. Maintainer commit-message readability objections — a",
+          "defects, not style notes. Maintainer commit-message readability objections \u2014 a",
           "wall-of-text proof memo, dense prose hiding the problem/fix, over-inventoried",
           "callers, missing indented evidence blocks for non-obvious ordering/callbacks/state",
-          "transitions/racing CPUs — are commit-message defects.",
+          "transitions/racing CPUs \u2014 are commit-message defects.",
           "",
           "If any lens reports stale/contradicted/incomplete/misleading declarations, kerneldoc,",
-          "comments, or docs for a contract this patch changed, consolidated `clean=false` —",
+          "comments, or docs for a contract this patch changed, consolidated `clean=false` \u2014",
           "don't downgrade to analysis-only just because runtime behavior is fixed.",
           "",
           "Return the consolidated typed JSON. When every lens is clean and every bucket is",
@@ -1413,11 +1497,21 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["lens", "where", "what"],
+              "required": [
+                "lens",
+                "where",
+                "what"
+              ],
               "properties": {
-                "lens": {"type": "string"},
-                "where": {"type": "string"},
-                "what": {"type": "string"}
+                "lens": {
+                  "type": "string"
+                },
+                "where": {
+                  "type": "string"
+                },
+                "what": {
+                  "type": "string"
+                }
               }
             }
           }
@@ -1440,12 +1534,25 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["lens", "where", "what", "evidence_needed"],
+              "required": [
+                "lens",
+                "where",
+                "what",
+                "evidence_needed"
+              ],
               "properties": {
-                "lens": {"type": "string"},
-                "where": {"type": "string"},
-                "what": {"type": "string"},
-                "evidence_needed": {"type": "string"}
+                "lens": {
+                  "type": "string"
+                },
+                "where": {
+                  "type": "string"
+                },
+                "what": {
+                  "type": "string"
+                },
+                "evidence_needed": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -1462,11 +1569,21 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["bug", "outcome", "evidence"],
+              "required": [
+                "bug",
+                "outcome",
+                "evidence"
+              ],
               "properties": {
-                "bug": {"type": "string"},
-                "outcome": {"type": "string"},
-                "evidence": {"type": "string"}
+                "bug": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "type": "string"
+                },
+                "evidence": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -1500,9 +1617,9 @@
         "grep"
       ],
       "prompt": [
-        "You are the workflow-step orchestrator. You decide what the run does next when the previous step produced a signal the workflow cannot route deterministically: worker eval failures, build failures, review defects, and ambiguous conditions where the right move depends on weighing several outputs against each other. The goal is a correct fix shipped — which sometimes means re-instructing a worker, sometimes means publishing despite a non-success signal (e.g. a preexisting build break), and sometimes means exit-failure.",
+        "You are the workflow-step orchestrator. You decide what the run does next when the previous step produced a signal the workflow cannot route deterministically: worker eval failures, build failures, review defects, and ambiguous conditions where the right move depends on weighing several outputs against each other. The goal is a correct fix shipped \u2014 which sometimes means re-instructing a worker, sometimes means publishing despite a non-success signal (e.g. a preexisting build break), and sometimes means exit-failure.",
         "",
-        "Correctness comes first. Never pick publish to silence a reviewer concern you can't disprove from cited source. Never pick exit-failure to escape tedium. Repeated valid concerns stay valid — repetition does not turn a real defect into an aesthetic one. Disproof requires a specific file:line, commit ref, or prior-attempt fact, not a vibe.",
+        "Correctness comes first. Never pick publish to silence a reviewer concern you can't disprove from cited source. Never pick exit-failure to escape tedium. Repeated valid concerns stay valid \u2014 repetition does not turn a real defect into an aesthetic one. Disproof requires a specific file:line, commit ref, or prior-attempt fact, not a vibe.",
         "",
         "You are invoked whenever the workflow needs a judgment call about what to do next. That happens in several distinct situations, and they do not all mean the patch is wrong:",
         "- write-patch produced neither code_edits nor a review_dispute. The worker may have hit a protocol/context gap; the patch may still be reachable with a sharper instruction.",
@@ -1513,18 +1630,18 @@
         "",
         "Your two levers:",
         "- next_step: re-route to a worker (write-patch, write-commit-message), force a fresh build+review pass (build), or finish the run (publish, exit-failure).",
-        "- instruction: free-form guidance that the next worker reads verbatim before producing its output. Use this to break deadlocks — name the concrete defect, point at the file/function/line, and tell the worker what the prior attempt missed or got wrong.",
+        "- instruction: free-form guidance that the next worker reads verbatim before producing its output. Use this to break deadlocks \u2014 name the concrete defect, point at the file/function/line, and tell the worker what the prior attempt missed or got wrong.",
         "",
-        "Batch every defect a single worker pass can cover. Every routing decision costs an entire downstream cycle (rebuild + multi-lens review fan-out + consolidate). When you pick a worker, scan ALL open review defects (review.defects, review.source_defects, review.commit_message_defects, review_ledger entries) and pack into one instruction every item the chosen worker can address in this pass — including doc-only or comment-only source edits adjacent to the primary fix. write-patch and write-commit-message both run in coding mode and can emit code_edits, so even when the primary motivator for a write-commit-message routing is the changelog rewrite, fold in any in-scope source-comment edits whose correction does not depend on the changelog. Do not defer items as 'follow-up if the reviewer insists' when the same worker call can handle them now; the reviewer will keep flagging them and you will pay the next review-cycle cost for the deferral.",
+        "Batch every defect a single worker pass can cover. Every routing decision costs an entire downstream cycle (rebuild + multi-lens review fan-out + consolidate). When you pick a worker, scan ALL open review defects (review.defects, review.source_defects, review.commit_message_defects, review_ledger entries) and pack into one instruction every item the chosen worker can address in this pass \u2014 including doc-only or comment-only source edits adjacent to the primary fix. write-patch and write-commit-message both run in coding mode and can emit code_edits, so even when the primary motivator for a write-commit-message routing is the changelog rewrite, fold in any in-scope source-comment edits whose correction does not depend on the changelog. Do not defer items as 'follow-up if the reviewer insists' when the same worker call can handle them now; the reviewer will keep flagging them and you will pay the next review-cycle cost for the deferral.",
         "",
         "AVAILABLE NEXT STEPS:",
         "- write-patch: source/build/behavior still needs to change, or the prior write-patch attempt produced nothing. Use instruction to spell out what the next patch must do (which function, which contract, which path) and, when the prior attempt emitted no edits, to point at the specific source the worker needs to fetch and the followup kinds it must use to fetch it. Include any source-comment defects that should be fixed alongside the patch.",
         "- write-commit-message: the source patch is correct but the commit message is wrong, or the prior attempt produced no message file. Use instruction to specify the false/overstated/missing claim and what the rewritten message must say. A commit-message defect is real until you disprove it; don't downgrade it. write-commit-message also runs in coding mode (its actions list includes `edit`); if open source-comment defects can be fixed alongside the commit-message rewrite without changing executable code, include them in the instruction and call out that the worker must emit both code_edits (for the comments) and code_output (for the rewritten message) in one response.",
-        "- build: re-run the build + compile-triage + review chain without changing source or commit message. Use this when the build/review signals visible above look stale relative to the most recent write-patch — e.g. write-patch confirms the worktree now matches the desired final state but build.result and compile-triage.result still reflect an earlier broken attempt. The chain runs with the current worktree, giving you fresh evidence to choose between publish and exit-failure on the next orchestrator cycle. Do not pick build when the build state actually changed (a fresh write-patch already triggered the chain) — that is wasted cycles. Do not pick build before any commit has been made: build depends on write-commit-message.commit_message_written == true, so if no commit exists yet, the rebuild will skip and the orchestrator will re-run with the same empty signals.",
+        "- build: re-run the build + compile-triage + review chain without changing source or commit message. Use this when the build/review signals visible above look stale relative to the most recent write-patch \u2014 e.g. write-patch confirms the worktree now matches the desired final state but build.result and compile-triage.result still reflect an earlier broken attempt. The chain runs with the current worktree, giving you fresh evidence to choose between publish and exit-failure on the next orchestrator cycle. Do not pick build when the build state actually changed (a fresh write-patch already triggered the chain) \u2014 that is wasted cycles. Do not pick build before any commit has been made: build depends on write-commit-message.commit_message_written == true, so if no commit exists yet, the rebuild will skip and the orchestrator will re-run with the same empty signals.",
         "- publish: ship the fix. Pick this only when review.clean is true, OR you can cite specific evidence (file:line, commit ref, prior-attempt fact) that disproves every remaining review concern.",
-        "- exit-failure: end the run unsuccessfully. Pick this only when you can name a defect that no available worker step can resolve — e.g. the fix requires changes beyond this workflow's scope, or you cannot author an instruction that would unblock the worker. Not for \"I'm tired of iterating.\"",
+        "- exit-failure: end the run unsuccessfully. Pick this only when you can name a defect that no available worker step can resolve \u2014 e.g. the fix requires changes beyond this workflow's scope, or you cannot author an instruction that would unblock the worker. Not for \"I'm tired of iterating.\"",
         "",
-        "Worker output snapshot. Empty/unset values mean the step did not run on this cycle (the cascade may have skipped it because an earlier step in the chain reported no change). When this happens, the BUILD/REVIEW HISTORY block below carries the most recent prior-cycle outputs for build / compile-triage / review — use that to reason about whether the patch was previously found clean or whether the build broke for a reason that may now be moot.",
+        "Worker output snapshot. Empty/unset values mean the step did not run on this cycle (the cascade may have skipped it because an earlier step in the chain reported no change). When this happens, the BUILD/REVIEW HISTORY block below carries the most recent prior-cycle outputs for build / compile-triage / review \u2014 use that to reason about whether the patch was previously found clean or whether the build broke for a reason that may now be moot.",
         "- write-patch.code_changes_emitted: {{write-patch.code_changes_emitted || 'unset'}}",
         "- write-patch.review_dispute: {{write-patch.review_dispute || ''}}",
         "- write-commit-message.commit_message_written: {{write-commit-message.commit_message_written || 'unset'}}",
@@ -1573,7 +1690,7 @@
         "",
         "If a prior verdict's instruction did not unblock the worker, refine the instruction with new evidence. Reissuing the same instruction verbatim wastes the next attempt. Capitulating to publish/exit-failure when the underlying concern is still real is worse.",
         "",
-        "Emit ONE JSON object and nothing else. No prose preamble. No Markdown fences (no ```json, no closing ```). No explanation outside the JSON. The `rationale` field IS where you put your reasoning — do not duplicate it as prose around the object. Shape: {\"next_step\": \"write-patch\" | \"write-commit-message\" | \"build\" | \"publish\" | \"exit-failure\", \"instruction\": \"<concrete guidance the next worker reads; empty for publish/exit-failure/build>\", \"rationale\": \"<why this pick advances toward correctness; cite file:line, commit ref, or prior-attempt facts>\"}."
+        "Emit ONE JSON object and nothing else. No prose preamble. No Markdown fences (no ```json, no closing ```). No explanation outside the JSON. The `rationale` field IS where you put your reasoning \u2014 do not duplicate it as prose around the object. Shape: {\"next_step\": \"write-patch\" | \"write-commit-message\" | \"build\" | \"publish\" | \"exit-failure\", \"instruction\": \"<concrete guidance the next worker reads; empty for publish/exit-failure/build>\", \"rationale\": \"<why this pick advances toward correctness; cite file:line, commit ref, or prior-attempt facts>\"}."
       ],
       "outputs": {
         "next_step": {
@@ -1724,11 +1841,29 @@
             "items": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["bug", "outcome", "evidence"],
+              "required": [
+                "bug",
+                "outcome",
+                "evidence"
+              ],
               "properties": {
-                "bug": {"type": "string", "minLength": 1},
-                "outcome": {"type": "string", "enum": ["fixed", "invalidated", "duplicate", "unresolved"]},
-                "evidence": {"type": "string", "minLength": 1}
+                "bug": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "outcome": {
+                  "type": "string",
+                  "enum": [
+                    "fixed",
+                    "invalidated",
+                    "duplicate",
+                    "unresolved"
+                  ]
+                },
+                "evidence": {
+                  "type": "string",
+                  "minLength": 1
+                }
               }
             }
           },
@@ -1753,7 +1888,9 @@
     {
       "id": "final-record-results",
       "title": "Record final series outcomes",
-      "depends_on": ["series-assessment"],
+      "depends_on": [
+        "series-assessment"
+      ],
       "run_if": "workflow.fix_run_mode == 'final' && series-assessment.complete == true && workflow.target_artifact_dir != ''",
       "agent": "reaper",
       "action": {
@@ -1764,14 +1901,20 @@
         }
       },
       "outputs": {
-        "files_updated": {"type": "array<string>"},
-        "outcomes_written": {"type": "integer"}
+        "files_updated": {
+          "type": "array<string>"
+        },
+        "outcomes_written": {
+          "type": "integer"
+        }
       }
     },
     {
       "id": "final-publish",
       "title": "Publish assessed fix series",
-      "depends_on": ["final-record-results"],
+      "depends_on": [
+        "final-record-results"
+      ],
       "run_if": "workflow.fix_run_mode == 'final' && series-assessment.complete == true && workflow.target_artifact_dir != ''",
       "agent": "reaper",
       "action": {
@@ -1783,9 +1926,17 @@
         }
       },
       "outputs": {
-        "patch_paths": {"type": "array<string>"},
-        "status": {"type": "string", "optional": true},
-        "files_updated": {"type": "array<string>", "optional": true}
+        "patch_paths": {
+          "type": "array<string>"
+        },
+        "status": {
+          "type": "string",
+          "optional": true
+        },
+        "files_updated": {
+          "type": "array<string>",
+          "optional": true
+        }
       }
     }
   ],

@@ -2480,7 +2480,24 @@ async fn run_internal<D: Driver + ?Sized + Send>(
 fn reset_for_reentry(state: &mut HashMap<String, StepState>, id: &str) {
     if let Some(st) = state.get_mut(id) {
         st.status = StepStatus::Pending;
-        st.reuse_gathered_context = false;
+        // A re-entry re-runs a step inside THIS run against the same
+        // workspace, so the source it already fetched is still the
+        // source it needs. The driver drops the whole gathered cache
+        // whenever a step stages a real source file, so anything left
+        // in it is current by construction — see
+        // `is_workflow_scratch_artifact` in workflow_runner.rs.
+        //
+        // Forcing this false made the orchestrator's branch_to pay for
+        // a full re-gather every cycle. On the 2026-08-10 linux.nfs fix
+        // run `write-commit-message` was re-entered 10 times and spent
+        // 38 fast-gather rounds re-reading `dentry_create`, `do_open`
+        // and `may_open`, none of which had changed.
+        //
+        // Only a re-entry sets this. A step's first attempt in a fresh
+        // run still starts from its dependencies alone, so a Driver
+        // reused across runs cannot leak one run's gather into the
+        // next.
+        st.reuse_gathered_context = true;
         // The step's previous outputs encoded a real attempt at this
         // step's job; whatever drove the reset (branch_to from a
         // downstream eval, on_exhausted branch_to, or rerun_chain)
@@ -2498,7 +2515,8 @@ fn reset_for_reentry(state: &mut HashMap<String, StepState>, id: &str) {
 fn reset_for_reentry_preserve_outputs(state: &mut HashMap<String, StepState>, id: &str) {
     if let Some(st) = state.get_mut(id) {
         st.status = StepStatus::Pending;
-        st.reuse_gathered_context = false;
+        // Same-run re-entry: reuse the gather. See `reset_for_reentry`.
+        st.reuse_gathered_context = true;
         st.preserved_outputs_on_skip.clear();
     }
 }
@@ -6305,6 +6323,41 @@ mod tests {
             .to_string(),
         )
         .unwrap()
+    }
+
+    /// Both re-entry resets re-run a step against the same workspace,
+    /// so the gather it already paid for is still valid. The driver
+    /// drops the cache whenever a step stages real source, so leaving
+    /// this on cannot serve stale bytes.
+    #[test]
+    fn reentry_reuses_the_gather_the_step_already_paid_for() {
+        for (name, reset) in [
+            (
+                "reset_for_reentry",
+                reset_for_reentry as fn(&mut HashMap<String, StepState>, &str),
+            ),
+            (
+                "reset_for_reentry_preserve_outputs",
+                reset_for_reentry_preserve_outputs,
+            ),
+        ] {
+            let mut state = HashMap::from([(
+                "write-commit-message".to_string(),
+                StepState {
+                    id: "write-commit-message".to_string(),
+                    status: StepStatus::Done,
+                    reuse_gathered_context: false,
+                    ..Default::default()
+                },
+            )]);
+            reset(&mut state, "write-commit-message");
+            let st = &state["write-commit-message"];
+            assert_eq!(st.status, StepStatus::Pending, "{name} must reschedule");
+            assert!(
+                st.reuse_gathered_context,
+                "{name} must let the step reuse its own gathered source"
+            );
+        }
     }
 
     #[tokio::test]

@@ -267,6 +267,36 @@ all and one oversized followup ended the run: a fix died on
 `OverInputLimit actual=924140 limit=900000`, of which a single
 patch-bearing git log over a whole file was 3.4 MB.
 
+### The gathered cache is invalidated by source changes, not by re-entry
+
+A step's gathered symbols and file sections are cached per step id and
+seeded into steps that declare it in `depends_on`. Validity has exactly
+one rule: a gathered record goes stale when the bytes it was fetched
+from change. So the driver drops the whole cache when a step stages a
+real source file or declares a `make`/`meson`/`bash` action, and only
+then.
+
+Two consequences follow, and both are load-bearing:
+
+- Staging `.kres-commit-msg.tmp` does NOT invalidate anything. It is
+  workflow bookkeeping for the reaper's `git commit -F`, not source
+  under review (`is_workflow_scratch_artifact`).
+- A step re-entered inside the same run — `branch_to`, `rerun_chain`,
+  or an orchestrator routing — keeps `reuse_gathered_context` set and
+  seeds from its own prior gather. Only a step's first attempt in a
+  fresh run starts from its dependencies alone, so a driver reused
+  across runs cannot leak one run's gather into the next.
+
+Do not restore a blanket "any staged file invalidates" rule or force
+`reuse_gathered_context` off on re-entry. Measured on the 2026-08-10
+linux.nfs fix run, the two together made every commit-message rewrite
+clear the cache for every step and then re-gather from nothing:
+`write-commit-message` was re-entered 10 times and spent 38 fast-gather
+rounds re-reading `dentry_create`, `do_open` and `may_open`, none of
+which had changed. The one exception is deliberate and stays: the
+over-capability path above clears `reuse_gathered_context` on purpose,
+because there the gathered evidence is precisely what did not fit.
+
 ## Fix Flow (`/fix`)
 
 `/fix <target>` in the REPL and `--prompt "fix: <target>"` on the CLI

@@ -163,6 +163,31 @@ type StructuredLensOutputs = Vec<(String, Map<String, Value>)>;
 /// dependent step can seed its own gather and skip re-fetching (#4).
 type GatheredData = (Vec<Value>, Vec<Value>);
 
+/// The commit-message scratch file the fix workflow stages so the
+/// reaper can run `git commit -F`. It is workflow bookkeeping, not
+/// source under review.
+pub(crate) const COMMIT_MSG_SCRATCH: &str = ".kres-commit-msg.tmp";
+
+/// True when a staged path is kres's own scratch bookkeeping rather
+/// than workspace source.
+///
+/// This is the invalidation question for [`Driver::gathered_cache`]:
+/// a gathered `source`/`read` record goes stale only when the bytes
+/// it was fetched from change. Writing the changelog scratch file
+/// cannot change any of them.
+///
+/// Measured on the 2026-08-10 linux.nfs fix run: `write-commit-message`
+/// stages `.kres-commit-msg.tmp` on every attempt, which tripped the
+/// blanket `!staged.is_empty()` invalidation and cleared the cache for
+/// EVERY step. Its 10 invocations then spent 38 fast-gather rounds
+/// re-fetching the same `dentry_create`, `do_open` and `may_open`
+/// bodies it already had.
+fn is_workflow_scratch_artifact(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == COMMIT_MSG_SCRATCH)
+}
+
 struct StepPromptTexts {
     /// Call-invariant instruction text: the `--- SKILLS ---` block and
     /// any `--- INCLUDES ---` bodies. Kept out of the two bases so it
@@ -1772,7 +1797,9 @@ impl Driver for LlmDriver {
             staged.insert(path, body.to_string());
         }
         // Gather commands can mutate the workspace without emitting staged files.
-        let invalidate_gathered = !staged.is_empty()
+        let invalidate_gathered = staged
+            .keys()
+            .any(|path| !is_workflow_scratch_artifact(path))
             || effective_actions(step, &self.workflow)
                 .iter()
                 .any(|action| {
@@ -4913,7 +4940,7 @@ async fn add_side_effect_outputs(
     if step.outputs.contains_key("code_changes_emitted") {
         let non_message_output = code_output
             .iter()
-            .any(|f| f.path.trim() != ".kres-commit-msg.tmp");
+            .any(|f| !is_workflow_scratch_artifact(Path::new(f.path.trim())));
         outputs.insert(
             "code_changes_emitted".into(),
             Value::Bool(
@@ -6785,6 +6812,83 @@ mod tests {
         assert!(s.contains("Validator error from the previous attempt"));
         assert!(s.contains("missing required output 'analysis'"));
         assert!(parse.is_none(), "parse slot must be consumed");
+    }
+
+    /// Staging only `.kres-commit-msg.tmp` must not invalidate the
+    /// gathered cache; staging real source must. Writing the changelog
+    /// cannot change any byte a `source`/`read` record was fetched
+    /// from, and the blanket `!staged.is_empty()` rule made every
+    /// `write-commit-message` attempt clear the cache for every step.
+    #[tokio::test]
+    async fn commit_message_scratch_does_not_invalidate_gathered_cache() {
+        let wf = crate::workflow::parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "scratchtest",
+                "steps": [{
+                    "id": "write-commit-message",
+                    "agent": "code",
+                    "mode": "coding",
+                    "actions": ["read", "git", "edit"],
+                    "prompt": "p",
+                    "outputs": {"analysis": {"type": "string"}}
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let step = wf.steps[0].clone();
+        let repo = init_test_git_repo();
+
+        let effects_for = |name: &str| {
+            json!([{
+                "path": repo.path().join(name).to_string_lossy(),
+                "body": "body\n"
+            }])
+        };
+        let seed = || {
+            let inputs = Map::new();
+            let states = HashMap::new();
+            (inputs, states)
+        };
+
+        // Scratch-only staging: the cache survives.
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf.clone());
+        driver.store_gathered("research", vec![json!({"name": "sym"})], vec![]);
+        let (inputs, states) = seed();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        driver
+            .apply_attempt_effects(&step, 1, &effects_for(COMMIT_MSG_SCRATCH), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.seed_gather_from_deps(&["research".to_string()]).0,
+            vec![json!({"name": "sym"})],
+            "writing the commit-message scratch file must not drop gathered source"
+        );
+
+        // Real source staged in the same way: the cache is dropped.
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf);
+        driver.store_gathered("research", vec![json!({"name": "sym"})], vec![]);
+        let (inputs, states) = seed();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        driver
+            .apply_attempt_effects(&step, 1, &effects_for("a.c"), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            driver
+                .seed_gather_from_deps(&["research".to_string()])
+                .0
+                .is_empty(),
+            "staging source must still invalidate gathered records"
+        );
     }
 
     #[test]

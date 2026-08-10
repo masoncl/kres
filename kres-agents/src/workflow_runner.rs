@@ -2778,11 +2778,19 @@ fn fast_gather_contract(disallowed_fields: &[&str], allow_skill_reads: bool) -> 
     } else {
         FAST_GATHER_ALLOWED_FIELDS_WITHOUT_SKILLS
     };
+    // The Followup DTO deserializes with deny_unknown_fields and its
+    // shape was never shown here, only the name of the array holding
+    // it. Models filled the gap with plausible extras -- `command`,
+    // `target`, `reason_detail`, `name_note`, `reason_context` -- and
+    // each one costs the round a re-run: 36 of 555 runs over one day.
+    let followup_shape = typed_output_item_schema("array<Followup>")
+        .map(|schema| format!("\n`followups` is an {schema}\n"))
+        .unwrap_or_default();
     format!(
         "--- FAST GATHER CONTRACT ---\n\
 This is the fast gather phase, not the final workflow step response. Gather only the source, history, build, or context needed by the final agent.\n\
 Reply only with the standard fast-agent JSON fields: {allowed_fields}.\n\
-Do not emit final workflow output fields such as {}. Those fields are accepted only from the final step response.",
+Do not emit final workflow output fields such as {}. Those fields are accepted only from the final step response.\n{followup_shape}",
         disallowed_fields.join(", ")
     )
 }
@@ -8401,6 +8409,22 @@ mod tests {
         assert!(contract.contains("analysis, followups, skill_reads, ready_for_slow"));
         assert!(contract.contains("clean, defects, source_defects"));
         assert!(!contract.contains("OUTPUT SCHEMA"));
+
+        // The Followup DTO rejects unknown fields, so the gather phase
+        // has to be shown its shape. Naming only the array let models
+        // invent `command`, `target` and `reason_detail`, each costing
+        // the round a re-run -- 36 of 555 runs over one day.
+        assert!(contract.contains("`followups` is an array of"));
+        for field in ["\"type\"", "\"name\"", "\"reason\"", "additionalProperties"] {
+            assert!(
+                contract.contains(field),
+                "gather contract must show {field}"
+            );
+        }
+        assert!(
+            !contract.contains("\"command\""),
+            "showing a field the DTO rejects would invite it"
+        );
     }
 
     #[test]

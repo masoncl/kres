@@ -50,11 +50,33 @@ use serde_json::{Map, Value};
 
 use crate::workflow::{Agent, Aggregate, Lens, OnExhausted, OnFailAction, Step, Workflow};
 
-/// Synthetic workflow step that carries review-history state across
-/// fix loops. It is not schedulable, but prompt interpolation can
-/// reference `{{review_ledger.ledger}}` exactly like any other step
-/// output, and snapshots persist it with the real steps.
-pub const REVIEW_LEDGER_STEP_ID: &str = "review_ledger";
+/// Synthetic workflow step holding the fix loop's objectives across
+/// review cycles. It is not schedulable, but prompt interpolation can
+/// reference `{{objectives.list}}` exactly like any other step output,
+/// and snapshots persist it with the real steps.
+///
+/// This is the loop's ONLY cross-round memory. Every real step is
+/// reset by `reset_dependents_preserving` when the orchestrator routes
+/// backwards, which takes its outputs into `prior_attempts` and clears
+/// them; a synthetic step is in no workflow's `depends_on`, so nothing
+/// resets it.
+///
+/// It is written by the step that declares an `objectives` output --
+/// the reconciliation pass -- and by nothing else. It previously had a
+/// separate fast-agent writer, which never once ran: entries could
+/// only be born from review defects, but the review's `clean == true`
+/// eval fails on exactly the rounds that have defects, and the writer
+/// was only reached on eval PASS. Measured across three fix runs
+/// including one that succeeded, `phase=review-ledger` appears zero
+/// times, so every prompt referencing the ledger had been rendering
+/// empty since it was added.
+pub const OBJECTIVES_STEP_ID: &str = "objectives";
+
+/// How many review cycles an objective may stay open before the
+/// reconciliation pass must make it the loop's `must_fix`, satisfy it,
+/// or withdraw it. Two, because the stall in the 2026-08-10 linux.nfs
+/// run was already visible at round three.
+pub const OBJECTIVE_STALE_ROUNDS: u64 = 2;
 
 /// Snapshot of one step's runtime state. Carries the everything
 /// needed to resume from disk: status, attempt counter, eval
@@ -426,48 +448,76 @@ pub trait Driver: Sync {
     ) -> Result<LensFanOutConsolidate, String> {
         Ok(LensFanOutConsolidate::Unsupported)
     }
-
-    /// Optional post-step ledger update. Production fix workflows
-    /// use this to maintain a structured review complaint ledger in
-    /// Rust state after review and coding steps settle. Returning
-    /// `None` leaves the ledger unchanged; errors are logged by the
-    /// executor and do not fail the underlying fix workflow.
-    async fn update_review_ledger(
-        &self,
-        _step: &Step,
-        _attempt: u32,
-        _ctx: &ExecContext<'_>,
-    ) -> Result<Option<Map<String, Value>>, String> {
-        Ok(None)
-    }
 }
 
-async fn update_accepted_review_ledger<D: Driver + ?Sized>(
-    driver: &D,
-    step: &Step,
-    attempt: u32,
-    inputs: &Map<String, Value>,
-    state: &mut HashMap<String, StepState>,
-) -> Result<(), String> {
-    let ledger_ctx = ExecContext {
-        workflow_inputs: inputs,
-        steps: state,
-    };
-    match driver
-        .update_review_ledger(step, attempt, &ledger_ctx)
-        .await
-    {
-        Ok(Some(outputs)) => {
-            let ledger = state
-                .entry(REVIEW_LEDGER_STEP_ID.to_string())
-                .or_insert_with(empty_review_ledger_state);
-            ledger.status = StepStatus::Done;
-            ledger.outputs = outputs;
+/// Fold a reconciliation pass's emitted objectives into the
+/// persistent store, stamping the round each was first raised.
+///
+/// Rust owns the round numbers for the same reason it owns the todo
+/// list: age is the forward-progress signal, and a model that
+/// restated its own objective's age could always report it as new.
+///
+/// Omission is not deletion. An objective the pass did not re-emit is
+/// carried forward unchanged, so a stale one cannot be retired by
+/// going quiet about it -- it has to be satisfied or withdrawn.
+fn merge_emitted_objectives(state: &mut HashMap<String, StepState>, emitted: &[Value]) {
+    let store = state
+        .entry(OBJECTIVES_STEP_ID.to_string())
+        .or_insert_with(empty_objectives_state);
+    let round = store
+        .outputs
+        .get("round")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let mut merged: Vec<Value> = store
+        .outputs
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    for item in emitted {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let existing = merged
+            .iter_mut()
+            .find(|held| held.get("id").and_then(Value::as_str) == Some(id));
+        match existing {
+            Some(held) => {
+                let first = held
+                    .get("first_round")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(round);
+                let mut updated = item.clone();
+                if let Some(obj) = updated.as_object_mut() {
+                    obj.insert("first_round".into(), Value::from(first));
+                    obj.insert("rounds_open".into(), Value::from(round - first + 1));
+                }
+                *held = updated;
+            }
+            None => {
+                let mut fresh = item.clone();
+                if let Some(obj) = fresh.as_object_mut() {
+                    obj.insert("first_round".into(), Value::from(round));
+                    obj.insert("rounds_open".into(), Value::from(1u64));
+                }
+                merged.push(fresh);
+            }
         }
-        Ok(None) => {}
-        Err(error) => return Err(error),
     }
-    Ok(())
+
+    store.outputs.insert("round".into(), Value::from(round));
+    store.outputs.insert("list".into(), Value::Array(merged));
+    store.status = StepStatus::Done;
+}
+
+/// True when this step owns the objectives store, i.e. it declares an
+/// `objectives` output. Data-driven so the executor does not need to
+/// know which workflow step is the reconciliation pass.
+fn step_owns_objectives(step: &Step) -> bool {
+    step.outputs.contains_key("objectives")
 }
 
 /// Read-only view exposed to `Driver::run`. Has the workflow inputs
@@ -1217,12 +1267,12 @@ pub async fn run_with_persistence_and_observer<D: Driver + ?Sized + Send>(
     .await
 }
 
-fn empty_review_ledger_state() -> StepState {
+fn empty_objectives_state() -> StepState {
     let mut outputs = Map::new();
-    outputs.insert("items".into(), Value::Array(Vec::new()));
-    outputs.insert("ledger".into(), Value::String("[]".into()));
+    outputs.insert("list".into(), Value::Array(Vec::new()));
+    outputs.insert("round".into(), Value::from(0u64));
     StepState {
-        id: REVIEW_LEDGER_STEP_ID.to_string(),
+        id: OBJECTIVES_STEP_ID.to_string(),
         status: StepStatus::Done,
         outputs,
         ..StepState::default()
@@ -1235,35 +1285,32 @@ fn snapshot_steps(workflow: &Workflow, state: &HashMap<String, StepState>) -> Ve
         .iter()
         .filter_map(|s| state.get(&s.id).cloned())
         .collect();
-    if !workflow.steps.iter().any(|s| s.id == REVIEW_LEDGER_STEP_ID) {
-        if let Some(ledger) = state.get(REVIEW_LEDGER_STEP_ID) {
+    if !workflow.steps.iter().any(|s| s.id == OBJECTIVES_STEP_ID) {
+        if let Some(ledger) = state.get(OBJECTIVES_STEP_ID) {
             steps.push(ledger.clone());
         }
     }
     steps
 }
 
-fn workflow_uses_review_ledger(workflow: &Workflow) -> bool {
+fn workflow_uses_objectives(workflow: &Workflow) -> bool {
     workflow.id == "fix"
         || workflow.steps.iter().any(|step| {
             step.prompt
                 .as_deref()
-                .map(|p| p.contains("review_ledger."))
+                .map(|p| p.contains("objectives."))
                 .unwrap_or(false)
                 || step
                     .consolidate
                     .as_ref()
-                    .map(|c| c.prompt.contains("review_ledger."))
+                    .map(|c| c.prompt.contains("objectives."))
                     .unwrap_or(false)
         })
 }
 
-fn ensure_review_ledger_state(state: &mut HashMap<String, StepState>, workflow: &Workflow) {
-    if workflow_uses_review_ledger(workflow) && !state.contains_key(REVIEW_LEDGER_STEP_ID) {
-        state.insert(
-            REVIEW_LEDGER_STEP_ID.to_string(),
-            empty_review_ledger_state(),
-        );
+fn ensure_objectives_state(state: &mut HashMap<String, StepState>, workflow: &Workflow) {
+    if workflow_uses_objectives(workflow) && !state.contains_key(OBJECTIVES_STEP_ID) {
+        state.insert(OBJECTIVES_STEP_ID.to_string(), empty_objectives_state());
     }
 }
 
@@ -1290,7 +1337,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             )
         })
         .collect();
-    ensure_review_ledger_state(&mut state, workflow);
+    ensure_objectives_state(&mut state, workflow);
 
     // Seed from a resume snapshot if present. Steps not in the
     // snapshot keep their fresh-Pending state; existing steps that
@@ -1302,7 +1349,7 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             if let Some(slot) = state.get_mut(&s.id) {
                 let resumed_status = match s.status {
                     StepStatus::Pending | StepStatus::BranchedAway
-                        if s.id != REVIEW_LEDGER_STEP_ID =>
+                        if s.id != OBJECTIVES_STEP_ID =>
                     {
                         StepStatus::Pending
                     }
@@ -1312,9 +1359,9 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     status: resumed_status,
                     ..s
                 };
-            } else if s.id == REVIEW_LEDGER_STEP_ID {
+            } else if s.id == OBJECTIVES_STEP_ID {
                 state.insert(
-                    REVIEW_LEDGER_STEP_ID.to_string(),
+                    OBJECTIVES_STEP_ID.to_string(),
                     StepState {
                         status: StepStatus::Done,
                         ..s
@@ -2055,15 +2102,14 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         );
         // Eval, if configured.
         let Some(eval) = &step.eval else {
-            if let Err(error) =
-                update_accepted_review_ledger(driver, step, attempt, &inputs, &mut state).await
-            {
-                driver.discard_attempt(step, attempt).await;
-                status = WorkflowStatus::Failure(format!(
-                    "step '{}' review ledger update failed before acceptance: {error}",
-                    step.id
-                ));
-                break;
+            if step_owns_objectives(step) {
+                let emitted = state
+                    .get(&step.id)
+                    .and_then(|st| st.outputs.get("objectives"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                merge_emitted_objectives(&mut state, &emitted);
             }
             let effect_ctx = ExecContext {
                 workflow_inputs: &inputs,
@@ -2180,15 +2226,14 @@ async fn run_internal<D: Driver + ?Sized + Send>(
             if let Some(accepted) = state.get_mut(&step.id) {
                 accepted.last_eval_reason = None;
             }
-            if let Err(error) =
-                update_accepted_review_ledger(driver, step, attempt, &inputs, &mut state).await
-            {
-                driver.discard_attempt(step, attempt).await;
-                status = WorkflowStatus::Failure(format!(
-                    "step '{}' review ledger update failed before acceptance: {error}",
-                    step.id
-                ));
-                break;
+            if step_owns_objectives(step) {
+                let emitted = state
+                    .get(&step.id)
+                    .and_then(|st| st.outputs.get("objectives"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                merge_emitted_objectives(&mut state, &emitted);
             }
             let effect_ctx = ExecContext {
                 workflow_inputs: &inputs,
@@ -2866,7 +2911,87 @@ fn eval_reconcile_covers_every_defect(
              that is simply absent will be re-reported by the same lens next round"
         ));
     }
-    (true, None)
+
+    escalation_is_honest(step, ctx)
+}
+
+/// The forward-progress rule.
+///
+/// The fix loop is supposed to converge. What it did on the 2026-08-10
+/// linux.nfs run was ask for the same thing ten times: the review
+/// raised the missing permission check on the new `vfs_open()`
+/// fallback in all ten rounds, the reconciliation answered with
+/// fifteen comment and kerneldoc rewrites, and the patch shipped
+/// without `may_open()`.
+///
+/// Policing the WORDING of the ask was the first attempt at this, and
+/// it was both rigid and easy to slip past. Measuring whether the ask
+/// WORKED is neither: once an objective has been open for
+/// `OBJECTIVE_STALE_ROUNDS` cycles the pass must stop spreading effort
+/// and commit -- name one stale objective in `must_fix`, or settle it
+/// as satisfied or withdrawn on evidence.
+///
+/// Rust owns the ages (`merge_emitted_objectives`), so this cannot be
+/// satisfied by a model reporting an old objective as new.
+fn escalation_is_honest(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return (true, None);
+    };
+    let emitted = outputs
+        .get("objectives")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let must_fix = outputs
+        .get("must_fix")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+
+    // Ages come from the store, which the model does not write.
+    let held: Vec<&Value> = ctx
+        .steps
+        .get(OBJECTIVES_STEP_ID)
+        .and_then(|state| state.outputs.get("list"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().collect())
+        .unwrap_or_default();
+    let age_of = |id: &str| -> u64 {
+        held.iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+            .and_then(|item| item.get("rounds_open").and_then(Value::as_u64))
+            .unwrap_or(0)
+    };
+
+    let mut stale: Vec<String> = Vec::new();
+    for objective in emitted {
+        let Some(id) = objective.get("id").and_then(Value::as_str) else {
+            return eval_fail("every objective needs a non-empty id so its age can be tracked");
+        };
+        let status = objective
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if status != "open" {
+            continue;
+        }
+        // +1: re-emitting it keeps it open through the round being
+        // reconciled now, which the store has not counted yet.
+        if age_of(id) + 1 >= OBJECTIVE_STALE_ROUNDS {
+            stale.push(id.to_string());
+        }
+    }
+    if stale.is_empty() || stale.iter().any(|id| id == must_fix) {
+        return (true, None);
+    }
+    eval_fail(&format!(
+        "objective(s) {stale:?} have been open for {} review cycle(s) or more and this pass \
+         neither settled them nor committed to one. Asking a third time will produce a third \
+         refusal. Either name one of them in `must_fix` -- which tells the review and the \
+         workers that nothing else matters until it lands -- or mark it satisfied with the \
+         evidence, or withdraw it with the scope statement that puts it out of contract",
+        OBJECTIVE_STALE_ROUNDS
+    ))
 }
 
 /// Every claim the validation pass emitted, in one flat list.
@@ -4276,7 +4401,11 @@ mod tests {
     }
 
     fn instruction(covers: Vec<i64>) -> Value {
-        json!({"covers": covers, "target": "source", "where": "a.c:1",
+        instruction_of_kind(covers, "behavior")
+    }
+
+    fn instruction_of_kind(covers: Vec<i64>, kind: &str) -> Value {
+        json!({"covers": covers, "target": "source", "kind": kind, "where": "a.c:1",
                "do": "fix it", "why": "a.c:1 is wrong"})
     }
 
@@ -4324,6 +4453,147 @@ mod tests {
             "must name the contradictory index: {reason}"
         );
         assert!(reason.contains("not both"));
+    }
+
+    /// The shape that slipped through on the 2026-08-10 linux.nfs run:
+    /// the reviewer says the code performs no permission check, and the
+    #[test]
+    fn reconcile_eval_accepts_a_dropped_defect_without_a_behaviour_instruction() {
+        assert_eq!(
+            run_reconcile_eval(
+                1,
+                json!({"dropped": [{"covers": [0], "reason": "out of contract per the fix todo"}]}),
+            ),
+            (true, None)
+        );
+    }
+
+    /// Ages are Rust's, and omission does not retire an objective.
+    #[test]
+    fn merging_objectives_stamps_age_and_carries_the_unmentioned_forward() {
+        let mut state = HashMap::new();
+        // Round 1: two objectives raised.
+        merge_emitted_objectives(&mut state, &[open_objective("O1"), open_objective("O2")]);
+        // Round 2: the pass re-emits only O1, and tries to tell us how
+        // old it is. Both claims are ignored.
+        let mut lying = open_objective("O1");
+        lying["first_round"] = json!(99);
+        lying["rounds_open"] = json!(1);
+        merge_emitted_objectives(&mut state, &[lying]);
+
+        let store = &state[OBJECTIVES_STEP_ID].outputs;
+        assert_eq!(store["round"], json!(2));
+        let list = store["list"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "an unmentioned objective is not deleted");
+
+        let o1 = list.iter().find(|o| o["id"] == json!("O1")).unwrap();
+        assert_eq!(o1["first_round"], json!(1), "Rust keeps the original round");
+        assert_eq!(o1["rounds_open"], json!(2), "and recomputes the age itself");
+
+        // O2 went unmentioned: carried forward at its round-1 age,
+        // still there to be answered for.
+        let o2 = list.iter().find(|o| o["id"] == json!("O2")).unwrap();
+        assert_eq!(o2["first_round"], json!(1));
+    }
+
+    /// Drive the escalation rule with a store that already holds
+    /// `held` (as Rust would have stamped it) and a pass emitting
+    /// `emitted`.
+    fn run_escalation_eval(held: Value, emitted: Value) -> (bool, Option<String>) {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "reconcile-review")
+            .unwrap();
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(
+            OBJECTIVES_STEP_ID.to_string(),
+            step_state(json!({"round": 2, "list": held})),
+        );
+        steps.insert(step.id.clone(), step_state(emitted));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        escalation_is_honest(&step, &ctx)
+    }
+
+    fn open_objective(id: &str) -> Value {
+        json!({"id": id, "statement": "call may_open() on the fallback", "status": "open"})
+    }
+
+    /// The 2026-08-10 linux.nfs shape: the same objective re-emitted
+    /// as open, round after round, with no commitment to landing it.
+    #[test]
+    fn escalation_eval_rejects_reasking_for_a_stale_objective() {
+        let (ok, reason) = run_escalation_eval(
+            json!([{"id": "O1", "rounds_open": 2}]),
+            json!({"objectives": [open_objective("O1")], "must_fix": ""}),
+        );
+        assert!(!ok);
+        let reason = reason.unwrap();
+        assert!(
+            reason.contains("O1"),
+            "must name the stale objective: {reason}"
+        );
+        assert!(reason.contains("must_fix"));
+    }
+
+    #[test]
+    fn escalation_eval_accepts_committing_to_the_stale_objective() {
+        assert_eq!(
+            run_escalation_eval(
+                json!([{"id": "O1", "rounds_open": 2}]),
+                json!({"objectives": [open_objective("O1")], "must_fix": "O1"}),
+            ),
+            (true, None)
+        );
+    }
+
+    /// Settling it is the other honest way out.
+    #[test]
+    fn escalation_eval_accepts_settling_the_stale_objective() {
+        for status in ["satisfied", "withdrawn"] {
+            let mut objective = open_objective("O1");
+            objective["status"] = json!(status);
+            objective["evidence"] = json!("fs/namei.c:5099 now calls may_open()");
+            assert_eq!(
+                run_escalation_eval(
+                    json!([{"id": "O1", "rounds_open": 3}]),
+                    json!({"objectives": [objective], "must_fix": ""}),
+                ),
+                (true, None),
+                "{status} should settle a stale objective"
+            );
+        }
+    }
+
+    /// A first-round objective is not stale: the loop has not yet had
+    /// a chance to act on it.
+    #[test]
+    fn escalation_eval_leaves_a_fresh_objective_alone() {
+        assert_eq!(
+            run_escalation_eval(
+                json!([]),
+                json!({"objectives": [open_objective("O2")], "must_fix": ""}),
+            ),
+            (true, None)
+        );
+    }
+
+    /// Committing to one stale objective is enough; the others are
+    /// explicitly waiting on it, which is the point of `must_fix`.
+    #[test]
+    fn escalation_eval_accepts_one_commitment_among_several_stale() {
+        assert_eq!(
+            run_escalation_eval(
+                json!([{"id": "O1", "rounds_open": 4}, {"id": "O2", "rounds_open": 2}]),
+                json!({"objectives": [open_objective("O1"), open_objective("O2")],
+                       "must_fix": "O2"}),
+            ),
+            (true, None)
+        );
     }
 
     #[test]
@@ -5630,7 +5900,6 @@ mod tests {
         struct TransactionDriver {
             accepted: std::sync::Mutex<Vec<u32>>,
             discarded: std::sync::Mutex<Vec<u32>>,
-            ledger_updates: std::sync::Mutex<Vec<u32>>,
         }
 
         #[async_trait]
@@ -5664,16 +5933,6 @@ mod tests {
             async fn discard_attempt(&self, _step: &Step, attempt: u32) {
                 self.discarded.lock().unwrap().push(attempt);
             }
-
-            async fn update_review_ledger(
-                &self,
-                _step: &Step,
-                attempt: u32,
-                _ctx: &ExecContext<'_>,
-            ) -> Result<Option<Map<String, Value>>, String> {
-                self.ledger_updates.lock().unwrap().push(attempt);
-                Ok(None)
-            }
         }
 
         let mut workflow = review_workflow();
@@ -5682,14 +5941,12 @@ mod tests {
         let mut driver = TransactionDriver {
             accepted: std::sync::Mutex::new(Vec::new()),
             discarded: std::sync::Mutex::new(Vec::new()),
-            ledger_updates: std::sync::Mutex::new(Vec::new()),
         };
         let trace = run(&workflow, &mut driver, target_inputs()).await;
 
         assert_eq!(trace.status, WorkflowStatus::Success);
         assert_eq!(*driver.discarded.lock().unwrap(), vec![1]);
         assert_eq!(*driver.accepted.lock().unwrap(), vec![2]);
-        assert_eq!(*driver.ledger_updates.lock().unwrap(), vec![2]);
         assert_eq!(
             trace
                 .events
@@ -5795,59 +6052,6 @@ mod tests {
         assert_eq!(*resumed.applies.lock().unwrap(), 1);
         assert_eq!(resumed_trace.final_state["write"].status, StepStatus::Done);
         assert!(resumed_trace.final_state["write"].pending_effects.is_none());
-    }
-
-    #[tokio::test]
-    async fn ledger_failure_happens_before_effect_application() {
-        struct LedgerFailure {
-            applied: std::sync::Mutex<bool>,
-        }
-        #[async_trait]
-        impl Driver for LedgerFailure {
-            async fn run(
-                &self,
-                _step: &Step,
-                _attempt: u32,
-                _ctx: &ExecContext<'_>,
-                _lens: Option<&Lens>,
-            ) -> Result<Map<String, Value>, DriverError> {
-                Ok(Map::from_iter([("analysis".into(), json!("accepted"))]))
-            }
-            async fn update_review_ledger(
-                &self,
-                _step: &Step,
-                _attempt: u32,
-                _ctx: &ExecContext<'_>,
-            ) -> Result<Option<Map<String, Value>>, String> {
-                Err("ledger unavailable".into())
-            }
-            async fn apply_attempt_effects(
-                &self,
-                _step: &Step,
-                _attempt: u32,
-                _effects: &Value,
-                _ctx: &ExecContext<'_>,
-            ) -> Result<Map<String, Value>, String> {
-                *self.applied.lock().unwrap() = true;
-                Ok(Map::new())
-            }
-        }
-
-        let workflow = crate::workflow::parse_workflow(
-            &json!({
-                "$schema_version": 1,
-                "id": "fix",
-                "steps": [{"id": "review", "agent": "slow", "prompt": "review"}]
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let mut driver = LedgerFailure {
-            applied: std::sync::Mutex::new(false),
-        };
-        let trace = run(&workflow, &mut driver, Map::new()).await;
-        assert!(matches!(trace.status, WorkflowStatus::Failure(_)));
-        assert!(!*driver.applied.lock().unwrap());
     }
 
     #[test]
@@ -6909,24 +7113,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn review_ledger_update_is_visible_and_persisted() {
+    async fn objectives_are_visible_downstream_and_persisted() {
         let tmp = tempfile::tempdir().unwrap();
         let wf_json = serde_json::json!({
             "$schema_version": 1,
-            "id": "ledger-test",
+            "id": "objectives-test",
             "steps": [
-                {"id": "review", "agent": "fast", "prompt": "p"},
-                {"id": "write-patch", "agent": "fast", "prompt": "p", "depends_on": ["review"]}
+                {"id": "reconcile-review", "agent": "slow", "prompt": "p",
+                 "outputs": {"objectives": {"type": "array<object>"}}},
+                {"id": "write-patch", "agent": "fast", "prompt": "p",
+                 "depends_on": ["reconcile-review"]}
             ]
         });
         let wf = parse_workflow(&wf_json.to_string()).unwrap();
 
-        struct LedgerDriver {
-            saw_ledger: std::sync::Arc<std::sync::Mutex<bool>>,
+        struct ObjectivesDriver {
+            downstream_saw: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
         }
 
         #[async_trait]
-        impl Driver for LedgerDriver {
+        impl Driver for ObjectivesDriver {
             async fn run(
                 &self,
                 step: &Step,
@@ -6935,62 +7141,46 @@ mod tests {
                 _lens: Option<&Lens>,
             ) -> Result<Map<String, Value>, DriverError> {
                 if step.id == "write-patch" {
-                    let items = ctx.steps[REVIEW_LEDGER_STEP_ID].outputs["items"]
-                        .as_array()
-                        .unwrap();
-                    assert_eq!(items.len(), 1);
-                    *self.saw_ledger.lock().unwrap() = true;
+                    let list = ctx.steps[OBJECTIVES_STEP_ID].outputs["list"].clone();
+                    *self.downstream_saw.lock().unwrap() = Some(list);
+                    return Ok(Map::new());
                 }
-                Ok(Map::new())
-            }
-
-            async fn update_review_ledger(
-                &self,
-                step: &Step,
-                attempt: u32,
-                _ctx: &ExecContext<'_>,
-            ) -> Result<Option<Map<String, Value>>, String> {
-                if step.id != "review" {
-                    return Ok(None);
-                }
-                let ledger = json!([{
-                    "id": "R1",
-                    "kind": "source",
-                    "status": "open",
-                    "summary": "missing source fix"
-                }]);
                 let mut out = Map::new();
-                out.insert("items".into(), ledger.clone());
-                out.insert("ledger".into(), Value::String(ledger.to_string()));
-                out.insert("updated_by_step".into(), Value::String(step.id.clone()));
-                out.insert("updated_attempt".into(), Value::Number(attempt.into()));
-                Ok(Some(out))
+                out.insert(
+                    "objectives".into(),
+                    json!([{"id": "O1", "statement": "call may_open()", "status": "open"}]),
+                );
+                Ok(out)
             }
         }
 
-        let saw_ledger = std::sync::Arc::new(std::sync::Mutex::new(false));
-        let mut driver = LedgerDriver {
-            saw_ledger: saw_ledger.clone(),
+        let downstream_saw = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut driver = ObjectivesDriver {
+            downstream_saw: downstream_saw.clone(),
         };
         let trace =
             run_with_persistence(&wf, &mut driver, Map::new(), 20, tmp.path().to_path_buf()).await;
         assert_eq!(trace.status, WorkflowStatus::Success);
-        assert!(*saw_ledger.lock().unwrap());
-        assert_eq!(
-            trace.final_state[REVIEW_LEDGER_STEP_ID].outputs["updated_by_step"],
-            Value::String("review".into())
-        );
 
-        let snap = WorkflowSnapshot::load(tmp.path(), "ledger-test").unwrap();
-        let ledger_state = snap
+        // Rust stamped the age; the step never wrote those fields.
+        let seen = downstream_saw
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("write-patch ran");
+        assert_eq!(seen[0]["id"], json!("O1"));
+        assert_eq!(seen[0]["first_round"], json!(1));
+        assert_eq!(seen[0]["rounds_open"], json!(1));
+
+        // The synthetic step rides the snapshot with the real steps.
+        let snap = WorkflowSnapshot::load(tmp.path(), "objectives-test").unwrap();
+        let stored = snap
             .steps
             .iter()
-            .find(|s| s.id == REVIEW_LEDGER_STEP_ID)
-            .expect("review ledger state persisted");
-        assert_eq!(
-            ledger_state.outputs["updated_by_step"],
-            Value::String("review".into())
-        );
+            .find(|s| s.id == OBJECTIVES_STEP_ID)
+            .expect("objectives state persisted");
+        assert_eq!(stored.outputs["round"], json!(1));
+        assert_eq!(stored.outputs["list"][0]["id"], json!("O1"));
     }
 
     /// Workflow.completion.success_when_any short-circuits the run.
@@ -7234,6 +7424,7 @@ mod tests {
             "instructions": [{
                 "covers": (0..defect_count as i64).collect::<Vec<_>>(),
                 "target": "source",
+                "kind": "behavior",
                 "where": "ctree.c:42",
                 "do": "widen the bound by one",
                 "why": "ctree.c:42 indexes one past the end"

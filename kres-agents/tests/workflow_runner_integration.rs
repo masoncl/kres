@@ -63,17 +63,16 @@ fn orchestrator_picks(next_step: &str) -> Value {
 }
 
 fn reconcile_one(target: &str, where_: &str) -> Value {
+    // A `source` instruction discharges a behaviour complaint by
+    // changing executable code; a `commit_message` one is changelog
+    // work. Both are what `reconcile_covers_every_defect` expects.
+    let kind = if target == "source" {
+        "behavior"
+    } else {
+        "changelog"
+    };
     fake_messages_response(&format!(
-        "Reconciled the lenses.\n{{\"instructions\": [{{\"covers\": [0],          \"target\": \"{target}\", \"where\": \"{where_}\",          \"do\": \"apply the reviewed correction\",          \"why\": \"{where_} still holds the wrong value\"}}],          \"contradictions\": [], \"dropped\": [],          \"analysis\": \"one lens reported; nothing to adjudicate\"}}"
-    ))
-}
-
-fn review_ledger_response(kind: &str, status: &str) -> Value {
-    fake_messages_response(&format!(
-        "{{\"ledger\": [{{\"id\": \"R1\", \"kind\": \"{kind}\", \"status\": \"{status}\", \
-         \"summary\": \"test review complaint\", \"latest\": \"test fixture\", \
-         \"history\": [{{\"step\": \"test\", \"attempt\": 1, \"action\": \"mapped\", \
-         \"note\": \"fixture ledger update\"}}]}}]}}"
+        "Reconciled the lenses.\n{{\"instructions\": [{{\"covers\": [0],          \"target\": \"{target}\", \"kind\": \"{kind}\", \"where\": \"{where_}\",          \"do\": \"apply the reviewed correction\",          \"why\": \"{where_} still holds the wrong value\"}}],          \"contradictions\": [], \"dropped\": [],          \"objectives\": [{{\"id\": \"O1\", \"statement\": \"the reviewed correction is applied\", \"status\": \"open\"}}], \"must_fix\": \"\",          \"analysis\": \"one lens reported; nothing to adjudicate\"}}"
     ))
 }
 
@@ -1100,7 +1099,6 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
     ]);
     responses.extend(dirty_source_review_responses(&workflow));
     responses.push_back(reconcile_one("source", "a.c"));
-    responses.push_back(review_ledger_response("source", "open"));
     responses.push_back(orchestrator_picks("write-patch"));
     responses.push_back(fake_messages_response(
         "Corrected patch.\n\
@@ -1109,7 +1107,6 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
           \"old_string\": \"int x = 2;\\n\", \
           \"new_string\": \"int x = 3;\\n\"}]}",
     ));
-    responses.push_back(review_ledger_response("source", "addressed"));
     // fixes-tag-search is skipped on the orchestrator-driven retry
     // (its run_if pins it to attempt == 0), so the next mock response
     // consumed after write-patch attempt 2 is the commit-message
@@ -1121,7 +1118,6 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
           \"purpose\": \"commit message\"}]}",
     ));
     responses.extend(clean_review_responses(&workflow));
-    responses.push_back(review_ledger_response("source", "resolved"));
     let (port, requests) = spawn_recording_mock(responses).await;
 
     let mut inputs = Map::new();
@@ -1146,6 +1142,19 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
         trace.status
     );
 
+    {
+        let all = requests.lock().await;
+        for (i, r) in all.iter().enumerate() {
+            let body = r.split("\r\n\r\n").last().unwrap_or("");
+            let v: serde_json::Value =
+                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+            let c = v["messages"][0]["content"].as_str().unwrap_or("?");
+            eprintln!(
+                "DBG[{i}] {}",
+                c.chars().take(60).collect::<String>().replace('\n', " ")
+            );
+        }
+    }
     let requests = requests.lock().await.join("\n---REQUEST---\n");
     assert!(
         requests.contains("--- PREVIOUS PATCH FROM `git diff HEAD~1` ---"),
@@ -1199,7 +1208,6 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
     ]);
     responses.extend(dirty_commit_message_review_responses(&workflow));
     responses.push_back(reconcile_one("commit_message", "commit message"));
-    responses.push_back(review_ledger_response("commit_message", "open"));
     responses.push_back(orchestrator_picks("write-commit-message"));
     responses.extend(vec![fake_messages_response(
         "Rewritten commit message.\n\
@@ -1207,9 +1215,7 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
           \"content\": \"subsystem: corrected claim\\n\\nBody with the corrected claim.\\n\\nAssisted-by: kres:test\\n\", \
           \"purpose\": \"commit message\"}]}",
     )]);
-    responses.push_back(review_ledger_response("commit_message", "addressed"));
     responses.extend(clean_review_responses(&workflow));
-    responses.push_back(review_ledger_response("commit_message", "resolved"));
     let (port, requests) = spawn_recording_mock(responses).await;
 
     let mut inputs = Map::new();
@@ -1553,6 +1559,7 @@ async fn reconcile_style_step_repairs_malformed_json_through_the_shared_loop() {
                 "prompt": "Reconcile the lenses.",
                 "outputs": {
                     "instructions": {"type": "array<object>"},
+                    "objectives": {"type": "array<object>", "optional": true},
                     "analysis": {"type": "string", "optional": true}
                 }
             }]
@@ -1569,8 +1576,10 @@ async fn reconcile_style_step_repairs_malformed_json_through_the_shared_loop() {
     ));
     responses.push_back(fake_messages_response(
         "{\"instructions\": [{\"covers\": [0], \"target\": \"source\", \
-          \"where\": \"a.c:1\", \"do\": \"fix it\", \"why\": \"a.c:1 is wrong\"}], \
-          \"analysis\": \"reconciled\"}",
+          \"kind\": \"behavior\", \"where\": \"a.c:1\", \"do\": \"fix it\", \
+          \"why\": \"a.c:1 is wrong\"}], \
+          \"objectives\": [{\"id\": \"O1\", \"statement\": \"a.c:1 is fixed\", \
+          \"status\": \"open\"}], \"analysis\": \"reconciled\"}",
     ));
     let (port, requests) = spawn_recording_mock(responses).await;
 
@@ -1619,7 +1628,8 @@ async fn actionless_step_may_not_edit_the_workspace() {
                 "mode": "review",
                 "actions": [],
                 "prompt": "Reconcile the lenses.",
-                "outputs": {"instructions": {"type": "array<object>"}}
+                "outputs": {"instructions": {"type": "array<object>"},
+                            "objectives": {"type": "array<object>", "optional": true}}
             }]
         })
         .to_string(),
@@ -1636,7 +1646,10 @@ async fn actionless_step_may_not_edit_the_workspace() {
     // The repair loop re-prompts; this time it reports without editing.
     responses.push_back(fake_messages_response(
         "{\"instructions\": [{\"covers\": [0], \"target\": \"source\", \
-          \"where\": \"a.c:1\", \"do\": \"fix it\", \"why\": \"a.c:1 is wrong\"}]}",
+          \"kind\": \"behavior\", \"where\": \"a.c:1\", \"do\": \"fix it\", \
+          \"why\": \"a.c:1 is wrong\"}], \
+          \"objectives\": [{\"id\": \"O1\", \"statement\": \"a.c:1 is fixed\", \
+          \"status\": \"open\"}]}",
     ));
     let (port, requests) = spawn_recording_mock(responses).await;
 

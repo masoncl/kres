@@ -115,18 +115,12 @@ use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
 use crate::workflow::{Agent as AgentRole, Aggregate, Mode, Step, Workflow};
-use crate::workflow_exec::{Driver, ExecContext, LensFanOutConsolidate, REVIEW_LEDGER_STEP_ID};
+use crate::workflow_exec::{Driver, ExecContext, LensFanOutConsolidate, OBJECTIVES_STEP_ID};
 
 /// Full step reruns after a response (and its one generic repair call) fails
 /// validation. This is not a budget for repeatedly repairing one response.
 const WORKFLOW_RESPONSE_RETRIES: usize = 3;
 const JSON_REPAIR_PREFIX: &str = "IMPORTANT: Reply with exactly one raw, unfenced JSON object matching OUTPUT SCHEMA, with no prose or Markdown backticks.";
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewLedgerResponse {
-    ledger: Vec<Value>,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -661,92 +655,6 @@ impl LlmDriver {
             Some(text) => base.clone().with_system(text.to_string()),
             None => base.clone(),
         }
-    }
-
-    async fn map_review_ledger(
-        &self,
-        step: &Step,
-        attempt: u32,
-        ctx: &ExecContext<'_>,
-    ) -> Result<Option<Map<String, Value>>, String> {
-        if self.workflow.id != "fix" || !step_participates_in_review_ledger(step.id.as_str()) {
-            return Ok(None);
-        }
-        if step.id == "review" {
-            if !review_outputs_or_ledger_nonempty(ctx) {
-                return Ok(None);
-            }
-        } else if !ledger_has_items_or_relevant_review(step.id.as_str(), ctx) {
-            return Ok(None);
-        }
-
-        let (client, base_cfg) = match self.pick(AgentRole::Fast) {
-            Ok(env) => (env.client.clone(), env.config.clone()),
-            Err(_) => self
-                .fallback_client_cfg_from_agent_runner(AgentRole::Fast)
-                .ok_or_else(|| {
-                    format!(
-                        "step '{}' review ledger: no fast AgentEnv and no AgentRunner fast client",
-                        step.id
-                    )
-                })?,
-        };
-        let user_text = build_review_ledger_prompt(step, attempt, ctx)?;
-        let messages = vec![Message::plain("user", user_text.clone())];
-        let call_cfg = self.config_with_mode(&base_cfg, Some(Mode::Generic));
-        if let Some(lg) = &self.logger {
-            let label = format!("phase=review-ledger step={} attempt={attempt}", step.id);
-            let request = call_cfg.request_meta();
-            lg.log_code_labeled_with_request(
-                "user",
-                Some(&label),
-                &format!("[step={} review_ledger]\n{}", step.id, user_text),
-                None,
-                None,
-                Some(&request),
-            );
-        }
-        let resp = tokio::select! {
-            _ = self.shutdown.cancelled() => {
-                return Err(format!(
-                    "step '{}' review ledger update cancelled before LLM call returned",
-                    step.id
-                ));
-            }
-            r = client.messages(&call_cfg, &messages) => {
-                r.map_err(|e| format!("step '{}' review ledger LLM call: {e}", step.id))?
-            }
-        };
-        self.record_direct_usage(AgentRole::Fast, &call_cfg, &resp.usage);
-        let text = response_text(&resp);
-        if let Some(lg) = &self.logger {
-            let label = format!("phase=review-ledger step={} attempt={attempt}", step.id);
-            lg.log_code_labeled_with_model(
-                "assistant",
-                Some(&label),
-                &text,
-                Some(LoggedUsage {
-                    input: resp.usage.input_tokens,
-                    output: resp.usage.output_tokens,
-                    cache_creation: resp.usage.cache_creation_input_tokens,
-                    cache_read: resp.usage.cache_read_input_tokens,
-                }),
-                None,
-                resp.model.as_deref(),
-            );
-        }
-        let parsed =
-            crate::json_repair::parse_strict_json::<ReviewLedgerResponse>("review-ledger", &text)
-                .map_err(|errors| format!("step '{}' {}", step.id, errors.join("; ")))?;
-        let ledger = Value::Array(parsed.ledger);
-        let rendered = serde_json::to_string_pretty(&ledger)
-            .map_err(|e| format!("review ledger render: {e}"))?;
-        let mut out = Map::new();
-        out.insert("items".into(), ledger);
-        out.insert("ledger".into(), Value::String(rendered));
-        out.insert("updated_by_step".into(), Value::String(step.id.clone()));
-        out.insert("updated_attempt".into(), Value::Number(attempt.into()));
-        Ok(Some(out))
     }
 
     /// Fallback for when no AgentEnv is wired but the AgentRunner
@@ -2257,139 +2165,13 @@ impl Driver for LlmDriver {
         self.stage_attempt(step, attempt, staged)?;
         Ok(LensFanOutConsolidate::Outputs(outputs))
     }
-
-    async fn update_review_ledger(
-        &self,
-        step: &Step,
-        attempt: u32,
-        ctx: &ExecContext<'_>,
-    ) -> Result<Option<Map<String, Value>>, String> {
-        self.map_review_ledger(step, attempt, ctx).await
-    }
 }
 
-fn step_participates_in_review_ledger(step_id: &str) -> bool {
-    matches!(step_id, "review" | "write-patch" | "write-commit-message")
-}
-
-fn ledger_has_items_or_relevant_review(step_id: &str, ctx: &ExecContext<'_>) -> bool {
-    ledger_has_relevant_items(step_id, ctx)
-        || match step_id {
-            "write-patch" => step_array_nonempty(ctx, "review", "source_defects"),
-            "write-commit-message" => step_array_nonempty(ctx, "review", "commit_message_defects"),
-            _ => false,
-        }
-}
-
-fn review_outputs_or_ledger_nonempty(ctx: &ExecContext<'_>) -> bool {
-    review_ledger_items(ctx)
-        .as_array()
-        .map(|items| !items.is_empty())
-        .unwrap_or(false)
-        || step_array_nonempty(ctx, "review", "source_defects")
-        || step_array_nonempty(ctx, "review", "commit_message_defects")
-        || step_array_nonempty(ctx, "review", "defects")
-}
-
-fn ledger_has_relevant_items(step_id: &str, ctx: &ExecContext<'_>) -> bool {
-    let Some(items) = review_ledger_items(ctx).as_array().cloned() else {
-        return false;
-    };
-    items.iter().any(|item| {
-        let Some(obj) = item.as_object() else {
-            return false;
-        };
-        let status = obj
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if matches!(status, "resolved" | "superseded") {
-            return false;
-        }
-        let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("other");
-        match step_id {
-            "write-patch" => !matches!(kind, "commit_message" | "trailer"),
-            "write-commit-message" => matches!(kind, "commit_message" | "trailer"),
-            _ => true,
-        }
-    })
-}
-
-fn review_ledger_items(ctx: &ExecContext<'_>) -> Value {
+fn objectives_list(ctx: &ExecContext<'_>) -> Value {
     ctx.steps
-        .get(REVIEW_LEDGER_STEP_ID)
+        .get(OBJECTIVES_STEP_ID)
         .and_then(|st| st.outputs.get("items").cloned())
         .unwrap_or_else(|| Value::Array(Vec::new()))
-}
-
-fn build_review_ledger_prompt(
-    step: &Step,
-    attempt: u32,
-    ctx: &ExecContext<'_>,
-) -> Result<String, String> {
-    let ledger = review_ledger_items(ctx);
-    let ledger_json =
-        serde_json::to_string_pretty(&ledger).map_err(|e| format!("review ledger encode: {e}"))?;
-    let outputs = ctx
-        .steps
-        .get(&step.id)
-        .map(|st| Value::Object(st.outputs.clone()))
-        .unwrap_or(Value::Null);
-    let outputs_json = serde_json::to_string_pretty(&outputs)
-        .map_err(|e| format!("review ledger step-output encode: {e}"))?;
-    let review_context = match step.id.as_str() {
-        "review" => {
-            "Map the review output into the ledger. Add new distinct complaints as open entries. \
-             If a complaint is the same root issue as an existing entry, update that entry instead \
-             of adding a duplicate. If the review is clean, only mark addressed or disputed entries \
-             resolved when the review output gives enough context to show that complaint was rechecked."
-        }
-        "write-patch" => {
-            "Map the patch author's response into the ledger. Source/build/behavior complaints may \
-             move from open to addressed when this attempt emitted relevant code changes, or to \
-             disputed when review_dispute explains why no code change is needed. Do not mark a \
-             complaint resolved; only a later review pass can do that."
-        }
-        "write-commit-message" => {
-            "Map the commit-message author response into the ledger. Commit-message-only complaints \
-             may move from open to addressed when this attempt rewrote the message. Do not mark a \
-             complaint resolved; only a later review pass can do that."
-        }
-        _ => "",
-    };
-    Ok(format!(
-        "You are maintaining the fix workflow review ledger.\n\n\
-         The ledger is structured state used to avoid re-litigating the same review complaint across \
-         write/review loops. Preserve stable entry ids. Merge semantically identical complaints even \
-         if wording, lens, or file:line citations changed. Keep unrelated complaints separate. Do \
-         not infer source correctness yourself; only map review comments and patch-author replies \
-         into ledger state.\n\n\
-         Entry shape:\n\
-         - id: stable short id like R1, R2, ...\n\
-         - kind: source | build | behavior | documentation | test | commit_message | trailer | other\n\
-         - status: open | addressed | disputed | resolved | superseded\n\
-         - summary: one sentence for the root complaint\n\
-         - latest: concise latest state/evidence\n\
-         - history: array of short events with step, attempt, action, and note\n\n\
-         Status rules:\n\
-         - open: review says the fix still has this defect.\n\
-         - addressed: coding/commit-message step claims or appears to have responded; needs review.\n\
-         - disputed: coding step says the review complaint is invalid; needs review adjudication.\n\
-         - resolved: review rechecked the complaint and no longer reports it.\n\
-         - superseded: a later complaint replaces this entry; include the replacement id in latest.\n\n\
-         {review_context}\n\n\
-         CURRENT STEP\n\
-         step: {step_id}\n\
-         attempt: {attempt}\n\n\
-         CURRENT LEDGER JSON\n\
-         {ledger_json}\n\n\
-         CURRENT STEP OUTPUTS JSON\n\
-         {outputs_json}\n\n\
-         Reply with one raw, unfenced JSON object and no prose or Markdown backticks. The `ledger` value must be a JSON array \
-         of entry objects. If the ledger is empty, return exactly this shape:\n\
-         {{\"ledger\": []}}\n",
-        step_id = step.id
-    ))
 }
 
 fn preserve_lens_analysis_for_consolidate(
@@ -5592,6 +5374,61 @@ fn render_previous_patch_diff_block(diff: &str) -> String {
 /// if the model restated the defect set it would also be choosing what
 /// the set contains, and a defect it declined to restate would be
 /// indistinguishable from one it resolved.
+/// The loop's objectives with the age Rust stamped on each.
+///
+/// Age is the forward-progress signal and the only thing that
+/// distinguishes round 1 from round 9. Without it the reconciliation
+/// pass re-derives the same complaint from scratch every cycle: on the
+/// 2026-08-10 linux.nfs run four underlying problems presented as 37
+/// differently-worded defect strings across ten rounds, and nothing
+/// noticed they were four.
+fn render_open_objectives(ctx: &ExecContext<'_>) -> String {
+    let list = objectives_list(ctx);
+    let items = list.as_array().map(Vec::as_slice).unwrap_or_default();
+    if items.is_empty() {
+        return "\n\n--- OPEN OBJECTIVES ---\n(none yet: this is the first reconciliation of \
+                this fix)\n--- END OPEN OBJECTIVES ---"
+            .to_string();
+    }
+    let mut body = String::new();
+    for item in items {
+        let field = |key: &str| {
+            item.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let rounds = item.get("rounds_open").and_then(Value::as_u64).unwrap_or(1);
+        let stale = if rounds >= crate::workflow_exec::OBJECTIVE_STALE_ROUNDS {
+            "  << STALE"
+        } else {
+            ""
+        };
+        body.push_str(&format!(
+            "{} [{}] open {} round(s){}\n    {}\n",
+            field("id"),
+            field("status"),
+            rounds,
+            stale,
+            field("statement")
+        ));
+    }
+    format!(
+        "\n\n--- OPEN OBJECTIVES ---\n\
+         Carried from earlier rounds of THIS fix, with the number of review cycles each has \
+         been open. Re-emit every one in `objectives`: keep it open, mark it satisfied with \
+         the evidence, or withdraw it with the reason. An objective you leave out is carried \
+         forward unchanged -- going quiet does not retire it.\n\n\
+         An objective open {} round(s) or more is STALE: what you have been asking for is not \
+         happening. Name one of them in `must_fix` and make the loop do that one thing, or \
+         settle it. Reissuing the same request a third time is the failure this field \
+         exists to prevent.\n\n{body}\
+         --- END OPEN OBJECTIVES ---",
+        crate::workflow_exec::OBJECTIVE_STALE_ROUNDS
+    )
+}
+
 fn render_reconcile_review_context(diff: Result<&str, &String>, ctx: &ExecContext<'_>) -> String {
     let defects = ctx
         .steps
@@ -5627,7 +5464,8 @@ fn render_reconcile_review_context(diff: Result<&str, &String>, ctx: &ExecContex
          you emit carries a `covers` array of these numbers, and every index below must appear \
          in `covers` on some instruction or some dropped entry.\n\n\
          {numbered}\
-         --- END NUMBERED REVIEW DEFECTS ---{}",
+         --- END NUMBERED REVIEW DEFECTS ---{}{}",
+        render_open_objectives(ctx),
         match diff {
             Ok(diff) => render_readonly_payload("CURRENT PATCH", "git diff HEAD~1", diff),
             Err(error) => format!(

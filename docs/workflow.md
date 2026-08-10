@@ -1096,20 +1096,68 @@ forward. `write-patch`, `write-commit-message` and the orchestrator all
 read the reconciled set as authoritative, with the raw per-lens
 defects kept as context.
 
-The `reconcile_covers_every_defect` builtin enforces the one property
-that makes this safe: every numbered defect appears in some
-`instructions[].covers` or `dropped[].covers`. That is a quantifier
-over two typed arrays, which the expression language cannot state, so
-it is a builtin for the same reason `validate_claims_wellformed` is
-one. A defect that simply vanished would be re-reported by the same
-lens on the next cycle, which is the oscillation this step exists to
-stop.
+`reconcile-review` also owns the loop's **objectives**, which are its
+only cross-round memory and the thing that lets it steer rather than
+just report.
 
-Being a plain non-lensed step, its malformed replies are repaired by
-the shared loop every workflow step uses — `WORKFLOW_RESPONSE_RETRIES`
-attempts, each re-prompted with `JSON_REPAIR_PREFIX` and the
-validator's own error. There is no reconciliation-specific repair path
-and there must not be one.
+An objective is one sentence about what must become true of the patch,
+carrying a stable id across rounds however differently the review
+words the complaint. The pass re-emits every objective each round and
+marks it `open`, `satisfied` (with evidence) or `withdrawn` (with the
+scope statement or the source that disproves it). Omission does not
+retire one: an objective the pass goes quiet about is carried forward
+unchanged, the same rule the todo list uses.
+
+**Rust owns the ages.** `merge_emitted_objectives` stamps `first_round`
+when an id is first seen and recomputes `rounds_open` every round, so a
+pass cannot reset a stale objective's clock by renaming it or by
+reporting its age itself. They live in the synthetic `objectives` step
+(`OBJECTIVES_STEP_ID`), which no workflow lists in `depends_on` and so
+nothing resets — every real step's outputs are taken into
+`prior_attempts` and cleared when the orchestrator routes backwards.
+
+**The forward-progress rule.** Once an objective has been open for
+`OBJECTIVE_STALE_ROUNDS` (2) cycles, asking again in different words
+has already failed twice. `escalation_is_honest` requires the pass to
+either name one stale objective in `must_fix` — which tells the review
+to check it first, tells both workers nothing else matters, and stops
+the orchestrator publishing while it is open — or settle it as
+satisfied or withdrawn on evidence. `scope_amendment` is the third
+lever: when the review keeps demanding work the fix todo does not
+cover, the pass narrows the contract, and when the fix cannot be
+correct without work the todo omitted, it widens it.
+
+This replaced an earlier guard that policed the WORDING of each
+instruction — a `kind` enum plus a `behavior_accepted` certification,
+with an eval rejecting any defect answered only by a comment rewrite.
+That was rigid, and measuring whether the ask *worked* subsumes it: an
+objective still open after two rounds trips the rule no matter how its
+instruction was phrased. `kind` survives as a hint to the worker and is
+no longer eval-enforced.
+
+The evidence for all of it is the 2026-08-10 linux.nfs pair. Run one,
+before the reconciliation step existed, failed at ten rounds but its
+patch called `may_open()`. Run two, with the step, also failed at ten
+rounds and its patch did not: the review raised the missing permission
+check in all ten rounds, and of the fifteen source instructions the
+step emitted across nine rounds every one was a comment or kerneldoc
+rewrite. Coverage was satisfied every round, because documenting a
+defect cites its index exactly as well as fixing it does.
+
+The reason the step could not tell round one from round nine is that
+its memory did not exist. `review_ledger` — a separate fast-agent pass
+that was supposed to merge semantically identical complaints across
+rounds — never ran once. Entries could only be born from review
+defects, but `update_accepted_review_ledger` was reached only on eval
+PASS and the review's eval is `clean == true`, which fails on exactly
+the rounds that have defects; on a clean round there is nothing to
+record. Its fallback writers were gated on `review.source_defects`,
+which `reset_dependents_preserving` has already cleared by the time
+they run. Measured across three fix runs including one that succeeded,
+`phase=review-ledger` appears zero times, so four underlying problems
+presented as 37 differently-worded defect strings and nothing noticed
+they were four. That mechanism is deleted; the reconciliation pass owns
+the store now, and writes it with no extra LLM call.
 
 ### Fix Flow Invariants
 

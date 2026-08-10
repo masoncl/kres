@@ -880,7 +880,16 @@
         "disproved or the fix contract put out of scope. Work the `target: source` entries in",
         "the order given. Do NOT reopen a resolved contradiction or reinstate a dropped defect;",
         "if you believe a resolution is wrong, say so in review_dispute with cited source.",
+        "Each entry carries a `kind`. `behavior` means executable code must change \u2014 a comment",
+        "or kerneldoc edit does not discharge it, and the reviewer will raise it again.",
+        "`documentation` means comment/kerneldoc text only: make that edit and do not alter",
+        "behavior under cover of it.",
         "{{reconcile-review.instructions || '[]'}}",
+        "",
+        "Behaviors the reconciliation judged correct as written, so only their description was",
+        "changed. If you find one of these judgements is wrong, do not silently fix the code:",
+        "say so in review_dispute with the source that contradicts it.",
+        "{{reconcile-review.behavior_accepted || '[]'}}",
         "",
         "How reconcile-review resolved the lens conflicts, and what it dropped:",
         "{{reconcile-review.contradictions || '[]'}}",
@@ -892,8 +901,15 @@
         "not a second worklist. When they disagree, the reconciled set wins.",
         "{{review.source_defects || ''}}",
         "",
-        "REVIEW LEDGER:",
-        "{{review_ledger.ledger || ''}}",
+        "LOOP OBJECTIVES (what this fix must make true, carried across review cycles, with how",
+        "many cycles each has been open). The reconciliation pass owns these:",
+        "{{objectives.list || '[]'}}",
+        "MUST FIX -- when non-empty, this objective id is the only thing that matters this round;",
+        "everything else waits until it lands:",
+        "{{reconcile-review.must_fix || ''}}",
+        "SCOPE AMENDMENT to the fix contract, in force for the rest of this fix:",
+        "{{reconcile-review.scope_amendment || ''}}",
+        "If MUST FIX is set, make it land in this pass. Do not spend the pass on anything else.",
         "Use this ledger as review history. Address open source/build/behavior entries for the",
         "current fix todo, and if you dispute one, put the evidence in review_dispute instead",
         "of re-editing unrelated code.",
@@ -1141,8 +1157,16 @@
         "not a second worklist. When they disagree, the reconciled set wins.",
         "{{review.commit_message_defects || ''}}",
         "",
-        "REVIEW LEDGER:",
-        "{{review_ledger.ledger || ''}}",
+        "LOOP OBJECTIVES (what this fix must make true, carried across review cycles, with how",
+        "many cycles each has been open). The reconciliation pass owns these:",
+        "{{objectives.list || '[]'}}",
+        "MUST FIX -- when non-empty, this objective id is the only thing that matters this round;",
+        "everything else waits until it lands:",
+        "{{reconcile-review.must_fix || ''}}",
+        "SCOPE AMENDMENT to the fix contract, in force for the rest of this fix:",
+        "{{reconcile-review.scope_amendment || ''}}",
+        "If MUST FIX is set and it is not a changelog objective, say so in analysis rather",
+        "than rewriting the message around it.",
         "Use this ledger as review history. Address open commit-message/trailer entries for the",
         "current fix todo, but do not make source changes here.",
         "",
@@ -1385,8 +1409,16 @@
         "PATCH AUTHOR DISPUTE OF PRIOR REVIEW, IF ANY:",
         "{{write-patch.review_dispute || ''}}",
         "",
-        "REVIEW LEDGER:",
-        "{{review_ledger.ledger || ''}}",
+        "LOOP OBJECTIVES (what this fix must make true, carried across review cycles, with how",
+        "many cycles each has been open). The reconciliation pass owns these:",
+        "{{objectives.list || '[]'}}",
+        "MUST FIX -- when non-empty, this objective id is the only thing that matters this round;",
+        "everything else waits until it lands:",
+        "{{reconcile-review.must_fix || ''}}",
+        "SCOPE AMENDMENT to the fix contract, in force for the rest of this fix:",
+        "{{reconcile-review.scope_amendment || ''}}",
+        "Re-check MUST FIX first and say plainly whether it is now satisfied. Honor the scope",
+        "amendment: do not report defects it puts out of scope.",
         "Use this ledger to recognize previously reported complaints. Do not re-report a resolved",
         "entry unless the current patch regressed it again; if an open, addressed, or disputed",
         "entry is still defective, report the concrete current defect with fresh evidence.",
@@ -1654,6 +1686,7 @@
               "required": [
                 "covers",
                 "target",
+                "kind",
                 "where",
                 "do",
                 "why"
@@ -1673,6 +1706,15 @@
                     "commit_message"
                   ],
                   "description": "Which worker can carry this out. source means write-patch; commit_message means write-commit-message."
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "behavior",
+                    "documentation",
+                    "changelog"
+                  ],
+                  "description": "What this instruction changes: behavior = executable code, documentation = comments or kerneldoc, changelog = the commit message. A hint to the worker about the edit expected. Rewording a comment to describe a behavior the reviewer called wrong is documentation, not behavior -- and it will leave the objective open."
                 },
                 "where": {
                   "type": "string",
@@ -1729,7 +1771,7 @@
                 },
                 "rationale": {
                   "type": "string",
-                  "description": "Why that resolution is correct, from cited source or the fix contract — not which lens sounded more confident."
+                  "description": "Why that resolution is correct, from cited source or the fix contract \u2014 not which lens sounded more confident."
                 }
               }
             }
@@ -1767,6 +1809,55 @@
         "analysis": {
           "type": "string",
           "optional": true
+        },
+        "objectives": {
+          "type": "array<object>",
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "id",
+                "statement",
+                "status"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Stable short id (O1, O2, ...). REUSE the id from OPEN OBJECTIVES when this is the same underlying problem, however differently the review worded it this round. A new id for an old problem resets its age and hides the stall."
+                },
+                "statement": {
+                  "type": "string",
+                  "description": "What must become true of the patch for this to be settled, in one sentence."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "open",
+                    "satisfied",
+                    "withdrawn"
+                  ],
+                  "description": "open = still not true of the patch. satisfied = now true, cite the evidence. withdrawn = should never have been asked, cite the scope statement or the source that disproves it."
+                },
+                "evidence": {
+                  "type": "string",
+                  "description": "For satisfied or withdrawn: the file:line, quoted source, or fix-contract sentence that settles it. A restatement of the objective is not evidence."
+                }
+              }
+            }
+          },
+          "description": "The loop's objectives, carried across review cycles. Re-emit every entry from OPEN OBJECTIVES plus any new ones this round's defects establish. Rust stamps the age; you cannot."
+        },
+        "must_fix": {
+          "type": "string",
+          "optional": true,
+          "description": "The id of the one objective the loop is now dedicated to. Everything else waits. Required once any objective has been open for two or more review cycles: at that point repeating the request has already failed twice, so the loop must commit to it or settle it. Empty when nothing is stale."
+        },
+        "scope_amendment": {
+          "type": "string",
+          "optional": true,
+          "description": "An amendment to the fix contract for the remaining rounds, passed verbatim to the review and both workers. Use it when the review keeps demanding work the CURRENT FIX TODO does not cover (narrow it, and say what is now out of scope) or when the fix cannot be correct without work the todo omitted (widen it, and say why). This is the lever for changing what the loop is trying to do, instead of asking harder for something it will not deliver."
         }
       },
       "eval": {
@@ -1803,16 +1894,43 @@
         "  goes to write-commit-message.",
         "",
         "Scope is a real defect class, not a tiebreaker. If the review is asking for changes",
-        "the CURRENT FIX TODO does not call for, drop them and say so — but only against the",
+        "the CURRENT FIX TODO does not call for, drop them and say so \u2014 but only against the",
         "contract below, never because the change looked large.",
         "",
         "Every index in the NUMBERED REVIEW DEFECTS block must appear in exactly one of",
         "`instructions[].covers` or `dropped[].covers`. A defect you neither instruct on nor",
         "drop will be reported again by the same lens on the next cycle.",
         "",
+        "YOU ARE THE LOOP'S CONTROLLER, NOT ITS MINUTE-TAKER. The fix<->review loop is supposed",
+        "to converge, and you are the only step that sees both what the review keeps asking for",
+        "and how long it has been asking. Maintain `objectives`: one entry per thing that must",
+        "become true of the patch, carrying the SAME id across rounds however differently the",
+        "review words it this time. Rust stamps how long each has been open; you cannot.",
+        "",
+        "Every round, for every open objective, decide: is it now true of the patch (satisfied,",
+        "cite the evidence), should it never have been asked (withdrawn, cite the scope statement",
+        "or the source that disproves it), or is it still outstanding (open)?",
+        "",
+        "When an objective is STALE - open two or more cycles - asking again in different words",
+        "has already failed twice and will fail again. You must use one of these levers:",
+        "  * `must_fix`: name that objective id. The review checks it first, both workers are told",
+        "    nothing else matters, and the orchestrator may not publish while it is open. Use this",
+        "    when the objective is right and the loop has simply been distracted.",
+        "  * mark it `satisfied` with evidence, if it is in fact already true of the patch.",
+        "  * mark it `withdrawn`, if the fix contract does not cover it or the source disproves it.",
+        "  * `scope_amendment`: when the review keeps demanding work the CURRENT FIX TODO does not",
+        "    cover, narrow the contract and say what is now out of scope; when the fix cannot be",
+        "    correct without work the todo omitted, widen it and say why. This changes what the",
+        "    loop is trying to do, which is sometimes the only way forward.",
+        "",
+        "A behavior complaint is not discharged by a comment that describes the behavior. If the",
+        "reviewer says the code performs no permission check, the objective stays open until the",
+        "code performs one or you can show it does not need to. An instruction to document the",
+        "gap leaves the objective open, and the next review raises it again.",
+        "",
         "Write `do` so the worker never needs the lens reports: state the change, not the",
         "objection. Cite the file:line that establishes each `why` from the source you were",
-        "given. You have no gathering actions — the lenses' own gathered source is attached,",
+        "given. You have no gathering actions \u2014 the lenses' own gathered source is attached,",
         "along with the current patch. If a defect cannot be judged from it, that is not a",
         "reason to drop it: carry it forward as an instruction that names the missing",
         "evidence in `why`.",
@@ -1829,13 +1947,19 @@
         "- commit_message_defects: {{review.commit_message_defects || '[]'}}",
         "- unresolved_risks: {{review.unresolved_risks || '[]'}}",
         "",
-        "PER-LENS REPORTS (each lens's own output, unmerged — this is where a contradiction",
+        "PER-LENS REPORTS (each lens's own output, unmerged \u2014 this is where a contradiction",
         "is visible, because the consolidated view above has already flattened it):",
         "{{review.lens_reports || '[]'}}",
         "",
-        "REVIEW LEDGER (complaint history across cycles; an entry already resolved here and",
         "not regressed by the current patch is a drop, with the ledger as the reason):",
-        "{{review_ledger.ledger || ''}}",
+        "LOOP OBJECTIVES (what this fix must make true, carried across review cycles, with how",
+        "many cycles each has been open). The reconciliation pass owns these:",
+        "{{objectives.list || '[]'}}",
+        "MUST FIX -- when non-empty, this objective id is the only thing that matters this round;",
+        "everything else waits until it lands:",
+        "{{reconcile-review.must_fix || ''}}",
+        "SCOPE AMENDMENT to the fix contract, in force for the rest of this fix:",
+        "{{reconcile-review.scope_amendment || ''}}",
         "",
         "YOUR PRIOR ATTEMPTS AT THIS RECONCILIATION:",
         "{{reconcile-review.prior_attempts || ''}}",
@@ -1878,7 +2002,7 @@
         "- next_step: re-route to a worker (write-patch, write-commit-message), force a fresh build+review pass (build), or finish the run (publish, exit-failure).",
         "- instruction: free-form guidance that the next worker reads verbatim before producing its output. Use this to break deadlocks \u2014 name the concrete defect, point at the file/function/line, and tell the worker what the prior attempt missed or got wrong.",
         "",
-        "Batch every defect a single worker pass can cover. Every routing decision costs an entire downstream cycle (rebuild + multi-lens review fan-out + consolidate). When you pick a worker, scan ALL open review defects (review.defects, review.source_defects, review.commit_message_defects, review_ledger entries) and pack into one instruction every item the chosen worker can address in this pass \u2014 including doc-only or comment-only source edits adjacent to the primary fix. write-patch and write-commit-message both run in coding mode and can emit code_edits, so even when the primary motivator for a write-commit-message routing is the changelog rewrite, fold in any in-scope source-comment edits whose correction does not depend on the changelog. Do not defer items as 'follow-up if the reviewer insists' when the same worker call can handle them now; the reviewer will keep flagging them and you will pay the next review-cycle cost for the deferral.",
+        "Batch every defect a single worker pass can cover. Every routing decision costs an entire downstream cycle (rebuild + multi-lens review fan-out + consolidate). When you pick a worker, scan ALL open review defects (review.defects, review.source_defects, review.commit_message_defects, the loop objectives above) and pack into one instruction every item the chosen worker can address in this pass \u2014 including doc-only or comment-only source edits adjacent to the primary fix. write-patch and write-commit-message both run in coding mode and can emit code_edits, so even when the primary motivator for a write-commit-message routing is the changelog rewrite, fold in any in-scope source-comment edits whose correction does not depend on the changelog. Do not defer items as 'follow-up if the reviewer insists' when the same worker call can handle them now; the reviewer will keep flagging them and you will pay the next review-cycle cost for the deferral.",
         "",
         "AVAILABLE NEXT STEPS:",
         "- write-patch: source/build/behavior still needs to change, or the prior write-patch attempt produced nothing. Use instruction to spell out what the next patch must do (which function, which contract, which path) and, when the prior attempt emitted no edits, to point at the specific source the worker needs to fetch and the followup kinds it must use to fetch it. Include any source-comment defects that should be fixed alongside the patch.",
@@ -1926,8 +2050,15 @@
         "- build stdout: {{build.stdout || ''}}",
         "- build stderr: {{build.stderr || ''}}",
         "",
-        "REVIEW LEDGER (cross-attempt complaint history):",
-        "{{review_ledger.ledger || ''}}",
+        "LOOP OBJECTIVES (what this fix must make true, carried across review cycles, with how",
+        "many cycles each has been open). The reconciliation pass owns these:",
+        "{{objectives.list || '[]'}}",
+        "MUST FIX -- when non-empty, this objective id is the only thing that matters this round;",
+        "everything else waits until it lands:",
+        "{{reconcile-review.must_fix || ''}}",
+        "SCOPE AMENDMENT to the fix contract, in force for the rest of this fix:",
+        "{{reconcile-review.scope_amendment || ''}}",
+        "If MUST FIX is set, route to the worker that can land it. Do not publish while it is open.",
         "",
         "CURRENT WRITE-PATCH OUTPUT (the most recent attempt's prose and typed followups; prior_attempts is empty on the first orchestrator invocation after a failed attempt, so read this section to learn WHY a worker just produced empty code_edits):",
         "- analysis: {{write-patch.analysis || ''}}",

@@ -4916,10 +4916,17 @@ async fn add_side_effect_outputs(
             Value::Bool(commit_message_written(code_output, workspace, staged)),
         );
     }
+    let target = target_finding_dir(_ctx);
     if step.outputs.contains_key("summary_written") {
         outputs.insert(
             "summary_written".into(),
-            Value::Bool(summary_written(code_output, code_edits, workspace, staged)),
+            Value::Bool(summary_written(
+                code_output,
+                code_edits,
+                workspace,
+                staged,
+                target.as_deref(),
+            )),
         );
     }
     if step.outputs.contains_key("severity_written") {
@@ -4928,7 +4935,16 @@ async fn add_side_effect_outputs(
             "severity_written".into(),
             Value::Bool(
                 severity
-                    .map(|s| severity_written(code_output, code_edits, workspace, staged, s))
+                    .map(|s| {
+                        severity_written(
+                            code_output,
+                            code_edits,
+                            workspace,
+                            staged,
+                            s,
+                            target.as_deref(),
+                        )
+                    })
                     .unwrap_or(false),
             ),
         );
@@ -5033,11 +5049,42 @@ fn commit_message_written(
     })
 }
 
+/// The finding directory this run was pointed at, when the workflow
+/// declares a `target` input naming one.
+///
+/// The artifact checks below use it to confirm the files landed where
+/// they belong. Without it they only asked whether *some* file named
+/// summary.md had been staged: on the 2026-08-10 kres-dentry batch a
+/// model emitted `home/clm/local/.../summary.md` with no leading slash,
+/// `resolve_workspace_path` joined that to the workspace, all three
+/// artifacts were written into
+/// `<workspace>/home/clm/local/...`, and the eval passed. The workflow
+/// reported success and the finding was left unvalidated.
+fn target_finding_dir(ctx: &ExecContext<'_>) -> Option<PathBuf> {
+    let target = ctx.workflow_inputs.get("target")?.as_str()?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(target);
+    path.is_absolute().then_some(path)
+}
+
+/// True when `path` sits directly inside `dir`, comparing the resolved
+/// forms so a `..` or symlink cannot smuggle a write out of the target.
+fn is_in_target_dir(path: &Path, dir: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    match path.parent() {
+        Some(parent) => canon(parent) == canon(dir),
+        None => false,
+    }
+}
+
 fn summary_written(
     code_output: &[kres_core::CodeFile],
     code_edits: &[kres_core::CodeEdit],
     workspace: &Path,
     staged: &std::collections::BTreeMap<PathBuf, String>,
+    target_dir: Option<&Path>,
 ) -> bool {
     let paths = code_output
         .iter()
@@ -5052,9 +5099,14 @@ fn summary_written(
                 .unwrap_or(false)
         })
         .any(|p| {
-            resolve_workspace_path(workspace, p)
-                .ok()
-                .and_then(|path| staged.get(&path))
+            let Ok(path) = resolve_workspace_path(workspace, p) else {
+                return false;
+            };
+            if target_dir.is_some_and(|dir| !is_in_target_dir(&path, dir)) {
+                return false;
+            }
+            staged
+                .get(&path)
                 .map(|body| !body.trim().is_empty())
                 .unwrap_or(false)
         })
@@ -5066,6 +5118,7 @@ fn severity_written(
     workspace: &Path,
     staged: &std::collections::BTreeMap<PathBuf, String>,
     severity: &str,
+    target_dir: Option<&Path>,
 ) -> bool {
     let Some(summary_path) = emitted_path_named(code_output, code_edits, workspace, "summary.md")
     else {
@@ -5074,6 +5127,11 @@ fn severity_written(
     let Some(dir) = summary_path.parent() else {
         return false;
     };
+    // The three files agreeing with each other is not enough; they have
+    // to agree in the finding directory this run was given.
+    if target_dir.is_some_and(|want| !is_in_target_dir(&summary_path, want)) {
+        return false;
+    }
     let Some(metadata_path) =
         emitted_path_named(code_output, code_edits, workspace, "metadata.yaml")
     else {
@@ -9206,6 +9264,78 @@ mod tests {
         assert_eq!(std::fs::read_to_string(target).unwrap(), "hello outside");
     }
 
+    /// The artifact checks must confirm the files landed in the finding
+    /// directory, not merely that something named summary.md was
+    /// staged somewhere.
+    ///
+    /// On the 2026-08-10 kres-dentry batch a model emitted
+    /// `home/clm/local/.../summary.md` with no leading slash.
+    /// resolve_workspace_path joined the relative path to the
+    /// workspace, all three artifacts were written into
+    /// `<workspace>/home/clm/local/...`, both checks returned true, the
+    /// eval passed and the workflow reported success -- while the
+    /// finding directory it was pointed at kept no summary at all.
+    #[test]
+    fn artifact_checks_reject_writes_outside_the_finding_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        // The operator named the finding directory in the prompt, which
+        // is what lets a write land outside the workspace at all.
+        kres_core::consent::get_or_install().grant_from_mention(target.path());
+        // Each artifact states the severity in its own format.
+        let body = |name: &str| match name {
+            "summary.md" => "# Severity\n\nlow\n".to_string(),
+            "metadata.yaml" => "severity: low\n".to_string(),
+            _ => "**Severity:** low\n".to_string(),
+        };
+
+        let inside = |name: &str| kres_core::CodeFile {
+            path: target.path().join(name).display().to_string(),
+            content: body(name),
+            purpose: String::new(),
+        };
+        // What the model actually emitted: the absolute path with its
+        // leading slash lost.
+        let relative = |name: &str| kres_core::CodeFile {
+            path: format!(
+                "{}/{name}",
+                target.path().display().to_string().trim_start_matches('/')
+            ),
+            content: body(name),
+            purpose: String::new(),
+        };
+
+        let builders: [&dyn Fn(&str) -> kres_core::CodeFile; 2] = [&inside, &relative];
+        for build in builders {
+            let files = vec![
+                build("summary.md"),
+                build("metadata.yaml"),
+                build("FINDING.md"),
+            ];
+            let staged: std::collections::BTreeMap<PathBuf, String> = files
+                .iter()
+                .map(|f| {
+                    (
+                        resolve_workspace_path(workspace.path(), &f.path).unwrap(),
+                        f.content.clone(),
+                    )
+                })
+                .collect();
+            let want = target.path();
+            let in_place = staged.keys().all(|p| p.starts_with(want));
+            assert_eq!(
+                summary_written(&files, &[], workspace.path(), &staged, Some(want)),
+                in_place,
+                "summary_written must track whether the write landed in the target"
+            );
+            assert_eq!(
+                severity_written(&files, &[], workspace.path(), &staged, "low", Some(want)),
+                in_place,
+                "severity_written must track whether the write landed in the target"
+            );
+        }
+    }
+
     #[test]
     fn summary_written_requires_non_empty_summary_md() {
         let workspace = tempfile::tempdir().unwrap();
@@ -9216,7 +9346,13 @@ mod tests {
             purpose: "triage summary".into(),
         }];
         let staged = stage_code_changes(workspace.path(), &files, &[]).unwrap();
-        assert!(summary_written(&files, &[], workspace.path(), &staged));
+        assert!(summary_written(
+            &files,
+            &[],
+            workspace.path(),
+            &staged,
+            None
+        ));
 
         let wrong_file = vec![kres_core::CodeFile {
             path: "not-summary.md".into(),
@@ -9228,7 +9364,8 @@ mod tests {
             &wrong_file,
             &[],
             workspace.path(),
-            &wrong_staged
+            &wrong_staged,
+            None
         ));
 
         let blank = vec![kres_core::CodeFile {
@@ -9237,7 +9374,13 @@ mod tests {
             purpose: "triage summary".into(),
         }];
         let staged = stage_code_changes(workspace.path(), &blank, &[]).unwrap();
-        assert!(!summary_written(&blank, &[], workspace.path(), &staged));
+        assert!(!summary_written(
+            &blank,
+            &[],
+            workspace.path(),
+            &staged,
+            None
+        ));
     }
 
     #[test]
@@ -9267,7 +9410,8 @@ mod tests {
             &[],
             workspace.path(),
             &staged,
-            "high"
+            "high",
+            None
         ));
         let summary_only = vec![summary];
         let staged = stage_code_changes(workspace.path(), &summary_only, &[]).unwrap();
@@ -9276,7 +9420,8 @@ mod tests {
             &[],
             workspace.path(),
             &staged,
-            "high"
+            "high",
+            None
         ));
 
         let mut mismatched = files;
@@ -9287,7 +9432,8 @@ mod tests {
             &[],
             workspace.path(),
             &staged,
-            "high"
+            "high",
+            None
         ));
     }
 

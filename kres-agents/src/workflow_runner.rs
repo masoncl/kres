@@ -655,7 +655,7 @@ impl LlmDriver {
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
             let label = format!("phase=review-ledger step={} attempt={attempt}", step.id);
-            lg.log_code_labeled(
+            lg.log_code_labeled_with_model(
                 "assistant",
                 Some(&label),
                 &text,
@@ -666,6 +666,7 @@ impl LlmDriver {
                     cache_read: resp.usage.cache_read_input_tokens,
                 }),
                 None,
+                resp.model.as_deref(),
             );
         }
         let parsed =
@@ -1141,7 +1142,7 @@ impl LlmDriver {
                         step.id, attempt, json_retry
                     ),
                 };
-                lg.log_code_labeled(
+                lg.log_code_labeled_with_model(
                     "assistant",
                     Some(&label),
                     &text,
@@ -1152,6 +1153,7 @@ impl LlmDriver {
                         cache_read: resp.usage.cache_read_input_tokens,
                     }),
                     None,
+                    resp.model.as_deref(),
                 );
             }
 
@@ -1871,7 +1873,7 @@ impl Driver for LlmDriver {
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
             let label = format!("phase=judge step={}", step.id);
-            lg.log_code_labeled(
+            lg.log_code_labeled_with_model(
                 "assistant",
                 Some(&label),
                 &text,
@@ -1882,6 +1884,7 @@ impl Driver for LlmDriver {
                     cache_read: resp.usage.cache_read_input_tokens,
                 }),
                 None,
+                resp.model.as_deref(),
             );
         }
         let parsed = crate::json_repair::parse_strict_json::<JudgeResponse>("judge", &text)
@@ -2010,7 +2013,7 @@ impl Driver for LlmDriver {
         let text = response_text(&resp);
         if let Some(lg) = &self.logger {
             let label = format!("phase=consolidate step={}", step.id);
-            lg.log_code_labeled(
+            lg.log_code_labeled_with_model(
                 "assistant",
                 Some(&label),
                 &text,
@@ -2021,6 +2024,7 @@ impl Driver for LlmDriver {
                     cache_read: resp.usage.cache_read_input_tokens,
                 }),
                 None,
+                resp.model.as_deref(),
             );
         }
         let outputs = extract_outputs(&text, step)

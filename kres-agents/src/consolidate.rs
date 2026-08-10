@@ -162,7 +162,7 @@ pub async fn consolidate_lenses_with_logger(
         // Same label as the user record above. Without it the response is
         // unattributable: a by-stage token accounting silently folded every
         // consolidate and promote call into the goal/todo bucket.
-        lg.log_code_labeled(
+        lg.log_code_labeled_with_model(
             "assistant",
             Some("phase=consolidate"),
             &text,
@@ -177,6 +177,7 @@ pub async fn consolidate_lenses_with_logger(
             } else {
                 Some(&thinking)
             },
+            resp.model.as_deref(),
         );
     }
     let response_contract =

@@ -257,7 +257,7 @@ pub async fn promote_prose_bugs_with_logger(
     let text = extract_text(&resp);
     if let Some(lg) = &logger {
         // Same label as the user record above; see the note in consolidate.rs.
-        lg.log_code_labeled(
+        lg.log_code_labeled_with_model(
             "assistant",
             Some("phase=promote"),
             &text,
@@ -268,6 +268,7 @@ pub async fn promote_prose_bugs_with_logger(
                 cache_read: resp.usage.cache_read_input_tokens,
             }),
             None,
+            resp.model.as_deref(),
         );
     }
     let response_contract = CodeResponseContract::default().requiring(["findings"]);

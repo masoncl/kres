@@ -1308,9 +1308,11 @@ mod tests {
         assert_eq!(wf.schema_version, 1);
         // Research plus deterministic status/commit/build/publish
         // steps around the LLM-authored patch/provenance/message/review
-        // steps, plus the post-review orchestrator that routes the
-        // next step when review is not clean.
-        assert_eq!(wf.steps.len(), 19, "fix workflow has 19 steps");
+        // steps, plus the reconciliation pass that merges the review
+        // lenses into one instruction set and the post-review
+        // orchestrator that routes the next step when review is not
+        // clean.
+        assert_eq!(wf.steps.len(), 20, "fix workflow has 20 steps");
         assert_eq!(
             wf.steps
                 .iter()
@@ -1628,11 +1630,45 @@ mod tests {
         );
         let on_fail = &review.eval.as_ref().unwrap().on_fail;
         assert_eq!(on_fail.action, OnFailAction::BranchTo);
-        // Review now hands off to the orchestrator step; the
-        // orchestrator owns the next-step decision and dispatches
-        // based on its own next_step output.
-        assert_eq!(on_fail.branch_to.as_deref(), Some("orchestrator"));
+        // Review hands off to reconcile-review, which merges the
+        // parallel lenses into one instruction set before the
+        // orchestrator routes on them. The orchestrator still owns the
+        // next-step decision and dispatches on its own next_step.
+        assert_eq!(on_fail.branch_to.as_deref(), Some("reconcile-review"));
         assert_eq!(on_fail.branch_to_output.as_deref(), None);
+
+        let reconcile = wf
+            .steps
+            .iter()
+            .find(|step| step.id == "reconcile-review")
+            .expect("fix workflow must reconcile the review lenses");
+        assert_eq!(reconcile.agent, Some(Agent::Code));
+        assert_eq!(
+            reconcile.actions.as_deref(),
+            Some(&[] as &[crate::workflow::ActionType]),
+            "reconcile-review adjudicates the lenses' own gather; it must not re-fetch"
+        );
+        assert!(
+            review_outputs.contains_key("lens_reports"),
+            "reconcile-review needs each lens's unmerged output to see a contradiction"
+        );
+        assert_eq!(
+            reconcile.eval.as_ref().map(|e| e.name.as_deref()),
+            Some(Some("reconcile_covers_every_defect")),
+            "every review defect must be instructed on or explicitly dropped"
+        );
+        let orchestrator = wf
+            .steps
+            .iter()
+            .find(|step| step.id == "orchestrator")
+            .unwrap();
+        assert!(
+            orchestrator
+                .depends_on
+                .iter()
+                .any(|dep| dep == "reconcile-review"),
+            "the orchestrator must route on the reconciled set, not the raw lens merge"
+        );
     }
 
     #[test]

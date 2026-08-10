@@ -2729,10 +2729,128 @@ fn eval_builtin(
         "fix_research_status" => Ok(eval_fix_research_status(step, ctx)),
         "fix_series_assessment" => Ok(eval_fix_series_assessment(step, ctx)),
         "orchestrator_dispatch" => Ok(eval_orchestrator_dispatch(step, ctx)),
+        "reconcile_covers_every_defect" => Ok(eval_reconcile_covers_every_defect(step, ctx)),
         "validate_claims_wellformed" => Ok(eval_validate_claims_wellformed(step, ctx)),
         "validate_verdict_consistency" => Ok(eval_validate_verdict_consistency(step, ctx)),
         other => Err(format!("unknown builtin eval '{other}'")),
     }
+}
+
+/// The reconciliation step turns N lens reports into ONE instruction
+/// set, so its load-bearing property is that nothing vanished on the
+/// way: every review defect must end up either driving an instruction
+/// or explicitly dropped with a reason.
+///
+/// That is a quantifier over two typed arrays, which the workflow
+/// expression language cannot state, so it is a builtin — the same
+/// reason `validate_claims_wellformed` is one. Rust numbers the
+/// defects when it renders them into the prompt, so `covers` is an
+/// index into `review.defects` and cannot be satisfied by paraphrase.
+fn eval_reconcile_covers_every_defect(
+    step: &Step,
+    ctx: &ExecContext<'_>,
+) -> (bool, Option<String>) {
+    let defects = ctx
+        .steps
+        .get("review")
+        .and_then(|state| state.outputs.get("defects"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
+        return eval_fail("current step outputs are missing");
+    };
+    let instructions = outputs
+        .get("instructions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let dropped = outputs
+        .get("dropped")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+
+    if defects.is_empty() {
+        return (true, None);
+    }
+    if instructions.is_empty() && dropped.is_empty() {
+        return eval_fail(&format!(
+            "review reported {} defect(s) but this step produced no instructions and dropped \
+             nothing; every defect must drive an instruction or be dropped with a reason",
+            defects.len()
+        ));
+    }
+
+    let mut covered: BTreeSet<i64> = BTreeSet::new();
+    let mut out_of_range: Vec<i64> = Vec::new();
+    for (label, entries) in [("instructions", instructions), ("dropped", dropped)] {
+        for (position, entry) in entries.iter().enumerate() {
+            let Some(covers) = entry.get("covers").and_then(Value::as_array) else {
+                return eval_fail(&format!(
+                    "{label}[{position}] is missing `covers`; it must list the NUMBERED REVIEW \
+                     DEFECT indices this entry accounts for"
+                ));
+            };
+            if covers.is_empty() {
+                return eval_fail(&format!(
+                    "{label}[{position}].covers is empty; an entry that accounts for no defect \
+                     does not belong in the reconciled set"
+                ));
+            }
+            for index in covers {
+                let Some(index) = index.as_i64() else {
+                    return eval_fail(&format!(
+                        "{label}[{position}].covers must contain integers indexing the NUMBERED \
+                         REVIEW DEFECTS block"
+                    ));
+                };
+                if index < 0 || index as usize >= defects.len() {
+                    out_of_range.push(index);
+                } else {
+                    covered.insert(index);
+                }
+            }
+        }
+    }
+    if !out_of_range.is_empty() {
+        return eval_fail(&format!(
+            "covers references defect index {out_of_range:?} but review reported {} defect(s), \
+             numbered 0..{}",
+            defects.len(),
+            defects.len() - 1
+        ));
+    }
+    let missing: Vec<usize> = (0..defects.len())
+        .filter(|index| !covered.contains(&(*index as i64)))
+        .collect();
+    if !missing.is_empty() {
+        let detail = missing
+            .iter()
+            .take(6)
+            .map(|index| {
+                let what = defects[*index]
+                    .get("what")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let lens = defects[*index]
+                    .get("lens")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                format!(
+                    "#{index} [{lens}] {}",
+                    what.chars().take(90).collect::<String>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return eval_fail(&format!(
+            "these review defects are in neither instructions[].covers nor dropped[].covers: \
+             {detail}. Carry each one into an instruction or drop it with a reason — a defect \
+             that is simply absent will be re-reported by the same lens next round"
+        ));
+    }
+    (true, None)
 }
 
 /// Every claim the validation pass emitted, in one flat list.
@@ -4114,6 +4232,85 @@ mod tests {
             steps: &steps,
         };
         eval_validate_claims_wellformed(&step, &ctx)
+    }
+
+    /// Drive `reconcile_covers_every_defect` with `defect_count`
+    /// review defects and the given reconciliation outputs.
+    fn run_reconcile_eval(defect_count: usize, outputs: Value) -> (bool, Option<String>) {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "reconcile-review")
+            .unwrap();
+        let defects: Vec<Value> = (0..defect_count)
+            .map(|i| json!({"lens": "maintainer", "where": "a.c:1", "what": format!("d{i}")}))
+            .collect();
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(
+            "review".to_string(),
+            step_state(json!({"defects": defects})),
+        );
+        steps.insert(step.id.clone(), step_state(outputs));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        eval_reconcile_covers_every_defect(&step, &ctx)
+    }
+
+    fn instruction(covers: Vec<i64>) -> Value {
+        json!({"covers": covers, "target": "source", "where": "a.c:1",
+               "do": "fix it", "why": "a.c:1 is wrong"})
+    }
+
+    #[test]
+    fn reconcile_eval_accepts_full_coverage_including_a_merge() {
+        // Two lenses reporting the same problem merge into one
+        // instruction covering both indices — the point of the step.
+        assert_eq!(
+            run_reconcile_eval(
+                3,
+                json!({"instructions": [instruction(vec![0, 2])],
+                                         "dropped": [{"covers": [1], "reason": "disproved at a.c:9"}]})
+            ),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn reconcile_eval_rejects_a_silently_dropped_defect() {
+        let (ok, reason) =
+            run_reconcile_eval(3, json!({"instructions": [instruction(vec![0, 1])]}));
+        assert!(!ok);
+        let reason = reason.unwrap();
+        assert!(
+            reason.contains("#2"),
+            "must name the abandoned defect: {reason}"
+        );
+        assert!(reason.contains("neither instructions[].covers nor dropped[].covers"));
+    }
+
+    #[test]
+    fn reconcile_eval_rejects_an_out_of_range_index() {
+        let (ok, reason) =
+            run_reconcile_eval(2, json!({"instructions": [instruction(vec![0, 1, 7])]}));
+        assert!(!ok);
+        assert!(reason.unwrap().contains("[7]"));
+    }
+
+    #[test]
+    fn reconcile_eval_rejects_an_entry_that_covers_nothing() {
+        let (ok, reason) = run_reconcile_eval(1, json!({"instructions": [instruction(vec![])]}));
+        assert!(!ok);
+        assert!(reason.unwrap().contains("covers is empty"));
+    }
+
+    /// A clean review has nothing to reconcile, so the step is
+    /// vacuously satisfied rather than failing for lack of output.
+    #[test]
+    fn reconcile_eval_passes_when_the_review_reported_nothing() {
+        assert_eq!(run_reconcile_eval(0, json!({})), (true, None));
     }
 
     #[test]
@@ -6994,6 +7191,24 @@ mod tests {
         })
     }
 
+    /// One reconciled instruction covering every defect index the
+    /// review reported, which is what `reconcile_covers_every_defect`
+    /// requires.
+    fn ok_reconcile_review(defect_count: usize) -> Value {
+        json!({
+            "instructions": [{
+                "covers": (0..defect_count as i64).collect::<Vec<_>>(),
+                "target": "source",
+                "where": "ctree.c:42",
+                "do": "widen the bound by one",
+                "why": "ctree.c:42 indexes one past the end"
+            }],
+            "contradictions": [],
+            "dropped": [],
+            "analysis": "one instruction covers the reported defects"
+        })
+    }
+
     fn with_fix_review_attempt(
         mut driver: ScriptedDriver,
         wf: &Workflow,
@@ -7699,6 +7914,7 @@ mod tests {
             .with("commit", 2, ok_commit())
             .with("build", 1, ok_build_clean())
             .with("build", 2, ok_build_clean())
+            .with("reconcile-review", 1, ok_reconcile_review(1))
             .with(
                 "orchestrator",
                 1,
@@ -7720,10 +7936,12 @@ mod tests {
             })
             .collect();
         assert_eq!(review_attempts, vec![1, 2]);
-        // Routing now flows review → orchestrator → write-patch.
+        // Routing now flows review → reconcile-review → orchestrator
+        // → write-patch: the lenses are merged into one instruction
+        // set before anything routes on them.
         assert!(trace.events.iter().any(|e| matches!(
             e,
-            TraceEvent::BranchedTo { from, to } if from == "review" && to == "orchestrator"
+            TraceEvent::BranchedTo { from, to } if from == "review" && to == "reconcile-review"
         )));
         assert!(trace.events.iter().any(|e| matches!(
             e,
@@ -7837,6 +8055,17 @@ mod tests {
             .with("commit", 2, ok_commit())
             .with("build", 1, ok_build_clean())
             .with("build", 2, ok_build_clean())
+            .with("reconcile-review", 1, json!({
+                "instructions": [{
+                    "covers": [0],
+                    "target": "commit_message",
+                    "where": "commit message, second paragraph",
+                    "do": "name only the entry points that actually bypass check_ops_safe",
+                    "why": "the claim overstates the set"
+                }],
+                "contradictions": [],
+                "dropped": []
+            }))
             .with(
                 "orchestrator",
                 1,
@@ -7849,10 +8078,11 @@ mod tests {
         eprintln!("{}", trace.pretty());
         assert_eq!(trace.status, WorkflowStatus::Success);
 
-        // Routing now flows review → orchestrator → write-commit-message.
+        // Routing now flows review → reconcile-review → orchestrator
+        // → write-commit-message.
         assert!(trace.events.iter().any(|e| matches!(
             e,
-            TraceEvent::BranchedTo { from, to } if from == "review" && to == "orchestrator"
+            TraceEvent::BranchedTo { from, to } if from == "review" && to == "reconcile-review"
         )));
         assert!(trace.events.iter().any(|e| matches!(
             e,

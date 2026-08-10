@@ -1052,6 +1052,57 @@ workflow snapshot resumes so already-settled edits, commits, builds, and review
 steps are not repeated. Completed outer todos are skipped. The final
 `series-assessment` has its own resumable inner snapshot as well.
 
+### One reconciled instruction set, not N lens verdicts
+
+The review lenses run as a parallel fan-out over one shared gather.
+Each is told the OTHER lenses exist — `parallel_lenses` carries
+`lens_identity`, which is `{type, name, id, reason}` — and none is
+shown a word of what another concluded. The consolidator that merges
+them does not adjudicate either: its rules are dedup, promote
+prose-only bugs, preserve unresolved work, and take the HIGHEST
+severity when lenses disagree. Every one of those is additive, so two
+lenses demanding incompatible things both survive into `defects[]`.
+
+`reconcile-review` is the step that resolves them. It runs after
+`review` and before `orchestrator`, on the slow coding agent, with
+`actions: []` — it adjudicates the lenses' own evidence and must not
+re-fetch. It receives:
+
+- `review.lens_reports`, a driver-owned copy of each lens's structured
+  output, unmerged. This is the only place a contradiction is visible;
+  the consolidated view has already flattened it.
+- the lenses' shared gather, seeded through `depends_on: ["review"]`
+  now that the structured lens path calls `store_gathered`.
+- a Rust-rendered NUMBERED REVIEW DEFECTS block plus the current
+  patch. Rust owns the numbering for the same reason it owns the todo
+  list: if the model restated the defect set it would also be choosing
+  what the set contains, and a defect it declined to restate would be
+  indistinguishable from one it resolved. The patch is best-effort —
+  when `git diff HEAD~1` fails the block says so rather than failing
+  the step, because the lens reports quote their own evidence.
+
+It emits `instructions[]` (each with a `target` of `source` or
+`commit_message`), `contradictions[]` recording how each conflict was
+resolved and why, and `dropped[]` for defects deliberately not carried
+forward. `write-patch`, `write-commit-message` and the orchestrator all
+read the reconciled set as authoritative, with the raw per-lens
+defects kept as context.
+
+The `reconcile_covers_every_defect` builtin enforces the one property
+that makes this safe: every numbered defect appears in some
+`instructions[].covers` or `dropped[].covers`. That is a quantifier
+over two typed arrays, which the expression language cannot state, so
+it is a builtin for the same reason `validate_claims_wellformed` is
+one. A defect that simply vanished would be re-reported by the same
+lens on the next cycle, which is the oscillation this step exists to
+stop.
+
+Being a plain non-lensed step, its malformed replies are repaired by
+the shared loop every workflow step uses — `WORKFLOW_RESPONSE_RETRIES`
+attempts, each re-prompted with `JSON_REPAIR_PREFIX` and the
+validator's own error. There is no reconciliation-specific repair path
+and there must not be one.
+
 ### Fix Flow Invariants
 
 - `[INVALID]` after research requires evidence that existed before the

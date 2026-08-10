@@ -62,6 +62,12 @@ fn orchestrator_picks(next_step: &str) -> Value {
     ))
 }
 
+fn reconcile_one(target: &str, where_: &str) -> Value {
+    fake_messages_response(&format!(
+        "Reconciled the lenses.\n{{\"instructions\": [{{\"covers\": [0],          \"target\": \"{target}\", \"where\": \"{where_}\",          \"do\": \"apply the reviewed correction\",          \"why\": \"{where_} still holds the wrong value\"}}],          \"contradictions\": [], \"dropped\": [],          \"analysis\": \"one lens reported; nothing to adjudicate\"}}"
+    ))
+}
+
 fn review_ledger_response(kind: &str, status: &str) -> Value {
     fake_messages_response(&format!(
         "{{\"ledger\": [{{\"id\": \"R1\", \"kind\": \"{kind}\", \"status\": \"{status}\", \
@@ -1093,6 +1099,7 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
         ),
     ]);
     responses.extend(dirty_source_review_responses(&workflow));
+    responses.push_back(reconcile_one("source", "a.c"));
     responses.push_back(review_ledger_response("source", "open"));
     responses.push_back(orchestrator_picks("write-patch"));
     responses.push_back(fake_messages_response(
@@ -1191,6 +1198,7 @@ async fn commit_message_review_retry_includes_old_message_and_patch_context() {
         ),
     ]);
     responses.extend(dirty_commit_message_review_responses(&workflow));
+    responses.push_back(reconcile_one("commit_message", "commit message"));
     responses.push_back(review_ledger_response("commit_message", "open"));
     responses.push_back(orchestrator_picks("write-commit-message"));
     responses.extend(vec![fake_messages_response(
@@ -1519,4 +1527,76 @@ fn turn_logger_session_dir_does_not_double() {
     // Third component is the session uuid; just check it parses
     // as something non-empty.
     assert!(!comps[2].as_os_str().is_empty());
+}
+
+/// `reconcile-review` is a plain (non-lensed) step, so its malformed
+/// replies must be repaired by the SAME loop every other workflow step
+/// uses — `WORKFLOW_RESPONSE_RETRIES` attempts, each re-prompted with
+/// the shared `JSON_REPAIR_PREFIX` plus the validator's own error —
+/// and not by anything bespoke to the reconciliation pass.
+///
+/// Driven through a one-step workflow that mirrors reconcile-review's
+/// contract rather than the whole fix workflow, so the assertion is
+/// about the repair path and cannot be knocked over by unrelated
+/// fixture drift.
+#[tokio::test]
+async fn reconcile_style_step_repairs_malformed_json_through_the_shared_loop() {
+    let workflow = parse_workflow(
+        &json!({
+            "$schema_version": 1,
+            "id": "reconcile-repair",
+            "steps": [{
+                "id": "reconcile-review",
+                "agent": "code",
+                "mode": "review",
+                "actions": [],
+                "prompt": "Reconcile the lenses.",
+                "outputs": {
+                    "instructions": {"type": "array<object>"},
+                    "analysis": {"type": "string", "optional": true}
+                }
+            }]
+        })
+        .to_string(),
+    )
+    .expect("test workflow must validate");
+
+    let mut responses = VecDeque::new();
+    // Prose wrapped around a fenced object that omits the required
+    // `instructions`.
+    responses.push_back(fake_messages_response(
+        "Here is my reconciliation:\n```json\n{\"analysis\": \"forgot the instructions\"}\n```",
+    ));
+    responses.push_back(fake_messages_response(
+        "{\"instructions\": [{\"covers\": [0], \"target\": \"source\", \
+          \"where\": \"a.c:1\", \"do\": \"fix it\", \"why\": \"a.c:1 is wrong\"}], \
+          \"analysis\": \"reconciled\"}",
+    ));
+    let (port, requests) = spawn_recording_mock(responses).await;
+
+    let inputs = derive_inputs(&workflow, Map::new());
+    let (_guard, workspace) = fresh_git_repo();
+    let mut driver = LlmDriver::new(workspace, workflow.clone())
+        .with_fast(fast_env_pointing_at(port))
+        .with_slow(slow_env_pointing_at(port))
+        .with_code(slow_env_pointing_at(port));
+
+    let trace = run(&workflow, &mut driver, inputs).await;
+    eprintln!("{}", trace.pretty());
+    assert_eq!(trace.status, WorkflowStatus::Success);
+
+    let requests = requests.lock().await.join("\n---REQUEST---\n");
+    assert!(
+        requests.contains(
+            "IMPORTANT: Reply with exactly one raw, unfenced JSON object matching OUTPUT SCHEMA"
+        ),
+        "malformed reply was not re-prompted with the shared JSON repair prefix"
+    );
+    assert!(
+        requests.contains(
+            "Validator error from the previous attempt: missing required model output(s): \
+             instructions"
+        ),
+        "the repair prompt did not carry the validator error naming the missing output"
+    );
 }

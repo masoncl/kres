@@ -168,6 +168,47 @@ type GatheredData = (Vec<Value>, Vec<Value>);
 /// source under review.
 pub(crate) const COMMIT_MSG_SCRATCH: &str = ".kres-commit-msg.tmp";
 
+/// Driver-owned output carrying each lens's own structured result,
+/// verbatim, alongside the consolidated one.
+///
+/// The consolidator merges lenses; it does not adjudicate between
+/// them, and its merge is additive — highest severity wins, prose-only
+/// bugs get promoted, unsupported negative claims become followups. So
+/// two lenses demanding incompatible things both survive into the
+/// consolidated set. A step that reconciles them needs to see who said
+/// what, which the consolidated output no longer records.
+///
+/// Rust owns this value. It is a copy of the typed per-lens outputs,
+/// never a model's description of them.
+pub(crate) const LENS_REPORTS_OUTPUT: &str = "lens_reports";
+
+/// The step that adjudicates the review lenses into one instruction
+/// set. Named here because Rust renders its numbered-defect block and
+/// the `reconcile_covers_every_defect` builtin checks against it.
+pub(crate) const RECONCILE_REVIEW_STEP: &str = "reconcile-review";
+
+/// Pack the per-lens structured outputs into [`LENS_REPORTS_OUTPUT`],
+/// but only for a step that declares it.
+fn add_lens_reports_output(
+    step: &Step,
+    outputs: &mut Map<String, Value>,
+    per_lens: &StructuredLensOutputs,
+) {
+    if !step.outputs.contains_key(LENS_REPORTS_OUTPUT) {
+        return;
+    }
+    let reports: Vec<Value> = per_lens
+        .iter()
+        .map(|(lens_id, lens_outputs)| {
+            let mut entry = Map::new();
+            entry.insert("lens".to_string(), Value::String(lens_id.clone()));
+            entry.insert("output".to_string(), Value::Object(lens_outputs.clone()));
+            Value::Object(entry)
+        })
+        .collect();
+    outputs.insert(LENS_REPORTS_OUTPUT.to_string(), Value::Array(reports));
+}
+
 /// True when a staged path is kres's own scratch bookkeeping rather
 /// than workspace source.
 ///
@@ -2142,14 +2183,21 @@ impl Driver for LlmDriver {
                 )
                 .await
                 .map_err(|e| format!("step '{}' shared lens fan-out: {e}", step.id))?;
+            // The gather every lens reasoned over. Cached before the
+            // per-lens outputs are unpacked so a dependent step that
+            // adjudicates them seeds from the same source instead of
+            // re-fetching it.
+            let shared_gather = (fanout.symbols.clone(), fanout.context.clone());
             let per_lens = structured_review_lens_outputs(step, fanout)?;
             // Run the same LLM consolidator used by every other lensed
             // step. The consolidator output is the single source of
             // truth for routing.
-            let outputs = self
+            let mut outputs = self
                 .consolidate(step, ctx, &per_lens)
                 .await
                 .map_err(|e| e.to_string())?;
+            self.store_gathered(&step.id, shared_gather.0, shared_gather.1);
+            add_lens_reports_output(step, &mut outputs, &per_lens);
             return Ok(LensFanOutConsolidate::Outputs(outputs));
         }
 
@@ -4632,6 +4680,7 @@ fn is_driver_overwritten_output(name: &str) -> bool {
             | "summary_written"
             | "severity_written"
             | "citation_check"
+            | LENS_REPORTS_OUTPUT
     )
 }
 
@@ -4647,6 +4696,7 @@ fn is_machine_populated_output(name: &str) -> bool {
             | "severity_written"
             | "review_dispute"
             | "citation_check"
+            | LENS_REPORTS_OUTPUT
     )
 }
 
@@ -5343,6 +5393,16 @@ async fn correction_context_for_step(
     if let Some(block) = prior_refutations_block(step, ctx) {
         return Ok(format!("{}{block}", previous_rejection_block(step, ctx)));
     }
+    if step.id == RECONCILE_REVIEW_STEP {
+        // Best-effort: the patch is useful context, but this step
+        // adjudicates lens reports that already quote their own
+        // evidence. Losing the diff must not cost the whole
+        // reconciliation — and a step that hard-failed here would
+        // send the run back around the review cycle it exists to
+        // shorten.
+        let diff = git_diff_head_parent(workspace).await;
+        return Ok(render_reconcile_review_context(diff.as_deref(), ctx));
+    }
     if commit_message_is_being_corrected(step, ctx) {
         let message = git_head_commit_message(workspace).await?;
         let diff = git_diff_head_parent(workspace).await?;
@@ -5498,6 +5558,63 @@ fn render_previous_patch_diff_block(diff: &str) -> String {
          code_edits for the corrected patch.\n{}\
          --- END PREVIOUS PATCH FROM `git diff HEAD~1` ---",
         render_readonly_payload("CURRENT PATCH", "git diff HEAD~1", diff),
+    )
+}
+
+/// Number the review's defects so the reconciliation step can cite
+/// them by index and `reconcile_covers_every_defect` can check the
+/// citation.
+///
+/// Rust owns the numbering for the same reason it owns the todo list:
+/// if the model restated the defect set it would also be choosing what
+/// the set contains, and a defect it declined to restate would be
+/// indistinguishable from one it resolved.
+fn render_reconcile_review_context(diff: Result<&str, &String>, ctx: &ExecContext<'_>) -> String {
+    let defects = ctx
+        .steps
+        .get("review")
+        .and_then(|state| state.outputs.get("defects"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut numbered = String::new();
+    for (index, defect) in defects.iter().enumerate() {
+        let field = |key: &str| {
+            defect
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        numbered.push_str(&format!(
+            "#{index} [lens: {}] {}\n    {}\n",
+            field("lens"),
+            field("where"),
+            field("what")
+        ));
+    }
+    if numbered.is_empty() {
+        numbered.push_str("(none)\n");
+    }
+    format!(
+        "\n\n--- NUMBERED REVIEW DEFECTS ---\n\
+         These are the review's defects, one per index, exactly as the lenses reported them. \
+         The indices are assigned here and are the ONLY way to refer to a defect: every entry \
+         you emit carries a `covers` array of these numbers, and every index below must appear \
+         in `covers` on some instruction or some dropped entry.\n\n\
+         {numbered}\
+         --- END NUMBERED REVIEW DEFECTS ---{}",
+        match diff {
+            Ok(diff) => render_readonly_payload("CURRENT PATCH", "git diff HEAD~1", diff),
+            Err(error) => format!(
+                "\n\n--- CURRENT PATCH UNAVAILABLE ---\n\
+                 `git diff HEAD~1` did not run: {error}\n\
+                 Reconcile from the lens reports and the source they quote. Do not treat the \
+                 missing diff as evidence that a defect is stale.\n\
+                 --- END CURRENT PATCH UNAVAILABLE ---"
+            ),
+        },
     )
 }
 

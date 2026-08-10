@@ -874,8 +874,22 @@
         "is genuinely needed, explicitly justify it in analysis with cited source or review",
         "evidence that rules the prior shape out.",
         "",
+        "RECONCILED REVIEW INSTRUCTIONS (authoritative when non-empty):",
+        "The review lenses ran in parallel and could not see each other, so reconcile-review",
+        "merged their duplicates, resolved their contradictions, and dropped what the source",
+        "disproved or the fix contract put out of scope. Work the `target: source` entries in",
+        "the order given. Do NOT reopen a resolved contradiction or reinstate a dropped defect;",
+        "if you believe a resolution is wrong, say so in review_dispute with cited source.",
+        "{{reconcile-review.instructions || '[]'}}",
+        "",
+        "How reconcile-review resolved the lens conflicts, and what it dropped:",
+        "{{reconcile-review.contradictions || '[]'}}",
+        "{{reconcile-review.dropped || '[]'}}",
+        "",
         "PATCH FEEDBACK FROM PRIOR BUILD OR REVIEW ATTEMPT, IF ANY:",
         "{{compile-triage.analysis || ''}}",
+        "The raw per-lens defects below are context for the reconciled instructions above,",
+        "not a second worklist. When they disagree, the reconciled set wins.",
         "{{review.source_defects || ''}}",
         "",
         "REVIEW LEDGER:",
@@ -1111,7 +1125,20 @@
         "- potential but unproven candidates: {{fixes-tag-search.unproven_fixes_candidates || ''}}",
         "- search analysis: {{fixes-tag-search.analysis || ''}}",
         "",
+        "RECONCILED REVIEW INSTRUCTIONS (authoritative when non-empty):",
+        "The review lenses ran in parallel and could not see each other, so reconcile-review",
+        "merged their duplicates, resolved their contradictions, and dropped what the source",
+        "disproved or the fix contract put out of scope. Work the `target: commit_message`",
+        "entries in the order given, and do not reinstate a dropped defect.",
+        "{{reconcile-review.instructions || '[]'}}",
+        "",
+        "How reconcile-review resolved the lens conflicts, and what it dropped:",
+        "{{reconcile-review.contradictions || '[]'}}",
+        "{{reconcile-review.dropped || '[]'}}",
+        "",
         "COMMIT-MESSAGE FEEDBACK FROM PRIOR REVIEW ATTEMPT, IF ANY:",
+        "The raw per-lens defects below are context for the reconciled instructions above,",
+        "not a second worklist. When they disagree, the reconciled set wins.",
         "{{review.commit_message_defects || ''}}",
         "",
         "REVIEW LEDGER:",
@@ -1588,6 +1615,11 @@
             }
           },
           "description": "Per-bug coverage outcomes from the bug-coverage lens. Each entry has a bug id (from metadata.bugs or research.fix_plan, may be empty for single-bug findings), an outcome (fixed | invalidated | deferred | unresolved), and evidence (file:line, commit ref, or todo id). Consumed by the record-results reaper step to persist per-bug results into the finding's metadata.yaml."
+        },
+        "lens_reports": {
+          "type": "array<object>",
+          "optional": true,
+          "description": "Machine-populated. Each lens's own structured output, verbatim, as [{lens, output}]. The consolidator merges lenses but does not adjudicate between them, and its merge is additive, so incompatible demands from two lenses both survive into defects[]. reconcile-review reads this to see who said what; the consolidated output no longer records that."
         }
       },
       "eval": {
@@ -1595,17 +1627,231 @@
         "expr": "clean == true",
         "on_fail": {
           "action": "branch_to",
-          "branch_to": "orchestrator",
+          "branch_to": "reconcile-review",
           "max_attempts": 10,
           "on_exhausted": "exit_failure"
         }
       }
     },
     {
+      "id": "reconcile-review",
+      "title": "Reconcile the review lenses into one instruction set",
+      "depends_on": [
+        "review"
+      ],
+      "run_if": "research.research_status == 'confirmed' && review.clean == false",
+      "agent": "code",
+      "mode": "review",
+      "actions": [],
+      "outputs": {
+        "instructions": {
+          "type": "array<object>",
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "covers",
+                "target",
+                "where",
+                "do",
+                "why"
+              ],
+              "properties": {
+                "covers": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  },
+                  "description": "Indices from the NUMBERED REVIEW DEFECTS block that this one instruction discharges. Merge duplicates: two lenses reporting the same problem are one instruction covering both indices."
+                },
+                "target": {
+                  "type": "string",
+                  "enum": [
+                    "source",
+                    "commit_message"
+                  ],
+                  "description": "Which worker can carry this out. source means write-patch; commit_message means write-commit-message."
+                },
+                "where": {
+                  "type": "string",
+                  "description": "file:line or file:function the change applies to. For a commit_message instruction, name the paragraph, trailer, or line."
+                },
+                "do": {
+                  "type": "string",
+                  "description": "The concrete change to make, stated so the worker can act without re-reading the lens reports. Imperative and specific: what to add, remove, or reword, not the objection that motivated it."
+                },
+                "why": {
+                  "type": "string",
+                  "description": "The defect this discharges, with the file:line or quoted source that establishes it."
+                }
+              }
+            }
+          },
+          "description": "The single cohesive instruction set for the next worker pass. Ordered most important first."
+        },
+        "contradictions": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "covers",
+                "lenses",
+                "conflict",
+                "resolution",
+                "rationale"
+              ],
+              "properties": {
+                "covers": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "lenses": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "conflict": {
+                  "type": "string",
+                  "description": "What the two lenses each demand, stated so the incompatibility is visible."
+                },
+                "resolution": {
+                  "type": "string",
+                  "description": "Which demand the instruction set follows, and what the other lens gets instead (nothing, a narrower version, or a commit-message note)."
+                },
+                "rationale": {
+                  "type": "string",
+                  "description": "Why that resolution is correct, from cited source or the fix contract — not which lens sounded more confident."
+                }
+              }
+            }
+          },
+          "description": "Lens demands that cannot both be satisfied, and how the instruction set resolves each. Empty when the lenses agreed."
+        },
+        "dropped": {
+          "type": "array<object>",
+          "optional": true,
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "covers",
+                "reason"
+              ],
+              "properties": {
+                "covers": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer"
+                  }
+                },
+                "reason": {
+                  "type": "string",
+                  "description": "Why this defect produces no instruction, with the file:line or quoted source that disproves it, or the scope statement from the fix contract that puts it out of scope."
+                }
+              }
+            }
+          },
+          "description": "Defects deliberately not carried forward. A defect may only leave the set through here."
+        },
+        "analysis": {
+          "type": "string",
+          "optional": true
+        }
+      },
+      "eval": {
+        "type": "builtin",
+        "name": "reconcile_covers_every_defect",
+        "on_fail": {
+          "action": "repeat",
+          "max_attempts": 3,
+          "on_exhausted": "continue"
+        }
+      },
+      "prompt": [
+        "Step 8b: RECONCILE THE REVIEW LENSES.",
+        "",
+        "Several review lenses ran in parallel on this same patch. Each saw the same source",
+        "and none saw any other's output, so they can and do contradict each other: one lens",
+        "asks for a check to be added and another calls the same check scope creep. Handing",
+        "both to the patch author is what makes a fix cycle oscillate instead of converge.",
+        "",
+        "Your job is to turn those reports into ONE instruction set the next worker pass can",
+        "execute without further adjudication. You are not reviewing the patch again and you",
+        "are not looking for new defects.",
+        "",
+        "Do all of this:",
+        "- MERGE duplicates. Two lenses describing the same problem are one instruction whose",
+        "  `covers` names both defect numbers.",
+        "- RESOLVE contradictions. When two demands cannot both be met, decide which one the",
+        "  patch follows and record the pair in `contradictions` with the reason. Decide from",
+        "  cited source and the fix contract below, not from which lens sounded more certain.",
+        "- DROP what the gathered source disproves, and what the fix contract puts out of",
+        "  scope. Say which in `reason`. A defect leaves the set only through `dropped`.",
+        "- ORDER what remains: correctness before style, source before commit message.",
+        "- SPLIT by worker. `target: source` goes to write-patch, `target: commit_message`",
+        "  goes to write-commit-message.",
+        "",
+        "Scope is a real defect class, not a tiebreaker. If the review is asking for changes",
+        "the CURRENT FIX TODO does not call for, drop them and say so — but only against the",
+        "contract below, never because the change looked large.",
+        "",
+        "Every index in the NUMBERED REVIEW DEFECTS block must appear in exactly one of",
+        "`instructions[].covers` or `dropped[].covers`. A defect you neither instruct on nor",
+        "drop will be reported again by the same lens on the next cycle.",
+        "",
+        "Write `do` so the worker never needs the lens reports: state the change, not the",
+        "objection. Cite the file:line that establishes each `why` from the source you were",
+        "given. You have no gathering actions — the lenses' own gathered source is attached,",
+        "along with the current patch. If a defect cannot be judged from it, that is not a",
+        "reason to drop it: carry it forward as an instruction that names the missing",
+        "evidence in `why`.",
+        "",
+        "BROADER FIX SERIES PLAN:",
+        "{{research.fix_plan || workflow.fix_series_plan || ''}}",
+        "",
+        "CURRENT FIX TODO (the scope contract for this commit):",
+        "{{workflow.current_fix_todo || ''}}",
+        "",
+        "CONSOLIDATED REVIEW OUTPUT:",
+        "- analysis: {{review.analysis || ''}}",
+        "- source_defects: {{review.source_defects || '[]'}}",
+        "- commit_message_defects: {{review.commit_message_defects || '[]'}}",
+        "- unresolved_risks: {{review.unresolved_risks || '[]'}}",
+        "",
+        "PER-LENS REPORTS (each lens's own output, unmerged — this is where a contradiction",
+        "is visible, because the consolidated view above has already flattened it):",
+        "{{review.lens_reports || '[]'}}",
+        "",
+        "REVIEW LEDGER (complaint history across cycles; an entry already resolved here and",
+        "not regressed by the current patch is a drop, with the ledger as the reason):",
+        "{{review_ledger.ledger || ''}}",
+        "",
+        "YOUR PRIOR ATTEMPTS AT THIS RECONCILIATION:",
+        "{{reconcile-review.prior_attempts || ''}}",
+        "",
+        "Do not emit code_edits or code_output. Do not amend commits. You produce",
+        "instructions only; the worker steps make the changes.",
+        "",
+        "Emit ONE JSON object and nothing else. No prose preamble, no Markdown fences."
+      ]
+    },
+    {
       "id": "orchestrator",
       "title": "Pick the next step based on review + prior-attempt history",
       "depends_on": [
-        "review"
+        "review",
+        "reconcile-review"
       ],
       "run_if": "research.research_status == 'confirmed' && ((write-patch.code_changes_emitted == false && write-patch.review_dispute == '') || write-commit-message.commit_message_written == false || review.clean == false || build.result == 'failed')",
       "agent": "slow",
@@ -1659,6 +1905,18 @@
         "- defects: {{review.defects || '[]'}}",
         "- source_defects: {{review.source_defects || '[]'}}",
         "- commit_message_defects: {{review.commit_message_defects || '[]'}}",
+        "",
+        "RECONCILED INSTRUCTION SET (reconcile-review merged the parallel lenses into one",
+        "non-contradictory worklist; every review defect is either instructed on here or",
+        "listed as dropped with a reason). Route on this, not on the raw defect counts: a",
+        "review with many defects that reconcile to commit-message-only work is a",
+        "write-commit-message routing, and defects that were all dropped are not a reason to",
+        "route anywhere. The instruction `target` field already says which worker each item",
+        "belongs to; pass the relevant entries through in your instruction.",
+        "- instructions: {{reconcile-review.instructions || '[]'}}",
+        "- contradictions resolved: {{reconcile-review.contradictions || '[]'}}",
+        "- dropped: {{reconcile-review.dropped || '[]'}}",
+        "- analysis: {{reconcile-review.analysis || ''}}",
         "- unresolved_risks: {{review.unresolved_risks || '[]'}}",
         "- outcomes: {{review.outcomes || '[]'}}",
         "",

@@ -313,6 +313,14 @@ pub struct LensFanoutOutput {
     pub fast_rounds: u8,
     pub attempted: usize,
     pub slow_variant_count: usize,
+    /// The shared gather every lens in this fan-out reasoned over.
+    ///
+    /// Surfaced so the caller can cache it for dependent steps
+    /// (`Driver::store_gathered`). A step that adjudicates the lens
+    /// outputs needs the same source the lenses saw, and re-fetching
+    /// it would be paying twice for bytes already in hand.
+    pub symbols: Vec<Value>,
+    pub context: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -2543,6 +2551,8 @@ impl AgentRunner {
         Ok(LensFanoutOutput {
             outputs,
             failures,
+            symbols: prepared.symbols.clone(),
+            context: prepared.context.clone(),
             fast_rounds: prepared.fast_rounds,
             attempted: prepared
                 .slow_variants

@@ -211,6 +211,8 @@ const CACHED_PREFIX_FIELDS: &[&str] = &[
 const SYNTHESIS_SESSION_LAYER: &[&str] = &["stable_instructions"];
 const SYNTHESIS_TASK_LAYER: &[&str] = &["output_schema"];
 const LENS_SHARED_CACHE_FIELDS: &[&str] = &[
+    "stable_instructions",
+    "output_schema",
     "question",
     "symbols",
     "context",
@@ -254,7 +256,20 @@ const LENS_SESSION_CACHE_FIELDS: &[&str] = &["common_skills", "previous_findings
 /// The rest of the shared prefix: everything scoped to one task. Must
 /// partition `LENS_SHARED_CACHE_FIELDS` together with
 /// `LENS_SESSION_CACHE_FIELDS`, or the per-lens delta changes shape.
-const LENS_TASK_CACHE_FIELDS: &[&str] = &["question", "symbols", "context", "skills", "plan"];
+///
+/// `stable_instructions` and `output_schema` ride here rather than in
+/// the session layer: they are stable across a task's lenses, but the
+/// session head has to stay byte-identical to `prompt::session_cache_head`
+/// so the prioritization agent can present the same bytes.
+const LENS_TASK_CACHE_FIELDS: &[&str] = &[
+    "stable_instructions",
+    "output_schema",
+    "question",
+    "symbols",
+    "context",
+    "skills",
+    "plan",
+];
 
 /// Abstraction over the main-agent's data-fetch capability.
 /// Implementations route followups to MCP tools, grep, read, git.
@@ -2189,6 +2204,14 @@ impl AgentRunner {
         let (symbols, context) = crate::symbol::canonicalize_prompt_evidence(&symbols, &context);
         let previous_findings = kres_core::findings_for_prompt_history(&ctx.previous_findings);
         let mut shared_cp = CodePrompt::new(prompt)
+            // Both are empty on the REPL task path and set by a
+            // workflow step. They must be attached here: the schema
+            // block used to live inside `prompt`, so moving it into its
+            // own field silently dropped every lens's output contract
+            // and made all four lenses of fix.json's review step fail
+            // validation and go to repair.
+            .with_stable_instructions(&ctx.stable_instructions)
+            .with_output_schema(&ctx.output_schema)
             .with_symbols(&symbols)
             .with_context(&context)
             .with_previous_findings(&previous_findings);
@@ -3279,6 +3302,49 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lens must be shown the output contract it is validated against.
+    ///
+    /// The schema block used to live inside `prompt`, so
+    /// `CodePrompt::new(prompt)` carried it. Moving it to its own field
+    /// dropped it from this path entirely: on a live fix run all four
+    /// lenses of the review step failed validation at once and went to
+    /// `[review lenses] repairing 4 lens output(s)`. The run still
+    /// produced output, which is why it was easy to miss.
+    #[test]
+    fn the_lens_prefix_carries_the_output_contract() {
+        use std::collections::BTreeSet;
+        let shared: BTreeSet<&str> = LENS_SHARED_CACHE_FIELDS.iter().copied().collect();
+        let session: BTreeSet<&str> = LENS_SESSION_CACHE_FIELDS.iter().copied().collect();
+        let task: BTreeSet<&str> = LENS_TASK_CACHE_FIELDS.iter().copied().collect();
+
+        for field in ["stable_instructions", "output_schema"] {
+            assert!(
+                shared.contains(field),
+                "{field} must not leak into every lens delta"
+            );
+            assert!(task.contains(field), "{field} belongs to the per-task head");
+            assert!(
+                !session.contains(field),
+                "{field} in the session head would break byte-identity with \
+                 prompt::session_cache_head"
+            );
+        }
+
+        // And the contract actually reaches a rendered lens prefix.
+        let syms = vec![json!({"name": "f"})];
+        let cp = CodePrompt::new("audit this")
+            .with_output_schema("--- OUTPUT SCHEMA ---\nclean: boolean")
+            .with_symbols(&syms);
+        let layered = cp
+            .to_layered_documents(LENS_SESSION_CACHE_FIELDS, LENS_TASK_CACHE_FIELDS)
+            .unwrap();
+        assert!(
+            layered.task.contains("OUTPUT SCHEMA"),
+            "the per-task cached head must carry the schema"
+        );
+        assert!(!layered.delta.contains("OUTPUT SCHEMA"));
+    }
 
     /// The session and task key sets must exactly partition the shared
     /// prefix. `lens_suffix` is still computed from the union, so a key

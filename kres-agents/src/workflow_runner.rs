@@ -893,7 +893,9 @@ impl LlmDriver {
             let mut pending_followups: Vec<crate::followup::Followup> = Vec::new();
             for json_retry in 0..=WORKFLOW_RESPONSE_RETRIES {
                 let allowed = effective_actions(step, &self.workflow);
-                let runner = agent_runner_with_gated_fetcher(runner_base, allowed);
+                let declares_no_actions = step.actions.as_ref().is_some_and(|list| list.is_empty());
+                let runner =
+                    agent_runner_with_gated_fetcher(runner_base, allowed, declares_no_actions);
                 let runner = &runner;
                 let mode = match self.mode_for(step) {
                     Some(crate::workflow::Mode::Coding) => kres_core::TaskMode::Coding,
@@ -2046,7 +2048,8 @@ impl Driver for LlmDriver {
         };
         // Same per-step gating as the regular AgentRunner path.
         let allowed = effective_actions(step, &self.workflow);
-        let runner = agent_runner_with_gated_fetcher(runner, allowed);
+        let declares_no_actions = step.actions.as_ref().is_some_and(|list| list.is_empty());
+        let runner = agent_runner_with_gated_fetcher(runner, allowed, declares_no_actions);
 
         let lenses: Vec<kres_core::LensSpec> = step
             .lenses
@@ -5632,14 +5635,23 @@ fn is_mutating_git_followup(command: &str) -> bool {
 fn agent_runner_with_gated_fetcher(
     base: &Arc<crate::pipeline::AgentRunner>,
     allowed: Vec<crate::workflow::ActionType>,
+    declares_no_actions: bool,
 ) -> Arc<crate::pipeline::AgentRunner> {
-    // A step that allows no actions has nothing a gather round can do,
-    // so it gets none. It still ran two: one where the agent asked to
-    // load a skill file and one where it said it was ready, 52s apiece
-    // on a step whose evidence was already seeded by its dependencies.
-    // Across a 113-finding batch that was 99 model calls spent deciding
-    // not to fetch anything.
-    let max_fast_rounds = if allowed.is_empty() {
+    // A step that declares `actions: []` has nothing a gather round can
+    // do, so it gets none. The refuters still ran two: one where the
+    // agent asked to load a skill file and one where it said it was
+    // ready, 52s apiece on a step whose evidence was already seeded by
+    // its dependencies -- 99 model calls across a 113-finding batch
+    // spent deciding not to fetch anything.
+    //
+    // Keyed on the step DECLARING an empty list, not on the effective
+    // list coming out empty. `effective_actions` also returns empty
+    // when neither the step nor the workflow defaults say anything, and
+    // silently dropping the gather phase for a step that just never
+    // mentioned actions would be a much worse bug than the one this
+    // fixes. Today only fix.json's reaper steps are in that position
+    // and they never take this path, which is luck rather than design.
+    let max_fast_rounds = if declares_no_actions {
         0
     } else {
         base.max_fast_rounds
@@ -8145,6 +8157,40 @@ mod tests {
     /// Uses triage.json because its `triage_coding` schema is the
     /// largest shipped one and it declares a typed DTO array alongside
     /// it.
+    /// Dropping the gather phase must key on a step DECLARING no
+    /// actions, not on the effective list happening to be empty.
+    ///
+    /// `effective_actions` also returns empty when neither the step nor
+    /// the workflow defaults mention actions. Ten fix.json steps are in
+    /// exactly that position; they are all reaper steps that never take
+    /// the LLM path, so the distinction costs nothing today and would
+    /// silently disable gathering for the first LLM step that forgets
+    /// to declare an action list.
+    #[test]
+    fn only_an_explicit_empty_action_list_disables_gathering() {
+        let wf = parse_workflow(
+            r#"{"$schema_version":1,"id":"w","steps":[
+                 {"id":"explicit","agent":"slow","prompt":"p","actions":[]},
+                 {"id":"inherits","agent":"slow","prompt":"p"},
+                 {"id":"declared","agent":"slow","prompt":"p","actions":["read"]}]}"#,
+        )
+        .unwrap();
+        let by = |id: &str| wf.steps.iter().find(|s| s.id == id).unwrap();
+
+        let declares = |s: &Step| s.actions.as_ref().is_some_and(|l| l.is_empty());
+        assert!(declares(by("explicit")));
+        assert!(
+            !declares(by("inherits")),
+            "no action list is not an empty one"
+        );
+        assert!(!declares(by("declared")));
+
+        // The effective list is empty for both of the first two, which
+        // is why it is the wrong thing to key on.
+        assert!(effective_actions(by("explicit"), &wf).is_empty());
+        assert!(effective_actions(by("inherits"), &wf).is_empty());
+    }
+
     /// A rejected attempt has to be told what was rejected. Without
     /// this the retry sees a bumped `attempt` counter and nothing else,
     /// and on the 2026-08-08 /validate batch eight runs spent all three

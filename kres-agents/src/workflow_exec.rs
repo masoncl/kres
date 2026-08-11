@@ -2847,8 +2847,12 @@ fn eval_reconcile_covers_every_defect(
         .map(Vec::as_slice)
         .unwrap_or_default();
 
+    // Escalation is about objectives, which persist across rounds, so
+    // it is checked even on a round whose own defect list is empty --
+    // a stale objective must not escape the rule just because this
+    // cycle's review happened to report nothing.
     if defects.is_empty() {
-        return (true, None);
+        return escalation_is_honest(step, ctx);
     }
     if instructions.is_empty() && dropped.is_empty() {
         return eval_fail(&format!(
@@ -2870,10 +2874,21 @@ fn eval_reconcile_covers_every_defect(
                      DEFECT indices this entry accounts for"
                 ));
             };
-            if covers.is_empty() {
+            // An INSTRUCTION covering no numbered defect is fine: the
+            // pass may add work the review did not itemise, e.g. a
+            // changelog edit implied by an objective. The invariant is
+            // that every DEFECT is covered, not that every instruction
+            // covers one. Rejecting these cost the 2026-08-10 18:35
+            // linux.nfs run its whole reconciliation: four defects were
+            // covered correctly and two extra commit_message entries
+            // carried `covers: []`.
+            //
+            // A DROPPED entry covering nothing is still vacuous -- it
+            // claims to abandon a defect without naming one.
+            if covers.is_empty() && label == "dropped" {
                 return eval_fail(&format!(
-                    "{label}[{position}].covers is empty; an entry that accounts for no defect \
-                     does not belong in the reconciled set"
+                    "dropped[{position}].covers is empty; name the defect index this entry \
+                     abandons"
                 ));
             }
             for index in covers {
@@ -4684,6 +4699,40 @@ mod tests {
         }
     }
 
+    /// A stale objective must not escape the rule on a round whose own
+    /// defect list happens to be empty. Objectives outlive rounds; the
+    /// early return for "no defects this cycle" used to skip
+    /// escalation entirely.
+    #[test]
+    fn escalation_still_applies_when_this_round_reported_no_defects() {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "reconcile-review")
+            .unwrap();
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert("review".to_string(), step_state(json!({"defects": []})));
+        steps.insert(
+            OBJECTIVES_STEP_ID.to_string(),
+            step_state(json!({"round": 3, "list": [{"id": "O1", "rounds_open": 3}]})),
+        );
+        steps.insert(
+            step.id.clone(),
+            step_state(json!({"objectives": [open_objective("O1")], "must_fix": ""})),
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let (ok, reason) = eval_reconcile_covers_every_defect(&step, &ctx);
+        assert!(
+            !ok,
+            "a 3-round-old objective slipped through a defect-free round"
+        );
+        assert!(reason.unwrap().contains("O1"));
+    }
+
     /// A first-round objective is not stale: the loop has not yet had
     /// a chance to act on it.
     #[test]
@@ -4719,11 +4768,30 @@ mod tests {
         assert!(reason.unwrap().contains("[7]"));
     }
 
+    /// An instruction tied to no numbered defect is legitimate extra
+    /// work; only a `dropped` entry naming nothing is vacuous.
     #[test]
-    fn reconcile_eval_rejects_an_entry_that_covers_nothing() {
-        let (ok, reason) = run_reconcile_eval(1, json!({"instructions": [instruction(vec![])]}));
+    fn reconcile_eval_allows_an_instruction_that_covers_no_numbered_defect() {
+        assert_eq!(
+            run_reconcile_eval(
+                1,
+                json!({"instructions": [instruction(vec![0]), instruction(vec![])]}),
+            ),
+            (true, None)
+        );
+    }
+
+    #[test]
+    fn reconcile_eval_rejects_a_dropped_entry_that_names_no_defect() {
+        let (ok, reason) = run_reconcile_eval(
+            1,
+            json!({"instructions": [instruction(vec![0])],
+                   "dropped": [{"covers": [], "reason": "out of scope"}]}),
+        );
         assert!(!ok);
-        assert!(reason.unwrap().contains("covers is empty"));
+        assert!(reason
+            .unwrap()
+            .contains("name the defect index this entry abandons"));
     }
 
     /// A clean review has nothing to reconcile, so the step is

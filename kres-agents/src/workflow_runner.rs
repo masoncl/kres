@@ -2167,10 +2167,21 @@ impl Driver for LlmDriver {
     }
 }
 
+/// The round number the reconciliation currently in flight will be
+/// stamped with. The store still holds the previous round's number
+/// because `merge_emitted_objectives` runs after the step is accepted.
+fn objectives_round(ctx: &ExecContext<'_>) -> u64 {
+    ctx.steps
+        .get(OBJECTIVES_STEP_ID)
+        .and_then(|st| st.outputs.get("round"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
 fn objectives_list(ctx: &ExecContext<'_>) -> Value {
     ctx.steps
         .get(OBJECTIVES_STEP_ID)
-        .and_then(|st| st.outputs.get("items").cloned())
+        .and_then(|st| st.outputs.get("list").cloned())
         .unwrap_or_else(|| Value::Array(Vec::new()))
 }
 
@@ -5206,7 +5217,16 @@ async fn correction_context_for_step(
         // send the run back around the review cycle it exists to
         // shorten.
         let diff = git_diff_head_parent(workspace).await;
-        return Ok(render_reconcile_review_context(diff.as_deref(), ctx));
+        // Compose the rejection reason in: this branch returns early,
+        // so without it a reconciliation retry is told nothing about
+        // why the last attempt was refused. Observed on the 2026-08-10
+        // 18:35 linux.nfs run -- three identical attempts, then
+        // `on_exhausted: continue` discarded the objectives entirely.
+        return Ok(format!(
+            "{}{}",
+            previous_rejection_block(step, ctx),
+            render_reconcile_review_context(diff.as_deref(), ctx)
+        ));
     }
     if commit_message_is_being_corrected(step, ctx) {
         let message = git_head_commit_message(workspace).await?;
@@ -5390,6 +5410,14 @@ fn render_open_objectives(ctx: &ExecContext<'_>) -> String {
                 this fix)\n--- END OPEN OBJECTIVES ---"
             .to_string();
     }
+    // The store's `rounds_open` was stamped by the PREVIOUS merge, so
+    // at prompt time it is one behind: the round being reconciled now
+    // has not been counted yet. `escalation_is_honest` adds that one
+    // back before testing staleness, so the block must too, or the
+    // model is shown "open 1 round(s)" with no STALE marker and then
+    // refused for not treating it as stale. Observed on the 2026-08-10
+    // 18:35 linux.sched run at reconciliation 2.
+    let in_progress = objectives_round(ctx).saturating_add(1);
     let mut body = String::new();
     for item in items {
         let field = |key: &str| {
@@ -5399,7 +5427,11 @@ fn render_open_objectives(ctx: &ExecContext<'_>) -> String {
                 .trim()
                 .to_string()
         };
-        let rounds = item.get("rounds_open").and_then(Value::as_u64).unwrap_or(1);
+        let rounds = item
+            .get("first_round")
+            .and_then(Value::as_u64)
+            .map(|first| in_progress.saturating_sub(first).saturating_add(1))
+            .unwrap_or(1);
         let stale = if rounds >= crate::workflow_exec::OBJECTIVE_STALE_ROUNDS {
             "  << STALE"
         } else {
@@ -6904,6 +6936,169 @@ mod tests {
                 .0
                 .is_empty(),
             "staging source must still invalidate gathered records"
+        );
+    }
+
+    /// The live shape from the 2026-08-10 18:35 linux.sched run: an
+    /// objective raised in round 1, still open at reconciliation 2.
+    /// The block rendered "open 1 round(s)" with no STALE marker while
+    /// `escalation_is_honest` counted it stale and refused the answer,
+    /// so the model was being asked to satisfy a rule it was shown as
+    /// not yet applicable.
+    #[test]
+    fn second_reconciliation_marks_a_round_one_objective_stale() {
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(
+            OBJECTIVES_STEP_ID.to_string(),
+            crate::workflow_exec::StepState {
+                outputs: json!({
+                    "round": 1,
+                    "list": [{"id": "O1", "statement": "call may_open()", "status": "open",
+                              "first_round": 1, "rounds_open": 1}]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                ..Default::default()
+            },
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let block = render_open_objectives(&ctx);
+        assert!(
+            block.contains("open 2 round(s)") && block.contains("<< STALE"),
+            "reconciliation 2 must show a round-1 objective as stale: {block}"
+        );
+    }
+
+    /// A reconciliation retry must be told why the last attempt was
+    /// refused. The reconcile branch of `correction_context_for_step`
+    /// returns early, so it has to compose `previous_rejection_block`
+    /// in itself; without that the retry is handed a byte-identical
+    /// prompt and reproduces the same rejected answer until the
+    /// attempt budget runs out. Observed on the 2026-08-10 18:35
+    /// linux.nfs run: three identical attempts, then
+    /// `on_exhausted: continue` dropped the objectives entirely.
+    #[tokio::test]
+    async fn reconcile_retry_is_told_why_the_last_attempt_was_refused() {
+        let wf = crate::workflow::parse_workflow(
+            &json!({
+                "$schema_version": 1,
+                "id": "reconcile-reject",
+                "steps": [{
+                    "id": RECONCILE_REVIEW_STEP,
+                    "agent": "code",
+                    "mode": "review",
+                    "actions": [],
+                    "prompt": "p",
+                    "outputs": {"objectives": {"type": "array<object>"}}
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let step = wf.steps[0].clone();
+        let repo = init_test_git_repo();
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf);
+        let _ = &driver;
+
+        let inputs = Map::new();
+        let mut states = HashMap::new();
+        states.insert(
+            RECONCILE_REVIEW_STEP.to_string(),
+            crate::workflow_exec::StepState {
+                last_eval_reason: Some("dropped[0].covers is empty".to_string()),
+                ..Default::default()
+            },
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+
+        let block = correction_context_for_step(repo.path(), &step, &ctx)
+            .await
+            .unwrap();
+        assert!(
+            block.contains("PREVIOUS ATTEMPT REJECTED"),
+            "retry prompt carried no rejection block: {block}"
+        );
+        assert!(
+            block.contains("dropped[0].covers is empty"),
+            "retry prompt did not name the eval's reason: {block}"
+        );
+        assert!(
+            block.contains("NUMBERED REVIEW DEFECTS"),
+            "the reconcile context itself must still be present: {block}"
+        );
+    }
+
+    /// The reconciliation pass has to SEE the ages to act on them.
+    ///
+    /// `render_open_objectives` reads the store through
+    /// `objectives_list`, which kept the pre-rename `items` key while
+    /// the store moved to `list`. The block therefore rendered "(none
+    /// yet: this is the first reconciliation)" on every round, so the
+    /// pass could never tell an objective was stale and never set
+    /// `must_fix` -- while the workers, which read `{{objectives.list}}`
+    /// through ordinary interpolation, saw the real data. Observed on
+    /// the 2026-08-10 18:00 linux.sched run at round 3.
+    #[test]
+    fn open_objectives_block_renders_the_stored_ages() {
+        let inputs = Map::new();
+        let mut steps = HashMap::new();
+        steps.insert(
+            OBJECTIVES_STEP_ID.to_string(),
+            crate::workflow_exec::StepState {
+                outputs: json!({
+                    "round": 3,
+                    "list": [
+                        {"id": "O1", "statement": "call may_open()", "status": "open",
+                         "first_round": 1, "rounds_open": 3},
+                        {"id": "O2", "statement": "fix the changelog", "status": "open",
+                         "first_round": 3, "rounds_open": 1}
+                    ]
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                ..Default::default()
+            },
+        );
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let block = render_open_objectives(&ctx);
+
+        // Ages shown must be the ages the eval enforces. The store is
+        // one round behind at prompt time, so an objective first seen
+        // in round 1, with the store at round 3, is being reconciled
+        // for the 4th time.
+        assert!(
+            block.contains("open 4 round(s)"),
+            "rendered age must match escalation_is_honest's view: {block}"
+        );
+        assert!(
+            !block.contains("none yet"),
+            "a populated store rendered as empty: {block}"
+        );
+        assert!(block.contains("O1"), "{block}");
+        assert!(block.contains("call may_open()"), "{block}");
+        assert!(
+            block.contains("<< STALE"),
+            "the stale objective must be marked: {block}"
+        );
+        assert!(
+            !block
+                .split("O2")
+                .nth(1)
+                .unwrap_or("")
+                .starts_with(" [open] open 1 round(s)  << STALE"),
+            "a fresh objective must not be marked stale: {block}"
         );
     }
 

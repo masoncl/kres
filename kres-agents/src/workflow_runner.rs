@@ -1983,53 +1983,70 @@ impl Driver for LlmDriver {
             rules = interpolated_rules,
             SCHEMA_HEADER = "OUTPUT SCHEMA"
         );
-        let messages = vec![Message::plain("user", user_text.clone())];
         let call_cfg = self.config_with_mode(&base_cfg, self.mode_for(step));
-        if let Some(lg) = &self.logger {
-            let label = format!("phase=consolidate step={}", step.id);
-            let request = call_cfg.request_meta();
-            lg.log_code_labeled_with_request(
-                "user",
-                Some(&label),
-                &format!("[step={} consolidate]\n{}", step.id, user_text),
-                None,
-                None,
-                Some(&request),
-            );
-        }
-        let resp = tokio::select! {
-            _ = self.shutdown.cancelled() => {
-                return Err(format!(
-                    "step '{}' consolidate cancelled before LLM call returned",
-                    step.id
-                )
-                .into());
+        let mut repair: Option<String> = None;
+        for _ in 0..=CONSOLIDATE_COHERENCE_RETRIES {
+            let user_text = match &repair {
+                Some(reason) => format!("{JSON_REPAIR_PREFIX}\n{reason}\n{user_text}"),
+                None => user_text.clone(),
+            };
+            let messages = vec![Message::plain("user", user_text.clone())];
+            if let Some(lg) = &self.logger {
+                let label = format!("phase=consolidate step={}", step.id);
+                let request = call_cfg.request_meta();
+                lg.log_code_labeled_with_request(
+                    "user",
+                    Some(&label),
+                    &format!("[step={} consolidate]\n{}", step.id, user_text),
+                    None,
+                    None,
+                    Some(&request),
+                );
             }
-            r = client.messages(&call_cfg, &messages) => {
-                r.map_err(|e| format!("step '{}' consolidate LLM call: {e}", step.id))?
+            let resp = tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    return Err(format!(
+                        "step '{}' consolidate cancelled before LLM call returned",
+                        step.id
+                    )
+                    .into());
+                }
+                r = client.messages(&call_cfg, &messages) => {
+                    r.map_err(|e| format!("step '{}' consolidate LLM call: {e}", step.id))?
+                }
+            };
+            self.record_direct_usage(role, &call_cfg, &resp.usage);
+            let text = response_text(&resp);
+            if let Some(lg) = &self.logger {
+                let label = format!("phase=consolidate step={}", step.id);
+                lg.log_code_labeled_with_model(
+                    "assistant",
+                    Some(&label),
+                    &text,
+                    Some(LoggedUsage {
+                        input: resp.usage.input_tokens,
+                        output: resp.usage.output_tokens,
+                        cache_creation: resp.usage.cache_creation_input_tokens,
+                        cache_read: resp.usage.cache_read_input_tokens,
+                    }),
+                    None,
+                    resp.model.as_deref(),
+                );
             }
-        };
-        self.record_direct_usage(role, &call_cfg, &resp.usage);
-        let text = response_text(&resp);
-        if let Some(lg) = &self.logger {
-            let label = format!("phase=consolidate step={}", step.id);
-            lg.log_code_labeled_with_model(
-                "assistant",
-                Some(&label),
-                &text,
-                Some(LoggedUsage {
-                    input: resp.usage.input_tokens,
-                    output: resp.usage.output_tokens,
-                    cache_creation: resp.usage.cache_creation_input_tokens,
-                    cache_read: resp.usage.cache_read_input_tokens,
-                }),
-                None,
-                resp.model.as_deref(),
-            );
+            let outputs = extract_outputs(&text, step)
+                .map_err(|e| format!("step '{}' consolidate output extraction: {e}", step.id))?;
+            if let Err(reason) = review_outcome_is_coherent(step, &outputs) {
+                repair = Some(reason);
+                continue;
+            }
+            return Ok(outputs);
         }
-        let outputs = extract_outputs(&text, step)
-            .map_err(|e| format!("step '{}' consolidate output extraction: {e}", step.id))?;
-        Ok(outputs)
+        Err(format!(
+            "step '{}' consolidate: {}",
+            step.id,
+            repair.unwrap_or_default()
+        )
+        .into())
     }
 
     /// Shared-gather + parallel lens fan-out + consolidate in one
@@ -2170,6 +2187,61 @@ impl Driver for LlmDriver {
 /// The round number the reconciliation currently in flight will be
 /// stamped with. The store still holds the previous round's number
 /// because `merge_emitted_objectives` runs after the step is accepted.
+/// Extra consolidator calls allowed to fix an incoherent verdict. One
+/// is enough in practice, and it re-runs only the merge, never the
+/// lens fan-out.
+const CONSOLIDATE_COHERENCE_RETRIES: usize = 1;
+
+/// A review that reports `clean == false` must say what is wrong.
+///
+/// `clean` is the routing signal: false sends the run to
+/// reconcile-review and blocks publish, so a false with nothing
+/// itemised hands every downstream step "not acceptable" and no work
+/// to do. It is caught here rather than downstream because the
+/// consolidator is what merged the lenses, and is the only agent that
+/// can say which lens's concern it dropped.
+///
+/// Observed on the 2026-08-10 20:07 linux.nfs run, review round 2:
+/// `clean=False` with every typed defect array empty. That run
+/// recovered only because the reconciliation had a live objective of
+/// its own to work from.
+///
+/// The opposite incoherence is refused too: `clean == true` while
+/// defects are still itemised would publish over an unreviewed defect.
+fn review_outcome_is_coherent(step: &Step, outputs: &Map<String, Value>) -> Result<(), String> {
+    if !step.outputs.contains_key("clean") || !step.outputs.contains_key("defects") {
+        return Ok(());
+    }
+    let Some(clean) = outputs.get("clean").and_then(Value::as_bool) else {
+        return Ok(());
+    };
+    let itemised: Vec<&str> = [
+        "defects",
+        "source_defects",
+        "commit_message_defects",
+        "unresolved_risks",
+    ]
+    .into_iter()
+    .filter(|key| {
+        outputs
+            .get(*key)
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty())
+    })
+    .collect();
+
+    match (clean, itemised.is_empty()) {
+        (false, true) => Err(
+            "you returned `clean: false` but every defect array is empty, which tells the next              step the patch is not acceptable while naming nothing to change. Either itemise              the concern that made it unclean -- in defects, source_defects,              commit_message_defects or unresolved_risks -- or return `clean: true`."
+                .to_string(),
+        ),
+        (true, false) => Err(format!(
+            "you returned `clean: true` while still reporting entries in {itemised:?}. A review              with outstanding defects is not clean; drop the entries you consider settled or              set `clean: false`."
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn objectives_round(ctx: &ExecContext<'_>) -> u64 {
     ctx.steps
         .get(OBJECTIVES_STEP_ID)
@@ -7033,6 +7105,60 @@ mod tests {
         assert!(
             block.contains("NUMBERED REVIEW DEFECTS"),
             "the reconcile context itself must still be present: {block}"
+        );
+    }
+
+    /// A review verdict must be actionable in both directions.
+    #[test]
+    fn review_outcome_coherence_rejects_a_verdict_that_names_nothing() {
+        let review = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "review")
+            .unwrap();
+
+        // The 2026-08-10 20:07 linux.nfs round 2 shape.
+        let err = review_outcome_is_coherent(
+            &review,
+            json!({"clean": false, "defects": [], "source_defects": [],
+                   "commit_message_defects": [], "unresolved_risks": []})
+            .as_object()
+            .unwrap(),
+        )
+        .expect_err("clean=false with nothing itemised must be refused");
+        assert!(err.contains("naming nothing to change"), "{err}");
+
+        // The dangerous inverse: publishing over an unreviewed defect.
+        let err = review_outcome_is_coherent(
+            &review,
+            json!({"clean": true,
+                   "defects": [{"lens": "bounds", "where": "a.c:1", "what": "off-by-one"}]})
+            .as_object()
+            .unwrap(),
+        )
+        .expect_err("clean=true with defects must be refused");
+        assert!(err.contains("outstanding defects is not clean"), "{err}");
+
+        // Both coherent verdicts pass.
+        for outputs in [
+            json!({"clean": true, "defects": []}),
+            json!({"clean": false,
+                   "defects": [{"lens": "races", "where": "a.c:2", "what": "unlocked read"}]}),
+        ] {
+            assert!(review_outcome_is_coherent(&review, outputs.as_object().unwrap()).is_ok());
+        }
+    }
+
+    /// A step that does not declare the review contract is untouched.
+    #[test]
+    fn review_outcome_coherence_ignores_a_non_review_step() {
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "reconcile-review")
+            .unwrap();
+        assert!(
+            review_outcome_is_coherent(&step, json!({"clean": false}).as_object().unwrap()).is_ok()
         );
     }
 

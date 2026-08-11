@@ -267,6 +267,26 @@ all and one oversized followup ended the run: a fix died on
 `OverInputLimit actual=924140 limit=900000`, of which a single
 patch-bearing git log over a whole file was 3.4 MB.
 
+### A review verdict must be actionable in both directions
+
+`clean` is the fix loop's routing signal: false sends the run to
+`reconcile-review` and blocks publish. A consolidation that returns
+`clean: false` with every typed defect array empty therefore tells
+every downstream step the patch is unacceptable while naming nothing
+to change, and `clean: true` alongside itemised defects would publish
+over an unreviewed one.
+
+`review_outcome_is_coherent` refuses both, and the driver re-runs the
+CONSOLIDATOR to fix it — one extra merge call, never the lens fan-out,
+bounded by `CONSOLIDATE_COHERENCE_RETRIES`. It is caught there because
+the consolidator is what merged the lenses and is the only agent that
+can say which lens's concern it dropped.
+
+Observed on the 2026-08-10 20:07 linux.nfs run, review round 2:
+`clean=False` with all four arrays empty. That run recovered only
+because the reconciliation had a live objective of its own to work
+from.
+
 ### The gathered cache is invalidated by source changes, not by re-entry
 
 A step's gathered symbols and file sections are cached per step id and

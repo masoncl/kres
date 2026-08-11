@@ -222,6 +222,13 @@ fn dirty_source_review_responses(workflow: &kres_agents::workflow::Workflow) -> 
               \"commit_message_defects\": [], \"analysis\": \"review clean\"}",
         ));
     }
+    // First consolidate reply is incoherent: `clean: false` with every
+    // defect array empty, which names nothing for the next step to do.
+    // The driver must re-merge (one extra consolidate call, no lens
+    // re-run) rather than pass the verdict downstream.
+    responses.push(fake_messages_response(
+        "Consolidate with no itemised concern.\n         {\"clean\": false, \"defects\": [], \"source_defects\": [],           \"commit_message_defects\": [], \"unresolved_risks\": [], \"outcomes\": [],           \"analysis\": \"something feels off\"}",
+    ));
     // Consolidate LLM call (semantic dedup of typed lists; routing
     // fields are overridden deterministically afterwards).
     responses.push(fake_messages_response(
@@ -1174,6 +1181,10 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
     assert!(
         requests.contains("KRES-READONLY| diff --git a/a.c b/a.c"),
         "previous patch diff was not inlined as read-only payload"
+    );
+    assert!(
+        requests.contains("every defect array is empty"),
+        "the incoherent consolidation was not sent back for a re-merge"
     );
 
     let out = std::process::Command::new("git")

@@ -2330,6 +2330,12 @@ fn review_outcome_is_coherent(step: &Step, outputs: &Map<String, Value>) -> Resu
 /// Lines of worktree context supplied either side of a changed hunk.
 const HUNK_CONTEXT_LINES: usize = 40;
 
+/// Bounds on the artifact scan: enough for a finding directory, small
+/// enough that a stray large directory cannot spawn a git process per
+/// hex string in it.
+const ARTIFACT_FILE_SCAN_MAX: usize = 32;
+const ARTIFACT_SHA_SCAN_MAX: usize = 24;
+
 /// `(path, first_line, last_line)` for every hunk in a unified diff,
 /// using the POST-image line numbers so the ranges index the current
 /// worktree.
@@ -5158,6 +5164,151 @@ fn commit_message_written(
 /// artifacts were written into
 /// `<workspace>/home/clm/local/...`, and the eval passed. The workflow
 /// reported success and the finding was left unvalidated.
+/// Distinct commit-ish hex strings named anywhere in a finding's
+/// artifacts, longest first so a 40-char sha is not shadowed by its
+/// own abbreviation.
+fn artifact_shas(dir: &Path) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten().take(ARTIFACT_FILE_SCAN_MAX) {
+        if !entry.path().is_file() {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        // Scan bytes, not chars, and slice out of the byte slice. An
+        // artifact is prose: it contains em dashes and other multi-byte
+        // characters, and `&body[start..i]` with `start = i + 1` walks
+        // straight into the middle of one. A run of ASCII hex digits is
+        // always valid UTF-8, so recovering the &str is infallible.
+        let bytes = body.as_bytes();
+        let mut start = 0usize;
+        for i in 0..=bytes.len() {
+            if i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                continue;
+            }
+            let run = &bytes[start..i];
+            // A bare decimal number is not a commit-ish, and a 32-hex
+            // run is a kres task uuid with its dashes stripped
+            // (`first_seen_task` in metadata.yaml) -- git abbreviates
+            // to 7-12 and spells full ids at 40, never 32.
+            if (12..=40).contains(&run.len())
+                && run.len() != 32
+                && run.iter().any(u8::is_ascii_alphabetic)
+            {
+                if let Ok(run) = std::str::from_utf8(run) {
+                    seen.insert(run.to_ascii_lowercase());
+                }
+            }
+            start = i + 1;
+        }
+    }
+    seen.into_iter().take(ARTIFACT_SHA_SCAN_MAX).collect()
+}
+
+/// Tell research which commits its own artifacts cite that are NOT in
+/// this workspace's history.
+///
+/// A finding accumulates a `results:` block naming the commit that
+/// fixed it. Reset the tree and re-run the finding and that commit
+/// becomes unreachable, while the claim "already fixed by <sha>" stays
+/// in `metadata.yaml` and contradicts the source the run is about to
+/// read. The workflow prompt already says a sha in an artifact is a
+/// hint until `git merge-base --is-ancestor` succeeds; this runs that
+/// check so the agent does not have to spend a round doing it.
+///
+/// Measured on the 2026-08-11 09:04 linux.mm run: the finding claimed
+/// `fixed` by 541053e9379b, an orphaned object after the tree was
+/// reset. Research attempt 2 spotted the contradiction, declined to
+/// classify, and was spent entirely on establishing what this function
+/// answers deterministically.
+async fn stale_artifact_sha_notice(workspace: &Path, ctx: &ExecContext<'_>) -> String {
+    let Some(dir) = target_finding_dir(ctx) else {
+        return String::new();
+    };
+    let mut stale: Vec<String> = Vec::new();
+    let mut present: Vec<String> = Vec::new();
+    for sha in artifact_shas(&dir) {
+        match git_commit_reachability(workspace, &sha).await {
+            Reachability::Ancestor => present.push(sha),
+            Reachability::Orphaned => {
+                stale.push(format!("{sha} (object exists, NOT an ancestor of HEAD)"))
+            }
+            Reachability::Unknown => stale.push(format!("{sha} (not in this repository)")),
+            Reachability::CheckFailed => {}
+        }
+    }
+    if stale.is_empty() && present.is_empty() {
+        return String::new();
+    }
+    let fmt = |v: &[String]| {
+        if v.is_empty() {
+            "  (none)\n".to_string()
+        } else {
+            v.iter().map(|s| format!("  {s}\n")).collect::<String>()
+        }
+    };
+    format!(
+        "\n\n--- COMMIT-ISH IDS CITED BY THIS FINDING'S ARTIFACTS ---\n\
+         Checked against this workspace with `git merge-base --is-ancestor <sha> HEAD`.\n\n\
+         In this history:\n{}\n\
+         NOT in this history — any artifact claim resting on one of these is unproven \
+         here, including a `results:` entry saying the bug is already fixed. Judge the \
+         defect from the source in front of you, not from these:\n{}\
+         --- END COMMIT-ISH IDS CITED BY THIS FINDING'S ARTIFACTS ---",
+        fmt(&present),
+        fmt(&stale),
+    )
+}
+
+enum Reachability {
+    Ancestor,
+    Orphaned,
+    Unknown,
+    CheckFailed,
+}
+
+async fn git_commit_reachability(workspace: &Path, sha: &str) -> Reachability {
+    let run = |args: Vec<String>| {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.current_dir(workspace).args(args);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), cmd.status())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        }
+    };
+    let Some(exists) = run(vec![
+        "cat-file".into(),
+        "-e".into(),
+        format!("{sha}^{{commit}}"),
+    ])
+    .await
+    else {
+        return Reachability::CheckFailed;
+    };
+    if !exists.success() {
+        return Reachability::Unknown;
+    }
+    match run(vec![
+        "merge-base".into(),
+        "--is-ancestor".into(),
+        sha.to_string(),
+        "HEAD".into(),
+    ])
+    .await
+    {
+        Some(status) if status.success() => Reachability::Ancestor,
+        Some(_) => Reachability::Orphaned,
+        None => Reachability::CheckFailed,
+    }
+}
+
 fn target_finding_dir(ctx: &ExecContext<'_>) -> Option<PathBuf> {
     let target = ctx.workflow_inputs.get("target")?.as_str()?.trim();
     if target.is_empty() {
@@ -5402,6 +5553,10 @@ async fn correction_context_for_step(
     }
     if let Some(block) = prior_refutations_block(step, ctx) {
         return Ok(format!("{}{block}", previous_rejection_block(step, ctx)));
+    }
+    if step.id == "research" {
+        let notice = stale_artifact_sha_notice(workspace, ctx).await;
+        return Ok(format!("{}{notice}", previous_rejection_block(step, ctx)));
     }
     if step.id == RECONCILE_REVIEW_STEP {
         // Best-effort: the patch is useful context, but this step
@@ -7307,6 +7462,175 @@ diff --git a/fs/gone.c b/fs/gone.c
             blob.contains("int y = 2;"),
             "current worktree text around the hunk must be supplied: {blob}"
         );
+    }
+
+    /// Research must be told which commits its own artifacts cite that
+    /// are not in this workspace's history.
+    ///
+    /// A finding accumulates a `results:` block naming the commit that
+    /// fixed it; reset the tree and that commit is orphaned while the
+    /// claim survives in metadata.yaml. On the 2026-08-11 09:04
+    /// linux.mm run the finding claimed `fixed` by 541053e9379b, an
+    /// orphaned object, and research spent a whole attempt declining
+    /// to classify while it worked that out.
+    #[tokio::test]
+    async fn stale_artifact_shas_are_separated_from_reachable_ones() {
+        let repo = init_test_git_repo();
+        // A second commit, then a commit that gets orphaned by a reset.
+        let git = |args: Vec<&str>| {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        git(vec!["commit", "-aqm", "reachable"]);
+        let reachable = git(vec!["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join("a.c"), "int x = 3;\n").unwrap();
+        git(vec!["commit", "-aqm", "orphan"]);
+        let orphaned = git(vec!["rev-parse", "HEAD"]);
+        git(vec!["reset", "-q", "--hard", &reachable]);
+
+        let finding = tempfile::tempdir().unwrap();
+        std::fs::write(
+            finding.path().join("metadata.yaml"),
+            format!(
+                "results:\n- outcome: fixed\n  evidence: 'Commit {orphaned} fixed it'\n\
+                 audited_at: {reachable}\n  unrelated: 1234567890123\n\
+                 first_seen_task: 13690d0957264d32a1f1b47cfdc0d44e\n"
+            ),
+        )
+        .unwrap();
+
+        let inputs = Map::from_iter([(
+            "target".to_string(),
+            Value::String(finding.path().to_string_lossy().into_owned()),
+        )]);
+        let steps = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let notice = stale_artifact_sha_notice(repo.path(), &ctx).await;
+
+        assert!(
+            notice.contains(&orphaned) && notice.contains("NOT an ancestor of HEAD"),
+            "the orphaned commit must be flagged: {notice}"
+        );
+        let stale_half = notice.split("NOT in this history").nth(1).unwrap_or("");
+        assert!(
+            !stale_half.contains(&reachable),
+            "a reachable commit must not be listed as stale: {notice}"
+        );
+        assert!(
+            !notice.contains("1234567890123"),
+            "a bare decimal is not a commit-ish: {notice}"
+        );
+        assert!(
+            !notice.contains("13690d0957264d32a1f1b47cfdc0d44e"),
+            "a 32-hex kres task uuid is not a commit-ish: {notice}"
+        );
+    }
+
+    /// Artifacts are prose and contain multi-byte characters. Scanning
+    /// them by byte index while slicing a `&str` panics the moment a
+    /// run ends next to one: "start byte index 50 is not a char
+    /// boundary; it is inside '—'". That crashed a real fix invocation
+    /// on the first artifact it read.
+    #[tokio::test]
+    async fn artifact_scan_survives_multibyte_characters() {
+        let repo = init_test_git_repo();
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path())
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let finding = tempfile::tempdir().unwrap();
+        // Em dashes, an accent and a non-Latin script, with commit-ish
+        // runs pressed right up against them on both sides.
+        std::fs::write(
+            finding.path().join("metadata.yaml"),
+            format!(
+                "title: \"clobbers state — permanently — over-counts\"\n\
+                 evidence: 'Commit {head}—fixed it; naïve retry — see 0123456789abcdef0123'\n\
+                 note: \"日本語 {head} 日本語\"\n"
+            ),
+        )
+        .unwrap();
+
+        let inputs = Map::from_iter([(
+            "target".to_string(),
+            Value::String(finding.path().to_string_lossy().into_owned()),
+        )]);
+        let steps = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+
+        // The point of the test is that this returns rather than panics.
+        let notice = stale_artifact_sha_notice(repo.path(), &ctx).await;
+        assert!(
+            notice.contains(&head),
+            "the reachable commit abutting an em dash must still be found: {notice}"
+        );
+        assert!(
+            notice.contains("0123456789abcdef0123"),
+            "a commit-ish run after a multi-byte char must still be found: {notice}"
+        );
+    }
+
+    /// Run the scan over the actual finding directory that panicked,
+    /// when it is present on this machine. Skipped in CI.
+    #[tokio::test]
+    async fn artifact_scan_over_the_finding_that_panicked() {
+        let dir = std::path::Path::new(
+            "/home/clm/local/bugs-page-alloc/findings/alloc_contig_undo_isolate_after_isolate_fail",
+        );
+        let repo = std::path::Path::new("/home/clm/local/linux.mm");
+        if !dir.is_dir() || !repo.join(".git").exists() {
+            return;
+        }
+        let inputs = Map::from_iter([(
+            "target".to_string(),
+            Value::String(dir.to_string_lossy().into_owned()),
+        )]);
+        let steps = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let notice = stale_artifact_sha_notice(repo, &ctx).await;
+        eprintln!("{notice}");
+        assert!(
+            notice.contains("541053e9379b"),
+            "the stale sha must be flagged"
+        );
+    }
+
+    /// A freeform-prose target has no finding directory to scan.
+    #[tokio::test]
+    async fn stale_artifact_notice_is_empty_without_a_finding_dir() {
+        let repo = init_test_git_repo();
+        let inputs = Map::from_iter([("target".to_string(), Value::String("some bug".into()))]);
+        let steps = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        assert!(stale_artifact_sha_notice(repo.path(), &ctx)
+            .await
+            .is_empty());
     }
 
     /// A review verdict must be actionable in both directions.

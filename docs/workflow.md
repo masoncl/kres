@@ -1116,6 +1116,21 @@ reporting its age itself. They live in the synthetic `objectives` step
 nothing resets — every real step's outputs are taken into
 `prior_attempts` and cleared when the orchestrator routes backwards.
 
+**Everything a worker reads lives in the store, not on the step.**
+`reset_dependents_preserving` preserves the outputs of the *branching*
+step only — which is why `orchestrator.instruction` reaches a worker
+and `reconcile-review.instructions` does not. The reconciliation pass
+is a transitive dependent of `write-patch` (write-patch → commit →
+build → review → reconcile-review), so branching back to the worker
+takes its outputs into `prior_attempts` and clears them. `must_fix`,
+`scope_amendment`, `instructions`, `contradictions` and `dropped` are
+therefore copied into the synthetic step by `merge_emitted_objectives`
+and referenced downstream as `{{objectives.*}}`. Referencing
+`{{reconcile-review.*}}` from a worker renders empty: measured on the
+2026-08-10 linux.nfs run, all eight `write-patch` prompts carried the
+reconciled instruction block with an empty array, so the step was
+writing into the void for the whole run.
+
 **The forward-progress rule.** Once an objective has been open for
 `OBJECTIVE_STALE_ROUNDS` (2) cycles, asking again in different words
 has already failed twice. `escalation_is_honest` requires the pass to

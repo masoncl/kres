@@ -1142,18 +1142,25 @@ async fn write_patch_review_retry_includes_previous_git_diff_context() {
         trace.status
     );
 
+    // The reconciliation pass steers the workers only if its output
+    // actually reaches them. It does not survive on the step itself:
+    // `reset_dependents_preserving` keeps the BRANCHING step's outputs
+    // (which is why `orchestrator.instruction` works) and clears every
+    // transitive dependent, and reconcile-review is one of write-patch's.
+    // The steering fields ride the synthetic `objectives` step instead.
     {
         let all = requests.lock().await;
-        for (i, r) in all.iter().enumerate() {
-            let body = r.split("\r\n\r\n").last().unwrap_or("");
-            let v: serde_json::Value =
-                serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
-            let c = v["messages"][0]["content"].as_str().unwrap_or("?");
-            eprintln!(
-                "DBG[{i}] {}",
-                c.chars().take(60).collect::<String>().replace('\n', " ")
-            );
-        }
+        let carried = all
+            .iter()
+            .filter(|r| {
+                r.contains("RECONCILED REVIEW INSTRUCTIONS") && r.contains("\\\"covers\\\"")
+            })
+            .count();
+        assert!(
+            carried >= 2,
+            "reconciled instructions never reached a worker prompt ({carried} of {} carried them)",
+            all.len()
+        );
     }
     let requests = requests.lock().await.join("\n---REQUEST---\n");
     assert!(

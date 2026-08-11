@@ -460,7 +460,12 @@ pub trait Driver: Sync {
 /// Omission is not deletion. An objective the pass did not re-emit is
 /// carried forward unchanged, so a stale one cannot be retired by
 /// going quiet about it -- it has to be satisfied or withdrawn.
-fn merge_emitted_objectives(state: &mut HashMap<String, StepState>, emitted: &[Value]) {
+fn merge_emitted_objectives(state: &mut HashMap<String, StepState>, outputs: &Map<String, Value>) {
+    let emitted = outputs
+        .get("objectives")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let store = state
         .entry(OBJECTIVES_STEP_ID.to_string())
         .or_insert_with(empty_objectives_state);
@@ -510,6 +515,36 @@ fn merge_emitted_objectives(state: &mut HashMap<String, StepState>, emitted: &[V
 
     store.outputs.insert("round".into(), Value::from(round));
     store.outputs.insert("list".into(), Value::Array(merged));
+
+    // The steering fields ride the store for the same reason the
+    // objectives do: they have to survive the cascade that carries
+    // them to the workers.
+    //
+    // `reset_dependents_preserving` preserves the outputs of the
+    // BRANCHING step only, which is why `orchestrator.instruction`
+    // reaches a worker and `reconcile-review.instructions` does not --
+    // the reconciliation pass is a transitive dependent of write-patch
+    // (write-patch -> commit -> build -> review -> reconcile-review),
+    // so branching back to write-patch takes its outputs into
+    // `prior_attempts` and clears them. Measured on the 2026-08-10
+    // linux.nfs run: all eight write-patch prompts rendered the
+    // reconciled instruction block with an empty array.
+    for key in [
+        "instructions",
+        "contradictions",
+        "dropped",
+        "must_fix",
+        "scope_amendment",
+    ] {
+        match outputs.get(key) {
+            Some(value) => {
+                store.outputs.insert(key.to_string(), value.clone());
+            }
+            None => {
+                store.outputs.remove(key);
+            }
+        }
+    }
     store.status = StepStatus::Done;
 }
 
@@ -2103,13 +2138,11 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         // Eval, if configured.
         let Some(eval) = &step.eval else {
             if step_owns_objectives(step) {
-                let emitted = state
+                let produced = state
                     .get(&step.id)
-                    .and_then(|st| st.outputs.get("objectives"))
-                    .and_then(Value::as_array)
-                    .cloned()
+                    .map(|st| st.outputs.clone())
                     .unwrap_or_default();
-                merge_emitted_objectives(&mut state, &emitted);
+                merge_emitted_objectives(&mut state, &produced);
             }
             let effect_ctx = ExecContext {
                 workflow_inputs: &inputs,
@@ -2227,13 +2260,11 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                 accepted.last_eval_reason = None;
             }
             if step_owns_objectives(step) {
-                let emitted = state
+                let produced = state
                     .get(&step.id)
-                    .and_then(|st| st.outputs.get("objectives"))
-                    .and_then(Value::as_array)
-                    .cloned()
+                    .map(|st| st.outputs.clone())
                     .unwrap_or_default();
-                merge_emitted_objectives(&mut state, &emitted);
+                merge_emitted_objectives(&mut state, &produced);
             }
             let effect_ctx = ExecContext {
                 workflow_inputs: &inputs,
@@ -4468,18 +4499,97 @@ mod tests {
         );
     }
 
+    /// The store must outlive the cascade that resets its author.
+    ///
+    /// `reset_dependents_preserving` preserves only the BRANCHING
+    /// step's outputs, so a worker reached by an orchestrator branch
+    /// sees `orchestrator.instruction` but NOT the reconciliation
+    /// pass's own outputs -- it is a transitive dependent of the
+    /// worker and gets cleared on the way back. Measured on the
+    /// 2026-08-10 linux.nfs run, all eight write-patch prompts
+    /// rendered the reconciled instruction block with an empty array,
+    /// so the whole step was writing into the void.
+    #[test]
+    fn steering_fields_survive_the_cascade_that_clears_their_author() {
+        let wf_json = serde_json::json!({
+            "$schema_version": 1,
+            "id": "cascade-test",
+            "steps": [
+                {"id": "write-patch", "agent": "fast", "prompt": "p"},
+                {"id": "review", "agent": "fast", "prompt": "p", "depends_on": ["write-patch"]},
+                {"id": "reconcile-review", "agent": "slow", "prompt": "p",
+                 "depends_on": ["review"],
+                 "outputs": {"objectives": {"type": "array<object>"}}}
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        let mut state = HashMap::new();
+        for id in ["write-patch", "review", "reconcile-review"] {
+            state.insert(
+                id.to_string(),
+                StepState {
+                    id: id.to_string(),
+                    status: StepStatus::Done,
+                    ..Default::default()
+                },
+            );
+        }
+        merge_emitted_objectives(
+            &mut state,
+            json!({"objectives": [open_objective("O1")],
+                   "must_fix": "O1",
+                   "instructions": [{"covers": [0]}]})
+            .as_object()
+            .unwrap(),
+        );
+        // The pass's own outputs, as the executor would have stored them.
+        state.get_mut("reconcile-review").unwrap().outputs =
+            json!({"objectives": [open_objective("O1")], "must_fix": "O1"})
+                .as_object()
+                .unwrap()
+                .clone();
+
+        // Orchestrator routes back to write-patch.
+        reset_for_reentry(&mut state, "write-patch");
+        reset_dependents_preserving(&wf, &mut state, "write-patch", None);
+
+        assert!(
+            state["reconcile-review"].outputs.is_empty(),
+            "the cascade is expected to clear the author's outputs"
+        );
+        let store = &state[OBJECTIVES_STEP_ID].outputs;
+        assert_eq!(
+            store["must_fix"],
+            json!("O1"),
+            "must_fix must reach the worker"
+        );
+        assert_eq!(store["instructions"][0]["covers"], json!([0]));
+        assert_eq!(store["list"][0]["id"], json!("O1"));
+    }
+
     /// Ages are Rust's, and omission does not retire an objective.
     #[test]
     fn merging_objectives_stamps_age_and_carries_the_unmentioned_forward() {
         let mut state = HashMap::new();
         // Round 1: two objectives raised.
-        merge_emitted_objectives(&mut state, &[open_objective("O1"), open_objective("O2")]);
+        merge_emitted_objectives(
+            &mut state,
+            json!({"objectives": [open_objective("O1"), open_objective("O2")]})
+                .as_object()
+                .unwrap(),
+        );
         // Round 2: the pass re-emits only O1, and tries to tell us how
         // old it is. Both claims are ignored.
         let mut lying = open_objective("O1");
         lying["first_round"] = json!(99);
         lying["rounds_open"] = json!(1);
-        merge_emitted_objectives(&mut state, &[lying]);
+        merge_emitted_objectives(
+            &mut state,
+            json!({"objectives": [lying], "must_fix": "O1"})
+                .as_object()
+                .unwrap(),
+        );
 
         let store = &state[OBJECTIVES_STEP_ID].outputs;
         assert_eq!(store["round"], json!(2));
@@ -4494,6 +4604,11 @@ mod tests {
         // still there to be answered for.
         let o2 = list.iter().find(|o| o["id"] == json!("O2")).unwrap();
         assert_eq!(o2["first_round"], json!(1));
+
+        // The steering fields ride the store, not the step, because
+        // the step's outputs are cleared by the cascade before a
+        // worker ever reads them.
+        assert_eq!(store["must_fix"], json!("O1"));
     }
 
     /// Drive the escalation rule with a store that already holds

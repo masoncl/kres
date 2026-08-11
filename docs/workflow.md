@@ -267,6 +267,34 @@ all and one oversized followup ended the run: a fix died on
 `OverInputLimit actual=924140 limit=900000`, of which a single
 patch-bearing git log over a whole file was 3.4 MB.
 
+### The review lenses are handed the patch, not asked to fetch it
+
+`supplied_review_evidence` seeds the lensed review's gather with two
+things from the worktree: `git diff HEAD~1`, and the current text
+around every hunk that diff touches (POST-image line ranges, ±40
+lines). Both are rendered through `render_readonly_payload`.
+
+They are seeded into `symbols`/`context` rather than given a prompt
+field of their own. That is a caching decision: those two fields are in
+`LENS_TASK_CACHE_FIELDS`, so the evidence is written once per review
+round and read by all six or seven lens calls in that round. A field of
+its own, or placement in the per-lens delta, would re-send the whole
+patch once per lens. A test pins that placement.
+
+Deliberately worktree-based, not symbol-index based: the review prompt
+warns that `source:` is stale for changed functions once a patch has
+landed, and reading the tree is what makes the warning unnecessary
+rather than merely stated. Callee lookups stay in the gather — they are
+not derivable from the diff.
+
+Measured on the 2026-08-11 06:24 linux.mm run, which motivated this:
+across nine review rounds the lenses issued 24 gather calls costing ~8
+minutes of wall time, against 3.4 minutes for all 47 parallel lens
+calls. The most requested item was `git diff HEAD~1`, once per round,
+and none of the 24 gather prompts carried a Rust-supplied payload. The
+cost of a review round is its gather, not its lens count — which is why
+skipping lenses is the wrong lever.
+
 ### A review verdict must be actionable in both directions
 
 `clean` is the fix loop's routing signal: false sends the run to

@@ -3387,6 +3387,23 @@ mod tests {
     fn the_session_layer_holds_the_cross_task_stable_fields() {
         assert!(LENS_SESSION_CACHE_FIELDS.contains(&"previous_findings"));
         assert!(LENS_SESSION_CACHE_FIELDS.contains(&"common_skills"));
+
+        // Evidence Rust supplies to the review lenses (the patch, and
+        // the worktree text around each hunk) is seeded into these two
+        // fields rather than a prompt field of its own, so that it is
+        // written once per review round and read by every lens in that
+        // round. Moving either into the per-lens delta would re-send
+        // the whole patch once per lens.
+        for supplied in ["symbols", "context"] {
+            assert!(
+                LENS_TASK_CACHE_FIELDS.contains(&supplied),
+                "{supplied} must stay in the shared task prefix"
+            );
+            assert!(
+                !LENS_SESSION_CACHE_FIELDS.contains(&supplied),
+                "{supplied} varies per task and would poison the session head"
+            );
+        }
         for per_task in ["question", "symbols", "context", "plan"] {
             assert!(
                 !LENS_SESSION_CACHE_FIELDS.contains(&per_task),

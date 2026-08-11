@@ -479,6 +479,82 @@ impl LlmDriver {
         self.seed_gather_from_deps(&gather_sources)
     }
 
+    /// Evidence the review lenses would otherwise spend gather rounds
+    /// asking Rust for.
+    ///
+    /// Measured on the 2026-08-11 06:24 linux.mm run: across nine
+    /// review rounds the lenses issued 24 gather calls costing ~8
+    /// minutes of wall time — more than double the 3.4 minutes the 47
+    /// parallel lens calls took — and the single most requested item
+    /// was `git diff HEAD~1`, asked once per round for a diff this
+    /// process already computes. Not one of the 24 gather prompts
+    /// carried a Rust-supplied payload.
+    ///
+    /// Supplies two things, both from the worktree rather than the
+    /// symbol index: the patch, and the current text around each hunk
+    /// it touches. The review prompt warns that `source:` is stale for
+    /// changed functions after a patch lands; reading the worktree is
+    /// what makes that warning unnecessary rather than merely stated.
+    ///
+    /// Callee lookups are deliberately left to the gather — they are
+    /// not derivable from the diff, and fetching them is correct.
+    ///
+    /// NOT covered end to end by any test. This seeds the SHARED lens
+    /// fan-out, which `lens_fan_out_consolidate` reaches only when an
+    /// `AgentRunner` is wired; the integration harness wires clients
+    /// but no runner, so its review falls through to the per-lens
+    /// executor path and never reaches here. Production does take the
+    /// shared path — `phase=cache-probe` appears only there, and the
+    /// 2026-08-11 linux.mm run logged 18 of them. Verify a change to
+    /// this function against a real run by grepping a review prompt
+    /// for `READONLY PAYLOAD: CURRENT PATCH`.
+    async fn supplied_review_evidence(&self, step: &Step) -> Vec<Value> {
+        if !uses_structured_review_outputs(step) {
+            return Vec::new();
+        }
+        let Ok(diff) = git_diff_head_parent(&self.workspace).await else {
+            // Best effort: no HEAD~1 yet, or git failed. The lenses can
+            // still fetch it themselves.
+            return Vec::new();
+        };
+        if diff.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut supplied = vec![serde_json::json!({
+            "source": "git diff HEAD~1",
+            "content": render_readonly_payload("CURRENT PATCH", "git diff HEAD~1", &diff),
+        })];
+        for (path, start, end) in changed_hunk_ranges(&diff) {
+            let Some(resolved) = resolve_workspace_path(&self.workspace, &path).ok() else {
+                continue;
+            };
+            let Ok(body) = std::fs::read_to_string(&resolved) else {
+                continue;
+            };
+            let lines: Vec<&str> = body.lines().collect();
+            let from = start.saturating_sub(1 + HUNK_CONTEXT_LINES);
+            let to = (end + HUNK_CONTEXT_LINES).min(lines.len());
+            if from >= to {
+                continue;
+            }
+            let numbered = lines[from..to]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{:>6}  {line}", from + i + 1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            supplied.push(serde_json::json!({
+                "source": format!("{path}:{}-{} (worktree)", from + 1, to),
+                "content": render_readonly_payload(
+                    &format!("CURRENT SOURCE {path}:{}-{}", from + 1, to),
+                    &format!("read {path} at HEAD+worktree"),
+                    &numbered,
+                ),
+            }));
+        }
+        supplied
+    }
+
     /// Record the symbols/context a step gathered so dependent steps
     /// can seed from it. Empty gathers replace prior entries because
     /// the same driver and step ids may be reused across workflow runs.
@@ -2088,6 +2164,8 @@ impl Driver for LlmDriver {
             Some(crate::workflow::Mode::Generic) => kres_core::TaskMode::Generic,
             _ => kres_core::TaskMode::Audit,
         };
+        let (seed_symbols, mut seed_context) = self.seed_gather_for_step(step, ctx);
+        seed_context.extend(self.supplied_review_evidence(step).await);
         let rctx = crate::pipeline::RunContext {
             // The consolidator does not receive the original lens prompt by
             // any other field. Give it the complete scope, not a step-id
@@ -2103,6 +2181,13 @@ impl Driver for LlmDriver {
             ),
             stable_instructions: prompt_texts.stable_instructions.clone(),
             output_schema: prompt_texts.schema_block.clone(),
+            // Evidence the lenses would otherwise spend gather rounds
+            // re-fetching. `gather()` folds these in before round 0, so
+            // they reach the lenses through the ordinary `symbols` /
+            // `context` fields and ride the task cache layer with them:
+            // one write per review round, read by every lens in it.
+            seed_symbols,
+            seed_context,
             ..crate::pipeline::RunContext::default()
         };
         if uses_structured_review_outputs(step) {
@@ -2240,6 +2325,43 @@ fn review_outcome_is_coherent(step: &Step, outputs: &Map<String, Value>) -> Resu
         )),
         _ => Ok(()),
     }
+}
+
+/// Lines of worktree context supplied either side of a changed hunk.
+const HUNK_CONTEXT_LINES: usize = 40;
+
+/// `(path, first_line, last_line)` for every hunk in a unified diff,
+/// using the POST-image line numbers so the ranges index the current
+/// worktree.
+fn changed_hunk_ranges(diff: &str) -> Vec<(String, usize, usize)> {
+    let mut out: Vec<(String, usize, usize)> = Vec::new();
+    let mut path: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let rest = rest.trim();
+            path =
+                (rest != "/dev/null").then(|| rest.strip_prefix("b/").unwrap_or(rest).to_string());
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(plus) = rest.split_whitespace().find(|f| f.starts_with('+')) else {
+            continue;
+        };
+        let mut nums = plus[1..].split(',');
+        let Some(start) = nums.next().and_then(|n| n.parse::<usize>().ok()) else {
+            continue;
+        };
+        let count = nums
+            .next()
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(1);
+        if let Some(path) = path.as_ref() {
+            out.push((path.clone(), start.max(1), start + count));
+        }
+    }
+    out
 }
 
 fn objectives_round(ctx: &ExecContext<'_>) -> u64 {
@@ -7105,6 +7227,85 @@ mod tests {
         assert!(
             block.contains("NUMBERED REVIEW DEFECTS"),
             "the reconcile context itself must still be present: {block}"
+        );
+    }
+
+    /// Hunk ranges index the POST-image, so they address the current
+    /// worktree rather than the pre-patch file.
+    #[test]
+    fn changed_hunk_ranges_uses_post_image_lines() {
+        let diff = "\
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7159,9 +7159,14 @@ int alloc_contig_frozen_range_noprof(unsigned long start,
+ 	some context
++	added line
+@@ -20,3 +25 @@ another hunk
+ 	more
+diff --git a/fs/gone.c b/fs/gone.c
+--- a/fs/gone.c
++++ /dev/null
+@@ -1,4 +0,0 @@
+-	deleted
+";
+        let ranges = changed_hunk_ranges(diff);
+        assert_eq!(
+            ranges,
+            vec![
+                ("mm/page_alloc.c".to_string(), 7159, 7173),
+                // A hunk header with no count means one line.
+                ("mm/page_alloc.c".to_string(), 25, 26),
+            ],
+            "a deleted file has no worktree text to supply"
+        );
+    }
+
+    /// A step that is not the lensed review gets nothing supplied.
+    #[tokio::test]
+    async fn supplied_review_evidence_is_scoped_to_the_review_step() {
+        let repo = init_test_git_repo();
+        let wf = fix_workflow();
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf.clone());
+        let write_patch = wf.steps.iter().find(|s| s.id == "write-patch").unwrap();
+        assert!(driver
+            .supplied_review_evidence(write_patch)
+            .await
+            .is_empty());
+    }
+
+    /// The review step is handed the patch and the current worktree
+    /// text around every hunk, so it does not spend gather rounds
+    /// asking Rust for what Rust already has.
+    #[tokio::test]
+    async fn supplied_review_evidence_carries_the_patch_and_current_source() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 1;\nint y = 2;\n").unwrap();
+        for args in [vec!["add", "a.c"], vec!["commit", "-m", "second", "-q"]] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let wf = fix_workflow();
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf.clone());
+        let review = wf.steps.iter().find(|s| s.id == "review").unwrap();
+
+        let supplied = driver.supplied_review_evidence(review).await;
+        let blob = serde_json::to_string(&supplied).unwrap();
+        assert!(
+            blob.contains("git diff HEAD~1"),
+            "the patch must be supplied: {blob}"
+        );
+        assert!(
+            blob.contains("KRES-READONLY"),
+            "supplied evidence must ride the read-only payload framing: {blob}"
+        );
+        assert!(
+            blob.contains("int y = 2;"),
+            "current worktree text around the hunk must be supplied: {blob}"
         );
     }
 

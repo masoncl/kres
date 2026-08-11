@@ -1098,7 +1098,7 @@
       "depends_on": [
         "fixes-tag-search"
       ],
-      "run_if": "research.research_status == 'confirmed' && write-patch.code_changes_emitted == true && (write-patch.review_dispute == '' || orchestrator.next_step == 'write-commit-message')",
+      "run_if": "research.research_status == 'confirmed' && (write-patch.code_changes_emitted == true || orchestrator.next_step == 'write-commit-message') && (write-patch.review_dispute == '' || orchestrator.next_step == 'write-commit-message')",
       "agent": "code",
       "mode": "coding",
       "actions": [

@@ -4699,6 +4699,72 @@ mod tests {
         }
     }
 
+    /// The orchestrator must be able to reach the commit-message
+    /// worker even when this cycle's write-patch produced nothing.
+    ///
+    /// On the 2026-08-11 08:01 linux.mm run the orchestrator routed to
+    /// write-patch, write-patch emitted no edits, and
+    /// `code_changes_emitted` went false — which closed
+    /// write-commit-message's gate for the rest of the run. The
+    /// orchestrator wanted a commit-message fix for a must_fix
+    /// objective, got the step skipped every time, fell back to
+    /// write-patch, and exhausted its ten attempts having run neither
+    /// worker to effect. write-patch even started editing
+    /// `.kres-commit-msg.tmp` through code_edits.
+    #[test]
+    fn orchestrator_can_reach_the_commit_message_worker_after_an_empty_patch() {
+        let wf = fix_workflow();
+        let step = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "write-commit-message")
+            .unwrap();
+        let run_if = step
+            .run_if
+            .as_deref()
+            .expect("write-commit-message gates itself");
+
+        let inputs = Map::new();
+        let state = |emitted: bool, next: &str| {
+            HashMap::from([
+                (
+                    "research".to_string(),
+                    step_state(json!({"research_status": "confirmed"})),
+                ),
+                (
+                    "write-patch".to_string(),
+                    step_state(json!({"code_changes_emitted": emitted, "review_dispute": ""})),
+                ),
+                (
+                    "orchestrator".to_string(),
+                    step_state(json!({"next_step": next})),
+                ),
+            ])
+        };
+        let run = |steps: &HashMap<String, StepState>| {
+            expr::eval(
+                run_if,
+                &ExecContext {
+                    workflow_inputs: &inputs,
+                    steps,
+                },
+                Some("write-commit-message"),
+            )
+            .unwrap()
+        };
+
+        // The livelock: write-patch produced nothing, and the
+        // orchestrator is explicitly asking for the changelog worker.
+        assert!(
+            run(&state(false, "write-commit-message")),
+            "an explicit orchestrator routing must open the gate"
+        );
+        // Normal first pass: the patch landed, no routing yet.
+        assert!(run(&state(true, "")));
+        // Still closed when nothing was patched and nobody asked.
+        assert!(!run(&state(false, "")));
+    }
+
     /// A stale objective must not escape the rule on a round whose own
     /// defect list happens to be empty. Objectives outlive rounds; the
     /// early return for "no defects this cycle" used to skip

@@ -5484,7 +5484,7 @@ fn render_open_objectives(ctx: &ExecContext<'_>) -> String {
     }
     // The store's `rounds_open` was stamped by the PREVIOUS merge, so
     // at prompt time it is one behind: the round being reconciled now
-    // has not been counted yet. `escalation_is_honest` adds that one
+    // has not been counted yet. `stale_objectives_are_escalated` adds that one
     // back before testing staleness, so the block must too, or the
     // model is shown "open 1 round(s)" with no STALE marker and then
     // refused for not treating it as stale. Observed on the 2026-08-10
@@ -7014,7 +7014,7 @@ mod tests {
     /// The live shape from the 2026-08-10 18:35 linux.sched run: an
     /// objective raised in round 1, still open at reconciliation 2.
     /// The block rendered "open 1 round(s)" with no STALE marker while
-    /// `escalation_is_honest` counted it stale and refused the answer,
+    /// `stale_objectives_are_escalated` counted it stale and refused the answer,
     /// so the model was being asked to satisfy a rule it was shown as
     /// not yet applicable.
     #[test]
@@ -7206,7 +7206,7 @@ mod tests {
         // for the 4th time.
         assert!(
             block.contains("open 4 round(s)"),
-            "rendered age must match escalation_is_honest's view: {block}"
+            "rendered age must match stale_objectives_are_escalated's view: {block}"
         );
         assert!(
             !block.contains("none yet"),
@@ -8785,7 +8785,7 @@ mod tests {
         );
         assert_eq!(unbacked["unbacked_fresh"].as_array().unwrap().len(), 1);
 
-        // The same citation labelled honestly is fine: a finding may
+        // The same citation labelled accurately is fine: a finding may
         // quote source it read from the finding itself, it just cannot
         // call that fresh.
         let quoted = check_claim_citations(

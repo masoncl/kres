@@ -1153,7 +1153,7 @@ writing into the void for the whole run.
 
 **The forward-progress rule.** Once an objective has been open for
 `OBJECTIVE_STALE_ROUNDS` (2) cycles, asking again in different words
-has already failed twice. `escalation_is_honest` requires the pass to
+has already failed twice. `stale_objectives_are_escalated` requires the pass to
 either name one stale objective in `must_fix` — which tells the review
 to check it first, tells both workers nothing else matters, and stops
 the orchestrator publishing while it is open — or settle it as

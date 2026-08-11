@@ -2852,7 +2852,7 @@ fn eval_reconcile_covers_every_defect(
     // a stale objective must not escape the rule just because this
     // cycle's review happened to report nothing.
     if defects.is_empty() {
-        return escalation_is_honest(step, ctx);
+        return stale_objectives_are_escalated(step, ctx);
     }
     if instructions.is_empty() && dropped.is_empty() {
         return eval_fail(&format!(
@@ -2958,7 +2958,7 @@ fn eval_reconcile_covers_every_defect(
         ));
     }
 
-    escalation_is_honest(step, ctx)
+    stale_objectives_are_escalated(step, ctx)
 }
 
 /// The forward-progress rule.
@@ -2979,7 +2979,7 @@ fn eval_reconcile_covers_every_defect(
 ///
 /// Rust owns the ages (`merge_emitted_objectives`), so this cannot be
 /// satisfied by a model reporting an old objective as new.
-fn escalation_is_honest(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
+fn stale_objectives_are_escalated(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option<String>) {
     let Some(outputs) = ctx.steps.get(&step.id).map(|state| &state.outputs) else {
         return (true, None);
     };
@@ -4646,7 +4646,7 @@ mod tests {
             workflow_inputs: &inputs,
             steps: &steps,
         };
-        escalation_is_honest(&step, &ctx)
+        stale_objectives_are_escalated(&step, &ctx)
     }
 
     fn open_objective(id: &str) -> Value {
@@ -4681,7 +4681,7 @@ mod tests {
         );
     }
 
-    /// Settling it is the other honest way out.
+    /// Settling the objective is the other way to clear the rule.
     #[test]
     fn escalation_eval_accepts_settling_the_stale_objective() {
         for status in ["satisfied", "withdrawn"] {

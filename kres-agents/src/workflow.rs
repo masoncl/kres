@@ -1637,6 +1637,36 @@ mod tests {
         assert_eq!(on_fail.branch_to.as_deref(), Some("reconcile-review"));
         assert_eq!(on_fail.branch_to_output.as_deref(), None);
 
+        // The source lenses skip a changelog-only round; `assertions`
+        // must not. It audits the commit message and the comments the
+        // patch adds, so a round where only the changelog changed is
+        // precisely the round its subject changed. Observed on the
+        // 2026-08-10 20:07 linux.nfs run: the review that returned
+        // clean=true and ended the run had skipped every lens except
+        // `maintainer`, so the final changelog rewrite was never
+        // claim-audited.
+        let review_lens = |id: &str| {
+            review
+                .lenses
+                .iter()
+                .find(|lens| lens.id == id)
+                .unwrap_or_else(|| panic!("fix review must define the {id} lens"))
+        };
+        assert!(
+            review_lens("assertions").skip_if.is_none(),
+            "the claim-audit lens must run on changelog-only review rounds"
+        );
+        assert!(
+            review_lens("maintainer").skip_if.is_none(),
+            "the maintainer lens reviews the changelog and must always run"
+        );
+        for id in ["memory-lifetime", "bounds", "races"] {
+            assert!(
+                review_lens(id).skip_if.is_some(),
+                "source lens {id} should skip a round that changed no source"
+            );
+        }
+
         let reconcile = wf
             .steps
             .iter()

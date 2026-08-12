@@ -295,6 +295,23 @@ and none of the 24 gather prompts carried a Rust-supplied payload. The
 cost of a review round is its gather, not its lens count — which is why
 skipping lenses is the wrong lever.
 
+### A step that rewrites the finding's artifacts is handed them
+
+A step declaring `summary_written` must emit `summary.md`, `metadata.yaml`
+and `FINDING.md` in full, so it needs their current bodies.
+`supplied_finding_artifacts` reads them from the finding directory and seeds
+them into the step's context on every attempt. An absent file is stated
+explicitly rather than omitted, so the step creates it instead of hunting for
+it.
+
+Leaving this to the gather made it a coin flip: nothing forces the fast agent
+to re-read them, and on a re-entry there is no cached copy either. Measured on
+the 2026-08-11 kres-inode batch, where a refutation sends
+`validate-reachability` back for another pass — of six attempts on one finding
+only two had the artifacts in context. Two of the other four refused to
+rewrite files they could not see, which fails the `summary_written` gate and
+ends the run; two rewrote FINDING.md from memory at a third of its size.
+
 ### A review verdict must be actionable in both directions
 
 `clean` is the fix loop's routing signal: false sends the run to
@@ -326,6 +343,12 @@ then.
 
 Two consequences follow, and both are load-bearing:
 
+- A write **outside the source workspace** invalidates nothing. The cache
+  holds evidence read out of the workspace, so a write into a consented
+  finding directory or a results tree cannot stale any of it
+  (`staged_write_can_stale_gathered_source`). `/validate` writes its three
+  artifacts into the finding directory, which is routinely a different tree
+  from the source under audit; those writes were wiping the whole cache.
 - Staging `.kres-commit-msg.tmp` does NOT invalidate anything. It is
   workflow bookkeeping for the reaper's `git commit -F`, not source
   under review (`is_workflow_scratch_artifact`).

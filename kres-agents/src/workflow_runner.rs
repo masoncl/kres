@@ -223,6 +223,33 @@ fn is_workflow_scratch_artifact(path: &Path) -> bool {
         .is_some_and(|name| name == COMMIT_MSG_SCRATCH)
 }
 
+/// True when writing `path` could change bytes that a gathered
+/// `source`/`read` record was fetched from.
+///
+/// The gathered cache holds evidence read out of the SOURCE WORKSPACE.
+/// A write landing anywhere else — a finding directory the operator
+/// consented to, a results tree — cannot stale any of it, and must not
+/// wipe it.
+///
+/// Getting this wrong is expensive. `/validate` writes summary.md,
+/// metadata.yaml and FINDING.md into the finding directory, which for
+/// the 2026-08-11 kres-inode batch sat in a different tree from the
+/// kernel under audit. Every one of those writes cleared the whole
+/// cache, so when a refutation sent `validate-reachability` back for
+/// another pass its gather started cold. Four of six attempts then ran
+/// without the finding's own body in context: two refused to rewrite
+/// files they could not see, which failed the summary_written gate and
+/// killed the run, and two rewrote FINDING.md from memory at a third
+/// of its size.
+fn staged_write_can_stale_gathered_source(workspace: &Path, path: &Path) -> bool {
+    if is_workflow_scratch_artifact(path) {
+        return false;
+    }
+    let workspace = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved.starts_with(&workspace)
+}
+
 struct StepPromptTexts {
     /// Call-invariant instruction text: the `--- SKILLS ---` block and
     /// any `--- INCLUDES ---` bodies. Kept out of the two bases so it
@@ -933,7 +960,9 @@ impl LlmDriver {
             // step's prior gather. The retry should add missing evidence
             // named in prior_attempts without discarding evidence already
             // fetched by the successful prior synthesis.
-            let (seed_symbols, seed_context) = self.seed_gather_for_step(step, ctx);
+            let (seed_symbols, mut seed_context) = self.seed_gather_for_step(step, ctx);
+            drop_superseded_artifact_context(&mut seed_context, &finding_artifact_paths(step, ctx));
+            seed_context.extend(supplied_finding_artifacts(step, ctx));
             // Preserve validated gather results across full synthesis retries
             // so a successful attempt can seed dependent steps.
             let mut captured_gathered: Option<(Vec<Value>, Vec<Value>)> = None;
@@ -1846,7 +1875,7 @@ impl Driver for LlmDriver {
         // Gather commands can mutate the workspace without emitting staged files.
         let invalidate_gathered = staged
             .keys()
-            .any(|path| !is_workflow_scratch_artifact(path))
+            .any(|path| staged_write_can_stale_gathered_source(&self.workspace, path))
             || effective_actions(step, &self.workflow)
                 .iter()
                 .any(|action| {
@@ -2334,6 +2363,9 @@ const HUNK_CONTEXT_LINES: usize = 40;
 /// enough that a stray large directory cannot spawn a git process per
 /// hex string in it.
 const ARTIFACT_FILE_SCAN_MAX: usize = 32;
+
+/// The three files a validation rewrites together.
+const FINDING_ARTIFACTS: [&str; 3] = ["metadata.yaml", "FINDING.md", "summary.md"];
 const ARTIFACT_SHA_SCAN_MAX: usize = 24;
 
 /// `(path, first_line, last_line)` for every hunk in a unified diff,
@@ -5164,6 +5196,98 @@ fn commit_message_written(
 /// artifacts were written into
 /// `<workspace>/home/clm/local/...`, and the eval passed. The workflow
 /// reported success and the finding was left unvalidated.
+/// The finding's own artifacts, handed to a step that has to rewrite
+/// them.
+///
+/// A step declaring `summary_written` must emit `summary.md`,
+/// `metadata.yaml` and `FINDING.md` in full. It can only do that
+/// safely if it has their current bodies, and leaving that to the
+/// gather makes it a coin flip: nothing forces the fast agent to
+/// re-read them, and on a re-entry there is no cached copy either.
+///
+/// Measured on the 2026-08-11 kres-inode batch. A refutation sends
+/// `validate-reachability` back for another pass; across six attempts
+/// on one finding only two had the artifacts in context. Of the four
+/// without, two refused to rewrite files they could not see -- which
+/// fails the `summary_written` gate and ends the run -- and two
+/// rewrote FINDING.md from memory at a third of its size. Both
+/// behaviours disappear once the bodies are always present.
+fn finding_artifact_paths(step: &Step, ctx: &ExecContext<'_>) -> Vec<PathBuf> {
+    if !step.outputs.contains_key("summary_written") {
+        return Vec::new();
+    }
+    let Some(dir) = target_finding_dir(ctx) else {
+        return Vec::new();
+    };
+    FINDING_ARTIFACTS
+        .iter()
+        .map(|name| dir.join(name))
+        .collect()
+}
+
+/// Drop gathered evidence for a file we are about to supply fresh.
+///
+/// A dependency step's gather often read the finding's artifacts, and
+/// `seed_gather_for_step` carries that copy forward. Leaving it beside
+/// the seeded one sends the same file twice, and — once a write commits
+/// and the step re-enters — sends two different versions of it, with
+/// nothing to tell the model which is current.
+fn drop_superseded_artifact_context(context: &mut Vec<Value>, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    context.retain(|item| {
+        let Some(source) = item.get("source").and_then(Value::as_str) else {
+            return true;
+        };
+        if source.contains("(current)") {
+            return true;
+        }
+        !paths
+            .iter()
+            .any(|path| source.contains(&*path.to_string_lossy()))
+    });
+}
+
+fn supplied_finding_artifacts(step: &Step, ctx: &ExecContext<'_>) -> Vec<Value> {
+    let paths = finding_artifact_paths(step, ctx);
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let mut supplied = Vec::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let name = name.as_str();
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            // Absent is legitimate: summary.md does not exist until the
+            // first validation writes it. Say so rather than staying
+            // silent, so the step does not go looking for it.
+            supplied.push(serde_json::json!({
+                "source": format!("{} (current)", path.display()),
+                "content": format!(
+                    "{} does not exist yet in the finding directory. Create it; there is no \
+                     prior content to preserve.",
+                    path.display()
+                ),
+            }));
+            continue;
+        };
+        supplied.push(serde_json::json!({
+            "source": format!("{} (current)", path.display()),
+            "content": render_readonly_payload(
+                &format!("CURRENT {name}"),
+                &format!("read {}", path.display()),
+                &body,
+            ),
+        }));
+    }
+    supplied
+}
+
 /// Distinct commit-ish hex strings named anywhere in a finding's
 /// artifacts, longest first so a 40-char sha is not shadowed by its
 /// own abbreviation.
@@ -7249,6 +7373,37 @@ mod tests {
             (inputs, states)
         };
 
+        // A write outside the source workspace -- a finding directory
+        // the operator consented to -- cannot stale workspace source.
+        let outside = tempfile::tempdir().unwrap();
+        kres_core::consent::get_or_install()
+            .grant_from_mention(outside.path())
+            .expect("grant the finding dir");
+        let driver = LlmDriver::new(repo.path().to_path_buf(), wf.clone());
+        driver.store_gathered("research", vec![json!({"name": "sym"})], vec![]);
+        let (inputs, states) = seed();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        driver
+            .apply_attempt_effects(
+                &step,
+                1,
+                &json!([{
+                    "path": outside.path().join("summary.md").to_string_lossy(),
+                    "body": "verdict\n"
+                }]),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            driver.seed_gather_from_deps(&["research".to_string()]).0,
+            vec![json!({"name": "sym"})],
+            "writing a finding artifact outside the workspace must not drop gathered source"
+        );
+
         // Scratch-only staging: the cache survives.
         let driver = LlmDriver::new(repo.path().to_path_buf(), wf.clone());
         driver.store_gathered("research", vec![json!({"name": "sym"})], vec![]);
@@ -7462,6 +7617,107 @@ diff --git a/fs/gone.c b/fs/gone.c
             blob.contains("int y = 2;"),
             "current worktree text around the hunk must be supplied: {blob}"
         );
+    }
+
+    /// A step that must rewrite the finding's artifacts is handed
+    /// their current bodies, every attempt, so it never has to choose
+    /// between refusing and rewriting from memory.
+    #[test]
+    fn finding_artifacts_are_supplied_to_the_step_that_rewrites_them() {
+        let finding = tempfile::tempdir().unwrap();
+        std::fs::write(
+            finding.path().join("metadata.yaml"),
+            "id: x\nstatus: active\n",
+        )
+        .unwrap();
+        std::fs::write(finding.path().join("FINDING.md"), "# the finding body\n").unwrap();
+        // summary.md deliberately absent: the first validation creates it.
+
+        let inputs = Map::from_iter([(
+            "target".to_string(),
+            Value::String(finding.path().to_string_lossy().into_owned()),
+        )]);
+        let steps = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let validate = crate::workflow::lookup_workflow(None, "validate").unwrap();
+        let reach = validate
+            .steps
+            .iter()
+            .find(|s| s.id == "validate-reachability")
+            .unwrap();
+
+        let supplied = supplied_finding_artifacts(reach, &ctx);
+        let blob = serde_json::to_string(&supplied).unwrap();
+        assert_eq!(
+            supplied.len(),
+            3,
+            "all three artifacts must be accounted for"
+        );
+        assert!(blob.contains("the finding body"), "{blob}");
+        assert!(blob.contains("status: active"), "{blob}");
+        assert!(
+            blob.contains("does not exist yet"),
+            "an absent summary.md must be stated, not omitted: {blob}"
+        );
+
+        // A step that does not rewrite them gets nothing.
+        let claims = validate
+            .steps
+            .iter()
+            .find(|s| s.id == "validate-claims")
+            .unwrap();
+        assert!(supplied_finding_artifacts(claims, &ctx).is_empty());
+    }
+
+    /// A dependency step's copy of an artifact is dropped in favour of
+    /// the freshly supplied one, so the model never sees two versions
+    /// of the same file.
+    ///
+    /// Measured on the 2026-08-12 kres-inode batch: every
+    /// validate-reachability prompt carried metadata.yaml twice, once
+    /// at 2649 bytes from the dependency gather and once at 4238 from
+    /// the seed. Identical content there, because the rejected
+    /// attempts' writes were discarded — but a committed write plus a
+    /// re-entry makes them disagree, with nothing marking which is
+    /// current.
+    #[test]
+    fn a_dependency_copy_of_a_supplied_artifact_is_dropped() {
+        let finding = tempfile::tempdir().unwrap();
+        let meta = finding.path().join("metadata.yaml");
+        let mut context = vec![
+            // What the dependency step's gather fetched, pre-write.
+            serde_json::json!({
+                "source": format!("read:{}:1+200", meta.display()),
+                "content": "status: active  # STALE",
+            }),
+            // Unrelated evidence must survive.
+            serde_json::json!({"source": "read:fs/inode.c:1+40", "content": "keep me"}),
+        ];
+        let paths = vec![meta.clone(), finding.path().join("FINDING.md")];
+
+        drop_superseded_artifact_context(&mut context, &paths);
+
+        let blob = serde_json::to_string(&context).unwrap();
+        assert!(
+            !blob.contains("STALE"),
+            "the dependency copy must go: {blob}"
+        );
+        assert!(
+            blob.contains("keep me"),
+            "unrelated evidence must stay: {blob}"
+        );
+
+        // A freshly supplied entry is never dropped, even though its
+        // source names the same path.
+        let mut supplied = vec![serde_json::json!({
+            "source": format!("{} (current)", meta.display()),
+            "content": "status: active  # CURRENT",
+        })];
+        drop_superseded_artifact_context(&mut supplied, &paths);
+        assert_eq!(supplied.len(), 1, "the supplied copy must survive");
     }
 
     /// Research must be told which commits its own artifacts cite that

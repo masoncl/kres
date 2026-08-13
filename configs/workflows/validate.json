@@ -3,10 +3,14 @@
   "$format": {
     "why_this_block_exists": [
       "$format is non-executable workflow documentation.",
-      "Validate is a sequential finding-validation workflow: one fast coding pass",
-      "checks the finding narrative for hallucinated claims, then one slow coding pass",
-      "does reachability/latency research and writes the same summary/severity artifacts",
-      "as triage. It intentionally has no lenses."
+      "Validate is a sequential finding-validation workflow with no lenses:",
+      "one fast coding pass checks each claim in the finding against source, a",
+      "second fast pass tests whether the surviving preconditions can hold on one",
+      "execution, and a slow coding pass decides the verdict and writes the same",
+      "summary/severity artifacts as triage. A verdict of Plausible is then",
+      "attacked by two refuters on two different models, either of which sends it",
+      "back. Behaviour is documented in docs/workflow-internals.md; keep that file",
+      "and this block in step."
     ]
   },
   "id": "validate",

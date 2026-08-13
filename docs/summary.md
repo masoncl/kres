@@ -19,7 +19,9 @@ findings through validations run on the cheaper model. That run:
 
 - exports every canonical finding under `<results>/summary-validation/` and
   runs the existing `validate` workflow against the active source workspace;
-  any validation failure aborts summary generation;
+  any validation failure aborts summary generation. The workflow itself —
+  its passes, verdict vocabulary and gates — is documented in
+  [workflow-internals.md](workflow-internals.md#validation-flow-validate);
 - renders only validation-produced narratives and structured verdicts, so
   stale pre-validation details cannot reintroduce contradicted claims;
 - reads `<results>/prompt.md` for the original question and does not parse

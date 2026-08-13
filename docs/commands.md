@@ -14,7 +14,10 @@ Shipped commands have one implementation path each:
 `review`, `triage`, `validate`, and `fix` are workflow-owned commands. They resolve
 through `configs/workflows/*.json` (or an override at
 `~/.kres/workflows/<name>.json`) and never fall back to a markdown prompt
-template.
+template. What each one does step by step — including `/validate`'s
+passes, its Rust-side gates and its refuters — is defined once in
+[workflow-internals.md](workflow-internals.md); [workflow.md](workflow.md)
+is the shorter operator-facing tour.
 
 `summary` and `summary-markdown` are report-rendering commands. Both CLI
 and REPL call `kres-repl/src/summary.rs`; they do not run through

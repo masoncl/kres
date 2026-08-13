@@ -191,8 +191,11 @@ there.
   publishing generated kernel fixes.
 - [docs/agents.md](docs/agents.md) — fast / slow / todo / etc
   agent flow and how follow-up tasks drive larger reviews.
-- [docs/workflow.md](docs/workflow.md) — the workflow-backed
-  `/review`, `/validate`, and `/fix` flows.
+- [docs/workflow.md](docs/workflow.md) — what the `/review`,
+  `/fix`, `/triage` and `/validate` workflows do and how a run
+  progresses.
+- [docs/workflow-internals.md](docs/workflow-internals.md) — step
+  contracts, evals, retry and branch semantics.
 - [docs/coding-tasks.md](docs/coding-tasks.md) — reproducer and
   fix generation (`code_output`, `code_edits`, `bash` verify).
 - [docs/turns-and-follow.md](docs/turns-and-follow.md) — when

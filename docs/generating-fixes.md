@@ -7,7 +7,8 @@ touches the tree, how it scopes commits, and how it avoids turning an
 uncertain bug report into a low-quality patch.
 
 The executable workflow is `configs/workflows/fix.json`. The detailed
-workflow runner semantics are documented in [workflow.md](workflow.md).
+workflow runner semantics are documented in
+[workflow-internals.md](workflow-internals.md).
 
 ## Starting Point
 

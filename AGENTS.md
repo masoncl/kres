@@ -565,11 +565,16 @@ Per-task, not per-session.
 
 ### Workflows
 
-Detailed workflow documentation lives in `docs/workflow.md`. Treat
-that file as the source of truth for `/fix`, `/review`, workflow
-runner behavior, reaper actions, retry semantics, and shipped
-workflow invariants. Keep this section short and update
-`docs/workflow.md` when workflow behavior changes.
+`docs/workflow.md` is the user-facing guide: what the four
+workflows do and how a run progresses. `docs/workflow-internals.md`
+is the source of truth for all four — `/fix`, `/review`, `/triage`
+and `/validate` — plus workflow runner behavior, reaper actions,
+retry semantics, and shipped workflow invariants. Do not add a
+second per-workflow description anywhere else: a standalone
+`/validate` snapshot existed once and went stale against the
+workflow it described. Keep this section short and update
+`docs/workflow-internals.md` when workflow behavior changes; update
+`docs/workflow.md` when the change is visible to an operator.
 
 ### Workspace and Mentioned Paths
 
@@ -692,8 +697,8 @@ used by the fix workflow after `Assisted-by:`. When omitted, kres derives
 | `/summary-markdown [FILE]` | Same as `/summary` but uses the `summary-markdown` template and defaults the filename to `summary.md` |
 | `/review <target>` | Run the embedded `review` workflow for `<target>` — CLI equivalent of `--prompt 'review: <target>'`. The shipped workflow defines the review prompt contract and lenses; execution uses the REPL task/todo loop so followups become next-turn review todos. This is workflow-only; no markdown prompt fallback exists |
 | `/triage <finding-dir>` | Run the embedded `triage` workflow for a kres-exported finding directory. The workflow includes the golden triage template, preserves followups, and validates that `summary.md` was actually written. This is workflow-only; no alternate prompt path exists |
-| `/validate <finding-dir> [source-workspace]` | Run the embedded `validate` workflow for a kres-exported finding directory against source workspace (default `.`). Three steps: the fast coding agent validates the finding's claims with typed provenance, a second fast step tests whether the surviving preconditions can hold simultaneously, and the slow coding agent proves reachability and writes `summary.md` plus severity updates like `/triage`. Both the claim step and the verdict step are gated by Rust-side `builtin` evals, not prompt text — see [docs/workflow.md](docs/workflow.md). This is workflow-only; no alternate prompt path exists |
-| `/fix <target>` | Run the embedded `fix` workflow for `<target>` — CLI equivalent of `--prompt 'fix: <target>'`. `fix` is workflow-only; no slash-command template or alternate prompt path is used. Drives the research → write-patch → write-commit-message → commit → build → triage/review → publish pipeline (see [docs/workflow.md](docs/workflow.md)) |
+| `/validate <finding-dir> [source-workspace]` | Run the embedded `validate` workflow for a kres-exported finding directory against source workspace (default `.`). Three steps: the fast coding agent validates the finding's claims with typed provenance, a second fast step tests whether the surviving preconditions can hold simultaneously, and the slow coding agent proves reachability and writes `summary.md` plus severity updates like `/triage`. Both the claim step and the verdict step are gated by Rust-side `builtin` evals, not prompt text — see [docs/workflow-internals.md](docs/workflow-internals.md). This is workflow-only; no alternate prompt path exists |
+| `/fix <target>` | Run the embedded `fix` workflow for `<target>` — CLI equivalent of `--prompt 'fix: <target>'`. `fix` is workflow-only; no slash-command template or alternate prompt path is used. Drives the research → write-patch → write-commit-message → commit → build → triage/review → publish pipeline (see [docs/workflow-internals.md](docs/workflow-internals.md)) |
 | `/report <file>` | Write all findings to markdown file |
 | `/followup` | Show deferred items (identified but skipped when goal met) |
 | `/next` | Run next todo item |

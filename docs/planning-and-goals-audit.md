@@ -3,7 +3,7 @@
 This document describes how kres currently creates plans, goals, and follow-up
 work. It is an implementation guide, not a proposed architecture. Detailed
 workflow step ordering, retries, review lenses, and fix publication semantics
-belong in [workflow.md](workflow.md).
+belong in [workflow-internals.md](workflow-internals.md).
 
 ## Ownership
 
@@ -101,7 +101,7 @@ final series assessment, not on an inferred range or per-todo patch fragments.
 
 Outer-series resume restores `fix-series.json`; inner workflow resume restores
 the corresponding per-todo execution snapshot. Exact behavior and artifact
-names are documented in [workflow.md](workflow.md).
+names are documented in [workflow-internals.md](workflow-internals.md).
 
 ## Static Workflows
 
@@ -140,4 +140,4 @@ termination depends on follow-up exhaustion, the goal configuration, and
 
 These are implementation constraints, not alternate workflow contracts. Any
 change to them should update this document and, when workflow behavior changes,
-[workflow.md](workflow.md).
+[workflow-internals.md](workflow-internals.md).

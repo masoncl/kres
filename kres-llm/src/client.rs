@@ -1242,7 +1242,20 @@ impl Client {
         let mut command = builder
             .build_command()
             .map_err(|e| LlmError::Other(format!("claude-codes initialization failed: {e}")))?;
-        command.args(["--bare", "--safe-mode", "--tools", ""]);
+        // `--setting-sources ""` loads no user, project or local settings, so
+        // the operator's hooks, plugins and project instructions stay out of a
+        // kres call. `--bare` isolates the same way, but it also restricts
+        // Anthropic auth to ANTHROPIC_API_KEY or an apiKeyHelper and never
+        // reads OAuth or the keychain, which leaves a CLI-only login unable to
+        // serve a request at all.
+        command.args([
+            "--safe-mode",
+            "--tools",
+            "",
+            "--setting-sources",
+            "",
+            "--disable-slash-commands",
+        ]);
         command.stderr(Stdio::null());
         if let Some(url) = base_url {
             command.env("ANTHROPIC_BASE_URL", url);

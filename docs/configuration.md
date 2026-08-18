@@ -205,7 +205,12 @@ optional; without them, the CLI's normal authentication and configuration
 apply.
 
 Each kres call uses a fresh, non-persistent Claude process and therefore starts
-with an empty conversation context. The process runs with tool access denied.
+with an empty conversation context. The process runs with tool access denied,
+slash commands disabled, and `--setting-sources ""`, so no user, project or
+local settings — hooks, plugins, project instructions — reach a kres call. It
+is deliberately not launched with `--bare`: that mode isolates the same way but
+restricts Anthropic auth to `ANTHROPIC_API_KEY` or an `apiKeyHelper`, never
+reading OAuth or the keychain, which is the credential a CLI-only operator has.
 The shipped example contains both Sonnet and Opus; select one with, for example,
 `claude-codes.json:claude-sonnet-5`.
 

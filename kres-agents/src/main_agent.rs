@@ -540,7 +540,7 @@ fn mcp_semcode_fallback_followup(
         name,
         reason: "MCP semcode lookup was unavailable, incomplete, or unparseable; using local grep/read fallback".into(),
         path: None,
-        nice_to_have: false,
+        required_for_progress: true,
     })
 }
 

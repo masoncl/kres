@@ -2741,8 +2741,12 @@ fn shared_fanout_lens_value(path: &[&str]) -> Value {
     let field = path.first().copied().unwrap_or("");
     match field {
         "id" => Value::String("assigned lens".into()),
+        // The brief itself lives only in `lens_instruction`;
+        // `parallel_lenses.your_lens` is an identity descriptor
+        // (`lens_self_identity`) and deliberately carries no `reason`,
+        // so do not send the agent there for its instructions.
         "investigate" => Value::String(
-            "Use the lens_instruction and parallel_lenses.your_lens fields for the assigned lens-specific review instructions.".into(),
+            "Use the lens_instruction field for the assigned lens-specific review instructions; parallel_lenses.your_lens names which lens is yours.".into(),
         ),
         _ => Value::String(format!(
             "Use parallel_lenses.your_lens.{} for the assigned lens-specific value.",
@@ -4471,6 +4475,9 @@ fn embedded_workflow_include(path: &str) -> Option<String> {
         || suffix.ends_with("/configs/prompts/triage-template.md")
     {
         return Some(include_str!("../../configs/prompts/triage-template.md").to_string());
+    }
+    if suffix == "configs/workflows/guards.md" || suffix.ends_with("/configs/workflows/guards.md") {
+        return Some(include_str!("../../configs/workflows/guards.md").to_string());
     }
     None
 }
@@ -9645,7 +9652,7 @@ diff --git a/fs/gone.c b/fs/gone.c
         // without one and the model invented `target`/`description`/
         // `detail`, costing a repair inference each time.
         assert!(tail.contains("array of "), "typed DTO arrays need a shape");
-        for needle in ["\"nice_to_have\"", "\"reason\""] {
+        for needle in ["\"required_for_progress\"", "\"reason\""] {
             assert!(
                 tail.contains(needle),
                 "followup shape must contain {needle}"
@@ -11469,14 +11476,14 @@ diff --git a/fs/gone.c b/fs/gone.c
                 name: "fs/foo.c".into(),
                 reason: "".into(),
                 path: None,
-                nice_to_have: false,
+                required_for_progress: true,
             },
             crate::followup::Followup {
                 kind: "bash".into(),
                 name: "rm -rf /".into(),
                 reason: "".into(),
                 path: None,
-                nice_to_have: false,
+                required_for_progress: true,
             },
             // 'question' always passes (it's not a fetch).
             crate::followup::Followup {
@@ -11484,7 +11491,7 @@ diff --git a/fs/gone.c b/fs/gone.c
                 name: "is x defined?".into(),
                 reason: "".into(),
                 path: None,
-                nice_to_have: false,
+                required_for_progress: true,
             },
         ];
         let result = gating.fetch(&followups, None).await.unwrap();
@@ -11553,7 +11560,7 @@ diff --git a/fs/gone.c b/fs/gone.c
                 name: "foo".into(),
                 reason: "[MISSING]".into(),
                 path: None,
-                nice_to_have: false,
+                required_for_progress: true,
             }],
             fast_rounds: 2,
             strategy: crate::response::ParseStrategy::WholeBody,

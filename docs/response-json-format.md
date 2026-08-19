@@ -55,7 +55,7 @@ Every followup requires a non-empty `reason` that explains what decision the
 requested evidence will unblock; this lets the fetcher and later agents retain
 the purpose when requests are deduplicated or served from cache. The optional
 `path` field scopes searches and file discovery. Optional
-`nice_to_have: true` marks a non-blocking followup; omitted or false is
+`required_for_progress: false` marks a non-blocking followup; omitted or true is
 blocking.
 
 `findings` is a delta, not the complete store. `code_output` and `code_edits`

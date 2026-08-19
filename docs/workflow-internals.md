@@ -568,10 +568,10 @@ snapshot.
      `research_status`; routing never depends on wording inside
      `analysis`.
    - `followups`: typed data requests. A blocking followup (default
-     `nice_to_have: false`) is a request for another gather round. Any
+     `required_for_progress: true`) is a request for another gather round. Any
      blocking followup makes the eval fail and triggers a retry that
      gathers the requested evidence. A nice-to-have followup
-     (`nice_to_have: true`) is a deferred audit suggestion that does
+     (`required_for_progress: false`) is a deferred audit suggestion that does
      not block — it may ride alongside any terminal status.
    - `affected_files`: paths the patch will touch.
    - `affected_symbols`: relevant symbols.
@@ -1629,8 +1629,33 @@ model ids must be qualified as `provider.json:model-id`.
 - `memory-lifetime`: allocation and initialization, publication, pointer
   ownership, refcounts, RCU grace periods, asynchronous use, cleanup paths,
   callback ownership, object layout, free ordering, leaks, use-after-free,
-  double-free, uninitialized memory, and allocator API misuse. Pure index,
-  range, and arithmetic errors remain owned by `bounds`.
+  double-free, uninitialized memory, and allocator API misuse. It no
+  longer defers index/range/arithmetic errors to `bounds`: that clause
+  went when the guard procedure was folded in, on the rule that a lens
+  is never told to stay quiet about a bug it found. The consolidator
+  dedups overlap.
+
+  This lens also carries the guard procedure. The TEST/WINDOW/USE
+  definition ships as `configs/workflows/guards.md`, pulled into the
+  review step's shared prompt via `@configs/workflows/guards.md` in
+  `include`, so every lens reads it once from the cached prefix;
+  `read_at_path` resolves includes against the RUN's cwd, so guards.md is
+  also registered in `embedded_workflow_include` and travels in the
+  binary. The lens names the state TEST read, the fact it establishes,
+  the USE it protects, what in the WINDOW changes that state, and the
+  ACTUAL requirement USE has of it.
+
+  It rides with lifetime rather than standing alone because the defect is
+  the same object seen twice. On the 2026-08-19 arch/x86/kvm/mmu reviews a
+  standalone guards lens repeatedly reached the right window and cleared
+  it — "does not drop mmu_lock, so the fact still holds at USE" — while
+  memory-lifetime was independently reading `kvm_mmu_child_role()` and
+  correctly reasoning that it propagates `role.direct`, never asking what
+  else the same role word carries. An object whose memory is never freed
+  can still have the property a guard checked about it go false, and can
+  carry that false property into whatever it is used to build or publish;
+  that is a lifetime question about a property rather than about storage.
+
 - `bounds`: array/index correctness, trusted versus untrusted indexes,
   integer overflow, truncation, and size calculation mistakes.
 - `races`: lock coverage, ordering, missed wakeups, shared-state races,

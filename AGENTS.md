@@ -232,6 +232,63 @@ User prompt → Task created → Task thread starts
 - Task states: `pending → inference → waiting_main → gathering → done`
 - `TaskManager` handles scheduling (respects `depends_on`), servicing, reaping
 
+### Requeue: fetching evidence without giving up the slot
+
+A slow agent that names evidence it did not have has not failed — it
+has said the gather stopped one hop short. That request used to become
+a followup: a new todo row, ranked against every other row, whose
+answer arrived (if ever) in a different task with a different brief.
+On the 2026-08-19 `arch/x86/kvm/mmu` review a lens asked for
+`make_mmu_pages_available`, the body landed four minutes later inside
+an unrelated task, and the task that needed it never saw it.
+
+A **requeue** fetches it instead and re-analyses, up to
+`followup::MAX_TASK_REQUEUES` (3) times per task.
+
+- It is not a retry. The response was valid; nothing is being
+  corrected. What repeats is fetch-then-analyse.
+- The slot is kept for free. `TaskManager::spawn` holds the semaphore
+  permit across the whole of `work`, so looping inside it cannot admit
+  another task, and nothing is reaped or published until the loop
+  settles. Do not implement a requeue by finishing the task and
+  re-dispatching: that returns the slot and re-enters ranking, which
+  is the failure being fixed.
+- What qualifies is decided from typed fields only, never prose
+  (`followup::requeue_evidence_requests`): `required_for_progress`,
+  because that is already the declared marker for a blocking evidence
+  request; kind is not `question`, because no fetcher can satisfy one
+  and a task that asked only questions must not spin; and the request
+  has not already been served this task, so re-asking cannot buy
+  another round.
+- Each round seeds the next gather with the previous round's symbols
+  and context. A requeue must never leave a lens seeing less than the
+  round that raised the question.
+- The plan's opening step never requeues. It builds the map the rest
+  of the plan is written against and later steps wait on it, so a
+  round there is serial time the whole run pays; the evidence it would
+  add is evidence the parallel steps fetch for themselves. On the
+  2026-08-19 arch/x86/kvm/mmu review the inventory step was the only
+  task to run in nineteen minutes, spending two requeues while nothing
+  else could start. The test is positional
+  (`followup::is_opening_plan_step`) — a plan step id is
+  model-generated prose and must not be matched on.
+- A round fetches every qualifying request, with no cap. The fetches
+  are main-agent/semcode work while the round costs a gather plus a
+  full lens fan-out, so bounding them saves almost nothing. A cap of
+  three was tried and removed: the caller pools all lenses' requests
+  before selecting, so truncation gave the whole budget to whichever
+  lens came first. On the 2026-08-19 arch/x86/kvm/mmu review the
+  `general` lens twice named `__kvm_mmu_prepare_zap_page` as its FIRST
+  request and lost both times to `memory-lifetime`'s list; that body
+  was never fetched across nine blocking requests, while the ordinary
+  gather in the same run pulled 148 distinct symbols.
+- The budget is small because each round costs a gather plus a full
+  lens fan-out. A chain still unresolved after three hops belongs in a
+  followup for a future task, not in more rounds here.
+
+Wired into the lensed path (`AgentRunner::run_with_lenses`), which is
+what `/review` uses. `run_once_with_ctx` does not requeue yet.
+
 ### Dispatch Backpressure: the Start Budget
 
 The shared todo list is the resource being protected, but protecting

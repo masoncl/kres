@@ -6179,7 +6179,7 @@ async fn run_review_file_scan(
                 name: target.to_string(),
                 reason: "whole-file structural inventory".to_string(),
                 path: None,
-                nice_to_have: false,
+                required_for_progress: true,
             }],
             None,
         )

@@ -339,10 +339,10 @@
         "- invalid: bug_proven=false, fix_contract_proven=false, invalidity_proven=true, needs_more_audit=false.",
         "- unconfirmed: invalidity_proven=false, and at least one of bug_proven/fix_contract_proven is false or needs_more_audit=true.",
         "",
-        "Followups have a single workflow meaning: a blocking followup (`nice_to_have` omitted",
-        "or false) is a request for another gather round. Emitting one fails this step's eval",
+        "Followups have a single workflow meaning: a blocking followup (`required_for_progress` omitted",
+        "or true) is a request for another gather round. Emitting one fails this step's eval",
         "regardless of status, and the runner re-runs research with the gathered evidence; that",
-        "is how you ask for more rounds. A nice-to-have followup (`nice_to_have: true`) is a",
+        "is how you ask for more rounds. A deferred followup (`required_for_progress: false`) is a",
         "deferred audit suggestion that does not block the eval \u2014 use this for the \"would be",
         "nice to double-check later\" notes you would otherwise hide in analysis prose, and",
         "ship them alongside any terminal status. Reach a terminal status only when you have",
@@ -399,7 +399,7 @@
         "followups": {
           "type": "array<Followup>",
           "optional": true,
-          "description": "Typed followups emitted by the slow agent. Each entry must satisfy the Followup schema (kind/name required). Set `nice_to_have: true` on entries that are deferred audits (would be nice to double-check, but the current verdict does not depend on them). Omit or set `nice_to_have: false` for blocking evidence requests; the eval rejects any terminal status while a blocking followup is present."
+          "description": "Typed followups emitted by the slow agent. Each entry must satisfy the Followup schema (kind/name required). Set `required_for_progress: false` on entries that are deferred audits (would be nice to double-check, but the current verdict does not depend on them). Omit or set `required_for_progress: true` for blocking evidence requests; the eval rejects any terminal status while a blocking followup is present."
         },
         "fix_plan": {
           "type": "array<object>",

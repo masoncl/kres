@@ -472,7 +472,7 @@ mod tests {
                     name: "a.c:2+2".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -504,7 +504,7 @@ mod tests {
                     name: "large.c".into(),
                     reason: "build inventory".into(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -549,7 +549,7 @@ mod tests {
                     name: "bio".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -568,7 +568,7 @@ mod tests {
                     name: "sector_t".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -601,7 +601,7 @@ mod tests {
                     name: "cma_release".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -646,7 +646,7 @@ mod tests {
                     name: "page_folio".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -701,7 +701,7 @@ mod tests {
                     name: "page_folio".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -761,7 +761,7 @@ mod tests {
                     name: "some_func".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -786,7 +786,7 @@ mod tests {
                     name: "check".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -811,7 +811,7 @@ mod tests {
                     name: "check; touch owned".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )

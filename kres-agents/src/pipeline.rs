@@ -1732,21 +1732,107 @@ impl AgentRunner {
         let lens_schema = CodeResponseContract::default()
             .schema_json_for(&["analysis", "findings", "followups"])
             .to_string();
-        let fanout = self
-            .run_lenses_shared_gather_repairing(
-                prompt,
-                lenses,
-                ctx,
-                shutdown,
-                LensRepairPolicy {
-                    max_retries: GENERIC_LENS_REPAIR_RETRIES,
-                    repair_instruction: "Your previous response for this review lens did not produce usable lens output. Reuse the same gathered source/context and reply with this lens's analysis, findings, or followups.",
-                    contract_name: "review-lens",
-                    schema: &lens_schema,
-                },
-                validate_generic_lens_output,
-            )
-            .await?;
+        // REQUEUE. A lens that names evidence it did not have has not
+        // failed — it has told us the gather stopped one hop short.
+        // Historically that request became a followup, i.e. a new todo
+        // row competing for a dispatch slot against everything else,
+        // and the answer came back (if ever) to a different task with a
+        // different brief. Observed on the 2026-08-19 arch/x86/kvm/mmu
+        // review: a lens asked for `make_mmu_pages_available`, the body
+        // arrived four minutes later inside an unrelated task, and the
+        // task that needed it never saw it.
+        //
+        // So fetch it here instead and re-analyse. The task keeps its
+        // slot for free: the semaphore permit in `TaskManager::spawn`
+        // is held across the whole of `work`, so looping inside it
+        // cannot let another task in, and nothing is reaped or
+        // published until the loop settles.
+        //
+        // Each round costs one gather plus one lens fan-out, which is
+        // why the budget is small and the selection is narrow — see
+        // `requeue_evidence_requests` for what qualifies.
+        //
+        // The plan's opening step is exempt: it is what every later
+        // step waits on, so a round there is serial time the whole run
+        // pays, and the evidence it would add is evidence the parallel
+        // steps fetch for themselves.
+        let requeue_allowed = !crate::followup::is_opening_plan_step(
+            ctx.plan.as_ref(),
+            ctx.active_plan_step_id.as_deref(),
+        );
+        let mut owned_ctx: Option<RunContext> = None;
+        let mut requeued: u32 = 0;
+        let mut requested: HashSet<String> = HashSet::new();
+        let fanout = loop {
+            let fanout = {
+                let ctx_ref = owned_ctx.as_ref().unwrap_or(ctx);
+                self.run_lenses_shared_gather_repairing(
+                    prompt,
+                    lenses,
+                    ctx_ref,
+                    shutdown,
+                    LensRepairPolicy {
+                        max_retries: GENERIC_LENS_REPAIR_RETRIES,
+                        repair_instruction: "Your previous response for this review lens did not produce usable lens output. Reuse the same gathered source/context and reply with this lens's analysis, findings, or followups.",
+                        contract_name: "review-lens",
+                        schema: &lens_schema,
+                    },
+                    validate_generic_lens_output,
+                )
+                .await?
+            };
+            if !requeue_allowed {
+                break fanout;
+            }
+            // One selection over every lens's requests pooled
+            // together, so `requested` dedups across lenses and a
+            // symbol two lenses both want is fetched once. Nothing is
+            // dropped: with no cap, pooling cannot starve a lens that
+            // happens to be ordered last.
+            let asked: Vec<crate::followup::Followup> = fanout
+                .outputs
+                .iter()
+                .flat_map(|output| output.parsed.followups.iter().cloned())
+                .collect();
+            let wanted = crate::followup::requeue_evidence_requests(&asked, &mut requested);
+            if wanted.is_empty() {
+                break fanout;
+            }
+            // Budget is checked against real demand, so the log below
+            // never claims requests were dropped when none were asked
+            // for. These logs are the only record of why a task
+            // stopped digging.
+            if requeued >= crate::followup::MAX_TASK_REQUEUES {
+                kres_core::async_eprintln!(
+                    "[requeue] budget of {} spent; {} evidence request(s) stay followups",
+                    crate::followup::MAX_TASK_REQUEUES,
+                    wanted.len(),
+                );
+                break fanout;
+            }
+            requeued += 1;
+            let preview: Vec<String> = wanted
+                .iter()
+                .take(5)
+                .map(|fu| format!("{}:{}", fu.kind, truncate(&fu.name, 40)))
+                .collect();
+            kres_core::async_eprintln!(
+                "[requeue {}/{}] fetching {} blocking request(s) and re-running {} lens(es): {}",
+                requeued,
+                crate::followup::MAX_TASK_REQUEUES,
+                wanted.len(),
+                lenses.len(),
+                preview.join(", "),
+            );
+            // Carry the gather forward as the next round's seed so the
+            // fetch is additive: a requeue must never make a lens see
+            // LESS than the round that asked the question.
+            let mut next = owned_ctx.take().unwrap_or_else(|| ctx.clone());
+            next.seed_symbols = fanout.symbols.clone();
+            next.seed_context = fanout.context.clone();
+            next.pending_followups = wanted;
+            owned_ctx = Some(next);
+        };
         let empty_lenses: Vec<String> = fanout
             .outputs
             .iter()
@@ -1867,7 +1953,7 @@ impl AgentRunner {
                      be treated as covering it"
                 ),
                 path: None,
-                nice_to_have: false,
+                required_for_progress: true,
             });
         }
         Ok(TaskSummary {
@@ -2304,9 +2390,11 @@ impl AgentRunner {
         let mut lens_specs: Vec<LensCallSpec> = Vec::with_capacity(lenses.len());
         for lens in lenses.iter() {
             // §20b: send identity-only lens descriptors to the slow
-            // agent.
+            // agent. `your_lens` omits `reason` because
+            // `lens_instruction` below already carries it verbatim;
+            // siblings keep theirs so this lens can see their remit.
             let parallel_lenses = json!({
-                "your_lens": lens_identity(lens),
+                "your_lens": lens_self_identity(lens),
                 "other_lenses": all_lenses
                     .iter()
                     .filter(|candidate| candidate.id != lens.id)
@@ -3203,11 +3291,31 @@ fn resolve_skill_read_in_subdirs(path: &str) -> Option<(std::path::PathBuf, Stri
     Some((resolved, content))
 }
 
+/// Strip a lens to `{type, name, id?}` for the `your_lens` slot of
+/// `parallel_lenses`.
+///
+/// Deliberately omits `reason`: the same text is already in the
+/// prompt verbatim as `lens_instruction`'s `(why: ...)` tail, two
+/// fields earlier and outside the cache prefix, so repeating it here
+/// bought a second full copy of the lens brief on every lens call and
+/// nothing else. Measured on the review workflow's five file-target
+/// lenses, that copy was 3,281 characters per task. Siblings still
+/// carry `reason` via [`lens_identity`] — a lens needs to know what
+/// its siblings cover, but not to be told its own remit twice.
+pub fn lens_self_identity(lens: &LensSpec) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), json!(lens.kind));
+    obj.insert("name".into(), json!(lens.name));
+    if !lens.id.is_empty() {
+        obj.insert("id".into(), json!(lens.id));
+    }
+    Value::Object(obj)
+}
+
 /// Strip a lens to `{type, name, id?, reason?}` for the
-/// `parallel_lenses` blob. Matches
-/// — we expose just enough for the slow agent to
-/// discriminate "your lens" from sibling lenses without bleeding any
-/// internal LensSpec fields into the prompt.
+/// `other_lenses` list and for per-call lens tagging. Carries
+/// `reason` so a lens can see what its siblings are covering; use
+/// [`lens_self_identity`] for the lens's own descriptor.
 pub fn lens_identity(lens: &LensSpec) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("type".into(), json!(lens.kind));
@@ -3312,6 +3420,34 @@ fn extract_text(resp: &kres_llm::request::MessagesResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lens is told its own remit once, not twice.
+    ///
+    /// `lens_instruction` carries the lens brief verbatim in its
+    /// `(why: ...)` tail. `your_lens` used to repeat it, so every lens
+    /// call shipped two identical copies of the same text outside the
+    /// cache prefix. Siblings keep `reason` — a lens needs their remit
+    /// to avoid duplicating their work — but its own is already there.
+    #[test]
+    fn your_lens_descriptor_omits_the_reason_lens_instruction_repeats() {
+        let mut lens = LensSpec::new("guards", "guards");
+        lens.reason = "Guard validity and check-then-act: ...".into();
+
+        let mine = lens_self_identity(&lens);
+        assert_eq!(mine.get("id").and_then(|v| v.as_str()), Some("guards"));
+        assert_eq!(mine.get("name").and_then(|v| v.as_str()), Some("guards"));
+        assert!(
+            mine.get("reason").is_none(),
+            "your_lens must not repeat the brief that lens_instruction carries"
+        );
+
+        let sibling = lens_identity(&lens);
+        assert_eq!(
+            sibling.get("reason").and_then(|v| v.as_str()),
+            Some("Guard validity and check-then-act: ..."),
+            "other_lenses still needs each sibling's remit"
+        );
+    }
 
     /// A lens must be shown the output contract it is validated against.
     ///
@@ -3579,7 +3715,7 @@ mod tests {
                     name: "x".into(),
                     reason: String::new(),
                     path: None,
-                    nice_to_have: false,
+                    required_for_progress: true,
                 }],
                 None,
             )
@@ -4132,7 +4268,7 @@ mod tests {
             name: name.to_string(),
             reason: String::new(),
             path: None,
-            nice_to_have: false,
+            required_for_progress: true,
         }
     }
 

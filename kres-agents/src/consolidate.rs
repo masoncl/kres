@@ -280,7 +280,7 @@ pub async fn consolidate_lenses_with_logger(
                 reason: "[MISSING] Rust rejected Finding fields after one schema-repair attempt; re-emit the same claims with valid typed fields before completion"
                     .into(),
                 path: None,
-                nice_to_have: false,
+                required_for_progress: true,
             });
         }
     }
@@ -485,7 +485,7 @@ mod tests {
             name: "kernel/a.c:1+20".into(),
             reason: "needed by lens".into(),
             path: None,
-            nice_to_have: false,
+            required_for_progress: true,
         };
         let f2 = f1.clone();
         let f3 = Followup {
@@ -493,7 +493,7 @@ mod tests {
             name: "foo".into(),
             reason: "needed by lens".into(),
             path: None,
-            nice_to_have: false,
+            required_for_progress: true,
         };
         let empty_findings = Vec::new();
         let lens1_followups = vec![f1, f3.clone()];

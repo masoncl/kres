@@ -214,7 +214,7 @@ impl DataFetcher for McpFetcher {
                                     name: fu.name.clone(),
                                     reason: fu.reason.clone(),
                                     path: fu.path.clone(),
-                                    nice_to_have: fu.nice_to_have,
+                                    required_for_progress: fu.required_for_progress,
                                 });
                             }
                         }
@@ -232,7 +232,7 @@ impl DataFetcher for McpFetcher {
                                 name: fu.name.clone(),
                                 reason: fu.reason.clone(),
                                 path: fu.path.clone(),
-                                nice_to_have: fu.nice_to_have,
+                                required_for_progress: fu.required_for_progress,
                             });
                         }
                     }

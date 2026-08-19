@@ -302,15 +302,26 @@ Request git history only for a specific semantic question source cannot answer.\
         "Do not survey or audit the whole repository unless the operator \
 explicitly asks for a whole-tree audit.\n\n",
     );
-    for include in &step.include {
-        if let Some(key) = include
-            .strip_prefix("{{globals.")
-            .and_then(|s| s.strip_suffix("}}"))
-        {
-            if let Some(s) = workflow.globals.get(key).and_then(|v| v.as_str()) {
-                prompt.push_str(s);
-                prompt.push_str("\n\n");
-            }
+    // Resolve includes through the workflow runner's resolver rather
+    // than a local `{{globals.X}}`-only loop: that loop silently
+    // dropped `@path` file includes and object-valued globals, so an
+    // include could be added to review.json and never reach the model.
+    {
+        let steps = HashMap::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &steps,
+        };
+        let block = kres_agents::workflow_runner::resolve_includes(
+            &step.include,
+            &workflow,
+            &ctx,
+            Some(&step.id),
+        )
+        .map_err(|e| anyhow::anyhow!("review include resolution: {e}"))?;
+        if !block.is_empty() {
+            prompt.push_str(&block);
+            prompt.push_str("\n\n");
         }
     }
     if let Some(p) = step.prompt.as_deref() {
@@ -2195,6 +2206,55 @@ mod tests {
             review_prompt_file_from_target("drivers/example/example.c", None).expect("workflow");
         assert_eq!(cfg.prompt_file.lenses.len(), 4);
         assert!(!cfg.prompt_file.lenses.iter().any(|l| l.id == "assertions"));
+        // The guard procedure is folded into memory-lifetime rather than
+        // being its own lens: the defect it hunts is a fact about an
+        // object going false, which is the same object the lifetime pass
+        // is already tracing. `investigate` maps to LensSpec::reason, so
+        // a misspelled field would ship a lens that asks the model
+        // nothing.
+        let ml = cfg
+            .prompt_file
+            .lenses
+            .iter()
+            .find(|l| l.id == "memory-lifetime")
+            .expect("file-target review keeps the memory-lifetime lens");
+        for phrase in [
+            "TEST",
+            "WINDOW",
+            "USE",
+            "ACTUAL requirement",
+            "use-after-free",
+            // The copy this asks about is how a falsified property
+            // reaches a freshly initialized object.
+            "origin of structure fields copied during initialization",
+        ] {
+            assert!(
+                ml.reason.contains(phrase),
+                "memory-lifetime lens lost its {phrase:?} step"
+            );
+        }
+        // The lens tells the model to work "per the GUARDS definition in
+        // INCLUDES". That definition ships as an `@` file include, which
+        // resolves off the RUN's cwd (a source tree being reviewed, not
+        // this checkout) before falling back to the embedded table — so
+        // assert it actually landed in the prompt rather than trusting
+        // the reference.
+        let p = &cfg.prompt_file.prompt;
+        assert!(
+            p.contains("A `guard` is those three parts"),
+            "guards.md include did not resolve into the review prompt"
+        );
+        assert!(p.contains("`WINDOW` begins inside `TEST`"));
+        // Lenses are never shown the generated response schema, so the
+        // only place they can learn that `required_for_progress` exists
+        // is this prompt text. Without it every request defaults to
+        // blocking and the requeue budget goes on whatever the lens
+        // happened to list first.
+        assert!(
+            p.contains("\"required_for_progress\": true|false"),
+            "review prompt does not teach the followup blocking flag"
+        );
+        assert!(p.contains("order them most decisive first"));
         assert!(cfg
             .prompt_file
             .prompt

@@ -103,14 +103,45 @@ User prompt → Task created → Task thread starts
   as not-a-bug (`ConfirmedLatent`, `NotADefect`, `Invalid`, `Fixed`);
   there is nothing downstream to protect and the refutation costs two
   slow calls.
-- Prompt/workflow fixes must be bug-agnostic. Do not add guidance that
-  names a specific missed regression, subsystem, file, function, helper,
-  or one-off mechanism because a recent run failed to find it. Generalize
-  to the review invariant instead: changed contracts, unchanged users,
-  concrete trigger paths, strong suspects, and typed followups for
-  missing evidence. Regression tests may check that generic invariants
-  are present, but prompts themselves must stay reusable across all bug
+- kres's own prompts must be bug-agnostic. No text kres ships to a
+  model may name a specific regression, subsystem, file, function,
+  helper, symbol, or one-off mechanism. Generalize to the review
+  invariant instead: changed contracts, unchanged users, concrete
+  trigger paths, strong suspects, and typed followups for missing
+  evidence. Regression tests may check that generic invariants are
+  present, but prompts themselves must stay reusable across all bug
   classes.
+
+  This is a rule about the TEXT, not about your reason for writing it.
+  It applies to every model-facing string equally: guidance, worked
+  EXAMPLES, sample values, enum descriptions, schema field docs,
+  defaults, and error messages. An earlier wording said "do not add
+  guidance that names … because a recent run failed to find it", and
+  both halves of that were an opening. On 2026-08-21 the
+  `invalidation.premise` field's two illustrative examples shipped as
+  `("mmu_lock is held for write across the whole update",
+  "check_memory_region_flags rejects the two flags together")` — the
+  second verbatim from the arch/x86/kvm/mmu findings that motivated the
+  field. It survived self-review twice, because an example is not
+  "guidance" and because the stated motive was "show the shape", not
+  "a run failed". Neither distinction survives contact with the
+  prompt, which ships to every review of every subsystem and seeds one
+  subsystem's vocabulary into all of them.
+
+  Model-facing means: `configs/prompts/**`, `configs/workflows/**`,
+  every Rust string literal that reaches a prompt, and anything
+  `steps[].include` pulls in. Rust `//` and `///` comments and
+  `#[cfg(test)]` fixtures are NOT model-facing and may name whatever
+  makes the reason legible — that is where a motivating bug belongs.
+  Before committing a change to any model-facing file, grep the whole
+  set for the identifiers of whatever you were just looking at.
+
+  An operator's own domain guide is a different thing and is not
+  covered: `~/.kres/skills/*.md` and the review-prompt trees they pull
+  in exist precisely to encode how one subsystem's APIs must be used.
+  Naming `is_page_fault_stale()` in a KVM subsystem guide is that
+  file's job. Naming it in kres's audit system prompt is this
+  violation.
 - Negative coverage claims must be earned. Agents, consolidators, todo
   updates, and goal checks must not accept phrases like "no remaining
   users", "all callers updated", "old path unreachable", "only reader",
@@ -138,6 +169,104 @@ User prompt → Task created → Task thread starts
   recovers any region. Do not extend this to grep, source, or any
   evidence a review reasons over, and do not turn it into a silent
   truncation by dropping the pointer or the byte count.
+- A finding delta carries only what changed. `Finding` requires `id`
+  and nothing else on the wire: `title`, `severity` and `summary`
+  default, because reusing an id to update or retire a record is a
+  shape kres asks for in its own prompts. `merge_into` was always
+  written for it — `prefer_longer` ignores an empty incoming string
+  and severity merges by max, so an absent field cannot blank or
+  downgrade a stored one.
+
+  The wire type used to demand a whole record, which made both shapes
+  unparseable. The retirement shape `review.json` instructs,
+  `{id, status: invalidated, invalidation}`, failed on `missing field
+  title`; so did `{id, open_questions}`. One such entry fails the
+  WHOLE response, so the lens is re-run: measured across 26 concurrent
+  reviews on 2026-08-22, 1,766 repair calls against 7,398 lens
+  responses, 91 for a missing title and 28 for a missing summary. The
+  prompt was instructing a shape the schema forbade.
+
+  Completeness is enforced where the store can tell an update from a
+  new finding, not at parse time. `apply_delta_to_list` refuses a
+  record that matches no existing id and carries no title or no
+  summary, counts `incomplete_refused`, and reports it as
+  `refused-incomplete=N`. It refuses BEFORE `semantic_duplicate_index`
+  runs: that match needs `id_title_token_overlap` over 0.70, a
+  titleless record gives it almost nothing, and merging into the wrong
+  record silently destroys a finding.
+
+  Do not restore `title`, `severity` or `summary` as required fields,
+  and do not move the completeness check back to parse time — parsing
+  cannot see whether the id already exists, which is the only thing
+  that distinguishes an update from a nameless new finding.
+
+  **This has been shipped broken three times, so the rule is about
+  the ENVELOPE, not the field.** Each delta-only channel was added
+  correctly on its own terms and left the shape carrying it
+  unparseable:
+
+  * `reactivate`, a wire-only boolean that reverses an invalidation.
+  * `resolved_questions`, added by commit `e5fd59b` ("kres: let a
+    finding's answered questions be closed") and described there as
+    "Wire-only: `merge_into` consumes it and it never reaches a stored
+    record" — modelled, in its own words, on `reactivate`.
+  * `invalidation`, added by commit `c114adb`. This entry's own
+    neighbour below has said "A delta setting `status: invalidated` on
+    an existing record carries `invalidation: {premise, evidence[]}`"
+    since that commit, and `review.json` has instructed exactly that
+    shape — while `{id, status, invalidation}` failed to deserialize
+    on `missing field title` the entire time.
+
+  Every author reasoned about the new field and about `merge_into`,
+  and none checked whether a record containing ONLY that field could
+  be parsed. It could not, so using any of these channels required
+  re-sending a whole record. Models do not: measured 30 minutes into
+  the 2026-08-22 batch, 479 of 1,504 finding records emitted were
+  partial — 32% — with `{id, invalidation, resolved_questions,
+  status}` among the most common shapes.
+
+  So: **when you add a field that only makes sense on a delta, add a
+  test that deserializes the minimal record the prompts instruct** —
+  `{id, <your field>}` and nothing else — and a second that merges it
+  and asserts the stored title, summary and severity survived.
+  `the_delta_shapes_the_prompts_ask_for_actually_parse` and
+  `an_update_keeps_the_stored_title_summary_and_severity` are those
+  tests; extend them rather than writing new ones beside them. A
+  field-level test on the new channel passes while the envelope is
+  broken, which is exactly how this reached production three times.
+
+- An invalidation must name the claim it rests on. A delta setting
+  `status: invalidated` on an existing record carries
+  `invalidation: {premise, evidence[]}`, where the premise is the one
+  claim that, being true, means the finding is not a bug, and the
+  evidence is its file:line citations. `apply_status_transition`
+  REFUSES the flip without both; the rest of the delta still merges
+  and `[findings]` reports `refused-invalidation=N`. Reversing needs
+  only that the premise be contradicted, and `Status::Unconfirmed` is
+  reachable from Active AND from Invalidated with no flag at all —
+  only Invalidated → Active still needs `reactivate: true`.
+
+  All of that exists because `invalidated` had become the bucket for
+  three different things and only one of them was disproof. On the
+  2026-08-20 arch/x86/kvm/mmu review, `mirror_root_dirty_log_kvm_bug_on`
+  and `tdp_mirror_cas_retry_livelock` were retired on the claim that
+  `check_memory_region_flags()` makes `KVM_MEM_GUEST_MEMFD` and
+  `KVM_MEM_LOG_DIRTY_PAGES` mutually exclusive — true of the flags in
+  one ioctl request, not of a slot over its lifetime. The same run
+  later filed the `KVM_MR_FLAGS_ONLY` bypass as its own high finding
+  (upstream `9935df5333aa`, `Cc: stable`), rewrote the retired
+  finding's title to name that bypass, and left the status alone,
+  because nothing linked a premise to the evidence refuting it. The
+  last two deltas said so outright: "status remains invalidated
+  pending confirmation of whether…" and "the decisive bodies were not
+  obtained, so status remains invalidated/unresolved rather than
+  disproved". Neither can produce a premise, so neither can invalidate
+  now, and both describe `Unconfirmed`.
+
+  Do not restore a bare `status: invalidated`, and do not let
+  `Unconfirmed` acquire an entry fee. The asymmetry is deliberate:
+  claiming a bug is dead should cost more than admitting you cannot
+  tell yet.
 - Every prior finding is sent to every agent, every time. Do not add
   relevance routing, anchor heuristics, or any other scheme that
   decides WHICH findings a review is allowed to see: a finding that
@@ -173,6 +302,30 @@ User prompt → Task created → Task thread starts
   restore the all-or-nothing behaviour: discarding four good lenses
   because a fifth hit a transport limit both wasted the work and,
   through the consecutive-error watchdog, halted the session.
+- A schema change is not done when the producer compiles. Every field
+  in a shared payload — the whole-file scan, a `PlanStep`, a `Finding`,
+  a `Followup`, a workflow step's declared outputs — is a contract with
+  three kinds of consumer, and all three have to move together:
+  1. **Rust**, which builds and reads the struct;
+  2. **the prompts**, which tell an agent what it will receive and what
+     it must return — the per-role system prompts under
+     `configs/prompts/`, the workflow JSON's step prompts and shared
+     globals, and any operator-facing prompt text;
+  3. **the tests that pin those promises**, which otherwise either fail
+     on the corrected prompt or keep passing while the prompt lies.
+
+  Before changing a field, enumerate its consumers and list them; do not
+  assume the compiler will find them, because a prompt that promises a
+  field nobody sends still compiles. An agent told it will receive
+  ratings that no longer exist is worse off than one told nothing: it
+  will wait for them, or prioritise as though it had them. The same
+  applies to a new field — adding it to the producer does nothing until
+  the consuming agent is told it exists, what it means, and what to do
+  with it.
+
+  Removing a field means removing every promise of it, in the same
+  change. Adding one means stating it in every prompt whose agent is
+  expected to act on it.
 - Rust must not infer semantic workflow state from free-form AI prose.
   Do not add substring/regex classifiers over model `analysis`,
   `invalid_evidence`, defect text, commit-message prose, or other natural
@@ -183,6 +336,101 @@ User prompt → Task created → Task thread starts
   returns structured JSON and make Rust consume only that structure.
   Prose may be preserved for humans and logs, but it must not be a hidden
   control channel.
+- The converse also holds: Rust must not emit a control signal into a
+  channel the model reads as criticism. `previous_rejection_block`
+  renders a step's `last_eval_reason` as "Your last response for this
+  step was not accepted: <reason>", so only an eval failure that will
+  re-run THAT step to correct itself may set it — `repeat` and
+  `rerun_chain`. A `branch_to` is how a CORRECT output moves control
+  elsewhere: `orchestrator_dispatch` returns `(false, "route to
+  <step>")` because returning false is the only way to trigger
+  `branch_to_output`; `review` fails `clean == true` exactly when it
+  found defects; `validate-refute` fails `refutation.refuted == false`
+  exactly when it refutes. None of those is a bad response.
+
+  On the 2026-08-20 futex2 series, finding
+  `futex_private_hash_put_uaf_mm`: the orchestrator routed to
+  write-commit-message, the branch was taken, and the step was then
+  re-prompted with "Your last response for this step was not accepted:
+  route to write-commit-message". It concluded its "next_step was
+  rejected only because it emitted 'route to write-commit-message' as
+  prose instead of the required JSON shape", re-issued the identical
+  decision, and on the next pass reasoned that "the only worker that
+  can land O4 is write-commit-message, and that routing was rejected
+  for this step … That leaves no worker step that can discharge the
+  open objective" — then picked `exit-failure`. The source patch was
+  complete and every lens had passed it.
+- No path from the author's machine may be committed as an
+  instruction. A checked-in file that tells a reader or an agent to
+  read, run, or write something names it with a placeholder the
+  install path substitutes, or with a path relative to the repo root,
+  never with `~/...` or `/home/<user>/...`. The review-prompts tree is
+  `@REVIEW_PROMPTS@`, resolved by `setup.sh --review-prompts` and
+  documented in [docs/configuration.md](docs/configuration.md) §
+  Kernel review prompts; there is exactly one such tree, so do not add
+  a second way to locate it.
+
+  This covers every file the repo ships: `AGENTS.md` and the other
+  root markdown procedures, `docs/**`, `skills/**`, `configs/**`, Rust
+  string literals, and `setup.sh` itself. An absolute home path in any
+  of them resolves on one machine and silently fails everywhere else,
+  and the reader cannot tell a wrong path from a missing file.
+
+  Two exceptions, both narrow. Analysis notes that record what was
+  measured — `validation-bugs.md`, `todo-updates.md`, the `*-design.md`
+  drafts — cite the tree the evidence came from, and that citation is
+  the point. Usage examples in `--help` text and docs may show a
+  concrete path when it is visibly an example (`e.g. /home/you/...`).
+  Neither is an instruction to read a file.
+
+  Commit `d0b28b2` ("kres: require the agent-parseable writing
+  rules") is why this is written down. It added "Follow
+  `~/local/src/review-prompts/WRITING-SKILL.md`" to the Writing
+  section below, on a repo that already had `@REVIEW_PROMPTS@` and a
+  `--review-prompts` install flag for that exact tree, and the same
+  slip had already shipped twice in `kres-review-inline-template.md`.
+  Before committing a doc or a prompt, grep the diff for `/home/` and
+  for `~/`.
+
+### Writing
+
+Follow `@REVIEW_PROMPTS@/WRITING-SKILL.md`, where `@REVIEW_PROMPTS@`
+is the review-prompts tree `setup.sh --review-prompts` names (see
+[docs/configuration.md](docs/configuration.md) § Kernel review
+prompts). It governs every
+string someone parses without its author present: the prompts under
+`configs/`, tool and error text, `[tag]` progress lines, commit
+messages, and this file. Write so that exactly one reading is possible.
+
+Five rules break most often in this repo.
+
+- Lead with the command, or with the `If <condition>:` that gates it.
+  A reason may ride along in a subordinate clause. Do not spend a
+  whole sentence on rationale before the reader knows what to do.
+- Hold one new proposition per sentence, two at most. A trailing
+  "which", a bare appositive, a semicolon, and a colon before a second
+  independent clause each smuggle in a third. Close the sentence
+  instead.
+- Name the relation between adjacent claims: "so", "since", "yet",
+  "once", "unless". Four sentences opening with a bare subject means
+  the connectives were deleted and have to go back.
+- Use one term per concept. Pick check or verify or validate, then
+  reuse it for the same action everywhere in the document.
+- Never strengthen a hedge while shortening. "may fail" does not
+  become "fails", and a shorter sentence must not claim more than the
+  source did.
+
+Read a draft back against the skill's second half before shipping it.
+Both failure modes are real and they are symmetric, so a check that
+hunts only long sentences drives you into a paragraph of bare
+declaratives that connects nothing.
+
+For a commit message the kernel template in the operator's global
+instructions still sets structure and trailer order. The skill adds
+what a template cannot: lead with the symptom rather than the
+mechanism, say so when you reproduced the defect, and describe the
+defect rather than only the edit. A message can agree perfectly with
+its diff and still misdescribe the bug.
 
 ### Lints
 - The pre-commit hook runs `cargo clippy --workspace --all-targets

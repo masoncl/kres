@@ -19,7 +19,7 @@
 //! cancellation, tracks state. The actual agent work is injected as a
 //! closure. kres-agents (Phase 4) will plug that closure in.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -169,6 +169,34 @@ struct Inner {
     /// mention sort after the ones it does, in storage order, which is
     /// what makes a new row "append until the next ranking places it".
     ranked_order: Vec<String>,
+    /// Rows claimed so far per survey group, keyed by `step_id` with
+    /// the empty string standing for the unattributed bucket.
+    ///
+    /// Dispatch prefers the least-served group, so a region of the
+    /// file that keeps producing followups cannot take every slot from
+    /// one that produced few. Measured on the 2026-08-21
+    /// arch/x86/kvm/mmu/mmu.c review: `audit-cluster-05` accumulated
+    /// 119 followups against `audit-cluster-10`'s 21, and nothing in
+    /// the ranking had any reason to correct that.
+    ///
+    /// Counts CLAIMS, not completions, so a group cannot monopolise
+    /// the queue while its work is still in flight. Not persisted: a
+    /// resumed session restarts the round robin, which is right,
+    /// because it also restarts the dispatch history the counts
+    /// describe.
+    claims_by_group: BTreeMap<String, usize>,
+}
+
+/// Is this row one of the survey groups themselves, rather than a
+/// followup discovered while auditing one?
+///
+/// Tested on `id` and `step_id` because those are the two fields
+/// `reconcile_update` restores from the original. `kind` is NOT usable:
+/// the todo agent owns `type`, and on the 2026-08-21 mmu.c review it
+/// had dropped the field from all 13 surviving group rows — 0 of 448
+/// rows still carried `kind == "review"`.
+pub fn is_survey_group_row(item: &TodoItem) -> bool {
+    !item.step_id.is_empty() && item.id == format!("review-{}", item.step_id)
 }
 
 #[derive(Debug, Clone)]
@@ -403,6 +431,7 @@ impl TaskManager {
                 deferred: Vec::new(),
                 starts_since_reap: 0,
                 ranked_order: Vec::new(),
+                claims_by_group: BTreeMap::new(),
             }),
             caches: Mutex::new(Caches {
                 symbol_cache: LruCache::new(symbol_cap),
@@ -1032,6 +1061,11 @@ impl TaskManager {
         // regenerates colliding ones. Leaving the order behind would
         // let a cleared session's ranking silently apply to the next.
         g.ranked_order.clear();
+        // Same argument, same reason: step ids restart at
+        // 01 for every coverage plan, so a surviving count would hand
+        // the next topic's first group a dispatch debt it never
+        // incurred.
+        g.claims_by_group.clear();
     }
 
     /// Remove one todo without replacing unrelated rows whose state
@@ -1082,6 +1116,23 @@ impl TaskManager {
 
     pub async fn todo_snapshot(&self) -> Vec<TodoItem> {
         self.inner.read().await.todo.clone()
+    }
+
+    /// How many survey group rows have not finished.
+    ///
+    /// While this is non-zero the file is by construction not fully
+    /// reviewed, so a whole-file goal cannot honestly be met: the
+    /// groups partition every function in the target. Callers use it
+    /// to skip work that can only restate what the row statuses
+    /// already say.
+    pub async fn outstanding_survey_groups(&self) -> usize {
+        self.inner
+            .read()
+            .await
+            .todo
+            .iter()
+            .filter(|item| is_survey_group_row(item) && !item.status.is_terminal())
+            .count()
     }
 
     /// Publish successful executor completion before any continuation LLM
@@ -1241,8 +1292,49 @@ impl TaskManager {
             .enumerate()
             .map(|(position, id)| (id.as_str(), position))
             .collect();
+        // Every survey group is analysed before any followup is. A
+        // followup is work discovered while auditing one group; letting
+        // it compete for slots before the other groups have run once
+        // means a productive region can consume the whole run. Measured
+        // on the 2026-08-21 mmu.c review: at 2h10m the prioritizer's
+        // top ten were all reachability questions on already-filed
+        // findings, and the row carrying the defect the run was
+        // chasing had appeared in ZERO rankings.
+        //
+        // Quantified over the group rows that EXIST, not over the
+        // plan's steps: retirement deletes a row, and on that same run
+        // only 13 of 15 steps still had one. Waiting on the missing two
+        // would never terminate.
+        let group_rows_pending = g
+            .todo
+            .iter()
+            .any(|item| is_survey_group_row(item) && !item.status.is_terminal());
+        // "Can still make progress on its own" means running now, or
+        // Pending WITH ITS DEPENDENCIES MET. A Pending group row whose
+        // dependency can never be satisfied would otherwise hold the
+        // gate shut forever while never being claimable — and
+        // dependency-blocked rows keep the Pending status, they do not
+        // become TodoStatus::Blocked, so testing the status alone
+        // misses exactly that case.
+        let group_rows_claimable = g.todo.iter().any(|item| {
+            is_survey_group_row(item)
+                && match item.status {
+                    TodoStatus::InProgress => true,
+                    TodoStatus::Pending => item
+                        .depends_on
+                        .iter()
+                        .all(|dependency| done.contains(dependency)),
+                    _ => false,
+                }
+        });
+        // Shut only while a group row can still make progress on its
+        // own. A gate that cannot open is not a gate, it is a deadlock:
+        // the same reasoning as the `g.tasks.is_empty()` escape above.
+        let gate_shut = group_rows_pending && group_rows_claimable;
+
         let mut result = TodoClaims::default();
         let mut ready: Vec<(usize, usize)> = Vec::new();
+        let mut gated = 0usize;
         for (index, item) in g.todo.iter().enumerate() {
             if item.status != TodoStatus::Pending {
                 continue;
@@ -1255,17 +1347,53 @@ impl TaskManager {
                 result.blocked += 1;
                 continue;
             }
+            if gate_shut && !is_survey_group_row(item) {
+                // Not dispatchable until the survey has been covered
+                // once, but still Pending and still counted below, so
+                // `/todo` and the reaper's drain logic see the real
+                // queue depth rather than an empty one.
+                gated += 1;
+                continue;
+            }
             // Unranked rows sort after every ranked one, and a stable
             // sort keeps them in storage order among themselves.
             let rank = rank_of.get(item.id.as_str()).copied().unwrap_or(usize::MAX);
             ready.push((rank, index));
         }
-        ready.sort_by_key(|(rank, _)| *rank);
-        result.remaining = ready.len().saturating_sub(claim_limit);
-        for (_, index) in ready.into_iter().take(claim_limit) {
+        result.remaining = ready.len().saturating_sub(claim_limit) + gated;
+        // Least-served group first, then the prioritizer's opinion
+        // WITHIN that group, then storage order. The ranking agent
+        // still decides which of a group's rows runs next; it no longer
+        // decides which group gets the slot.
+        //
+        // Re-selected on every iteration rather than sorted once,
+        // because a claim changes the key: one dispatch of N slots must
+        // spread across N groups, not hand all N to whichever group was
+        // least-served when the wave began.
+        let mut taken = 0usize;
+        while taken < claim_limit {
+            let Some(position) = ready
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (rank, index))| {
+                    let step = g.todo[*index].step_id.as_str();
+                    (
+                        g.claims_by_group.get(step).copied().unwrap_or(0),
+                        *rank,
+                        *index,
+                    )
+                })
+                .map(|(position, _)| position)
+            else {
+                break;
+            };
+            let (_, index) = ready.swap_remove(position);
             let item = &mut g.todo[index];
             item.status = TodoStatus::InProgress;
+            let step = item.step_id.clone();
             result.items.push(item.clone());
+            *g.claims_by_group.entry(step).or_insert(0) += 1;
+            taken += 1;
         }
         g.starts_since_reap = g.starts_since_reap.saturating_add(result.items.len());
         result
@@ -1896,6 +2024,241 @@ mod tests {
         assert_eq!(mgr.start_budget().await, 4);
         assert_eq!(mgr.claim_ranked_todos(9, 0).await.items.len(), 3);
         hold.notify_waiters();
+    }
+
+    fn group_row(step: &str) -> TodoItem {
+        let mut t = TodoItem::new(format!("audit {step}"), "review");
+        t.id = format!("review-{step}");
+        t.step_id = step.to_string();
+        t
+    }
+
+    fn followup_row(id: &str, step: &str) -> TodoItem {
+        let mut t = TodoItem::new(id, "source");
+        t.id = id.to_string();
+        t.step_id = step.to_string();
+        t
+    }
+
+    /// The todo agent owns `type`, and on the 2026-08-21 mmu.c review
+    /// it had dropped it from all 13 surviving group rows: 0 of 448
+    /// still carried `kind == "review"`. Only `id` and `step_id` are
+    /// restored by `reconcile_update`, so only those may be tested.
+    #[test]
+    fn a_group_row_is_identified_by_id_not_by_kind() {
+        let mut row = group_row("audit-cluster-01");
+        assert!(is_survey_group_row(&row));
+        row.kind = String::new();
+        assert!(is_survey_group_row(&row), "kind must not be load-bearing");
+
+        assert!(!is_survey_group_row(&followup_row(
+            "some-followup",
+            "audit-cluster-01"
+        )));
+        // A row with a step but no matching id is a followup.
+        let mut orphan = group_row("audit-cluster-02");
+        orphan.id = "review-audit-cluster-99".into();
+        assert!(!is_survey_group_row(&orphan));
+    }
+
+    /// Every survey group is analysed before any followup is.
+    /// The goal check is skipped while any group is unfinished, so it
+    /// must report that state exactly. Being wrong in the "0" direction
+    /// lets a premature goal-met DRAIN retire groups that never ran --
+    /// the fairness gate cannot stop that, because a drain is not a
+    /// dispatch.
+    #[tokio::test]
+    async fn outstanding_survey_groups_counts_only_unfinished_groups() {
+        let mgr = TaskManager::with_caps(8, 8);
+        mgr.seed_todo_if_empty(vec![
+            group_row("g1"),
+            group_row("g2"),
+            followup_row("f1", "g1"),
+        ])
+        .await;
+        assert_eq!(mgr.outstanding_survey_groups().await, 2);
+
+        mgr.mark_todo_done("review-g1").await;
+        assert_eq!(mgr.outstanding_survey_groups().await, 1);
+
+        mgr.mark_todo_done("review-g2").await;
+        assert_eq!(
+            mgr.outstanding_survey_groups().await,
+            0,
+            "a pending followup is not an unfinished group"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_without_survey_groups_reports_nothing_outstanding() {
+        // Non-review work must not have its goal checks suppressed.
+        let mgr = TaskManager::with_caps(8, 8);
+        mgr.seed_todo_if_empty(vec![followup_row("a", ""), followup_row("b", "step")])
+            .await;
+        assert_eq!(mgr.outstanding_survey_groups().await, 0);
+    }
+
+    #[tokio::test]
+    async fn followups_wait_until_every_group_has_run() {
+        let mgr = TaskManager::with_caps(8, 8);
+        mgr.seed_todo_if_empty(vec![
+            group_row("g1"),
+            group_row("g2"),
+            followup_row("f1", "g1"),
+            followup_row("f2", "g1"),
+        ])
+        .await;
+
+        let first = mgr.claim_ranked_todos(9, 0).await;
+        let ids: Vec<&str> = first.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["review-g1", "review-g2"], "groups only");
+        assert_eq!(first.remaining, 2, "followups still visible as queued");
+
+        // One group done, one still running: the gate holds.
+        mgr.mark_todo_done("review-g1").await;
+        assert!(mgr.claim_ranked_todos(9, 0).await.items.is_empty());
+
+        mgr.mark_todo_done("review-g2").await;
+        let after = mgr.claim_ranked_todos(9, 0).await;
+        let ids: Vec<&str> = after.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["f1", "f2"]);
+    }
+
+    /// A gate that cannot open is a deadlock. With no group row left
+    /// able to make progress, followups must dispatch.
+    #[tokio::test]
+    async fn the_gate_lifts_when_no_group_row_can_progress() {
+        let mgr = TaskManager::with_caps(8, 8);
+        let mut blocked = group_row("g1");
+        blocked.status = TodoStatus::Blocked;
+        mgr.seed_todo_if_empty(vec![blocked, followup_row("f1", "g1")])
+            .await;
+
+        let claims = mgr.claim_ranked_todos(9, 0).await;
+        let ids: Vec<&str> = claims.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["f1"],
+            "a permanently-blocked group must not stall the run"
+        );
+    }
+
+    /// A Pending group row whose dependency can never be met keeps
+    /// the Pending status -- it never becomes TodoStatus::Blocked --
+    /// so a gate that only looked at the status would hold shut
+    /// forever on a row that is never claimable.
+    #[tokio::test]
+    async fn the_gate_lifts_when_a_group_row_is_dependency_deadlocked() {
+        let mgr = TaskManager::with_caps(8, 8);
+        let mut stuck = group_row("g1");
+        stuck.depends_on = vec!["a-row-that-does-not-exist".into()];
+        mgr.seed_todo_if_empty(vec![stuck, followup_row("f1", "g1")])
+            .await;
+
+        let claims = mgr.claim_ranked_todos(9, 0).await;
+        let ids: Vec<&str> = claims.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["f1"]);
+    }
+
+    /// ...but a dependency that CAN still be met must hold the gate,
+    /// or the guarantee is worthless.
+    #[tokio::test]
+    async fn a_satisfiable_group_dependency_still_holds_the_gate() {
+        let mgr = TaskManager::with_caps(8, 8);
+        let mut later = group_row("g2");
+        later.depends_on = vec!["review-g1".into()];
+        mgr.seed_todo_if_empty(vec![group_row("g1"), later, followup_row("f1", "g1")])
+            .await;
+
+        let first = mgr.claim_ranked_todos(9, 0).await;
+        let ids: Vec<&str> = first.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["review-g1"], "g2 blocked, f1 gated");
+
+        mgr.mark_todo_done("review-g1").await;
+        let second = mgr.claim_ranked_todos(9, 0).await;
+        let ids: Vec<&str> = second.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["review-g2"], "g2 now runnable, f1 still gated");
+
+        mgr.mark_todo_done("review-g2").await;
+        let third = mgr.claim_ranked_todos(9, 0).await;
+        assert_eq!(third.items.len(), 1);
+        assert_eq!(third.items[0].id, "f1");
+    }
+
+    /// No survey groups at all -- /fix, /triage, an operator prompt --
+    /// means no gate.
+    #[tokio::test]
+    async fn a_run_without_survey_groups_is_never_gated() {
+        let mgr = TaskManager::with_caps(8, 8);
+        mgr.seed_todo_if_empty(vec![followup_row("f1", ""), followup_row("f2", "")])
+            .await;
+        assert_eq!(mgr.claim_ranked_todos(9, 0).await.items.len(), 2);
+    }
+
+    /// Equal share per group, so a region that keeps producing
+    /// followups cannot take every slot from one that produced few.
+    /// On the 2026-08-21 review audit-cluster-05 held 119 followups
+    /// against audit-cluster-10's 21.
+    #[tokio::test]
+    async fn dispatch_is_shared_equally_across_groups() {
+        let mgr = TaskManager::with_caps(8, 8);
+        let mut rows = vec![group_row("busy"), group_row("quiet")];
+        for n in 0..6 {
+            rows.push(followup_row(&format!("busy-{n}"), "busy"));
+        }
+        rows.push(followup_row("quiet-0", "quiet"));
+        rows.push(followup_row("quiet-1", "quiet"));
+        mgr.seed_todo_if_empty(rows).await;
+
+        // Clear the gate.
+        mgr.claim_ranked_todos(9, 0).await;
+        mgr.mark_todo_done("review-busy").await;
+        mgr.mark_todo_done("review-quiet").await;
+
+        // Four slots must not all go to the group with six rows.
+        let wave = mgr.claim_ranked_todos(4, 0).await;
+        let quiet = wave.items.iter().filter(|i| i.step_id == "quiet").count();
+        assert_eq!(
+            quiet, 2,
+            "both quiet rows run before busy takes a third slot"
+        );
+        assert_eq!(wave.items.len(), 4);
+
+        // Once quiet is drained it stops competing and busy proceeds.
+        let next = mgr.claim_ranked_todos(4, 0).await;
+        assert!(next.items.iter().all(|i| i.step_id == "busy"));
+    }
+
+    /// `/clear` wipes the todo list and the ranking for the same
+    /// reason it must wipe the fairness counts: step ids restart at
+    /// 01 for every coverage plan, so a surviving count would hand the
+    /// next topic's first group a dispatch debt it never incurred.
+    #[tokio::test]
+    async fn clearing_the_session_resets_the_fairness_counts() {
+        let mgr = TaskManager::with_caps(8, 8);
+        mgr.seed_todo_if_empty(vec![group_row("g1"), followup_row("f1", "g1")])
+            .await;
+        mgr.claim_ranked_todos(9, 0).await;
+        mgr.clear_session_work().await;
+
+        // A fresh topic reusing the same step id must start level with
+        // a brand-new one.
+        mgr.seed_todo_if_empty(vec![
+            group_row("g1"),
+            group_row("g2"),
+            followup_row("a", "g1"),
+            followup_row("b", "g2"),
+        ])
+        .await;
+        mgr.claim_ranked_todos(9, 0).await;
+        mgr.mark_todo_done("review-g1").await;
+        mgr.mark_todo_done("review-g2").await;
+        let wave = mgr.claim_ranked_todos(1, 0).await;
+        assert_eq!(wave.items.len(), 1);
+        assert_eq!(
+            wave.items[0].step_id, "g1",
+            "g1 must not be penalised for the cleared session's claims"
+        );
     }
 
     #[tokio::test]

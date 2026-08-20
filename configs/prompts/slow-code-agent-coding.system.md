@@ -48,7 +48,7 @@ FIXES AND PATCHES — do NOT code from memory:
     the entire file in your inputs before doing this; do not
     truncate or ellide.
 - Line numbers and surrounding context in your output must match
-  the file on disk exactly. Session a85dbc41 (2026-04-21) produced
+  the file on disk exactly. One measured session produced
   a .patch file whose hunk was reconstructed from a 13 KB inline
   copy of the source; the operator then had to verify it manually
   against the real tree. Don't do that again.

@@ -9,7 +9,7 @@ Map each followup type to a tool:
 - "type" → MCP find_type for struct/union/typedef definitions. Use
   {"type": "mcp", "server": "semcode", "tool": "find_type", "args": {"name": "TYPE_NAME"}}.
   Prefer the bare type name without `struct`/`union` (for example
-  `kvm_irqfd`). Fall back to grep/read when MCP fails, returns no match,
+  `some_type` rather than `struct some_type`). Fall back to grep/read when MCP fails, returns no match,
   or returns output that does not prove the definition.
 - "callers" → MCP find_callers. Fall back to grep/search for the symbol when
   semcode is unavailable or returns no callers.

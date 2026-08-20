@@ -119,9 +119,21 @@ mod tests {
             body.contains("concrete evidence for negative claims"),
             "fast prompt must require evidence before broad clean review claims"
         );
+        // What bootstrap supplies changed when the change survey was
+        // removed: a structural inventory plus functional groups, each
+        // with a rationale. A prompt that still promised ratings would
+        // have the agent waiting for data nothing sends.
         assert!(
-            body.contains("bootstrap supplies a change-informed ranked file_survey inventory"),
-            "fast prompt must consume the bootstrap scan for named-file review"
+            body.contains("functional groups"),
+            "fast prompt must consume the bootstrap groups for named-file review"
+        );
+        assert!(
+            body.contains("rationale"),
+            "fast prompt must tell the agent its task carries a group rationale"
+        );
+        assert!(
+            !body.contains("risk survey") && !body.contains("file risk"),
+            "fast prompt must not still promise change-survey output"
         );
         assert!(
             body.contains("must not request another survey"),

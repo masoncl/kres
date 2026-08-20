@@ -186,6 +186,14 @@ mod tests {
         let body = lookup("commit-kernel").unwrap();
         let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
         for marker in [
+            // Emphasis, not structure. A template can enforce trailer
+            // order and column width, yet a message that obeys both can
+            // still bury the reason a maintainer would care.
+            "Lead with the symptom",
+            "Say so when the defect was reproduced",
+            "Describe the defect, not only the edit",
+            "Argue once",
+            "One defect, one patch",
             "When the doc and this template disagree, the doc wins",
             "Rule 0 — 75-column wrap (the most important one)",
             "Make a non-prose descriptor from the appended \"Non-prose technical description techniques\" catalog the default way to explain the bug",

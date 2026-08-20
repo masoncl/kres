@@ -524,6 +524,22 @@ async fn fix_workflow_runs_end_to_end_against_mock_llm() {
         requests.contains("creator path -> transformed state"),
         "research prompt did not require a concrete trigger path"
     );
+    // The step's own action allowlist has to be in the prompt, not
+    // only in the rejection message a disallowed followup earns. A
+    // step writing a plan dispatches nothing, so it is never refused
+    // and would otherwise never find out -- which is how the
+    // 2026-08-20 futex2 research step wrote itself a contract whose
+    // step 1 was to build and run a program.
+    assert!(
+        requests.contains("--- ACTIONS AVAILABLE TO THIS STEP ---"),
+        "no step prompt stated its action allowlist"
+    );
+    assert!(
+        requests
+            .contains("keep what it \\nrequires inside what the executing step can actually do")
+            || requests.contains("requires inside what the executing step can actually do"),
+        "the allowlist block did not carry the plan-writing rule"
+    );
 
     let wp = produced("write-patch");
     assert_eq!(wp.get("build_target"), Some(&json!("a.o")));

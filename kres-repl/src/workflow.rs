@@ -280,14 +280,15 @@ files, symbols, and unchanged contract consumers.\n\n",
             "\nTARGET KIND: current-workspace source scope (not a git ref)\n\n\
 Review the current source named by TARGET. There is no implied commit, range, \
 base revision, or target diff. Do not invent one and do not request `git show` \
-or `git diff` merely to establish scope. Before goal and plan creation, generate \
-one rename-aware target-file diff covering the last six months, assess that net diff \
-with one low-effort change survey (chunking it when necessary), survey the file \
-exactly once, then have one non-lensed slow call combine the structural and change \
-ratings. Use that ranking to build the initial semantic \
-coverage plan. Later review tasks \
-gather targeted function bodies, types, callers, and line ranges. Request git history only for a specific semantic \
-question that source alone cannot answer.\n\n",
+or `git diff` merely to establish scope. Before goal and plan creation, bootstrap \
+surveys the file exactly once for its structural inventory, then reads the whole \
+file to determine its functional groups: each group is a set of functions that \
+belong together, with a stated rationale for why they are one group and how they \
+relate. Those groups become the semantic coverage plan, one step each. Every group \
+is analysed before any followup is, and thereafter each group receives an equal \
+share of dispatch, so no part of the file is starved on a long run. Later review \
+tasks gather targeted function bodies, types, callers, and line ranges. Request git \
+history only for a specific semantic question that source alone cannot answer.\n\n",
         );
     } else {
         prompt.push_str(
@@ -421,6 +422,23 @@ enum FixTodoStatus {
     InProgress,
     Done,
     Failed,
+    /// The todo's fix contract asked for a capability the executing
+    /// step does not have, so no amount of retrying or re-auditing
+    /// can land it — it needs re-planning. Distinct from `Failed`
+    /// because nothing went wrong with the run: the plan was wrong.
+    ///
+    /// On the 2026-08-20 futex2 series, finding
+    /// `lsui_eagain_amplifies_unlock_pi_fph_leak`: todo 1 of 3
+    /// committed cleanly as `b5f08caba30e`, then todo 2's contract
+    /// opened with "Step 1 (evidence): build and run, with the tree's
+    /// aarch64 gcc and with clang, at both -O2 and -O0, a minimal
+    /// program …". The `research` step's allowlist is `read, source,
+    /// type, git, grep, callers`. The model said so on its first round
+    /// — "the decisive one (a bash compiler experiment) is in any case
+    /// rejected by this step's allowlist" — asked for it twice more
+    /// anyway, and the series died as a generic "research_status was
+    /// unconfirmed, expected confirmed" after 106 model calls.
+    Unexecutable,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -1326,6 +1344,56 @@ async fn run_fix_series_driver(
                 let item_research_confirmed = item_research_status.as_deref() == Some("confirmed");
                 let item_ok = item_workflow_ok && item_research_confirmed;
 
+                // Unexecutable is terminal for this todo and is NOT a
+                // run failure to be retried: the contract asked for a
+                // capability the step does not have, so the revision
+                // and plan-update paths below (both gated on
+                // `unconfirmed`) cannot help either. Stop the series
+                // here, but say what is actually wrong and name the
+                // commits that did land, instead of reporting a
+                // generic "research_status was X, expected confirmed".
+                if item_research_status.as_deref() == Some("unexecutable") {
+                    let requirement =
+                        step_output_string(&item_trace, "research", "unexecutable_requirement")
+                            .unwrap_or_else(|| "unspecified".to_string());
+                    let detail = step_output_string(&item_trace, "research", "unexecutable_detail")
+                        .unwrap_or_default();
+                    series_state.tracked[idx].status = FixTodoStatus::Unexecutable;
+                    async_println(format!(
+                        "[fix series] unexecutable {}/{} {} ({requirement}): {detail}",
+                        idx + 1,
+                        fix_series_plan.as_array().map(Vec::len).unwrap_or_default(),
+                        series_state.tracked[idx].todo.id
+                    ));
+                    let landed: Vec<String> = series_state
+                        .tracked
+                        .iter()
+                        .filter(|item| item.status == FixTodoStatus::Done)
+                        .filter_map(|item| {
+                            item.commit_sha.as_ref().map(|sha| {
+                                format!("{} ({})", &sha[..sha.len().min(12)], item.todo.id)
+                            })
+                        })
+                        .collect();
+                    let landed = if landed.is_empty() {
+                        "none".to_string()
+                    } else {
+                        landed.join(", ")
+                    };
+                    events.extend(item_trace.events);
+                    final_state = item_trace.final_state;
+                    status = WorkflowStatus::Failure(format!(
+                        "fix todo '{}' is unexecutable as specified: it needs {requirement} \
+                         ({detail}). Re-plan the todo or run it in a step with that \
+                         capability. Commits already landed: {landed}",
+                        series_state.tracked[idx].todo.id
+                    ));
+                    if let Err(e) = reconcile_fix_series(&series_state, results_dir, &inputs) {
+                        status = WorkflowStatus::Failure(e);
+                    }
+                    break;
+                }
+
                 if item_research_status.as_deref() == Some("invalid") {
                     if let Err(e) = write_partial_invalidation_for_todo(
                         &inputs,
@@ -2187,7 +2255,14 @@ mod tests {
             .prompt_file
             .prompt
             .contains("TARGET KIND: git commit or range"));
-        assert!(cfg.prompt_file.prompt.contains("full Finding records"));
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("A NEW finding is a full Finding record"));
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("reuse its id and send ONLY the fields that changed"));
         assert!(cfg.prompt_file.prompt.contains("target diff/stat"));
         assert!(cfg.prompt_file.prompt.contains("Do not enumerate"));
         assert!(!cfg.prompt_file.prompt.contains("Knot Resolver"));
@@ -2198,6 +2273,36 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("Merge the per-lens outputs"));
+    }
+
+    /// The group-audit instruction used to be spelled out inside every
+    /// group's todo `reason` -- 463 bytes repeated across 45 rows on
+    /// the 2026-08-22 mmu.c review, 45% of all group-row reason text,
+    /// re-sent whole every time the todo agent or the prioritizer was
+    /// handed the list. It now lives once in `globals.group_audit`, so
+    /// the rows carry only labels. This pins the other half: if the
+    /// global stops reaching the prompt, or a label is renamed on the
+    /// Rust side without the global following it, the lens is left
+    /// reading a heading nothing explains.
+    #[test]
+    fn the_group_audit_contract_reaches_every_lens_prompt() {
+        let cfg =
+            review_prompt_file_from_target("drivers/example/example.c", None).expect("workflow");
+        let prompt = &cfg.prompt_file.prompt;
+        for label in [
+            crate::session::GROUP_LABEL_WHY,
+            crate::session::GROUP_LABEL_FUNCTIONS,
+            crate::session::GROUP_LABEL_NEIGHBOURS,
+        ] {
+            assert!(
+                prompt.contains(label.trim_end_matches([':', ' '])),
+                "review.json explains no label {label:?}; a group row would ship \
+                 a heading the lens has never been told the meaning of"
+            );
+        }
+        // And the instruction itself, not merely the vocabulary.
+        assert!(prompt.contains("EVERY function under FUNCTIONS"));
+        assert!(prompt.contains("not complete until every named function has been read"));
     }
 
     #[test]
@@ -2248,13 +2353,25 @@ mod tests {
         // Lenses are never shown the generated response schema, so the
         // only place they can learn that `required_for_progress` exists
         // is this prompt text. Without it every request defaults to
-        // blocking and the requeue budget goes on whatever the lens
-        // happened to list first.
+        // blocking, so nothing leaves the task as separate review work
+        // and the three requeue rounds are spent on whatever the lens
+        // listed, decisive or not.
         assert!(
             p.contains("\"required_for_progress\": true|false"),
             "review prompt does not teach the followup blocking flag"
         );
-        assert!(p.contains("order them most decisive first"));
+        // `requeue_evidence_requests` applies no per-round cap
+        // (kres-agents/src/followup.rs) and AGENTS.md records that a cap
+        // of three was tried and removed. The prompt said "only a few
+        // are fetched per round, so order them most decisive first",
+        // which told lenses to ration a budget that does not exist --
+        // and this assertion is what kept that promise alive through
+        // the change that removed it. What IS bounded is rounds.
+        assert!(
+            p.contains("there is no per-round limit"),
+            "review prompt still rations a per-round fetch budget that does not exist"
+        );
+        assert!(p.contains("What is bounded is the number of rounds"));
         assert!(cfg
             .prompt_file
             .prompt
@@ -2263,10 +2380,19 @@ mod tests {
             .prompt_file
             .prompt
             .contains("There is no implied commit"));
+        // The bootstrap promise the operator prompt makes must match
+        // what bootstrap actually produces. It used to promise a
+        // six-month change survey and combined risk ratings; it now
+        // promises functional groups with rationales.
         assert!(cfg
             .prompt_file
             .prompt
-            .contains("one low-effort change survey"));
+            .contains("determine its functional groups"));
+        assert!(cfg.prompt_file.prompt.contains("rationale"));
+        assert!(
+            !cfg.prompt_file.prompt.contains("change survey"),
+            "the change survey is gone; the prompt must not still promise it"
+        );
         assert_eq!(
             cfg.file_scan_target.as_deref(),
             Some("drivers/example/example.c")

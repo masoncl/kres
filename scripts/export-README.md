@@ -118,7 +118,15 @@ Recognised keys (every value is a case-insensitive regex except
   | `has`       | finding directory contains the named file        |
   |             | (e.g. `has:summary.md` selects only triaged      |
   |             | findings)                                        |
-  | `since`     | YYYY-MM-DD; row's date must be ≥ this           |
+  | `since`     | date bound; row's date must be ≥ this           |
+
+The date bound parses ISO first (`2026-04-01`, `20260401`,
+`2026-04-01T09:30`), then `2026/04/01`, then the month / year
+prefixes `2026-04` and `2026`, which mean the first day of that
+month / year. `python-dateutil` widens that set when it is
+installed, but the script never requires it. Rows without a
+readable date never match the bound, and the value cannot
+contain whitespace — the query tokenizer splits on it.
 
 Examples:
 
@@ -138,6 +146,9 @@ Examples:
 
 # every finding that touches a file under net/ipv4/
 ./findings-index.py --search "file:^net/ipv4/"
+
+# everything found since May, still active
+./findings-index.py --search "since:2026-05-01 -a status:active"
 
 # exact-match a single function (anchor with ^ and $)
 ./findings-index.py --search "function:^acpi_os_execute$"

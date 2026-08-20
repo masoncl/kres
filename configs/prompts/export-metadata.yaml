@@ -3,7 +3,11 @@ id: {{id}}
 title: {{title}}
 severity: {{!severity}}
 status: {{!status}}
-filename: {{filename}}
+{{#has_invalidation}}invalidation:
+  premise: {{invalidation_premise}}
+  evidence:
+{{#invalidation_evidence}}    - {{item}}
+{{/invalidation_evidence}}{{/has_invalidation}}filename: {{filename}}
 subsystem: {{subsystem}}
 git:
   sha: {{git_sha}}

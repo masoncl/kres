@@ -424,14 +424,14 @@
                     "items": {
                       "type": "string"
                     },
-                    "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y. Compile-time only."
+                    "description": "Kconfig symbols that must be set, e.g. CONFIG_SOME_FEATURE=y. Compile-time only."
                   },
                   "runtime_state": {
                     "type": "array",
                     "items": {
                       "type": "string"
                     },
-                    "description": "Runtime conditions that must hold, e.g. sched_core_enabled(rq) == true, a static branch enabled, a sysctl, a cgroup setting, a topology. NOT kconfig."
+                    "description": "Runtime conditions that must hold, e.g. a feature predicate returning true, a static branch enabled, a sysctl, a cgroup setting, a topology. NOT kconfig."
                   },
                   "call_site": {
                     "type": "string",
@@ -707,14 +707,14 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y. Compile-time only."
+                "description": "Kconfig symbols that must be set, e.g. CONFIG_SOME_FEATURE=y. Compile-time only."
               },
               "runtime_state": {
                 "type": "array",
                 "items": {
                   "type": "string"
                 },
-                "description": "Runtime conditions that must hold, e.g. sched_core_enabled(rq) == true, a static branch enabled, a sysctl, a cgroup setting, a topology. NOT kconfig."
+                "description": "Runtime conditions that must hold, e.g. a feature predicate returning true, a static branch enabled, a sysctl, a cgroup setting, a topology. NOT kconfig."
               },
               "call_site": {
                 "type": "string",
@@ -947,7 +947,7 @@
                         "items": {
                           "type": "string"
                         },
-                        "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y."
+                        "description": "Kconfig symbols that must be set, e.g. CONFIG_SOME_FEATURE=y."
                       }
                     },
                     "description": "Compile-time gating only."

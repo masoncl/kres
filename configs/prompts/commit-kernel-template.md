@@ -12,6 +12,42 @@ conventions, write it to a workspace file via `code_output`, then
 commit with `git commit -s -F <that-file>`. Sign-off comes from
 `-s`; do not type `Signed-off-by:` by hand.
 
+## Emphasis — what to include, and in what order
+
+The structure rules below cannot tell you what belongs in the message.
+The common failure is emphasis rather than invention: the message argues
+the mechanism at length and buries, or omits, the reason a maintainer
+would care.
+
+**Lead with the symptom.** Open with what a user or the kernel does
+wrong. Mechanism comes second and the code change last. A reader who
+stops after the first sentence must still know why the patch exists. A
+message that opens with how the code works, and reaches the consequence
+in the fourth paragraph, reads as a cleanup however serious the defect
+is.
+
+**Say so when the defect was reproduced.** A reproduction is the
+strongest sentence in the message, so carry it when the finding records
+one. When there is none, say that too, and say whether you are proposing
+a backport. Both directions are calibration, and omitting an observed
+reproduction throws away the evidence that makes the patch credible.
+
+**Describe the defect, not only the edit.** A message can agree
+perfectly with its diff and still misdescribe the bug. Check it against
+the finding as well as against the hunks, and ask two questions. Does
+the message state the failure the finding established? Would a reader
+who trusts the message reach the same severity the evidence supports?
+Where those diverge the message is wrong even though every sentence in
+it is true.
+
+**Argue once.** Alternatives considered, why the approach is safe, and
+replies to objections nobody has raised belong in the review thread
+rather than the message. Keep only what a reader needs in five years.
+
+**One defect, one patch.** Before writing, check whether another finding
+already covers the same code path. Two independently written messages
+for the same one-line fix is a review burden, not thoroughness.
+
 ## Subject
 
 ```

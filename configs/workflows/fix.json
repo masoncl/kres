@@ -299,6 +299,18 @@
         "or when the finding needs more audit work before patching. Do not route unconfirmed",
         "research to write-patch.",
         "",
+        "Use research_status=unexecutable and valid=false when more audit in this step",
+        "cannot settle the todo at all, because its fix contract requires a capability",
+        "this step does not have: running a compiler or a program, a build, a shell",
+        "command, hardware, or a maintainer/design decision that no source evidence can",
+        "settle. Set unexecutable_requirement to the matching enum value and",
+        "unexecutable_detail to one sentence naming the missing capability. The test is",
+        "whether ANOTHER gather round could help: if it could, the status is unconfirmed,",
+        "not unexecutable. This is not an escape from a hard todo and not for evidence you",
+        "simply have not fetched yet -- exhaust the actions this step DOES allow first.",
+        "It exists because a planner can write a fix contract this step can never satisfy,",
+        "and such a todo has to be re-planned rather than re-audited.",
+        "",
         "Proving a concrete bug requires proving the alleged state is valid and reachable,",
         "not merely that one local function would mishandle that state if it appeared. For",
         "each required flag combination, object state, lock state, refcount state, callback",
@@ -338,6 +350,7 @@
         "- confirmed: bug_proven=true, fix_contract_proven=true, invalidity_proven=false, needs_more_audit=false.",
         "- invalid: bug_proven=false, fix_contract_proven=false, invalidity_proven=true, needs_more_audit=false.",
         "- unconfirmed: invalidity_proven=false, and at least one of bug_proven/fix_contract_proven is false or needs_more_audit=true.",
+        "- unexecutable: fix_contract_proven=false, invalidity_proven=false, needs_more_audit=false (more audit cannot help), and unexecutable_requirement set to something other than none.",
         "",
         "Followups have a single workflow meaning: a blocking followup (`required_for_progress` omitted",
         "or true) is a request for another gather round. Emitting one fails this step's eval",
@@ -369,9 +382,26 @@
           "values": [
             "confirmed",
             "invalid",
-            "unconfirmed"
+            "unconfirmed",
+            "unexecutable"
           ],
-          "description": "confirmed means a concrete bug and fix contract were proven; invalid means source/commit evidence disproves the bug; unconfirmed means do not patch yet."
+          "description": "confirmed means a concrete bug and fix contract were proven; invalid means source/commit evidence disproves the bug; unconfirmed means do not patch yet, but more audit in this step could still settle it; unexecutable means this todo's fix contract cannot be carried out by this step no matter how much more audit it does, because it requires a capability the step does not have."
+        },
+        "unexecutable_requirement": {
+          "type": "enum",
+          "optional": true,
+          "values": [
+            "none",
+            "disallowed_action",
+            "runtime_or_hardware",
+            "human_decision"
+          ],
+          "description": "What the fix contract requires that this step cannot supply. `none` unless research_status is unexecutable. `disallowed_action` means the contract needs an action kind outside this step's allowlist (running a compiler or a program, a build, a shell command). `runtime_or_hardware` means it needs execution, hardware, or a running kernel. `human_decision` means it needs a maintainer or design decision that no amount of source evidence can settle. Rust routes on this value; never on analysis prose."
+        },
+        "unexecutable_detail": {
+          "type": "string",
+          "optional": true,
+          "description": "One sentence naming the specific missing capability, for a human reading the series report. Required when research_status is unexecutable, empty otherwise. Not parsed."
         },
         "valid": {
           "type": "boolean",
@@ -2332,10 +2362,11 @@
       "research.research_status == 'unconfirmed' && workflow.target_artifact_dir == ''",
       "publish.completed",
       "review.clean == true && workflow.target_artifact_dir == ''",
-      "orchestrator.next_step == 'publish' && workflow.target_artifact_dir == ''"
+      "orchestrator.next_step == 'publish' && workflow.target_artifact_dir == ''",
+      "research.research_status == 'unexecutable' && workflow.fix_run_mode == 'todo'"
     ],
     "failure_when_any": [
-      "workflow.fix_run_mode == 'todo' && research.research_status != 'confirmed'",
+      "workflow.fix_run_mode == 'todo' && research.research_status != 'confirmed' && research.research_status != 'unexecutable'",
       "research.research_status == 'invalid' && (research.invalid_evidence_kind != 'source_or_commit_evidence' || research.invalid_evidence == '')",
       "orchestrator.next_step == 'exit-failure'"
     ]

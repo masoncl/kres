@@ -2305,7 +2305,38 @@ async fn run_internal<D: Driver + ?Sized + Send>(
         // Hand the rejection back to the next attempt. The eval already
         // states precisely what was wrong; the retry used to be told
         // only its attempt number.
-        st.last_eval_reason = eval_reason.clone();
+        //
+        // Only when the next thing to happen is THIS step trying
+        // again. A `branch_to` eval is not a rejection of the output —
+        // it is how a correct output moves control somewhere else, and
+        // `previous_rejection_block` renders whatever lands here as
+        // "Your last response for this step was not accepted".
+        //
+        // Every shipped `branch_to` is of that second kind. The
+        // orchestrator's `orchestrator_dispatch` returns
+        // `(false, "route to <step>")` because returning false is how
+        // `branch_to_output` is triggered at all; `review` fails
+        // `clean == true` precisely when it did its job and found
+        // defects; `validate-refute` fails `refutation.refuted ==
+        // false` when it successfully refutes.
+        //
+        // On the 2026-08-20 futex2 series, finding
+        // `futex_private_hash_put_uaf_mm`: the orchestrator routed to
+        // write-commit-message, the branch was taken, and the step was
+        // then re-prompted with "Your last response for this step was
+        // not accepted: route to write-commit-message". It replied
+        // that its "next_step was rejected only because it emitted
+        // 'route to write-commit-message' as prose instead of the
+        // required JSON shape", re-issued the identical decision, and
+        // on the pass after that concluded that "the only worker that
+        // can land O4 is write-commit-message, and that routing was
+        // rejected for this step … That leaves no worker step that can
+        // discharge the open objective" — and picked exit-failure. The
+        // source fix was already complete and every lens had passed it.
+        st.last_eval_reason = match eval.on_fail.action {
+            OnFailAction::Repeat | OnFailAction::RerunChain => eval_reason.clone(),
+            OnFailAction::BranchTo | OnFailAction::Continue | OnFailAction::ExitFailure => None,
+        };
 
         let eval_failures = st.eval_failures;
         let max = eval.on_fail.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
@@ -2393,6 +2424,11 @@ async fn run_internal<D: Driver + ?Sized + Send>(
                     // the dependents chain (workflow author wired
                     // them up loosely), reset it explicitly too.
                     reset_for_reentry_preserve_outputs(&mut state, &step.id);
+                    // Same reason as the non-exhausted branch above:
+                    // control moved, the output was not rejected.
+                    if let Some(branched) = state.get_mut(&step.id) {
+                        branched.last_eval_reason = None;
+                    }
                 }
             }
             continue;
@@ -3636,6 +3672,31 @@ fn eval_fix_research_status(step: &Step, ctx: &ExecContext<'_>) -> (bool, Option
                 && invalid_evidence_kind == "none"
                 && !invalidity_proven
                 && (!bug_proven || !fix_contract_proven || needs_more_audit)
+        }
+        // `unexecutable` says the fix contract cannot be carried out
+        // by THIS step whatever it reads next — the planner asked for
+        // a capability the step does not have. `needs_more_audit ==
+        // false` is the discriminator against `unconfirmed`: if
+        // another gather round could settle it, that is unconfirmed.
+        //
+        // The typed requirement is mandatory. Without it the status is
+        // an unfalsifiable "I give up", which is what it exists to
+        // replace.
+        "unexecutable" => {
+            let requirement = output_str(outputs, "unexecutable_requirement").unwrap_or("none");
+            let detail = output_str(outputs, "unexecutable_detail").unwrap_or("");
+            if requirement == "none" || detail.trim().is_empty() {
+                return eval_fail(
+                    "research_status 'unexecutable' needs unexecutable_requirement (not 'none') \
+                     and a non-empty unexecutable_detail naming the missing capability",
+                );
+            }
+            !valid
+                && invalid_evidence.is_empty()
+                && invalid_evidence_kind == "none"
+                && !invalidity_proven
+                && !fix_contract_proven
+                && !needs_more_audit
         }
         other => return eval_fail(&format!("unknown research_status '{other}'")),
     };
@@ -6074,7 +6135,8 @@ mod tests {
         let consolidate = step.consolidate.as_ref().unwrap().prompt.as_str();
         let eval = step.eval.as_ref().unwrap();
 
-        assert!(schema.contains("full Finding records"));
+        assert!(schema.contains("A NEW finding is a full Finding record"));
+        assert!(schema.contains("reuse its id and send ONLY the fields that changed"));
         assert!(schema.contains("relevant_symbols"));
         assert!(schema.contains("\"followups\""));
         assert!(review_intro.contains("Find every concrete correctness bug"));
@@ -9517,6 +9579,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_branch_is_not_recorded_as_a_rejection_of_the_branching_step() {
+        // `previous_rejection_block` renders `last_eval_reason` as
+        // "Your last response for this step was not accepted: <reason>".
+        // A branch_to eval is how a CORRECT output moves control, so
+        // nothing may be left there for it. See the futex2
+        // `futex_private_hash_put_uaf_mm` run: the orchestrator was
+        // told its own accepted routing was a rejection, decided it had
+        // no worker left, and exited failure on a finished patch.
+        let wf_json = json!({
+            "$schema_version": 1,
+            "id": "branch-reason-wf",
+            "steps": [
+                {
+                    "id": "write-patch",
+                    "agent": "slow",
+                    "prompt": "p",
+                    "outputs": {"done": {"type": "boolean"}}
+                },
+                {
+                    "id": "router",
+                    "agent": "slow",
+                    "prompt": "p",
+                    "depends_on": ["write-patch"],
+                    "outputs": {"next_step": {"type": "string"}},
+                    "eval": {
+                        "type": "builtin",
+                        "name": "orchestrator_dispatch",
+                        "on_fail": {
+                            "action": "branch_to",
+                            "branch_to_output": "next_step",
+                            "max_attempts": 2,
+                            "on_exhausted": "exit_failure"
+                        }
+                    }
+                }
+            ]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        // The router always routes to a worker, so `orchestrator_dispatch`
+        // always returns (false, "route to write-patch") and the branch
+        // is always taken.
+        struct AlwaysRoutes;
+        #[async_trait]
+        impl Driver for AlwaysRoutes {
+            async fn run(
+                &self,
+                step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut m = Map::new();
+                match step.id.as_str() {
+                    "write-patch" => m.insert("done".into(), Value::Bool(true)),
+                    _ => m.insert("next_step".into(), Value::String("write-patch".into())),
+                };
+                Ok(m)
+            }
+        }
+        let mut driver = AlwaysRoutes;
+        let trace = run(&wf, &mut driver, Map::new()).await;
+
+        assert!(trace.events.iter().any(|e| matches!(
+            e,
+            TraceEvent::BranchedTo { from, to } if from == "router" && to == "write-patch"
+        )));
+        let router = trace.final_state.get("router").expect("router state");
+        assert_eq!(
+            router.last_eval_reason, None,
+            "a branch must not leave a rejection for the branching step to read back"
+        );
+        // The branch is still counted, or the routing loop is unbounded.
+        assert!(router.eval_failures > 0);
+    }
+
+    #[tokio::test]
+    async fn a_repeat_still_tells_the_retry_what_was_wrong() {
+        // The complement, on the SAME builtin: `orchestrator_dispatch`
+        // fails two very different ways. A valid routing verb is a
+        // branch and carries no rejection (test above); an unknown one
+        // is a genuine rejection of the output and the retry has to be
+        // told, or it re-makes the same mistake. Losing that was the
+        // 2026-08-08 /validate failure, where eight runs re-made one
+        // omission the eval had named every time.
+        let wf_json = json!({
+            "$schema_version": 1,
+            "id": "repeat-reason-wf",
+            "steps": [{
+                "id": "router",
+                "agent": "slow",
+                "prompt": "p",
+                "outputs": {"next_step": {"type": "string"}},
+                "eval": {
+                    "type": "builtin",
+                    "name": "orchestrator_dispatch",
+                    "on_fail": {"action": "repeat", "max_attempts": 2}
+                }
+            }]
+        });
+        let wf = parse_workflow(&wf_json.to_string()).unwrap();
+
+        struct EmitsGarbage;
+        #[async_trait]
+        impl Driver for EmitsGarbage {
+            async fn run(
+                &self,
+                _step: &Step,
+                _attempt: u32,
+                _ctx: &ExecContext<'_>,
+                _lens: Option<&Lens>,
+            ) -> Result<Map<String, Value>, DriverError> {
+                let mut m = Map::new();
+                m.insert("next_step".into(), Value::String("wander-off".into()));
+                Ok(m)
+            }
+        }
+        let mut driver = EmitsGarbage;
+        let trace = run(&wf, &mut driver, Map::new()).await;
+        let router = trace.final_state.get("router").expect("router state");
+        assert!(
+            router
+                .last_eval_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("unknown next_step") && r.contains("wander-off")),
+            "a repeat retry must still be told what failed: {:?}",
+            router.last_eval_reason
+        );
+    }
+
+    #[tokio::test]
     async fn over_input_limit_never_mutates_prior_attempts() {
         let wf_json = json!({
             "$schema_version": 1,
@@ -9616,6 +9809,137 @@ mod tests {
                 "analysis preserved on entry {i}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn unexecutable_research_ends_a_todo_run_without_failing_it() {
+        // In todo mode `research_status != 'confirmed'` is a workflow
+        // failure. `unexecutable` has to escape that clause, or the
+        // series driver sees WorkflowStatus::Failure and cannot tell a
+        // mis-planned todo from a broken run.
+        let wf = fix_workflow();
+        let mut inputs = finding_dir_inputs();
+        inputs.insert("fix_run_mode".into(), json!("todo"));
+        inputs.insert("target_artifact_dir".into(), json!(""));
+
+        let mut driver = ScriptedDriver::new().with(
+            "research",
+            1,
+            json!({
+                "research_status": "unexecutable",
+                "valid": false,
+                "invalid_evidence": "",
+                "invalid_evidence_kind": "none",
+                "unexecutable_requirement": "disallowed_action",
+                "unexecutable_detail": "step 1 of the contract is to build and run a C program",
+                "affected_files": [],
+                "affected_symbols": [],
+                "research_decision": {
+                    "bug_proven": true,
+                    "fix_contract_proven": false,
+                    "invalidity_proven": false,
+                    "needs_more_audit": false
+                },
+                "analysis": "cannot be executed by this step"
+            }),
+        );
+        let trace = run(&wf, &mut driver, inputs).await;
+        assert!(
+            matches!(
+                trace.status,
+                WorkflowStatus::Success | WorkflowStatus::TerminalSuccess(_)
+            ),
+            "unexecutable must terminate the item run cleanly, got {:?}",
+            trace.status
+        );
+    }
+
+    #[test]
+    fn unexecutable_research_needs_a_typed_missing_capability() {
+        // The status exists so a todo whose contract the step can never
+        // satisfy stops looking like "not confirmed yet". Without the
+        // typed requirement it is just an unfalsifiable "I give up",
+        // which is the thing it replaces.
+        let step = fix_workflow()
+            .steps
+            .into_iter()
+            .find(|step| step.id == "research")
+            .expect("fix.json has a research step");
+        let base = |extra: Value| -> HashMap<String, StepState> {
+            let mut outs = json!({
+                "research_status": "unexecutable",
+                "valid": false,
+                "invalid_evidence": "",
+                "invalid_evidence_kind": "none",
+                "followups": [],
+                "research_decision": {
+                    "bug_proven": true,
+                    "fix_contract_proven": false,
+                    "invalidity_proven": false,
+                    "needs_more_audit": false
+                }
+            });
+            let (Value::Object(o), Value::Object(e)) = (&mut outs, &extra) else {
+                unreachable!()
+            };
+            for (k, v) in e {
+                o.insert(k.clone(), v.clone());
+            }
+            ctx_with(&[("research", 1, 0, outs)])
+        };
+
+        // Missing entirely.
+        let states = base(json!({}));
+        let inputs = Map::new();
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        let (ok, reason) = eval_fix_research_status(&step, &ctx);
+        assert!(!ok);
+        assert!(reason
+            .unwrap_or_default()
+            .contains("unexecutable_requirement"));
+
+        // Named but with no detail for the human who has to re-plan it.
+        let states = base(json!({"unexecutable_requirement": "disallowed_action",
+                                 "unexecutable_detail": "   "}));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(!eval_fix_research_status(&step, &ctx).0);
+
+        // Both present: accepted.
+        let states = base(json!({
+            "unexecutable_requirement": "disallowed_action",
+            "unexecutable_detail": "the contract's step 1 is to build and run a C program; \
+                                    this step allows read/source/type/git/grep/callers"
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(eval_fix_research_status(&step, &ctx).0);
+
+        // needs_more_audit is the discriminator against `unconfirmed`:
+        // if another gather round could settle it, this is the wrong
+        // status and must be refused.
+        let states = base(json!({
+            "unexecutable_requirement": "disallowed_action",
+            "unexecutable_detail": "needs a compiler",
+            "research_decision": {
+                "bug_proven": true,
+                "fix_contract_proven": false,
+                "invalidity_proven": false,
+                "needs_more_audit": true
+            }
+        }));
+        let ctx = ExecContext {
+            workflow_inputs: &inputs,
+            steps: &states,
+        };
+        assert!(!eval_fix_research_status(&step, &ctx).0);
     }
 
     #[test]

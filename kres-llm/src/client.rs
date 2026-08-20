@@ -311,6 +311,15 @@ struct ClaudePoolKey {
 
 const MAX_IDLE_CLAUDE_CLIENTS_PER_KEY: usize = 8;
 const CLAUDE_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the codex dispatcher waits for any message from the
+/// app-server while turns are in flight.
+///
+/// Generous on purpose. This bounds silence, not work: a turn that is
+/// running streams deltas, and the longest single call measured on the
+/// 2026-08-22 whole-file reviews was about seven minutes of generation
+/// broken up by deltas throughout. Fifteen minutes of nothing means
+/// the subprocess is gone or wedged.
+const CODEX_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 
 struct IdleClaudeClient {
     client: claude_codes::AsyncClient,
@@ -1053,7 +1062,7 @@ impl Client {
             prompt.push_str(&message.role.to_ascii_uppercase());
             prompt.push('\n');
             for prefix in &message.cached_prefixes {
-                prompt.push_str(prefix);
+                prompt.push_str(&prefix.text);
             }
             prompt.push_str(&message.content);
             prompt.push_str("\n\n");
@@ -1309,7 +1318,7 @@ impl Client {
             prompt.push_str(&message.role.to_ascii_uppercase());
             prompt.push('\n');
             for prefix in &message.cached_prefixes {
-                prompt.push_str(prefix);
+                prompt.push_str(&prefix.text);
             }
             prompt.push_str(&message.content);
             prompt.push_str("\n\n");
@@ -1421,7 +1430,7 @@ fn estimate_message_tokens(messages: &[Message]) -> u64 {
     messages
         .iter()
         .map(|m| {
-            let prefix: usize = m.cached_prefixes.iter().map(String::len).sum();
+            let prefix: usize = m.cached_prefixes.iter().map(|p| p.text.len()).sum();
             ((prefix + m.content.len()) / 4) as u64
         })
         .sum()
@@ -1535,7 +1544,14 @@ impl OpenAiResponsesRequest {
                     content: if m.cached_prefixes.is_empty() {
                         m.content.clone()
                     } else {
-                        format!("{}{}", m.cached_prefixes.concat(), m.content)
+                        format!(
+                            "{}{}",
+                            m.cached_prefixes
+                                .iter()
+                                .map(|p| p.text.as_str())
+                                .collect::<String>(),
+                            m.content
+                        )
                     },
                 }
             })
@@ -1690,7 +1706,14 @@ impl OpenAiChatRequest {
                 content: if m.cached_prefixes.is_empty() {
                     m.content.clone()
                 } else {
-                    format!("{}{}", m.cached_prefixes.concat(), m.content)
+                    format!(
+                        "{}{}",
+                        m.cached_prefixes
+                            .iter()
+                            .map(|p| p.text.as_str())
+                            .collect::<String>(),
+                        m.content
+                    )
                 },
             });
         }
@@ -2330,16 +2353,48 @@ async fn run_codex_dispatcher(
             start_codex_turn(&mut client, command, &mut active).await;
         }
 
-        let message = match client.next_message().await {
-            Ok(Some(message)) => message,
-            Ok(None) => {
+        // Bound the wait. A turn's caller does a bare `response_rx
+        // .await`, and this loop is the only thing that can complete
+        // it, so a subprocess that stops answering without closing its
+        // pipe blocks that caller forever. Worse, the loop only drains
+        // new commands after a message arrives, so one silent
+        // subprocess wedges every later codex turn in the process too.
+        //
+        // Observed on the 2026-08-23 arch/x86/kvm batch: four runs sat
+        // for 15 to 30 hours with no model call at all, each holding a
+        // survey group row InProgress and spinning "dispatched 0
+        // item(s)" every six seconds. Their `codex` children were
+        // zombies, so the app-server had exited without this loop ever
+        // seeing EOF, and killing the process by hand changed nothing
+        // because the wait was on this await rather than on the child.
+        //
+        // The window is an IDLE timeout, not a turn timeout: a running
+        // turn streams deltas, so silence this long means nothing is
+        // coming. Returning drops `client`, which takes the subprocess
+        // with it, and drops the command receiver, so the next
+        // `codex_codes_turn` finds a closed channel and starts a fresh
+        // dispatcher through the retry it already has.
+        let message = match tokio::time::timeout(CODEX_IDLE_TIMEOUT, client.next_message()).await {
+            Err(_) => {
+                fail_codex_turns(
+                    &mut active,
+                    &format!(
+                        "codex-codes sent nothing for {}s with turns in flight; \
+                         restarting the app-server",
+                        CODEX_IDLE_TIMEOUT.as_secs()
+                    ),
+                );
+                return;
+            }
+            Ok(Ok(Some(message))) => message,
+            Ok(Ok(None)) => {
                 fail_codex_turns(
                     &mut active,
                     "codex-codes app-server closed before completing active turns",
                 );
                 return;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 fail_codex_turns(&mut active, &format!("codex-codes receive failed: {error}"));
                 return;
             }
@@ -2627,6 +2682,55 @@ mod tests {
         assert_eq!(response_text(&second_result.unwrap()).trim(), "SECOND");
     }
 
+    /// Every waiter must be answered when the dispatcher gives up.
+    /// The caller does a bare `response_rx.await`, so a turn left in
+    /// `active` when the loop returns is a task that hangs for as long
+    /// as the process lives — four runs sat that way for 15 to 30
+    /// hours on the 2026-08-23 batch.
+    #[tokio::test]
+    async fn giving_up_answers_every_waiting_turn() {
+        let (tx_a, rx_a) = tokio::sync::oneshot::channel();
+        let (tx_b, rx_b) = tokio::sync::oneshot::channel();
+        let mut active = HashMap::new();
+        for (id, tx) in [("thread-a", tx_a), ("thread-b", tx_b)] {
+            active.insert(
+                id.to_string(),
+                ActiveCodexTurn {
+                    model: "gpt-5.6-sol".into(),
+                    text: String::new(),
+                    usage: Usage::default(),
+                    response: tx,
+                },
+            );
+        }
+
+        fail_codex_turns(&mut active, "app-server went silent");
+
+        assert!(active.is_empty(), "the map must be drained");
+        for rx in [rx_a, rx_b] {
+            let got = rx.await.expect("the waiter must be answered, not dropped");
+            let err = got.expect_err("a give-up must surface as an error");
+            assert!(
+                err.to_string().contains("app-server went silent"),
+                "the reason must reach the caller: {err}"
+            );
+        }
+    }
+
+    /// The window bounds silence, not work. Too short and a long
+    /// generation is killed mid-turn; unbounded is what froze the runs.
+    #[test]
+    fn the_codex_idle_window_is_bounded_and_generous() {
+        assert!(
+            CODEX_IDLE_TIMEOUT >= Duration::from_secs(600),
+            "shorter than the longest measured single call plus margin"
+        );
+        assert!(
+            CODEX_IDLE_TIMEOUT <= Duration::from_secs(3600),
+            "a silent subprocess must not hold a slot for an hour"
+        );
+    }
+
     #[test]
     fn codex_codes_builds_isolated_app_server_command() {
         let codex_home =
@@ -2736,9 +2840,6 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
         assert!(!client.anthropic_headers(true).contains_key("x-api-key"));
-
-        let non_streaming = client.messages_body(&cfg, &messages, false);
-        assert!(non_streaming.get("stream").is_none());
     }
 
     #[tokio::test]

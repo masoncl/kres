@@ -891,7 +891,8 @@ impl LlmDriver {
         // same workspace. It is carried separately so it can be its own
         // cached block; `attempt` and the schema tail stay in the
         // volatile base, where they belong.
-        let stable_instructions = format!("{skills_prelude}{includes_prelude}");
+        let actions_prelude = step_actions_prelude(step, &self.workflow);
+        let stable_instructions = format!("{skills_prelude}{includes_prelude}{actions_prelude}");
         // The schema tail is derived from step.outputs alone, so it is
         // the same bytes on every call of this step -- across attempts,
         // across findings, across concurrent runs. It joins the cached
@@ -3570,6 +3571,45 @@ async fn git_commit_parents(workspace: &Path, revision: &str) -> Result<Vec<Stri
         .collect())
 }
 
+/// Apply git's `whitespace` cleanup mode to a commit message.
+///
+/// `run_commit_fix_with_shutdown` runs `git commit -F <file>` with no
+/// editor, and git-commit(1) defines `--cleanup=default` in that case
+/// as `whitespace`: strip trailing whitespace from every line, drop
+/// leading and trailing empty lines, and collapse runs of empty lines
+/// into one. (`#` comments survive; that is what separates
+/// `whitespace` from `strip`.) So the message git stores is not the
+/// file's bytes, and the intent comparisons below have to be made on
+/// the stored form or they compare the message to a rewrite of itself.
+///
+/// Measured on the 2026-08-20 futex2 series, finding
+/// `requeue_pi_state_read_missing_acquire`: the commit succeeded as
+/// `34872949764a` with exactly the intended subject and body, and the
+/// workflow then failed itself with "HEAD moved … with a different
+/// message". The whole divergence was lines 15 and 24, each four
+/// spaces — the blank lines INSIDE a four-space-indented verbatim
+/// excerpt of `futex_requeue_pi_wakeup_sync()`. Kernel commit style
+/// indents quoted code by four spaces, so any excerpt spanning a blank
+/// line produces a whitespace-only line and hits this.
+fn git_whitespace_cleanup(message: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    // Starts true so leading empty lines are dropped by the same test
+    // that collapses interior runs.
+    let mut prev_empty = true;
+    for line in message.lines() {
+        let line = line.trim_end();
+        if line.is_empty() && prev_empty {
+            continue;
+        }
+        prev_empty = line.is_empty();
+        out.push(line);
+    }
+    while out.last().is_some_and(|last| last.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
 async fn run_commit_fix_recoverable_with_shutdown(
     workspace: &Path,
     files: &str,
@@ -3581,7 +3621,7 @@ async fn run_commit_fix_recoverable_with_shutdown(
 ) -> Result<CommitFixResult, String> {
     let message_body = std::fs::read_to_string(workspace.join(message_path))
         .map_err(|error| format!("read durable commit message {message_path}: {error}"))?;
-    if message_body.trim() != expected_message {
+    if git_whitespace_cleanup(&message_body) != git_whitespace_cleanup(expected_message) {
         return Err(format!(
             "commit-fix recovery conflict: {message_path} changed after intent was persisted"
         ));
@@ -3641,7 +3681,12 @@ async fn validate_commit_matches_intent(
     pre_head: &str,
     expected_message: &str,
 ) -> Result<(), String> {
-    if !commit.message.starts_with(expected_message) {
+    // Prefix, not equality: `git commit -s` appends a Signed-off-by
+    // trailer the persisted intent does not carry. Both sides go
+    // through the cleanup git itself applied on the way in.
+    if !git_whitespace_cleanup(&commit.message)
+        .starts_with(&git_whitespace_cleanup(expected_message))
+    {
         return Err(format!(
             "commit-fix recovery conflict: HEAD moved from {pre_head} to {} with a different message",
             commit.sha
@@ -6203,6 +6248,53 @@ fn agent_runner_with_gated_fetcher(
     })
 }
 
+/// State a step's action allowlist in its prompt.
+///
+/// The allowlist was enforced and never declared: `effective_actions`
+/// reached only `agent_runner_with_gated_fetcher`, which drops a
+/// disallowed followup at dispatch and appends "followup kind 'x'
+/// rejected by step allowlist [...]" to the context. So a step learned
+/// its own capabilities by being refused, one kind at a time, and a
+/// step writing a PLAN never learned them at all — planning emits
+/// prose describing work for later, nothing is dispatched, so nothing
+/// is refused.
+///
+/// On the 2026-08-20 futex2 series, finding
+/// `lsui_eagain_amplifies_unlock_pi_fph_leak`, the `research` step
+/// wrote a fix contract for itself opening "Step 1 (evidence): build
+/// and run, with the tree's aarch64 gcc and with clang, at both -O2
+/// and -O0, a minimal program …". Its allowlist is `read, source,
+/// type, git, grep, callers`. The same step then executed that
+/// contract, discovered the gap from a rejection message — quoting it
+/// back in `{:?}` case, "rejected by this step's allowlist [Read,
+/// Source, Type, Git, Grep, …]" — asked for `bash` twice more anyway,
+/// and the series died after 106 model calls.
+///
+/// This is call-invariant per step, so it rides in
+/// `stable_instructions` and is written to the cache once rather than
+/// re-sent per attempt.
+fn step_actions_prelude(step: &Step, wf: &Workflow) -> String {
+    let allowed = effective_actions(step, wf);
+    let names: Vec<String> = allowed
+        .iter()
+        .filter_map(|a| serde_json::to_value(a).ok())
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    let list = if names.is_empty() {
+        "none — this step cannot fetch anything; work from what you were given".to_string()
+    } else {
+        names.join(", ")
+    };
+    format!(
+        "--- ACTIONS AVAILABLE TO THIS STEP ---\n{list}\n\n\
+         That list is exhaustive. A followup of any other kind is dropped before it \
+         reaches a fetcher, so evidence you cannot obtain with these will not arrive \
+         however many rounds you spend asking for it. If you are writing a plan, a \
+         contract, or an instruction for a later step to carry out, keep what it \
+         requires inside what the executing step can actually do.\n\n"
+    )
+}
+
 /// Effective action allowlist for a step: step.actions wins,
 /// otherwise workflow.defaults.actions. An empty allowlist means
 /// "no actions permitted".
@@ -6997,6 +7089,39 @@ mod tests {
     use crate::workflow_exec::StepState;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn every_step_is_told_which_actions_it_has() {
+        // The allowlist used to be enforced and never declared, so a
+        // step learned it by being refused a followup at a time -- and
+        // a step writing a PLAN never learned it at all, because
+        // planning dispatches nothing and so is never refused. That is
+        // how the 2026-08-20 futex2 research step came to write itself
+        // a fix contract whose step 1 was "build and run ... a minimal
+        // program" with no bash in its allowlist.
+        let wf = fix_workflow();
+        let research = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "research")
+            .expect("fix.json has a research step");
+        let block = step_actions_prelude(research, &wf);
+        assert!(block.contains("--- ACTIONS AVAILABLE TO THIS STEP ---"));
+        for kind in ["read", "source", "type", "git", "grep", "callers"] {
+            assert!(block.contains(kind), "{kind} missing from: {block}");
+        }
+        // The capability the futex2 contract needed, and did not have.
+        assert!(!block.contains("bash"));
+        // Named because a planner writing work for later is the case
+        // the rejection path can never reach.
+        assert!(block.contains("writing a plan"));
+
+        // A step that declares no actions says so rather than
+        // rendering an empty list.
+        let mut mute = research.clone();
+        mute.actions = Some(vec![]);
+        assert!(step_actions_prelude(&mute, &wf).contains("cannot fetch anything"));
+    }
 
     fn fix_workflow() -> Workflow {
         parse_workflow(include_str!("../../configs/workflows/fix.json")).unwrap()
@@ -8731,6 +8856,95 @@ diff --git a/fs/gone.c b/fs/gone.c
         assert_eq!(
             git_rev_parse_head_optional(repo.path()).await.unwrap(),
             pre_head
+        );
+    }
+
+    #[test]
+    fn whitespace_cleanup_matches_git() {
+        // Trailing whitespace off every line, leading and trailing
+        // empty lines dropped, runs of empty lines collapsed to one,
+        // `#` comments kept (that is `whitespace`, not `strip`).
+        assert_eq!(git_whitespace_cleanup("\n\nsubject\n\n"), "subject");
+        assert_eq!(git_whitespace_cleanup("subject   \n"), "subject");
+        assert_eq!(git_whitespace_cleanup("a\n\n\n\nb\n"), "a\n\nb");
+        assert_eq!(git_whitespace_cleanup("a\n    \n\t\nb"), "a\n\nb");
+        assert_eq!(git_whitespace_cleanup("a\n# note\nb"), "a\n# note\nb");
+        // Idempotent, so normalising an already-stored message is safe.
+        let once = git_whitespace_cleanup("s\n\n    body    \n\n\n");
+        assert_eq!(git_whitespace_cleanup(&once), once);
+    }
+
+    #[tokio::test]
+    async fn commit_fix_accepts_a_message_git_rewrote_by_cleanup() {
+        // The 2026-08-20 futex2 failure, reduced: a four-space-indented
+        // verbatim code excerpt whose interior blank line carries the
+        // indent. git strips it, so a byte comparison rejects a commit
+        // git just made from this very file.
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        let intent = "futex: add acquire ordering\n\n\
+                      Body paragraph.\n\n\
+                      kernel/futex/requeue.c:helper\n\n    \
+                      old = atomic_read_acquire(&q->state);\n    \n    \
+                      return old;\n";
+        assert!(
+            intent.contains("\n    \n"),
+            "the indented blank must survive into the file"
+        );
+        std::fs::write(repo.path().join(".kres-commit-msg.tmp"), intent).unwrap();
+        let pre_head = git_rev_parse_head_optional(repo.path()).await.unwrap();
+
+        let commit = run_commit_fix_recoverable(
+            repo.path(),
+            "a.c",
+            ".kres-commit-msg.tmp",
+            false,
+            &pre_head,
+            intent.trim(),
+        )
+        .await
+        .expect("git's own whitespace cleanup must not read as a different message");
+
+        // git really did rewrite it — otherwise this test proves nothing.
+        assert!(!commit.message.contains("\n    \n"));
+        assert!(commit.message.starts_with("futex: add acquire ordering"));
+        // ...and the Signed-off-by trailer `-s` appends is tolerated.
+        assert!(commit.message.contains("Signed-off-by:"));
+    }
+
+    #[tokio::test]
+    async fn commit_fix_still_rejects_a_genuinely_different_message() {
+        let repo = init_test_git_repo();
+        std::fs::write(repo.path().join("a.c"), "int x = 2;\n").unwrap();
+        std::fs::write(repo.path().join(".kres-commit-msg.tmp"), "test: mine\n").unwrap();
+        let pre_head = git_rev_parse_head_optional(repo.path()).await.unwrap();
+
+        // Someone else commits, moving HEAD off the recorded pre_head.
+        std::fs::write(repo.path().join("b.c"), "int y = 1;\n").unwrap();
+        for args in [
+            vec!["add", "b.c"],
+            vec!["commit", "-m", "test: someone else's commit"],
+        ] {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+        }
+
+        let result = run_commit_fix_recoverable(
+            repo.path(),
+            "a.c",
+            ".kres-commit-msg.tmp",
+            false,
+            &pre_head,
+            "test: mine",
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(e) if e.contains("with a different message")),
+            "expected a different-message rejection, got ok={}",
+            result.is_ok()
         );
     }
 
@@ -11550,6 +11764,7 @@ diff --git a/fs/gone.c b/fs/gone.c
             details: vec![],
             introduced_by: None,
             first_seen_at: None,
+            invalidation: None,
         };
         let summary = TaskSummary {
             raw_response: r#"{"analysis": "the answer is 42"}"#.into(),

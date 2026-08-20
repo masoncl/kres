@@ -58,7 +58,9 @@ pub use plan::{
 };
 pub use session_state::{ReviewFileScanState, SessionState, SessionStateError};
 pub use shutdown::Shutdown;
-pub use task::{ReadyTodos, ReapedTask, Task, TaskId, TaskManager, TaskState, TodoClaims};
+pub use task::{
+    is_survey_group_row, ReadyTodos, ReapedTask, Task, TaskId, TaskManager, TaskState, TodoClaims,
+};
 pub use todo::{coverage_is_unwritten, TodoItem, TodoStatus, PLACEHOLDER_COVERAGE};
 
 pub mod version {

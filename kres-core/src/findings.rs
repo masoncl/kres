@@ -48,7 +48,12 @@ pub enum FindingsError {
     Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Severity {
+    /// Also the value an omitted `severity` takes. `merge_into` raises
+    /// severity by max, and Low is that max's identity, so a delta
+    /// that does not mention severity cannot change one.
+    #[default]
     Low,
     Medium,
     High,
@@ -63,6 +68,44 @@ pub enum Status {
     Unconfirmed,
     Fixed,
     Invalidated,
+}
+
+/// Why a finding is invalidated, as a typed claim instead of prose.
+///
+/// An invalidation always rests on something being TRUE about the
+/// code — a lock that is held, a bound already enforced, a flag
+/// combination the API rejects. Naming that claim is what makes the
+/// invalidation falsifiable: a later pass that reads the same code and
+/// finds the claim does not hold can reverse the status without having
+/// to re-derive the whole finding.
+///
+/// Recorded because the 2026-08-20 arch/x86/kvm/mmu review invalidated
+/// `mirror_root_dirty_log_kvm_bug_on` on the claim that
+/// `check_memory_region_flags()` makes `KVM_MEM_GUEST_MEMFD` and
+/// `KVM_MEM_LOG_DIRTY_PAGES` mutually exclusive. That claim is only
+/// true of the flags in one ioctl request, not of a slot over its
+/// lifetime, and the same run later filed the `KVM_MR_FLAGS_ONLY`
+/// bypass as its own high finding. The refutation existed; nothing
+/// connected it to the invalidation it destroyed, because the claim
+/// lived only in `summary` prose.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InvalidationBasis {
+    /// The single claim the invalidation rests on, phrased so that
+    /// the claim being true means the finding is not a bug.
+    pub premise: String,
+    /// `filename:line` citations that establish `premise`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+}
+
+impl InvalidationBasis {
+    /// A basis Rust will accept: a premise, and at least one citation
+    /// for it. Without the citation the premise is an assertion, which
+    /// is the thing being guarded against.
+    pub fn is_well_formed(&self) -> bool {
+        !self.premise.trim().is_empty() && self.evidence.iter().any(|e| !e.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -109,7 +152,28 @@ pub struct FindingDetail {
 #[serde(deny_unknown_fields)]
 pub struct Finding {
     pub id: String,
+    /// Defaulted, like `summary` and `severity`, so that an UPDATE can
+    /// be expressed: reuse an existing id and send only the fields
+    /// that changed.
+    ///
+    /// The layer beneath already worked that way — `prefer_longer`
+    /// ignores an empty incoming string and severity merges by max —
+    /// but the wire type demanded a whole record, so the two shapes
+    /// this system asks agents for could not be parsed at all. The
+    /// retirement shape the review prompt instructs,
+    /// `{id, status: invalidated, invalidation}`, failed on `missing
+    /// field title`; so did `{id, open_questions}`. One such entry
+    /// fails the entire response, so the lens is re-run: measured over
+    /// 26 concurrent reviews on 2026-08-22, 1,766 repair calls against
+    /// 7,398 lens responses, 91 of them for a missing title and 28 for
+    /// a missing summary.
+    ///
+    /// A record that names no existing id and carries no title is not
+    /// an update — `apply_delta_to_list` refuses it rather than
+    /// storing a nameless finding.
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub severity: Severity,
     #[serde(default)]
     pub status: Status,
@@ -117,6 +181,7 @@ pub struct Finding {
     pub relevant_symbols: Vec<RelevantSymbol>,
     #[serde(default)]
     pub relevant_file_sections: Vec<RelevantFileSection>,
+    #[serde(default)]
     pub summary: String,
     #[serde(default)]
     pub reproducer_sketch: String,
@@ -192,6 +257,16 @@ pub struct Finding {
     /// `git show` round-trip to print the attribution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introduced_by: Option<IntroducedBy>,
+
+    /// The claim a `Status::Invalidated` record rests on. Set by
+    /// `merge_into` when it accepts an invalidation, cleared when the
+    /// record leaves that status.
+    ///
+    /// Required: an incoming delta that flips an existing record to
+    /// invalidated without a well-formed basis is REFUSED, and the
+    /// record keeps its prior status. See [`InvalidationBasis`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidation: Option<InvalidationBasis>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
@@ -295,6 +370,7 @@ mod open_question_tests {
             resolved_questions: vec![],
             details: vec![],
             introduced_by: None,
+            invalidation: None,
             first_seen_at: None,
         }
     }
@@ -397,6 +473,7 @@ mod redaction_tests {
             resolved_questions: vec![],
             details: vec![],
             introduced_by: None,
+            invalidation: None,
             first_seen_at: None,
         }
     }
@@ -597,6 +674,8 @@ impl FindingsStore {
             updated: counts.updated,
             invalidated: counts.invalidated,
             reactivated: counts.reactivated,
+            invalidation_refused: counts.invalidation_refused,
+            incomplete_refused: counts.incomplete_refused,
             changed: counts.changed,
             turn_n: next_turn,
             tasks_since_change,
@@ -638,6 +717,16 @@ pub struct ApplyReport {
     /// `updated` so an operator eyeballing a run can see the rare
     /// case where a prior invalidation was reversed.
     pub reactivated: u32,
+    /// Count of `status: invalidated` deltas rejected for want of a
+    /// well-formed [`InvalidationBasis`]. Surfaced so an operator can
+    /// see a lens repeatedly trying to park an unproven finding in the
+    /// invalidated bucket.
+    pub invalidation_refused: u32,
+    /// Count of records that named no existing finding and lacked a
+    /// title or a summary — a delta whose id does not exist. Surfaced
+    /// so a model that keeps sending updates for a finding it never
+    /// filed is visible rather than silently ignored.
+    pub incomplete_refused: u32,
     pub changed: bool,
     pub turn_n: u32,
     pub tasks_since_change: u32,
@@ -649,6 +738,11 @@ pub struct DeltaCounts {
     pub updated: u32,
     pub invalidated: u32,
     pub reactivated: u32,
+    pub invalidation_refused: u32,
+    /// Records that named no existing finding and carried no title or
+    /// no summary. They are deltas for an id that does not exist, so
+    /// there is nothing to merge them into and not enough to store.
+    pub incomplete_refused: u32,
     pub changed: bool,
 }
 
@@ -666,9 +760,12 @@ pub fn apply_delta_to_list(
         match current.iter().position(|e| e.id == incoming.id) {
             Some(idx) => {
                 let was_invalidated = current[idx].status == Status::Invalidated;
-                let changed = merge_into(&mut current[idx], incoming, task_id);
+                let outcome = merge_into(&mut current[idx], incoming, task_id);
                 record_detail(&mut current[idx], task_id, task_analysis);
-                if changed {
+                if outcome.invalidation_refused {
+                    counts.invalidation_refused += 1;
+                }
+                if outcome.changed {
                     let is_invalidated = current[idx].status == Status::Invalidated;
                     if !was_invalidated && is_invalidated {
                         counts.invalidated += 1;
@@ -681,11 +778,22 @@ pub fn apply_delta_to_list(
                 }
             }
             None => {
+                // Nothing to merge into, so this has to stand alone —
+                // and a finding with no title or no summary cannot.
+                // Refuse before `semantic_duplicate_index` gets a look
+                // at it: that match needs `id_title_token_overlap` to
+                // clear 0.70, a titleless record gives it almost
+                // nothing to work with, and merging into the wrong
+                // record silently destroys a finding.
+                if incoming.title.trim().is_empty() || incoming.summary.trim().is_empty() {
+                    counts.incomplete_refused += 1;
+                    continue;
+                }
                 if incoming.status != Status::Invalidated {
                     if let Some(idx) = semantic_duplicate_index(current, incoming) {
-                        let changed = merge_into(&mut current[idx], incoming, task_id);
+                        let outcome = merge_into(&mut current[idx], incoming, task_id);
                         record_detail(&mut current[idx], task_id, task_analysis);
-                        if changed {
+                        if outcome.changed {
                             counts.updated += 1;
                             counts.changed = true;
                         }
@@ -876,24 +984,106 @@ const SEMANTIC_DUP_STOPWORDS: &[&str] = &[
 /// precise but SHORTER loses — but it prevents the common downgrade
 /// path (incoming is a one-sentence reminder; existing is the full
 /// analysis). Empty incoming is always ignored regardless of length.
-fn merge_into(existing: &mut Finding, incoming: &Finding, task_id: Option<&str>) -> bool {
-    let mut changed = false;
+#[derive(Default)]
+struct StatusTransition {
+    changed: bool,
+    /// An incoming `status: invalidated` was rejected for want of a
+    /// well-formed [`InvalidationBasis`]. The record keeps its prior
+    /// status; the rest of the delta still merges.
+    invalidation_refused: bool,
+}
 
-    // Status transitions. `reactivate: true` is a specific, rarer
-    // signal; when set it WINS regardless of what `status` carries.
-    // Treating reactivate as authoritative avoids a contradictory
-    // delta (both `status: "invalidated"` and `reactivate: true`)
-    // producing a transient Active→Invalidated→Active flip with
-    // `changed` set twice for what is really a single transition.
+/// Move `existing.status` according to `incoming`.
+///
+/// The table, and why each entry is what it is:
+///
+/// - `reactivate: true` on an invalidated record → Active. Wins over
+///   whatever `status` carries, so a contradictory delta produces one
+///   transition rather than a flip and a flip back.
+/// - → Invalidated, with a well-formed basis → accepted, basis stored.
+/// - → Invalidated, without one → REFUSED. An invalidation that cannot
+///   name the claim it rests on is not negative evidence, it is an
+///   unproven reachability argument wearing negative evidence's badge.
+///   On the 2026-08-20 arch/x86/kvm/mmu review two findings were held
+///   invalidated by deltas that said so outright — "status remains
+///   invalidated pending confirmation of whether…" and "the decisive
+///   bodies were not obtained, so status remains invalidated/unresolved
+///   rather than disproved". Both are real host-DoS bugs.
+/// - → Unconfirmed from Active OR Invalidated → accepted, no flag
+///   needed. This is the state those two deltas wanted. Leaving it
+///   unreachable is what made `invalidated` the dumping ground for
+///   everything that was not provable in one pass.
+/// - Unconfirmed → Active → accepted plainly. Only Invalidated → Active
+///   needs `reactivate`, because only that one contradicts a recorded
+///   claim.
+///
+/// `Fixed` is not part of the review vocabulary; it arrives from the
+/// validate path, which writes the status directly rather than through
+/// a delta, so an incoming `Fixed` here is ignored.
+fn apply_status_transition(existing: &mut Finding, incoming: &Finding) -> StatusTransition {
+    let mut out = StatusTransition::default();
+
     if incoming.reactivate {
         if existing.status == Status::Invalidated {
             existing.status = Status::Active;
-            changed = true;
+            existing.invalidation = None;
+            out.changed = true;
         }
-    } else if incoming.status == Status::Invalidated && existing.status != Status::Invalidated {
-        existing.status = Status::Invalidated;
-        changed = true;
+        return out;
     }
+
+    match incoming.status {
+        Status::Invalidated => {
+            let basis = incoming
+                .invalidation
+                .as_ref()
+                .filter(|b| b.is_well_formed());
+            let Some(basis) = basis else {
+                // Already-invalidated records are not "refused" — the
+                // delta is extending a record whose basis is already on
+                // file, which is the ordinary shape of a later pass
+                // adding detail.
+                out.invalidation_refused = existing.status != Status::Invalidated;
+                return out;
+            };
+            if existing.status != Status::Invalidated {
+                existing.status = Status::Invalidated;
+                out.changed = true;
+            }
+            if existing.invalidation.as_ref() != Some(basis) {
+                existing.invalidation = Some(basis.clone());
+                out.changed = true;
+            }
+        }
+        Status::Unconfirmed => {
+            if matches!(existing.status, Status::Active | Status::Invalidated) {
+                existing.status = Status::Unconfirmed;
+                existing.invalidation = None;
+                out.changed = true;
+            }
+        }
+        Status::Active => {
+            if existing.status == Status::Unconfirmed {
+                existing.status = Status::Active;
+                out.changed = true;
+            }
+        }
+        Status::Fixed => {}
+    }
+
+    out
+}
+
+struct MergeOutcome {
+    changed: bool,
+    invalidation_refused: bool,
+}
+
+fn merge_into(existing: &mut Finding, incoming: &Finding, task_id: Option<&str>) -> MergeOutcome {
+    let mut changed = false;
+
+    let transition = apply_status_transition(existing, incoming);
+    changed |= transition.changed;
 
     // Prefer the higher severity.
     if incoming.severity > existing.severity {
@@ -937,7 +1127,10 @@ fn merge_into(existing: &mut Finding, incoming: &Finding, task_id: Option<&str>)
         }
     }
 
-    changed
+    MergeOutcome {
+        changed,
+        invalidation_refused: transition.invalidation_refused,
+    }
 }
 
 /// Overwrite `existing` with `incoming` when the incoming value is
@@ -1294,6 +1487,88 @@ mod tests {
         );
     }
 
+    /// A delta that retires `id`, carrying the basis Rust now demands.
+    /// The wire shapes this system asks agents for. Both failed to
+    /// deserialize before `title`/`summary`/`severity` were defaulted.
+    #[test]
+    fn the_delta_shapes_the_prompts_ask_for_actually_parse() {
+        let update: Finding =
+            serde_json::from_str(r#"{"id":"x","open_questions":["q"]}"#).expect("update parses");
+        assert_eq!(update.id, "x");
+        assert!(update.title.is_empty());
+        assert_eq!(
+            update.severity,
+            Severity::Low,
+            "an omitted severity must be the identity of merge_into's max, or a \
+             silent delta would raise every finding it touches"
+        );
+
+        let retire: Finding = serde_json::from_str(
+            r#"{"id":"x","status":"invalidated","invalidation":{"premise":"p","evidence":["a.c:1"]}}"#,
+        )
+        .expect("the retirement shape review.json instructs must parse");
+        assert_eq!(retire.status, Status::Invalidated);
+    }
+
+    #[test]
+    fn an_update_keeps_the_stored_title_summary_and_severity() {
+        let mut list = vec![sample_finding("f")];
+        let mut delta: Finding =
+            serde_json::from_str(r#"{"id":"f","open_questions":["is it reachable?"]}"#).unwrap();
+        delta.open_questions = vec!["is it reachable?".into()];
+
+        let counts = apply_delta_to_list(&mut list, &[delta], Some("t1"), None);
+
+        assert_eq!(list.len(), 1, "an update must not create a second record");
+        assert_eq!(list[0].title, "finding f", "title survived the delta");
+        assert_eq!(list[0].summary, "s", "summary survived the delta");
+        assert_eq!(
+            list[0].severity,
+            Severity::High,
+            "a delta with no severity must not downgrade"
+        );
+        assert_eq!(list[0].open_questions, vec!["is it reachable?".to_string()]);
+        assert_eq!(counts.updated, 1);
+        assert_eq!(counts.incomplete_refused, 0);
+    }
+
+    #[test]
+    fn an_update_for_an_unknown_id_is_refused_not_stored() {
+        // Nothing to merge into and not enough to stand alone. Storing
+        // it would put a nameless finding in the report; guessing a
+        // merge target from a titleless record is how a real finding
+        // gets silently overwritten.
+        let mut list = vec![sample_finding("f")];
+        let orphan: Finding =
+            serde_json::from_str(r#"{"id":"typo","open_questions":["q"]}"#).unwrap();
+
+        let counts = apply_delta_to_list(&mut list, &[orphan], Some("t1"), None);
+
+        assert_eq!(list.len(), 1, "the orphan delta must not be stored");
+        assert_eq!(counts.incomplete_refused, 1);
+        assert_eq!(counts.added, 0);
+        assert!(!counts.changed);
+    }
+
+    #[test]
+    fn a_complete_new_finding_still_inserts() {
+        let mut list: Vec<Finding> = vec![];
+        let counts = apply_delta_to_list(&mut list, &[sample_finding("new")], Some("t1"), None);
+        assert_eq!(counts.added, 1);
+        assert_eq!(counts.incomplete_refused, 0);
+        assert_eq!(list.len(), 1);
+    }
+
+    fn invalidating_delta(id: &str, premise: &str) -> Finding {
+        let mut f = sample_finding(id);
+        f.status = Status::Invalidated;
+        f.invalidation = Some(InvalidationBasis {
+            premise: premise.to_string(),
+            evidence: vec!["kernel/thing.c:42".into()],
+        });
+        f
+    }
+
     fn sample_finding(id: &str) -> Finding {
         Finding {
             id: id.to_string(),
@@ -1315,8 +1590,30 @@ mod tests {
             resolved_questions: vec![],
             details: vec![],
             introduced_by: None,
+            invalidation: None,
             first_seen_at: None,
         }
+    }
+
+    #[test]
+    fn generated_schema_carries_the_invalidation_basis() {
+        // The lens fan-out is never shown this schema — it learns the
+        // shape from `globals.finding_schema` prose. The JSON-repair
+        // and finding-repair calls ARE shown it, and they are the only
+        // chance a malformed `invalidation` gets to be fixed rather
+        // than dropped, so the field has to be in here.
+        let schema = serde_json::to_value(schemars::schema_for!(Finding)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("invalidation"));
+        let defs = schema["$defs"].as_object().unwrap();
+        let basis = &defs["InvalidationBasis"];
+        let required: Vec<&str> = basis["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(required.contains(&"premise"));
     }
 
     #[test]
@@ -1601,8 +1898,7 @@ mod tests {
             .apply_delta(&[sample_finding("a")], Some("t1"), None)
             .await
             .unwrap();
-        let mut inv = sample_finding("a");
-        inv.status = Status::Invalidated;
+        let inv = invalidating_delta("a", "the store is under the write lock");
         let rep2 = store.apply_delta(&[inv], Some("t2"), None).await.unwrap();
         assert_eq!(rep2.invalidated, 1);
         assert_eq!(rep2.reactivated, 0);
@@ -1628,6 +1924,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalidation_without_a_basis_is_refused() {
+        // The 2026-08-20 arch/x86/kvm/mmu shape: a delta that says in
+        // as many words that it cannot establish the claim, and sets
+        // `invalidated` anyway ("status remains invalidated pending
+        // confirmation of whether..."). The finding must survive.
+        let dir = tmp_dir("no-basis");
+        let store = FindingsStore::new(&dir.join("findings.json"))
+            .await
+            .unwrap();
+        store
+            .apply_delta(&[sample_finding("a")], Some("t1"), None)
+            .await
+            .unwrap();
+
+        let mut bare = sample_finding("a");
+        bare.status = Status::Invalidated;
+        let rep = store.apply_delta(&[bare], Some("t2"), None).await.unwrap();
+        assert_eq!(rep.invalidated, 0);
+        assert_eq!(rep.invalidation_refused, 1);
+        assert_eq!(store.snapshot().await[0].status, Status::Active);
+
+        // A premise with no citation is an assertion, not evidence.
+        let mut uncited = sample_finding("a");
+        uncited.status = Status::Invalidated;
+        uncited.invalidation = Some(InvalidationBasis {
+            premise: "the flags are mutually exclusive".into(),
+            evidence: vec![],
+        });
+        let rep = store
+            .apply_delta(&[uncited], Some("t3"), None)
+            .await
+            .unwrap();
+        assert_eq!(rep.invalidation_refused, 1);
+        assert_eq!(store.snapshot().await[0].status, Status::Active);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn refused_invalidation_still_merges_the_rest_of_the_delta() {
+        // Refusing the status flip must not cost the pass its work:
+        // the symbols it fetched and the prose it wrote still land.
+        let dir = tmp_dir("refused-merges");
+        let store = FindingsStore::new(&dir.join("findings.json"))
+            .await
+            .unwrap();
+        store
+            .apply_delta(&[sample_finding("a")], Some("t1"), None)
+            .await
+            .unwrap();
+        let mut bare = sample_finding("a");
+        bare.status = Status::Invalidated;
+        bare.summary = "a much longer summary carrying real new mechanism detail".into();
+        let rep = store.apply_delta(&[bare], Some("t2"), None).await.unwrap();
+        assert_eq!(rep.invalidation_refused, 1);
+        assert_eq!(rep.updated, 1);
+        let snap = store.snapshot().await;
+        assert_eq!(snap[0].status, Status::Active);
+        assert!(snap[0].summary.starts_with("a much longer"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_leaves_invalidated_without_the_reactivate_flag() {
+        // The cheap exit. A pass that knocks the premise down but
+        // cannot yet show the bug fires must be able to say so, and
+        // the recorded premise must not survive the move.
+        let dir = tmp_dir("unconfirmed-exit");
+        let store = FindingsStore::new(&dir.join("findings.json"))
+            .await
+            .unwrap();
+        store
+            .apply_delta(&[sample_finding("a")], Some("t1"), None)
+            .await
+            .unwrap();
+        store
+            .apply_delta(
+                &[invalidating_delta(
+                    "a",
+                    "the two flags cannot be set together",
+                )],
+                Some("t2"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.snapshot().await[0].status, Status::Invalidated);
+
+        let mut unsure = sample_finding("a");
+        unsure.status = Status::Unconfirmed;
+        let rep = store
+            .apply_delta(&[unsure], Some("t3"), None)
+            .await
+            .unwrap();
+        // Leaving Invalidated is a reactivation for counting purposes.
+        assert_eq!(rep.reactivated, 1);
+        let snap = store.snapshot().await;
+        assert_eq!(snap[0].status, Status::Unconfirmed);
+        assert!(snap[0].invalidation.is_none());
+
+        // ...and Unconfirmed → Active needs no flag either.
+        let mut back = sample_finding("a");
+        back.status = Status::Active;
+        store.apply_delta(&[back], Some("t4"), None).await.unwrap();
+        assert_eq!(store.snapshot().await[0].status, Status::Active);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn plain_active_still_cannot_reverse_an_invalidation() {
+        let dir = tmp_dir("active-no-flag");
+        let store = FindingsStore::new(&dir.join("findings.json"))
+            .await
+            .unwrap();
+        store
+            .apply_delta(&[sample_finding("a")], Some("t1"), None)
+            .await
+            .unwrap();
+        store
+            .apply_delta(
+                &[invalidating_delta("a", "the bound is enforced upstream")],
+                Some("t2"),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut plain = sample_finding("a");
+        plain.status = Status::Active;
+        store.apply_delta(&[plain], Some("t3"), None).await.unwrap();
+        let snap = store.snapshot().await;
+        assert_eq!(snap[0].status, Status::Invalidated);
+        assert_eq!(
+            snap[0].invalidation.as_ref().map(|b| b.premise.as_str()),
+            Some("the bound is enforced upstream")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_later_pass_can_replace_the_recorded_premise() {
+        // An already-invalidated record is not "refused" when a delta
+        // extends it without a basis — that is the ordinary shape of a
+        // later pass adding detail — but a delta that DOES carry a new
+        // premise replaces the old one, so the claim on file always
+        // matches the argument currently being made.
+        let dir = tmp_dir("premise-replace");
+        let store = FindingsStore::new(&dir.join("findings.json"))
+            .await
+            .unwrap();
+        store
+            .apply_delta(&[sample_finding("a")], Some("t1"), None)
+            .await
+            .unwrap();
+        store
+            .apply_delta(
+                &[invalidating_delta("a", "iterators filter mirror roots out")],
+                Some("t2"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut extend = sample_finding("a");
+        extend.status = Status::Invalidated;
+        let rep = store
+            .apply_delta(&[extend], Some("t3"), None)
+            .await
+            .unwrap();
+        assert_eq!(rep.invalidation_refused, 0);
+
+        let narrowed = invalidating_delta("a", "the flags are exclusive in one request");
+        store
+            .apply_delta(&[narrowed], Some("t4"), None)
+            .await
+            .unwrap();
+        let snap = store.snapshot().await;
+        assert_eq!(
+            snap[0].invalidation.as_ref().map(|b| b.premise.as_str()),
+            Some("the flags are exclusive in one request")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn reactivate_wins_over_contradictory_invalidated_status() {
         // A misbehaving incoming delta that carries BOTH
         // `status: "invalidated"` AND `reactivate: true` must
@@ -1640,12 +2119,10 @@ mod tests {
             .apply_delta(&[sample_finding("a")], Some("t1"), None)
             .await
             .unwrap();
-        let mut inv = sample_finding("a");
-        inv.status = Status::Invalidated;
+        let inv = invalidating_delta("a", "the store is under the write lock");
         store.apply_delta(&[inv], Some("t2"), None).await.unwrap();
         assert_eq!(store.snapshot().await[0].status, Status::Invalidated);
-        let mut both = sample_finding("a");
-        both.status = Status::Invalidated;
+        let mut both = invalidating_delta("a", "the store is under the write lock");
         both.reactivate = true;
         store.apply_delta(&[both], Some("t3"), None).await.unwrap();
         let snap = store.snapshot().await;
@@ -1736,8 +2213,7 @@ mod tests {
             .apply_delta(&[sample_finding("a")], Some("t1"), None)
             .await
             .unwrap();
-        let mut inv = sample_finding("a");
-        inv.status = Status::Invalidated;
+        let mut inv = invalidating_delta("a", "the caller already holds the write lock");
         inv.summary = "".into(); // empty: don't overwrite
         let rep = store.apply_delta(&[inv], Some("t2"), None).await.unwrap();
         assert_eq!(rep.invalidated + rep.updated, 1);
@@ -1999,5 +2475,35 @@ mod tests {
         let s = serde_json::to_string(&f).unwrap();
         assert!(s.contains("\"severity\":\"high\""));
         assert!(s.contains("\"status\":\"active\""));
+    }
+}
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+
+    /// The schema the model is shown must agree with the prompt: only
+    /// `id` is unconditionally required, because an update is a legal
+    /// record. Completeness of a NEW finding is enforced by
+    /// `apply_delta_to_list`, which can see whether the id exists.
+    #[test]
+    fn only_id_is_required_on_the_wire() {
+        let schema = serde_json::to_value(schemars::schema_for!(Finding)).unwrap();
+        let required: Vec<String> = schema["required"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(required, vec!["id".to_string()], "got {required:?}");
+        let props = schema["properties"].as_object().expect("properties");
+        for field in ["id", "title", "severity", "summary", "status"] {
+            assert!(
+                props.contains_key(field),
+                "`{field}` missing from the schema"
+            );
+        }
     }
 }

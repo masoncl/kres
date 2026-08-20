@@ -134,12 +134,39 @@ pub fn is_opening_plan_step(plan: Option<&kres_core::Plan>, active_step_id: Opti
 pub fn requeue_evidence_requests(items: &[Followup], seen: &mut HashSet<String>) -> Vec<Followup> {
     items
         .iter()
-        .filter(|f| f.required_for_progress)
-        .filter(|f| f.kind != "question")
-        .filter(|f| !f.name.trim().is_empty())
+        .filter(|f| is_requeueable(f))
         .filter(|f| seen.insert(f.cache_key()))
         .cloned()
         .collect()
+}
+
+/// The typed test for "a fetcher can satisfy this, and it blocks the
+/// analysis". Shared so selection and attribution cannot disagree
+/// about which requests a round is serving.
+fn is_requeueable(f: &Followup) -> bool {
+    f.required_for_progress && f.kind != "question" && !f.name.trim().is_empty()
+}
+
+/// Is this lens waiting on any of the evidence the round is fetching?
+///
+/// A requeue re-runs only the lenses whose question the fetch answers.
+/// Re-running a lens that asked for nothing spends a full slow call to
+/// re-derive a conclusion it already reached, and it reaches it from a
+/// context that only grew, so the second answer is not even
+/// independent.
+///
+/// Measured on the 2026-08-22 arch/x86/kvm/mmu/mmu.c review: 25
+/// completed fan-outs against 81 requeue rounds, every round re-running
+/// every lens. Matching on the fetched set rather than on "did this
+/// lens ask anything" is what makes a shared request re-run BOTH
+/// lenses that wanted it, while a request already served earlier in the
+/// task re-runs neither — the same anti-spin rule
+/// [`requeue_evidence_requests`] applies through `seen`.
+pub fn lens_awaits_evidence(followups: &[Followup], fetching: &HashSet<String>) -> bool {
+    followups
+        .iter()
+        .filter(|f| is_requeueable(f))
+        .any(|f| fetching.contains(&f.cache_key()))
 }
 
 /// Same check against a `serde_json::Value` array, for code paths
@@ -349,5 +376,61 @@ mod tests {
         // that is how a lens that never accepts an answer would burn
         // the whole budget.
         assert!(requeue_evidence_requests(&items, &mut seen).is_empty());
+    }
+
+    /// A requeue costs a full slow call per lens it re-runs. Only the
+    /// lenses the fetch is FOR may pay it.
+    #[test]
+    fn only_the_lens_that_asked_is_re_run() {
+        let mut seen = HashSet::new();
+        let asker = vec![fu("source", "make_mmu_pages_available", true)];
+        let settled = vec![fu("question", "is this reachable", true)];
+        let wanted = requeue_evidence_requests(&asker, &mut seen);
+        let fetching: HashSet<String> = wanted.iter().map(|f| f.cache_key()).collect();
+
+        assert!(lens_awaits_evidence(&asker, &fetching));
+        assert!(
+            !lens_awaits_evidence(&settled, &fetching),
+            "a lens that asked only a question has nothing a fetcher can bring it"
+        );
+        assert!(
+            !lens_awaits_evidence(&[], &fetching),
+            "a lens that asked for nothing keeps the answer it already gave"
+        );
+    }
+
+    #[test]
+    fn a_shared_request_re_runs_every_lens_that_wanted_it() {
+        // Pooling fetches the body once. Both lenses stopped on it, so
+        // both must see it -- attributing it to whichever lens the
+        // pool happened to dedup first would strand the other.
+        let mut seen = HashSet::new();
+        let a = vec![fu("source", "__kvm_mmu_prepare_zap_page", true)];
+        let b = vec![
+            fu("source", "__kvm_mmu_prepare_zap_page", true),
+            fu("callers", "mmu_page_zap_pte", true),
+        ];
+        let pooled: Vec<Followup> = a.iter().chain(b.iter()).cloned().collect();
+        let wanted = requeue_evidence_requests(&pooled, &mut seen);
+        assert_eq!(wanted.len(), 2, "the shared body is fetched once");
+        let fetching: HashSet<String> = wanted.iter().map(|f| f.cache_key()).collect();
+        assert!(lens_awaits_evidence(&a, &fetching));
+        assert!(lens_awaits_evidence(&b, &fetching));
+    }
+
+    #[test]
+    fn re_asking_a_served_request_does_not_buy_another_round() {
+        // `seen` already holds it, so nothing is fetched and the lens
+        // is not re-run: the anti-spin rule reaches lens selection
+        // through the same set.
+        let mut seen = HashSet::new();
+        let asked = vec![fu("source", "kvm_mmu_child_role", true)];
+        let first = requeue_evidence_requests(&asked, &mut seen);
+        assert_eq!(first.len(), 1);
+
+        let again = requeue_evidence_requests(&asked, &mut seen);
+        let fetching: HashSet<String> = again.iter().map(|f| f.cache_key()).collect();
+        assert!(again.is_empty());
+        assert!(!lens_awaits_evidence(&asked, &fetching));
     }
 }

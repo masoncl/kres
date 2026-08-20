@@ -1267,7 +1267,6 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         workspace: args.workspace.clone(),
         mcp_config: mcp_config.clone(),
         persist_path,
-        resume_change_survey: args.resume,
         assisted_by,
         // Piped/redirected stdout has no operator on the other end,
         // so once the work-stop condition fires there is no one to
@@ -3084,7 +3083,17 @@ mod tests {
         assert_eq!(cfg.prompt_file.lenses[0].id, "memory-lifetime");
         assert!(cfg.prompt_file.lenses.iter().any(|l| l.id == "assertions"));
         assert!(cfg.prompt_file.prompt.contains("TARGET: HEAD"));
-        assert!(cfg.prompt_file.prompt.contains("full Finding records"));
+        // Both halves of the record contract, because they are what
+        // make the delta shape usable: a new finding is whole, an
+        // update names an id and sends only what changed.
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("A NEW finding is a full Finding record"));
+        assert!(cfg
+            .prompt_file
+            .prompt
+            .contains("reuse its id and send ONLY the fields that changed"));
         assert!(cfg.prompt_file.prompt.contains("target diff/stat"));
         assert!(cfg.prompt_file.prompt.contains("Do not enumerate"));
         assert!(!cfg.prompt_file.prompt.contains("Knot Resolver"));

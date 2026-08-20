@@ -1163,10 +1163,14 @@ Thanks."#,
 
     #[test]
     fn repaired_findings_return_to_their_original_positions() {
+        // The invalid record carries an unknown field. It used to be
+        // one missing `title`, but a title-less record is now a legal
+        // UPDATE to an existing finding rather than a malformed one,
+        // so it no longer exercises the repair path.
         let mut response = CodeResponseContract::default()
             .allowing_invalid_findings()
             .validate(
-                r#"{"findings":[{"id":"bad","severity":"high"},{"id":"good","title":"good","severity":"high","summary":"s"}]}"#,
+                r#"{"findings":[{"id":"bad","title":"b","severity":"high","summary":"s","bogus":1},{"id":"good","title":"good","severity":"high","summary":"s"}]}"#,
             )
             .unwrap();
         let repaired: Finding = serde_json::from_value(serde_json::json!({

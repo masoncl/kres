@@ -451,6 +451,32 @@ fn build_context(f: &Finding, git: &GitHead) -> Ctx {
         Value::Scalar(severity_str(f.severity).into()),
     );
     c.insert("status".into(), Value::Scalar(status_str(f.status).into()));
+    // The claim an `invalidated` status rests on, exported so triage
+    // can do what its template already asks — check whether current
+    // source still supports the nonexistence — against a specific
+    // claim instead of re-deriving the whole argument from prose.
+    // Empty for every other status.
+    if let Some(basis) = f.invalidation.as_ref() {
+        c.insert("has_invalidation".into(), Value::Scalar("1".into()));
+        c.insert(
+            "invalidation_premise".into(),
+            Value::Scalar(basis.premise.clone()),
+        );
+        c.insert(
+            "invalidation_evidence".into(),
+            Value::Items(
+                basis
+                    .evidence
+                    .iter()
+                    .map(|e| {
+                        let mut m: BTreeMap<String, Value> = BTreeMap::new();
+                        m.insert("item".into(), Value::Scalar(e.clone()));
+                        m
+                    })
+                    .collect(),
+            ),
+        );
+    }
     c.insert("git_sha".into(), Value::Scalar(git.sha.clone()));
     c.insert("git_subject".into(), Value::Scalar(git.subject.clone()));
     // Canonical top-level filename: prefer the first relevant symbol's
@@ -886,6 +912,7 @@ mod tests {
             details: vec![],
             introduced_by: None,
             first_seen_at: None,
+            invalidation: None,
         }
     }
 
@@ -968,6 +995,33 @@ mod tests {
         ctx.insert("list".into(), Value::Items(items));
         let t = "{{#has_list}}list:\n{{#list}}  - {{item}}\n{{/list}}{{/has_list}}";
         assert_eq!(render(t, &ctx), "list:\n  - \"a\"\n  - \"b\"\n");
+    }
+
+    #[test]
+    fn invalidation_premise_reaches_metadata_and_is_absent_otherwise() {
+        // Triage is told a stale `invalidated` is not authoritative and
+        // must be re-checked against current source. It can only do
+        // that against a named claim, so the claim has to survive the
+        // export.
+        let plain = render(
+            METADATA_TEMPLATE,
+            &build_context(&finding_sample(), &git_sample()),
+        );
+        assert!(!plain.contains("invalidation:"));
+
+        let mut retired = finding_sample();
+        retired.status = kres_core::findings::Status::Invalidated;
+        retired.invalidation = Some(kres_core::findings::InvalidationBasis {
+            premise: "check_memory_region_flags rejects both flags in one request".into(),
+            evidence: vec!["virt/kvm/kvm_main.c:1586".into()],
+        });
+        let out = render(METADATA_TEMPLATE, &build_context(&retired, &git_sample()));
+        assert!(out.contains("status: invalidated\n"));
+        assert!(out.contains("invalidation:\n"));
+        assert!(out.contains(
+            "  premise: \"check_memory_region_flags rejects both flags in one request\"\n"
+        ));
+        assert!(out.contains("    - \"virt/kvm/kvm_main.c:1586\"\n"));
     }
 
     #[test]

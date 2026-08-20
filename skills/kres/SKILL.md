@@ -150,10 +150,15 @@ regex value.
 | `function`  | any symbol name under `relevant_symbols:`                |
 | `regex`     | the joined row text (sev + subsys + date + status +      |
 |             | id + title)                                              |
-| `since`     | `YYYY-MM-DD`; row's date must be ≥ this                 |
+| `since`     | date bound; row's date must be ≥ this                    |
 
 Every value except `since:` is a case-insensitive regex. Anchor
 with `^foo$` for exact matches.
+
+The date bound parses ISO first (`2026-04-01`, `20260401`,
+`2026-04-01T09:30`), then `2026/04/01`, then `2026-04` / `2026`,
+which mean the first day of that month / year. Undated rows never
+match it. The value cannot contain whitespace.
 
 ### Example queries
 
@@ -163,6 +168,7 @@ with `^foo$` for exact matches.
 ./findings-index.py --search "( severity:high -o severity:medium ) -a subsystem:mm -a since:2026-04-01"
 ./findings-index.py --search "file:^net/ipv4/"
 ./findings-index.py --search "function:^pwq_ -a severity:high"
+./findings-index.py --search "since:2026-04-01 -a status:active"
 ```
 
 Refer to the tree's own `README.md` for any clauses or keys added

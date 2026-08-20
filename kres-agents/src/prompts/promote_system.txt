@@ -26,12 +26,34 @@ HARD CONSTRAINTS — violations are bugs:
 
 - Return finding deltas only. For a prose-only bug, emit a NEW
   finding. For prose that directly disproves an existing finding,
-  emit the SAME id with `status: "invalidated"`. For prose that
-  directly proves an invalidated finding real again, emit the SAME
-  id with `status: "active"` and `reactivate: true`.
+  emit the SAME id with `status: "invalidated"` AND
+  `"invalidation": {"premise": "...", "evidence": ["file.c:123"]}`.
+  The premise is the ONE claim the prose established that, being
+  true, means this is not a bug; the evidence is the file:line
+  citations the prose gave for it. Both must come from the prose —
+  do not supply a premise the analysis did not argue. A delta with
+  `status: "invalidated"` and no premise-plus-citation is REJECTED
+  and the finding keeps its old status, so an invalidation you
+  cannot source is an invalidation you must not emit.
+
+- When the prose leaves an existing finding unsettled rather than
+  disproved — it could not establish reachability, the decisive
+  code was not fetched, the mechanism holds but no trigger was
+  named — emit the SAME id with `status: "unconfirmed"`. That needs
+  no premise and no flag. Do NOT reach for `invalidated` because
+  `unconfirmed` feels weak; "invalidated pending confirmation" is a
+  contradiction the caller rejects.
+
+- Each existing finding you are shown carries `invalidation` when
+  it has one. If the prose contradicts that recorded premise, the
+  invalidation has lost its whole basis: emit the SAME id with
+  `status: "active"` and `reactivate: true` when the prose also
+  shows the bug is real, or `status: "unconfirmed"` when it only
+  breaks the premise. Prose that directly proves an invalidated
+  finding real again likewise gets `reactivate: true`.
 
 - Do not re-emit an existing finding just to improve wording. Same-id
-  output is only for invalidation or reactivation. On a colliding id
+  output is only for a status change. On a colliding id
   for a NEW active finding the caller RENAMES your entry by appending
   `__promoted_<n>`; that is a safety net, not a license to duplicate
   covered bugs.

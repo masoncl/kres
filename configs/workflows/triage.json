@@ -282,7 +282,7 @@
                         "items": {
                           "type": "string"
                         },
-                        "description": "Kconfig symbols that must be set, e.g. CONFIG_SCHED_CORE=y."
+                        "description": "Kconfig symbols that must be set, e.g. CONFIG_SOME_FEATURE=y."
                       }
                     },
                     "description": "Compile-time gating only."

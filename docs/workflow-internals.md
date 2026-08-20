@@ -549,12 +549,17 @@ snapshot.
 
    Required outputs:
 
-   - `research_status`: `confirmed`, `invalid`, or `unconfirmed`.
+   - `research_status`: `confirmed`, `invalid`, `unconfirmed`, or
+     `unexecutable`.
      `confirmed` means gathered source proves a concrete bug exists at
      workspace HEAD and `analysis` contains a specific fix contract.
      `invalid` means source/commit evidence disproves the bug.
      `unconfirmed` means the bug may be real but research could not
-     prove or disprove it well enough to patch.
+     prove or disprove it well enough to patch — another gather round
+     could still settle it.
+     `unexecutable` means no amount of further audit in this step can
+     settle the todo, because its fix contract requires a capability
+     the step does not have.
    - `valid`: compatibility mirror; true only when
      `research_status=confirmed`.
    - `invalid_evidence`: file:line or commit ref proving the bug is
@@ -579,6 +584,12 @@ snapshot.
    Optional outputs:
 
    - `analysis`: research narrative and fix sketch for later steps.
+   - `unexecutable_requirement`: `none`, `disallowed_action`,
+     `runtime_or_hardware`, or `human_decision`. What the fix contract
+     needs that this step cannot supply. Required to be something other
+     than `none` when `research_status=unexecutable`.
+   - `unexecutable_detail`: one sentence naming the missing capability,
+     for the human who has to re-plan the todo. Never parsed.
 
    The research step has a structural `builtin` eval named
    `fix_research_status`. It accepts only one of these typed states,
@@ -599,6 +610,48 @@ snapshot.
      `research_decision` must say invalidity is not proven and either the
      bug, the fix contract, or both remain unproven, or more audit is
      needed.
+   - unexecutable: `research_status=unexecutable`, `valid=false`,
+     `invalid_evidence=""`, `invalid_evidence_kind=none`,
+     `unexecutable_requirement` set to something other than `none`, a
+     non-empty `unexecutable_detail`, and `research_decision` saying the
+     fix contract is not proven, invalidity is not proven, and
+     `needs_more_audit=false`. That last boolean is the discriminator
+     against `unconfirmed`: if another gather round could settle the
+     todo, the status is `unconfirmed`.
+
+   `unexecutable` is terminal for the todo and is deliberately excluded
+   from the `fix_run_mode == 'todo' && research_status != 'confirmed'`
+   failure clause, so the item run ends cleanly and the series driver
+   sees the distinction. The driver records the todo as
+   `FixTodoStatus::Unexecutable`, prints
+   `[fix series] unexecutable i/n <id> (<requirement>): <detail>`, and
+   stops the series with a message naming the requirement and the
+   commits that already landed. It does not publish a partial series.
+   The revision and plan-update paths cannot help here — both are gated
+   on `unconfirmed`, and re-auditing is exactly what will not work.
+
+   Every step's prompt now states its own allowlist, in an `--- ACTIONS
+   AVAILABLE TO THIS STEP ---` block inside the cached
+   `stable_instructions`, together with the rule that a plan or
+   contract written for a later step must stay inside what the
+   executing step can do. Before that the allowlist was enforced and
+   never declared: it reached only the fetcher gate, which drops a
+   disallowed followup and appends "followup kind 'x' rejected by step
+   allowlist [...]" to the context. A step therefore learned its own
+   capabilities by being refused, one kind at a time — and a step
+   writing a PLAN never learned them at all, because planning
+   dispatches nothing and so is never refused.
+
+   `unexecutable` remains the backstop for when a contract is wrong
+   anyway. On the 2026-08-20 futex2 series,
+   finding `lsui_eagain_amplifies_unlock_pi_fph_leak` landed todo 1 of 3
+   as commit `b5f08caba30e`, then todo 2's contract opened with "Step 1
+   (evidence): build and run, with the tree's aarch64 gcc and with
+   clang, at both -O2 and -O0, a minimal program …". The `research`
+   step allows `read, source, type, git, grep, callers`. The model said
+   so on its first round, asked for `bash` twice more anyway, and the
+   series died as a generic "research_status was unconfirmed, expected
+   confirmed" after 106 model calls.
 
    Malformed JSON, missing required outputs, inconsistent typed fields,
    or a blocking followup all consume the research eval retry budget

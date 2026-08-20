@@ -21,6 +21,27 @@ use kres_llm::{
     LlmCredentials, Model, Provider,
 };
 
+/// The prose-writing rules appended to every role whose output a
+/// person reads as narrative. One copy, so the rules cannot drift
+/// between roles.
+const WRITING_STYLE: &str = include_str!("../../configs/prompts/writing-style.md");
+
+/// Roles that produce narrative for a human reader: review analyses,
+/// finding summaries and mechanism text, generic prose answers, files
+/// the coding agent writes, and workflow synthesis output.
+///
+/// `main-agent` and `routing-agent` emit `<actions>` blocks and routing
+/// JSON rather than prose, so they are excluded. `todo-agent` writes
+/// only a row name, a reason and a coverage sentence, and its prompt is
+/// thirteen lines, so attaching a page of style to it would invert the
+/// ratio for three short strings.
+const PROSE_ROLES: &[&str] = &[
+    "slow-code-agent-audit.system.md",
+    "slow-code-agent-generic.system.md",
+    "slow-code-agent-coding.system.md",
+    "workflow-synthesis.system.md",
+];
+
 /// Which agent role this config describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -265,6 +286,12 @@ impl AgentConfig {
         //   3. Both missing → error, same as before.
         if let Some(ref sf) = cfg.system_file {
             let candidates = system_file_candidates(cfg_path, sf);
+            let basename = candidates
+                .first()
+                .and_then(|p| p.file_name())
+                .and_then(|o| o.to_str())
+                .unwrap_or("")
+                .to_string();
             let mut last_err: Option<std::io::Error> = None;
             for resolved in &candidates {
                 match std::fs::read_to_string(resolved) {
@@ -276,11 +303,7 @@ impl AgentConfig {
                 }
             }
             if cfg.system.is_none() {
-                let basename = candidates
-                    .first()
-                    .and_then(|p| p.file_name())
-                    .and_then(|o| o.to_str())
-                    .unwrap_or("");
+                let basename = basename.as_str();
                 if let Some(embedded) = crate::embedded_prompts::lookup(basename) {
                     cfg.system = Some(embedded.to_string());
                 } else {
@@ -295,6 +318,17 @@ impl AgentConfig {
                     return Err(AgentError::Other(format!(
                         "system_file {attempted}: {disk_err} (no embedded fallback for basename '{basename}')"
                     )));
+                }
+            }
+            // Append after the source is resolved, not inside the
+            // embedded arm, so an operator override at
+            // `~/.kres/system-prompts/<basename>` still gets the
+            // writing rules. Pasting them into each prompt file would
+            // lose them on exactly the override that replaces it.
+            if let Some(system) = cfg.system.as_mut() {
+                if PROSE_ROLES.contains(&basename.as_str()) {
+                    system.push_str("\n\n");
+                    system.push_str(WRITING_STYLE);
                 }
             }
         }
@@ -1001,6 +1035,67 @@ mod tests {
             "error should mention the embedded-fallback attempt, got: {msg}"
         );
         std::fs::remove_file(&p).ok();
+    }
+
+    /// A prose role gets the writing rules whether its prompt came
+    /// from disk or from the embedded table. Appending them inside the
+    /// embedded arm would lose them on exactly the operator override
+    /// that replaces the file.
+    #[test]
+    fn a_prose_role_gets_the_writing_rules_from_either_source() {
+        let dir = std::env::temp_dir().join(format!("kres-style-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("system-prompts")).unwrap();
+        let cfg_path = dir.join("agent.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"api_key":"sk-x","system_file":"system-prompts/slow-code-agent-audit.system.md","models":{"m":{}}}"#,
+        )
+        .unwrap();
+
+        // No file on disk: the embedded copy is used.
+        let embedded = AgentConfig::load(&cfg_path).unwrap().system.unwrap();
+        assert!(
+            embedded.contains("WRITING STYLE")
+                && embedded.contains("It is a band, not a direction"),
+            "embedded audit prompt did not receive the writing rules"
+        );
+
+        // Operator override on disk: the rules must still arrive.
+        std::fs::write(
+            dir.join("system-prompts/slow-code-agent-audit.system.md"),
+            "OPERATOR OVERRIDE BODY\n",
+        )
+        .unwrap();
+        let overridden = AgentConfig::load(&cfg_path).unwrap().system.unwrap();
+        assert!(
+            overridden.contains("OPERATOR OVERRIDE BODY"),
+            "override was not honoured"
+        );
+        assert!(
+            overridden.contains("WRITING STYLE"),
+            "an override dropped the writing rules"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A role that emits actions or routing JSON must not carry a page
+    /// of prose style it can never use.
+    #[test]
+    fn a_non_prose_role_does_not_get_the_writing_rules() {
+        let dir = std::env::temp_dir().join(format!("kres-style-main-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("agent.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"api_key":"sk-x","system_file":"system-prompts/main-agent.system.md","models":{"m":{}}}"#,
+        )
+        .unwrap();
+        let body = AgentConfig::load(&cfg_path).unwrap().system.unwrap();
+        assert!(
+            !body.contains("WRITING STYLE"),
+            "main-agent got prose rules"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

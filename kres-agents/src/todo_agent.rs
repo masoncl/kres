@@ -31,7 +31,11 @@ use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::todo::{TodoItem, TodoStatus};
 use kres_core::UsageTracker;
 use kres_llm::{
-    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+    client::Client,
+    config::CallConfig,
+    model::ThinkingBudget,
+    request::{CachedPrefix, Message},
+    Model,
 };
 
 use crate::error::AgentError;
@@ -353,7 +357,9 @@ pub async fn update_todo_via_agent_with_logger(
         role: "user".into(),
         content: split.delta.clone(),
         cache: false,
-        cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then(|| split.stable.clone())),
+        cached_prefixes: Vec::from_iter(
+            (!split.stable.is_empty()).then(|| CachedPrefix::short(split.stable.clone())),
+        ),
     }];
     if let Some(lg) = &logger {
         let request = cfg.request_meta();
@@ -460,74 +466,7 @@ pub async fn update_todo_via_agent_with_logger(
         pending: pending_from_agent,
     } = reconcile_update(&todo_list, parsed, plan);
 
-    // --- Programmatic dedup backstop for pending items ----------------
-    // Two items are duplicates only when they refer to the same code:
-    // either both bags lack file-path tokens (pure-prose tasks like
-    // "investigate slab corruption") and >=70% of remaining tokens
-    // overlap, OR their path-token sets share at least one path AND
-    // overall token overlap >=70%. Items whose path-token sets are
-    // both non-empty and disjoint are NEVER duplicates -- they
-    // operate on different files. This is what keeps sibling
-    // compile-verify-v4 / compile-verify-v6 steps from collapsing
-    // into one (their .o paths differ even though the surrounding
-    // prose is near-identical).
-    let mut ref_entries: Vec<DedupEntry> = Vec::new();
-    let mut completed_ids: HashSet<String> = HashSet::new();
-    let mut completed_names: HashSet<String> = HashSet::new();
-    for d in done_final.iter() {
-        if !d.id.is_empty() {
-            completed_ids.insert(d.id.clone());
-        }
-        if !d.name.is_empty() {
-            completed_names.insert(d.name.to_ascii_lowercase());
-        }
-        let bag = format!("{} {} {}", d.name, d.reason, d.coverage);
-        let entry = DedupEntry::from_bag(d.name.clone(), &bag);
-        if !entry.is_empty() {
-            ref_entries.push(entry);
-        }
-    }
-    let mut filtered_pending: Vec<TodoItem> = Vec::new();
-    let mut dropped: Vec<(String, String)> = Vec::new();
-    for p in pending_from_agent.into_iter() {
-        if pending_matches_completed_exact(&p, &completed_ids, &completed_names) {
-            dropped.push((p.name.clone(), "completed item".to_string()));
-            continue;
-        }
-        let bag = format!("{} {}", p.name, p.reason);
-        let entry = DedupEntry::from_bag(p.name.clone(), &bag);
-        if entry.is_empty() {
-            filtered_pending.push(p);
-            continue;
-        }
-        let mut dup = false;
-        for r in &ref_entries {
-            if entry.is_duplicate_of(r) {
-                dup = true;
-                dropped.push((p.name.clone(), r.label.clone()));
-                break;
-            }
-        }
-        if !dup {
-            ref_entries.push(entry);
-            filtered_pending.push(p);
-        }
-    }
-
-    if !dropped.is_empty() {
-        tracing::info!(
-            target: "kres_agents",
-            "todo agent dedup dropped {} pending item(s): {}",
-            dropped.len(),
-            dropped
-                .iter()
-                .take(3)
-                .map(|(p, d)| format!("{}~{}", truncate(p, 40), truncate(d, 40)))
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-    }
-
+    let filtered_pending = dedup_pending_rows(&done_final, pending_from_agent);
     // Order: done rows (Rust-owned), then live rows in stable storage
     // order. This is not a ranking — see `crate::prioritize`.
     let mut result = Vec::with_capacity(done_final.len() + filtered_pending.len());
@@ -770,9 +709,10 @@ fn reconcile_update(
         pending.push(item.clone());
     }
     if !stale.is_empty() {
-        tracing::info!(
-            target: "kres_agents",
-            "dropped {} unemitted item(s) bound to a finished plan step: {}",
+        // Also a deletion, so also operator-visible. See the dedup
+        // drop above for why tracing alone is not enough.
+        kres_core::async_eprintln!(
+            "[todo update] dropped {} unemitted item(s) bound to a finished plan step: {}",
             stale.len(),
             stale
                 .iter()
@@ -802,6 +742,116 @@ fn reconcile_update(
         .filter(|item| item.status.is_terminal())
         .collect();
     Reconciled { done, pending }
+}
+
+/// Programmatic near-duplicate dedup of the agent's pending rows.
+///
+/// Pure so the invariants below are testable without an API call.
+/// Returns the surviving rows in order.
+fn dedup_pending_rows(done_final: &[TodoItem], pending_from_agent: Vec<TodoItem>) -> Vec<TodoItem> {
+    // --- Programmatic dedup backstop for pending items ----------------
+    // Two items are duplicates only when they refer to the same code:
+    // either both bags lack file-path tokens (pure-prose tasks like
+    // "investigate slab corruption") and >=70% of remaining tokens
+    // overlap, OR their path-token sets share at least one path AND
+    // overall token overlap >=70%. Items whose path-token sets are
+    // both non-empty and disjoint are NEVER duplicates -- they
+    // operate on different files. This is what keeps sibling
+    // compile-verify-v4 / compile-verify-v6 steps from collapsing
+    // into one (their .o paths differ even though the surrounding
+    // prose is near-identical).
+    //
+    // A survey group row takes no part in this, on either side. The
+    // groups are a PARTITION of one file's function list, generated by
+    // Rust, so two of them are disjoint by construction and a prose
+    // verdict about them can only ever be wrong. Their bags are also
+    // the worst possible input to the heuristic: every row carries the
+    // same Rust-authored "audit every function in this list"
+    // instruction, none carries a path token (they name functions, not
+    // files), so `is_duplicate_of` skips the disjoint-footprint guard
+    // and decides on overlap alone -- and `denom` is the SMALLER bag,
+    // so the victim is always the group with the least prose of its
+    // own.
+    //
+    // Measured on the 2026-08-22 arch/x86/kvm/mmu/mmu.c review
+    // (kvm27), which is what found this: of 49 group rows the todo
+    // agent emitted correctly, three were deleted here --
+    // audit-group-19 at 0.75 overlap against group-06, -33 at 0.73
+    // against group-14, -49 at 0.72 against group-06. Groups 33 and 49
+    // hold two functions each and 19 had the shortest rationale. That
+    // silently removed 11 functions, among them is_cr0_pg,
+    // kvm_calc_cpu_role and kvm_arch_vcpu_pre_fault_memory, from a
+    // review whose whole contract is that every function is covered.
+    let mut ref_entries: Vec<DedupEntry> = Vec::new();
+    let mut completed_ids: HashSet<String> = HashSet::new();
+    let mut completed_names: HashSet<String> = HashSet::new();
+    for d in done_final.iter() {
+        if !d.id.is_empty() {
+            completed_ids.insert(d.id.clone());
+        }
+        if !d.name.is_empty() {
+            completed_names.insert(d.name.to_ascii_lowercase());
+        }
+        if kres_core::is_survey_group_row(d) {
+            continue;
+        }
+        let bag = format!("{} {} {}", d.name, d.reason, d.coverage);
+        let entry = DedupEntry::from_bag(d.name.clone(), &bag);
+        if !entry.is_empty() {
+            ref_entries.push(entry);
+        }
+    }
+    let mut filtered_pending: Vec<TodoItem> = Vec::new();
+    let mut dropped: Vec<(String, String)> = Vec::new();
+    for p in pending_from_agent.into_iter() {
+        if pending_matches_completed_exact(&p, &completed_ids, &completed_names) {
+            dropped.push((p.name.clone(), "completed item".to_string()));
+            continue;
+        }
+        if kres_core::is_survey_group_row(&p) {
+            filtered_pending.push(p);
+            continue;
+        }
+        let bag = format!("{} {}", p.name, p.reason);
+        let entry = DedupEntry::from_bag(p.name.clone(), &bag);
+        if entry.is_empty() {
+            filtered_pending.push(p);
+            continue;
+        }
+        let mut dup = false;
+        for r in &ref_entries {
+            if entry.is_duplicate_of(r) {
+                dup = true;
+                dropped.push((p.name.clone(), r.label.clone()));
+                break;
+            }
+        }
+        if !dup {
+            ref_entries.push(entry);
+            filtered_pending.push(p);
+        }
+    }
+
+    if !dropped.is_empty() {
+        // Deleting work is a scheduling decision and belongs in the
+        // operator-visible narrative, not only in tracing. On kvm27
+        // three group rows were removed here and `console.jsonl` --
+        // the record that exists to explain WHY the scheduler did what
+        // it did -- said nothing at all, so the loss was only found by
+        // diffing the agent's reply against session.json.
+        kres_core::async_eprintln!(
+            "[todo update] dedup dropped {} pending item(s): {}",
+            dropped.len(),
+            dropped
+                .iter()
+                .take(3)
+                .map(|(p, d)| format!("{}~{}", truncate(p, 40), truncate(d, 40)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+
+    filtered_pending
 }
 
 fn mark_completed_todo(items: &mut [TodoItem], completed_todo_ids: &[&str]) {
@@ -1105,8 +1155,17 @@ fn flush_tok(tok: &mut String, out: &mut HashSet<String>) {
 fn fallback_dedup(existing: &[TodoItem], new_followups: &[Value]) -> Vec<TodoItem> {
     let mut out = existing.to_vec();
     stamp_missing_coverage(&mut out);
+    // Survey group rows are excluded for the same reason they are
+    // excluded from `dedup_pending_rows`: their bags are one
+    // Rust-authored instruction paragraph repeated across every group,
+    // with no path token to separate them, so a short incoming
+    // followup is a near-subset of any of them and `denom` is the
+    // smaller bag. This path cannot delete a group row -- it only
+    // filters arriving followups -- but it can silently swallow the
+    // followup a group's own audit just raised.
     let mut existing_tokens: Vec<HashSet<String>> = out
         .iter()
+        .filter(|t| !kres_core::is_survey_group_row(t))
         .map(|t| dedup_tokens(&format!("{} {} {}", t.name, t.reason, t.coverage)))
         .filter(|s| !s.is_empty())
         .collect();
@@ -2313,5 +2372,127 @@ Actual: {"todo":[{"name":"actual","status":"done"}]}"#;
         })];
         let merged = fallback_dedup(&existing, &new_fu);
         assert_eq!(merged.len(), 2);
+    }
+
+    /// A survey group row carries a Rust-authored instruction
+    /// paragraph identical across every group, and names functions
+    /// rather than files, so it has no path token to separate it from
+    /// its siblings. That is precisely the input the prose heuristic
+    /// mishandles, and it deleted three of kvm27's 49 groups.
+    fn survey_group_row(n: u32, title: &str, members: &str) -> TodoItem {
+        let mut item = TodoItem::new(
+            format!("Audit {title}: {members}"),
+            // `kind` is deliberately not "review": the group row is
+            // identified by id, and kvm27's todo agent had dropped
+            // the field from every surviving group row.
+            "investigate",
+        );
+        item.step_id = format!("audit-group-{n:02}");
+        item.id = format!("review-{}", item.step_id);
+        item.reason = format!(
+            "WHY THESE FUNCTIONS ARE ONE GROUP: {title}.\n\nRead and audit the \
+             body of EVERY function in this list, and the neighbours they \
+             call, for defects in this group's contract. Do not stop after \
+             the first issue. Emit typed followups when more source, \
+             callers, history, or API context is needed to be confident."
+        );
+        item
+    }
+
+    #[test]
+    fn survey_group_rows_are_never_deduped_against_each_other() {
+        // Shapes taken from the 2026-08-22 arch/x86/kvm/mmu/mmu.c run:
+        // one large group, then the three small ones the heuristic
+        // scored at 0.75, 0.73 and 0.72 overlap and removed.
+        let rows = vec![
+            survey_group_row(
+                6,
+                "MMU context initialization",
+                "__kvm_mmu_refresh_passthrough_bits, init_kvm_nested_mmu, \
+                 kvm_init_mmu, kvm_mmu_reset_context, reset_guest_paging_metadata",
+            ),
+            survey_group_row(
+                19,
+                "MMU role computation",
+                "is_cr0_pg, is_cr4_pae, kvm_calc_cpu_role",
+            ),
+            survey_group_row(
+                33,
+                "Pre-fault mapping ioctl support",
+                "kvm_arch_vcpu_pre_fault_memory, kvm_tdp_map_page",
+            ),
+            survey_group_row(
+                49,
+                "Guest page-table root accessors",
+                "get_guest_cr3, kvm_mmu_get_guest_pgd",
+            ),
+        ];
+        let expected: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+
+        let kept = dedup_pending_rows(&[], rows);
+
+        let got: Vec<String> = kept.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            got, expected,
+            "every group is a disjoint slice of one file's function list; \
+             none may be dropped as a near-duplicate of another"
+        );
+    }
+
+    #[test]
+    fn a_group_row_does_not_suppress_an_ordinary_followup() {
+        // The exemption is symmetric: a group row must not enter the
+        // reference set either, or its boilerplate becomes a template
+        // that swallows short followups raised while auditing it.
+        let mut followup = TodoItem::new(
+            "Read and audit the body of every function in this list for \
+             contract defects",
+            "review",
+        );
+        followup.id = "some-followup".into();
+        followup.step_id = "audit-group-19".into();
+
+        let rows = vec![
+            survey_group_row(19, "MMU role computation", "is_cr0_pg, is_cr4_pae"),
+            followup,
+        ];
+        let kept = dedup_pending_rows(&[], rows);
+        assert_eq!(kept.len(), 2, "followup was swallowed by group boilerplate");
+    }
+
+    #[test]
+    fn the_api_failure_path_does_not_swallow_a_followup_either() {
+        // fallback_dedup is a second copy of the same heuristic, taken
+        // when the todo call fails or the session is cancelled. It
+        // cannot delete a group row, but a group row left in its
+        // reference set eats the followups that group's own audit
+        // raised.
+        let existing = vec![survey_group_row(
+            19,
+            "MMU role computation",
+            "is_cr0_pg, is_cr4_pae",
+        )];
+        let arriving = vec![serde_json::json!({
+            "type": "source",
+            "name": "Read and audit the body of every function in this list \
+                     for contract defects",
+            "reason": "the group's contract is established elsewhere",
+        })];
+        let merged = fallback_dedup(&existing, &arriving);
+        assert_eq!(
+            merged.len(),
+            2,
+            "followup was swallowed by group boilerplate"
+        );
+    }
+
+    #[test]
+    fn ordinary_prose_rows_are_still_deduped() {
+        // The exemption must not disable the backstop for the rows it
+        // was written for.
+        let a = TodoItem::new("Investigate slab corruption in the free path", "review");
+        let b = TodoItem::new("Investigate slab corruption in the free path", "review");
+        let kept = dedup_pending_rows(&[], vec![a, b]);
+        assert_eq!(kept.len(), 1);
     }
 }

@@ -18,11 +18,6 @@ use kres_core::log::TurnLogger;
 use kres_core::{format_usage_summary, FindingsStore, TaskManager, TaskState, UsageTracker};
 use kres_llm::RateLimiter;
 
-use crate::change_survey::{
-    change_survey_chunk_prompt, change_survey_prompt, parse_inference_risks,
-    split_diff_for_inference, split_source_for_inference, ChangeSurveyDiffChunk,
-    ChangeSurveyReport, ChangeSurveySourceChunk,
-};
 use crate::commands::{parse_command, Command};
 
 #[derive(Debug, Clone)]
@@ -108,7 +103,6 @@ pub struct ReplConfig {
     /// Reuse a matching `change-survey.json` checkpoint. This follows the
     /// same explicit-resume contract as `session.json`; fresh sessions still
     /// write checkpoints but never inherit one from an earlier run.
-    pub resume_change_survey: bool,
     /// When true, exit the REPL once the work-stop condition fires
     /// (`--turns 0` goal-met / no-progress / no-goal-batch-finished),
     /// instead of staying open waiting for further operator input.
@@ -139,7 +133,6 @@ impl Default for ReplConfig {
             workspace: PathBuf::from("."),
             mcp_config: None,
             persist_path: None,
-            resume_change_survey: false,
             exit_on_idle: false,
             assisted_by: "kres:claude-sonnet-5".to_string(),
         }
@@ -284,6 +277,14 @@ pub struct Session {
     initial_prompt: Option<String>,
     initial_prompt_mode: Option<kres_agents::TaskMode>,
     review_file_scan_target: Arc<tokio::sync::RwLock<Option<String>>>,
+    /// Per-plan-step in-file source closure, seeded into every task
+    /// spawned for that step so the lens has its call neighbourhood
+    /// whether or not it thinks to ask. Keyed by `PlanStep::id`;
+    /// populated only when a coverage plan is built, and deliberately
+    /// not persisted — a `--resume` rebuilds no plan, so it seeds
+    /// nothing and degrades to the gather-only behaviour.
+    cluster_context:
+        Arc<tokio::sync::RwLock<std::collections::BTreeMap<String, Vec<serde_json::Value>>>>,
     /// Last reaped task's analysis — consumed by /reply.
     last_analysis: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Findings loaded from disk at Session::new time. Applied to
@@ -420,8 +421,6 @@ async fn persist_session_state_to(
         .filter(|state: &kres_core::ReviewFileScanState| {
             !state.target.trim().is_empty()
                 && !state.source_hash.trim().is_empty()
-                && !state.baseline.trim().is_empty()
-                && !state.head.trim().is_empty()
                 && !state.scan.trim().is_empty()
         });
     let state = kres_core::SessionState {
@@ -537,6 +536,9 @@ impl Session {
                 initial_prompt: None,
                 initial_prompt_mode: None,
                 review_file_scan_target: Arc::new(tokio::sync::RwLock::new(None)),
+                cluster_context: Arc::new(tokio::sync::RwLock::new(
+                    std::collections::BTreeMap::new(),
+                )),
                 last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
                 pending_bootstrap: findings,
                 logger: None,
@@ -573,6 +575,7 @@ impl Session {
             initial_prompt: None,
             initial_prompt_mode: None,
             review_file_scan_target: Arc::new(tokio::sync::RwLock::new(None)),
+            cluster_context: Arc::new(tokio::sync::RwLock::new(std::collections::BTreeMap::new())),
             last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
             pending_bootstrap: Vec::new(),
             logger: None,
@@ -718,7 +721,7 @@ impl Session {
         *self.review_file_scan_target.write().await = None;
         if let Some(scan) = state.review_file_scan.as_ref() {
             *self.review_file_scan_target.write().await = Some(scan.target.clone());
-            match review_file_scan_matches_current_window(&self.cfg.workspace, scan).await {
+            match review_file_scan_matches_current_source(&self.cfg.workspace, scan) {
                 Ok(true) => {
                     self.mgr
                         .cache_context(
@@ -1715,6 +1718,8 @@ impl Session {
                     let mut apply_updated: u32 = 0;
                     let mut apply_invalidated: u32 = 0;
                     let mut apply_reactivated: u32 = 0;
+                    let mut apply_inv_refused: u32 = 0;
+                    let mut apply_incomplete_refused: u32 = 0;
                     if had_delta {
                         let delta = working_delta.clone();
                         // effective_analysis is the prose we want on
@@ -1745,6 +1750,8 @@ impl Session {
                                     apply_updated = rep.updated;
                                     apply_invalidated = rep.invalidated;
                                     apply_reactivated = rep.reactivated;
+                                    apply_inv_refused = rep.invalidation_refused;
+                                    apply_incomplete_refused = rep.incomplete_refused;
                                 }
                                 Err(e) => {
                                     kres_core::async_eprintln!("findings apply: {e}");
@@ -1767,6 +1774,8 @@ impl Session {
                             apply_updated = counts.updated;
                             apply_invalidated = counts.invalidated;
                             apply_reactivated = counts.reactivated;
+                            apply_inv_refused = counts.invalidation_refused;
+                            apply_incomplete_refused = counts.incomplete_refused;
                         }
                     }
                     // Promoted-findings cross-reference trailer on
@@ -1847,12 +1856,14 @@ impl Session {
                     }
                     if had_delta {
                         kres_core::async_eprintln!(
-                            "[findings] {} total (added={} updated={} invalidated={} reactivated={} changed={} quiescent={})",
+                            "[findings] {} total (added={} updated={} invalidated={} reactivated={} refused-invalidation={} refused-incomplete={} changed={} quiescent={})",
                             final_list.len(),
                             apply_added,
                             apply_updated,
                             apply_invalidated,
                             apply_reactivated,
+                            apply_inv_refused,
+                            apply_incomplete_refused,
                             changed,
                             quiescent,
                         );
@@ -2974,6 +2985,13 @@ impl Session {
                 .remove_cached_context(REVIEW_FILE_SCAN_CACHE_KEY)
                 .await;
         }
+        // TEMPORARY EXPERIMENT: retain the scan so the plan can be
+        // built in Rust over every function instead of by the planner
+        // over the top of the ranking. See coverage_plan_steps().
+        let mut coverage_scan: Option<String> = None;
+        // The scan names functions but carries no edges between them,
+        // so the source has to be re-read to group by call adjacency.
+        let mut coverage_scan_target: Option<String> = None;
         let planning_text = if include_recent_context && review_submission {
             let target = self.review_file_scan_target.read().await.clone();
             if let Some(target) = target {
@@ -2989,11 +3007,6 @@ impl Session {
                             &orc,
                             &self.cfg.workspace,
                             &target,
-                            self.cfg
-                                .persist_path
-                                .as_ref()
-                                .map(|path| path.with_file_name("change-survey.json")),
-                            self.cfg.resume_change_survey,
                             self.mgr.root_shutdown(),
                         )
                         .await
@@ -3013,7 +3026,12 @@ impl Session {
                 };
                 match scan {
                     Some(scan) => format!(
-                        "{persisted_plan_prompt}\n\n--- WHOLE-FILE RISK SCAN ---\n{scan}\n--- END WHOLE-FILE RISK SCAN ---\nUse this source-derived ranking when defining the completion goal and semantic coverage plan. Do not add a survey/scan step to the plan."
+                        "{persisted_plan_prompt}\n\n--- WHOLE-FILE FUNCTION INVENTORY ---\n{}\n--- END WHOLE-FILE FUNCTION INVENTORY ---\nThis is every function the target defines, with how often each name is spelled. It carries no risk ratings. Use it to scope a completion goal that covers the whole file. Do not add a survey/scan step to the plan.",
+                        {
+                            coverage_scan = Some(scan.clone());
+                            coverage_scan_target = Some(target.clone());
+                            scan
+                        }
                     ),
                     None => persisted_plan_prompt.clone(),
                 }
@@ -3133,7 +3151,115 @@ impl Session {
         if include_recent_context {
             if let (Some(gc), Some(goal)) = (planning_goal_client, defined_goal.as_ref()) {
                 let existing = self.mgr.plan_snapshot().await;
-                let plan = if let Some(steps) = embedded_steps {
+                // TEMPORARY EXPERIMENT: when a whole-file scan exists,
+                // build the plan here so its steps cover every rated
+                // function, and skip define_plan entirely. The planner
+                // is free to pick a subset of a 312-function file; this
+                // is not.
+                // Group the partition by who calls whom rather than by
+                // adjacent position in the inventory, so a defect in
+                // the COMPOSITION of two individually-boring functions
+                // can reach one lens prompt. Empty edges reproduce the
+                // name-ordered chunking exactly, so no ctags means a
+                // worse partition and never a failure.
+                // Primary path: read the file and let the coding agent
+                // say what its functional groups are. Falls back to
+                // call-graph accretion, which falls back in turn to
+                // fixed chunks of the roster — three tiers, so a
+                // missing tool or a failed call costs partition
+                // quality and never the review.
+                let semantic = match coverage_scan_target.as_deref() {
+                    Some(target) if coverage_scan.is_some() => {
+                        determine_function_groups(
+                            &orc,
+                            &self.cfg.workspace,
+                            target,
+                            self.cfg
+                                .persist_path
+                                .as_ref()
+                                .map(|path| path.with_file_name("function-groups.json"))
+                                .as_deref(),
+                            self.mgr.root_shutdown(),
+                        )
+                        .await
+                    }
+                    _ => None,
+                };
+                let coverage_edges = match &semantic {
+                    Some((_, _, edges)) => edges.clone(),
+                    None => match coverage_scan_target.as_deref() {
+                        Some(target) => call_edges_for_target(&self.cfg.workspace, target),
+                        None => CallEdges::default(),
+                    },
+                };
+                let coverage_steps = match &semantic {
+                    Some((groups, ranges, edges)) => {
+                        let steps = plan_steps_from_groups(groups, ranges, edges);
+                        let members_by_step = steps
+                            .iter()
+                            .zip(groups.iter())
+                            .map(|(step, group)| (step.id.clone(), group.members.clone()))
+                            .collect();
+                        Some(CoveragePlan {
+                            steps,
+                            members_by_step,
+                        })
+                    }
+                    None => coverage_scan
+                        .as_deref()
+                        .map(|scan| coverage_plan_steps(scan, 25, &coverage_edges)),
+                }
+                .filter(|coverage| !coverage.steps.is_empty());
+                let plan = if let Some(coverage) = coverage_steps {
+                    kres_core::async_eprintln!(
+                        "[coverage plan] {} step(s) covering every function in the target (define_plan skipped)",
+                        coverage.steps.len()
+                    );
+                    // Seed each step with the source within
+                    // CLUSTER_CONTEXT_DEPTH hops of its members. The
+                    // lens fan-out reads it whether or not a lens asks,
+                    // which is the point: on the 2026-08-21 mmu.c run
+                    // the bodies that settled the fault-path defect
+                    // were fetched 108-287 times run-wide and reached
+                    // the cluster that needed them zero times.
+                    //
+                    // Computed unconditionally, including to nothing.
+                    // Step ids restart at 01 for every coverage plan,
+                    // whichever scheme produced them, so a map left over from a previous
+                    // target would hand this review the bodies of a
+                    // different file under the same key — worse than
+                    // seeding nothing at all.
+                    {
+                        let seeds = match coverage_scan_target.as_deref() {
+                            Some(target) => cluster_context_seeds(
+                                &self.cfg.workspace,
+                                target,
+                                &coverage.members_by_step,
+                                &coverage_edges,
+                            ),
+                            None => std::collections::BTreeMap::new(),
+                        };
+                        if !seeds.is_empty() {
+                            let chars: usize = seeds
+                                .values()
+                                .flatten()
+                                .filter_map(|s| {
+                                    s.get("definition").and_then(serde_json::Value::as_str)
+                                })
+                                .map(str::len)
+                                .sum();
+                            let functions: usize = seeds.values().map(Vec::len).sum();
+                            kres_core::async_eprintln!(
+                                "[cluster context] seeded {functions} function bod(ies), {chars} chars across {} step(s) (depth {CLUSTER_CONTEXT_DEPTH})",
+                                seeds.len()
+                            );
+                        }
+                        *self.cluster_context.write().await = seeds;
+                    }
+                    let mut plan = kres_core::Plan::new(&persisted_plan_prompt, goal, task_mode);
+                    plan.steps = kres_core::plan::normalize_steps(coverage.steps);
+                    Some(plan)
+                } else if let Some(steps) = embedded_steps {
                     let steps = kres_core::plan::normalize_steps(steps);
                     if steps.is_empty() {
                         kres_agents::define_plan(
@@ -3197,6 +3323,20 @@ impl Session {
         let task_brief = text.clone();
         let task_brief_clone = task_brief.clone();
         let active_plan_step_id = step_id.clone();
+        // The step's in-file call neighbourhood, if a coverage plan
+        // built one. Empty for every other path — an operator prompt,
+        // a followup row with no step, a resumed session — which
+        // leaves gathering exactly as it was.
+        let cluster_seed_symbols = match active_plan_step_id.as_deref() {
+            Some(id) => self
+                .cluster_context
+                .read()
+                .await
+                .get(id)
+                .cloned()
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         let lenses = self.lenses.read().await.clone();
         let lens_consolidate_rules = self.lens_consolidate_rules.read().await.clone();
         let consolidator = self.consolidator.clone();
@@ -3274,7 +3414,7 @@ impl Session {
         let has_review_scan = review_scan.is_some();
         let text = match review_scan {
                 Some(scan) => format!(
-                    "WHOLE-FILE RISK SCAN (already completed; do not request another survey):\n{scan}\n\n---\n\n{text}"
+                    "WHOLE-FILE FUNCTION INVENTORY (already gathered; do not request another survey):\n{scan}\n\n---\n\n{text}"
                 ),
                 None => text,
         };
@@ -3317,9 +3457,12 @@ impl Session {
                     // OUTPUT SCHEMA tail, so the historical per-mode
                     // slow prompt selection applies.
                     synthesis_system: None,
-                    // The REPL task path uses TaskManager's own
-                    // symbol/context cache, not the workflow per-step
-                    // gather seed.
+                    // A coverage-plan step arrives with its own call
+                    // neighbourhood already in hand; everything else
+                    // is still gathered, including all cross-file
+                    // evidence, which the in-file ctags graph cannot
+                    // see at any depth.
+                    seed_symbols: cluster_seed_symbols,
                     ..RunContext::default()
                 };
                 // Dispatch by mode:
@@ -4680,17 +4823,30 @@ impl Session {
         // inherit the prior topic's goal — exactly the
         // cross-topic bleed /clear exists to prevent.
         *self.session_goal.lock().await = None;
-        let removed_change_checkpoint = self
+        // And the per-step seeded source. It is keyed by
+        // `audit-cluster-NN`, which the next coverage plan reuses from
+        // 01, so a surviving map would seed the next topic's first
+        // cluster with the previous file's function bodies.
+        self.cluster_context.write().await.clear();
+
+        // The functional-group checkpoint is keyed by target and
+        // source hash, so it would happily outlive the topic that
+        // produced it. /clear means forget this topic: the change
+        // survey's checkpoint was removed here for the same reason.
+        if let Some(path) = self
             .cfg
             .persist_path
             .as_ref()
-            .map(|path| remove_change_survey_checkpoint(&path.with_file_name("change-survey.json")))
-            .transpose()
-            .map(Option::unwrap_or_default)
-            .unwrap_or_else(|error| {
-                kres_core::async_eprintln!("/clear: failed to remove change survey: {error}");
-                false
-            });
+            .map(|path| path.with_file_name("function-groups.json"))
+        {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    kres_core::async_eprintln!("/clear: failed to remove function groups: {error}")
+                }
+            }
+        }
         // Drop every outside-workspace consent. The store is
         // global (OnceLock); without this a /clear would leave
         // grants from the prior topic in place and a follow-up
@@ -4698,10 +4854,9 @@ impl Session {
         // operator forgot they'd allowed.
         let dropped_grants = kres_core::consent::get().map(|s| s.clear()).unwrap_or(0);
         kres_core::async_eprintln!(
-            "/clear: stopped {} task(s), reset findings + todo + accumulated context, dropped {} consent grant(s), removed change survey: {}",
+            "/clear: stopped {} task(s), reset findings + todo + accumulated context, dropped {} consent grant(s)",
             out.stopped + out.grace_expired,
-            dropped_grants,
-            removed_change_checkpoint
+            dropped_grants
         );
     }
 
@@ -4843,6 +4998,1172 @@ fn parse_compact_response(text: &str) -> Option<String> {
         .and_then(|response| (!response.summary.trim().is_empty()).then_some(response.summary))
 }
 
+/// Intra-file call/reference adjacency over the scan's functions.
+///
+/// Undirected: for co-membership in an audit step, "A names B" and
+/// "B names A" are the same relation, and mutual recursion is not
+/// stronger evidence than one-way.
+#[derive(Debug, Default, Clone)]
+struct CallEdges {
+    adjacency: std::collections::BTreeMap<String, BTreeSet<String>>,
+}
+
+impl CallEdges {
+    fn neighbours(&self, name: &str) -> Option<&BTreeSet<String>> {
+        self.adjacency.get(name)
+    }
+
+    /// Ordered iteration over the adjacency, for rendering the graph
+    /// into a prompt. `BTreeMap`, so the order is stable and the
+    /// rendered text is byte-identical for identical edges.
+    fn iter(&self) -> impl Iterator<Item = (&String, &BTreeSet<String>)> {
+        self.adjacency.iter()
+    }
+
+    fn link(&mut self, a: &str, b: &str) {
+        if a == b {
+            return;
+        }
+        self.adjacency
+            .entry(a.to_string())
+            .or_default()
+            .insert(b.to_string());
+        self.adjacency
+            .entry(b.to_string())
+            .or_default()
+            .insert(a.to_string());
+    }
+}
+
+/// Function name -> inclusive 1-based line range, from ctags.
+///
+/// Same invocation as `ctags_function_inventory` plus `--fields=+ne`,
+/// which adds `line` and `end`. Degrades to an empty map exactly as
+/// that function does: no ctags, a non-zero exit, or unparseable
+/// output all mean "no ranges", never an error, because the grouping
+/// this feeds is an optimisation of the partition and never a
+/// precondition for producing one.
+fn ctags_function_ranges(target: &Path) -> std::collections::BTreeMap<String, (usize, usize)> {
+    let output = match std::process::Command::new("ctags")
+        .args([
+            "--output-format=json",
+            "--languages=C",
+            "--kinds-C=f",
+            "--fields=+ne",
+            "--sort=no",
+            "-o",
+            "-",
+        ])
+        .arg(target)
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return std::collections::BTreeMap::new(),
+    };
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut ranges = std::collections::BTreeMap::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            return std::collections::BTreeMap::new();
+        };
+        if value.get("kind").and_then(serde_json::Value::as_str) != Some("function") {
+            continue;
+        }
+        let (Some(name), Some(start), Some(end)) = (
+            value.get("name").and_then(serde_json::Value::as_str),
+            value.get("line").and_then(serde_json::Value::as_u64),
+            value.get("end").and_then(serde_json::Value::as_u64),
+        ) else {
+            continue;
+        };
+        if start == 0 || end < start {
+            continue;
+        }
+        // A name defined twice (#ifdef arms) keeps the first range;
+        // both bodies name much the same things and picking
+        // deterministically matters more than picking the larger.
+        ranges
+            .entry(name.to_string())
+            .or_insert((start as usize, end as usize));
+    }
+    ranges
+}
+
+/// Which target-local functions each function's body names.
+///
+/// Pure, so the partition it feeds is testable without ctags or a
+/// workspace. Bodies are sliced by the ctags ranges, stripped of
+/// comments and string literals by the same helper the survey's
+/// occurrence counter uses, and split on the same identifier rule.
+///
+/// This over-approximates calls, deliberately. `.rmap_zap =
+/// kvm_zap_rmap` is recorded even though it is an assignment, not a
+/// call — an ops-table entry is exactly the unchanged-dispatch
+/// relation a review is told to trace, so it belongs in the same
+/// step. It under-approximates through token-pasting macros, which is
+/// why the step text also names the neighbours that did not fit.
+fn call_edges_from_source(
+    source: &str,
+    ranges: &std::collections::BTreeMap<String, (usize, usize)>,
+) -> CallEdges {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut edges = CallEdges::default();
+    for (name, (start, end)) in ranges {
+        if *start > lines.len() {
+            continue;
+        }
+        let body = lines[start - 1..(*end).min(lines.len())].join("\n");
+        let code = code_without_comments_and_literals(&body);
+        for token in code.split(|byte| !is_identifier_byte(*byte)) {
+            if token.is_empty() {
+                continue;
+            }
+            let Ok(token) = std::str::from_utf8(token) else {
+                continue;
+            };
+            if token != name && ranges.contains_key(token) {
+                edges.link(name, token);
+            }
+        }
+    }
+    edges
+}
+
+/// Intra-file edges for the scan target, or none.
+///
+/// Every failure mode — no ctags, an unreadable file, a target that
+/// resolves outside the workspace — yields an empty set, which makes
+/// `coverage_plan_steps` fall back to name-ordered chunking. The
+/// grouping is an optimisation of the partition, never a precondition
+/// for producing one.
+fn call_edges_for_target(workspace: &Path, target: &str) -> CallEdges {
+    let path = review_target_path(workspace, target);
+    let ranges = ctags_function_ranges(&path);
+    if ranges.is_empty() {
+        kres_core::async_eprintln!(
+            "[coverage plan] no ctags function ranges for {target}; chunking in name order"
+        );
+        return CallEdges::default();
+    }
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return CallEdges::default();
+    };
+    call_edges_from_source(&source, &ranges)
+}
+
+// ---------------------------------------------------------------- //
+// Semantic functional groups                                        //
+// ---------------------------------------------------------------- //
+
+/// One function's purpose, as read out of the source by pass 1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FunctionPurpose {
+    name: String,
+    /// One sentence on what the function does.
+    purpose: String,
+    /// An open-vocabulary role the model proposes. Not an enum: a fixed
+    /// taxonomy would be this code deciding what kinds of function a
+    /// file is allowed to contain.
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PurposeResponse {
+    functions: Vec<FunctionPurpose>,
+}
+
+/// One functional group, as decided by pass 2 and reconciled by Rust.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FunctionGroup {
+    name: String,
+    /// Why these functions are one group and how they relate. Carried
+    /// into the step description and therefore into every lens prompt
+    /// for the group, so a lens is told what it is looking at instead
+    /// of inferring it from a member's name.
+    rationale: String,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupResponse {
+    groups: Vec<FunctionGroup>,
+}
+
+/// Pass 1 + pass 2 output for one target, checkpointed so a resumed or
+/// re-submitted session does not re-infer them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FunctionGroupPlan {
+    target: String,
+    source_hash: String,
+    purposes: Vec<FunctionPurpose>,
+    groups: Vec<FunctionGroup>,
+}
+
+/// Slice the source into chunks that never cut a function in half.
+///
+/// Pass 1 asks what each function does, so handing it half a body
+/// guarantees a wrong answer for that function. Boundaries come from
+/// the ctags ranges Rust already holds. A function longer than the
+/// target on its own becomes its own chunk rather than being split.
+///
+/// The caller passes the LARGEST target the transport allows, not a
+/// size chosen to create parallelism. Pass 1 is asked what a function
+/// is FOR, which is a question about its place in the file: read
+/// beside the six functions sharing its data structure, a function can
+/// be described by that relationship; read alone in a small window it
+/// cannot, and the purpose text that pass 2 draws every group boundary
+/// from gets correspondingly vaguer. Smaller chunks buy wall-clock and
+/// pay in exactly the signal these two passes exist to produce. Chunks
+/// still run concurrently, so a file that genuinely needs several gets
+/// the parallelism anyway — it just never gets it by shrinking the
+/// window.
+fn chunk_source_on_function_boundaries(
+    source_lines: &[&str],
+    ranges: &std::collections::BTreeMap<String, (usize, usize)>,
+    target_bytes: usize,
+) -> Vec<(Vec<String>, String)> {
+    // Ordered by position so a chunk is a contiguous region of the
+    // file and the model reads it the way the file is written.
+    let mut ordered: Vec<(&str, usize, usize)> = ranges
+        .iter()
+        .filter(|(_, (start, _))| *start > 0 && *start <= source_lines.len())
+        .map(|(name, (start, end))| (name.as_str(), *start, *end))
+        .collect();
+    ordered.sort_by_key(|(name, start, _)| (*start, *name));
+
+    let mut chunks = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut body = String::new();
+    for (name, start, end) in ordered {
+        let text = source_lines[start - 1..end.min(source_lines.len())].join("\n");
+        if !body.is_empty() && body.len() + text.len() > target_bytes {
+            chunks.push((std::mem::take(&mut names), std::mem::take(&mut body)));
+        }
+        names.push(name.to_string());
+        body.push_str(&text);
+        body.push('\n');
+    }
+    if !names.is_empty() {
+        chunks.push((names, body));
+    }
+    chunks
+}
+
+/// The system prompt both grouping passes run under.
+///
+/// `slow_system_for_mode` already falls back from the coding prompt to
+/// the audit one, so `None` means neither is loaded — a broken
+/// configuration rather than a normal path. Say so instead of silently
+/// sending an empty system block.
+fn grouping_system_prompt(runner: &Arc<AgentRunner>) -> String {
+    match runner.slow_system_for_mode(kres_core::TaskMode::Coding) {
+        Some(system) => system.clone(),
+        None => {
+            kres_core::async_eprintln!(
+                "[function groups] no slow coding or audit system prompt is loaded; grouping calls run without one"
+            );
+            String::new()
+        }
+    }
+}
+
+/// Pass 1 — what does each function do?
+///
+/// Chunked on function boundaries and run concurrently. Coverage is not
+/// a contract: a function the model does not describe simply carries an
+/// empty purpose into pass 2. AGENTS.md records what demanding an exact
+/// roster cost on kernel/sched/fair.c — an invented
+/// `__account_cfs_rq_runtime_placeholder`, and 147 correct ratings
+/// discarded for being three short.
+async fn infer_function_purposes(
+    runner: &Arc<AgentRunner>,
+    target: &str,
+    source_lines: &[&str],
+    ranges: &std::collections::BTreeMap<String, (usize, usize)>,
+    shutdown: &kres_core::Shutdown,
+) -> Vec<FunctionPurpose> {
+    let chunks =
+        chunk_source_on_function_boundaries(source_lines, ranges, INFERENCE_PARTITION_BYTES);
+    if chunks.is_empty() {
+        return Vec::new();
+    }
+    kres_core::async_eprintln!(
+        "[function groups] reading {} function(s) for purpose across {} chunk(s)",
+        ranges.len(),
+        chunks.len()
+    );
+    let system = grouping_system_prompt(runner);
+    let results = futures::stream::iter(chunks.into_iter().enumerate().map(
+        |(index, (names, body))| {
+            let system = system.clone();
+            async move {
+                let prompt = format!(
+                    "Read this contiguous region of {target} and say what each function DOES.\n\n\
+                     Return exactly one raw JSON object:\n\
+                     {{\"functions\":[{{\"name\":string,\"purpose\":string,\"role\":string}}]}}\n\n\
+                     `purpose` is one sentence: the job this function performs for its callers, \
+                     naming the object it operates on. Not a restatement of its name, not a \
+                     description of its control flow.\n\
+                     `role` is a short tag you choose for the kind of function it is. There is no \
+                     fixed vocabulary; use whatever categories this file actually exhibits.\n\
+                     Describe the functions named below. If you cannot tell what one does, omit \
+                     it rather than guessing. No markdown, no prose outside the JSON.\n\n\
+                     FUNCTIONS IN THIS REGION: {}\n\n\
+                     SOURCE:\n{body}",
+                    names.join(", ")
+                );
+                let response = runner
+                    .run_primary_slow_inference(
+                        &system,
+                        &prompt,
+                        &format!("function-purpose chunk {}", index + 1),
+                        shutdown,
+                    )
+                    .await;
+                match response {
+                    Ok(text) => {
+                        match kres_agents::json_repair::parse_strict_json::<PurposeResponse>(
+                            "function-purpose",
+                            &text,
+                        ) {
+                            Ok(parsed) => parsed.functions,
+                            Err(error) => {
+                                kres_core::async_eprintln!(
+                                    "[function groups] purpose chunk {} unparseable: {}",
+                                    index + 1,
+                                    error.join("; ")
+                                );
+                                Vec::new()
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        kres_core::async_eprintln!(
+                            "[function groups] purpose chunk {} failed: {error}",
+                            index + 1
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        },
+    ))
+    .buffer_unordered(INFERENCE_CHUNK_CONCURRENCY)
+    .collect::<Vec<Vec<FunctionPurpose>>>()
+    .await;
+
+    // Keep only real functions, first description wins, and order by
+    // name so the checkpoint and the pass-2 prompt are byte-stable.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut purposes: Vec<FunctionPurpose> = results
+        .into_iter()
+        .flatten()
+        .filter(|p| ranges.contains_key(&p.name) && seen.insert(p.name.clone()))
+        .collect();
+    purposes.sort_by(|a, b| a.name.cmp(&b.name));
+    purposes
+}
+
+/// Pass 2 — which functions belong together, and why?
+///
+/// One call, and deliberately no bodies: it needs to know what each
+/// function does and how they connect, which is purposes plus edges.
+/// That is ~15 KB for a 312-function file, so this call fits regardless
+/// of target size — the only part that scales is pass 1, which is
+/// parallel.
+async fn infer_function_groups(
+    runner: &Arc<AgentRunner>,
+    target: &str,
+    purposes: &[FunctionPurpose],
+    ranges: &std::collections::BTreeMap<String, (usize, usize)>,
+    edges: &CallEdges,
+    shutdown: &kres_core::Shutdown,
+) -> Option<Vec<FunctionGroup>> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let described: std::collections::BTreeMap<&str, &FunctionPurpose> =
+        purposes.iter().map(|p| (p.name.as_str(), p)).collect();
+    let mut roster = String::new();
+    for name in ranges.keys() {
+        let degree = edges.neighbours(name).map_or(0, |n| n.len());
+        match described.get(name.as_str()) {
+            Some(p) => roster.push_str(&format!(
+                "{name} [{}] (degree {degree}): {}\n",
+                p.role.trim(),
+                p.purpose.trim()
+            )),
+            None => roster.push_str(&format!("{name} (degree {degree}): (not described)\n")),
+        }
+    }
+    let mut edge_list = String::new();
+    for (from, tos) in edges.iter() {
+        if !ranges.contains_key(from) {
+            continue;
+        }
+        let related: Vec<&str> = tos
+            .iter()
+            .filter(|to| ranges.contains_key(to.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !related.is_empty() {
+            edge_list.push_str(&format!("{from} -- {}\n", related.join(", ")));
+        }
+    }
+    let prompt = format!(
+        "Partition every function in {target} into functional groups.\n\n\
+         Return exactly one raw JSON object:\n\
+         {{\"groups\":[{{\"name\":string,\"rationale\":string,\"members\":[string]}}]}}\n\n\
+         A group is a set of functions that belong together because they do one job: they \
+         operate on the same object, maintain the same contract, or implement one phase of one \
+         operation.\n\n\
+         `name` says what the group is FOR. Do not name a group after one of its members.\n\
+         `rationale` says why these functions are one group and how they relate to each other — \
+         the shared object, the contract they jointly maintain, the phase they implement. A \
+         rationale that only restates the name is not an answer.\n\n\
+         There is NO target number of groups and NO size limit. Groups will be very uneven: a \
+         file usually has a few large subsystems and a tail of small utility groups, and \
+         flattening that loses the structure this pass exists to find. Use as many or as few \
+         groups as the file actually has.\n\n\
+         Prefer grouping functions that reference each other, but purpose wins over adjacency: \
+         two functions that call each other for an incidental reason do not belong together, and \
+         two that never touch but jointly maintain one invariant do.\n\n\
+         Every function below should appear in exactly one group. Omit any you genuinely cannot \
+         place. No markdown, no prose outside the JSON.\n\n\
+         FUNCTIONS:\n{roster}\n\
+         REFERENCES BETWEEN THEM:\n{edge_list}"
+    );
+    let system = grouping_system_prompt(runner);
+    for attempt in 1..=2 {
+        let response = runner
+            .run_primary_slow_inference(
+                &system,
+                &prompt,
+                &format!("function-grouping attempt {attempt}"),
+                shutdown,
+            )
+            .await;
+        match response {
+            Ok(text) => {
+                match kres_agents::json_repair::parse_strict_json::<GroupResponse>(
+                    "function-grouping",
+                    &text,
+                ) {
+                    Ok(parsed) if !parsed.groups.is_empty() => return Some(parsed.groups),
+                    Ok(_) => kres_core::async_eprintln!(
+                        "[function groups] attempt {attempt} returned no groups"
+                    ),
+                    Err(error) => kres_core::async_eprintln!(
+                        "[function groups] attempt {attempt} unparseable: {}",
+                        error.join("; ")
+                    ),
+                }
+            }
+            Err(error) => {
+                kres_core::async_eprintln!("[function groups] attempt {attempt} failed: {error}")
+            }
+        }
+        if shutdown.is_cancelled() {
+            break;
+        }
+    }
+    None
+}
+
+/// Turn pass 2's answer into an exhaustive partition, deterministically.
+///
+/// The model is trusted for grouping judgement and for nothing else.
+/// Every rule here is arithmetic, and none of them can fail the review.
+///
+/// What this deliberately does NOT do is resize groups. No maximum, no
+/// minimum, no splitting, no merging: a 60-function subsystem and a
+/// 3-function utility group are both truthful descriptions of a file,
+/// and flattening them to a uniform size destroys the only information
+/// this pass exists to produce. Prompt size is bounded separately, by
+/// `CLUSTER_CONTEXT_BUDGET_CHARS` on the seeded source.
+fn reconcile_function_groups(
+    proposed: Vec<FunctionGroup>,
+    ranges: &std::collections::BTreeMap<String, (usize, usize)>,
+    edges: &CallEdges,
+) -> Vec<FunctionGroup> {
+    let mut groups: Vec<FunctionGroup> = Vec::new();
+    let mut owner: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut invented = 0usize;
+    let mut duplicated = 0usize;
+
+    for group in proposed {
+        let mut members = Vec::new();
+        for member in group.members {
+            if !ranges.contains_key(&member) {
+                invented += 1;
+                continue;
+            }
+            if owner.contains_key(&member) {
+                duplicated += 1;
+                continue;
+            }
+            owner.insert(member.clone(), groups.len());
+            members.push(member);
+        }
+        if members.is_empty() {
+            continue;
+        }
+        groups.push(FunctionGroup {
+            name: group.name,
+            rationale: group.rationale,
+            members,
+        });
+    }
+    if invented > 0 || duplicated > 0 {
+        kres_core::async_eprintln!(
+            "[function groups] dropped {invented} name(s) that are not functions in the target and {duplicated} duplicate assignment(s)"
+        );
+    }
+
+    // Adopt everything pass 2 left out, so the partition is exhaustive
+    // without having demanded exhaustiveness of the model. A function
+    // joins the group holding the plurality of its neighbours; ties go
+    // to the larger group, then to the earlier one.
+    let unplaced: Vec<&String> = ranges
+        .keys()
+        .filter(|name| !owner.contains_key(*name))
+        .collect();
+    let mut orphans: Vec<String> = Vec::new();
+    for name in unplaced {
+        let mut votes: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        if let Some(neighbours) = edges.neighbours(name) {
+            for neighbour in neighbours {
+                if let Some(index) = owner.get(neighbour.as_str()) {
+                    *votes.entry(*index).or_insert(0) += 1;
+                }
+            }
+        }
+        match votes
+            .iter()
+            .max_by_key(|(index, count)| {
+                (**count, groups[**index].members.len(), usize::MAX - **index)
+            })
+            .map(|(index, _)| *index)
+        {
+            Some(index) => {
+                groups[index].members.push(name.clone());
+                owner.insert(name.clone(), index);
+            }
+            None => orphans.push(name.clone()),
+        }
+    }
+    if !orphans.is_empty() {
+        kres_core::async_eprintln!(
+            "[function groups] {} function(s) had no grouped neighbour and were collected as ungrouped",
+            orphans.len()
+        );
+        orphans.sort();
+        groups.push(FunctionGroup {
+            name: "ungrouped functions".to_string(),
+            rationale:
+                "These functions were not placed in any functional group and have no reference \
+                 to a function that was. They are reviewed together only because nothing \
+                 connects them to the rest of the file; treat each on its own."
+                    .to_string(),
+            members: orphans,
+        });
+    }
+
+    // Largest first by total source bytes, so the biggest subsystem is
+    // step 01 and `followup::is_opening_plan_step` keeps a meaningful
+    // referent. Deterministic given the same model output.
+    let weight = |group: &FunctionGroup| -> usize {
+        group
+            .members
+            .iter()
+            .filter_map(|name| ranges.get(name))
+            .map(|(start, end)| end.saturating_sub(*start) + 1)
+            .sum()
+    };
+    groups.sort_by(|a, b| weight(b).cmp(&weight(a)).then(a.name.cmp(&b.name)));
+    for group in &mut groups {
+        group.members.sort();
+    }
+    groups
+}
+
+/// One plan step per functional group.
+///
+/// The rationale rides in the description, which
+/// `review_todos_from_plan` copies into the todo's `reason` and which
+/// therefore reaches every lens prompt for the group. That is the one
+/// channel the group's meaning travels on; a group whose rationale is
+/// dropped here is a group the lens has to guess at.
+///
+/// The three labels below are the whole of the group-audit format.
+/// What they MEAN is stated once, in `globals.group_audit` in
+/// review.json, which reaches every lens through the step's `include`
+/// block. They are constants so that the two halves cannot drift: a
+/// label renamed here without the global following it would leave the
+/// lens reading a heading nothing explains.
+pub(crate) const GROUP_LABEL_WHY: &str = "WHY THESE FUNCTIONS ARE ONE GROUP: ";
+pub(crate) const GROUP_LABEL_FUNCTIONS: &str = "FUNCTIONS: ";
+pub(crate) const GROUP_LABEL_NEIGHBOURS: &str = "NEIGHBOURS IN OTHER GROUPS: ";
+
+fn plan_steps_from_groups(
+    groups: &[FunctionGroup],
+    ranges: &std::collections::BTreeMap<String, (usize, usize)>,
+    edges: &CallEdges,
+) -> Vec<kres_core::PlanStep> {
+    let in_scan: BTreeSet<&str> = ranges.keys().map(String::as_str).collect();
+    groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let members: Vec<&str> = group.members.iter().map(String::as_str).collect();
+            let mut step = kres_core::PlanStep::new(
+                format!("audit-group-{:02}", index + 1),
+                format!(
+                    "Audit {} ({} functions): {} …",
+                    group.name,
+                    members.len(),
+                    members
+                        .iter()
+                        .take(3)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            // Labels only. What they MEAN is `globals.group_audit` in
+            // review.json, which every lens gets once, in its own
+            // cached include block. It used to be spelled out per row,
+            // and on the 2026-08-22 mmu.c review that was 463 bytes
+            // repeated across 45 group rows -- 20,835 bytes, 45% of
+            // all group-row `reason` text -- re-sent in full every
+            // time the todo agent or the prioritizer was handed the
+            // list. Keep this side group-SPECIFIC; anything true of
+            // every group belongs in the global.
+            let mut description = format!(
+                "{GROUP_LABEL_WHY}{}\n{GROUP_LABEL_FUNCTIONS}{}",
+                group.rationale.trim(),
+                group.members.join(", ")
+            );
+            let spilled = spilled_neighbours(&members, &in_scan, edges);
+            if !spilled.is_empty() {
+                description.push_str(&format!("\n{GROUP_LABEL_NEIGHBOURS}{}", spilled.join(", ")));
+            }
+            step.description = description;
+            step
+        })
+        .collect()
+}
+
+/// Determine the target's functional groups: both inference passes,
+/// reconciliation, and the checkpoint that keeps a resumed session
+/// from re-deciding them.
+///
+/// Returns `None` on any failure, which makes the caller fall back to
+/// BFS accretion over the call graph. Grouping is an improvement to the
+/// partition, never a precondition for producing one.
+async fn determine_function_groups(
+    runner: &Arc<AgentRunner>,
+    workspace: &Path,
+    target: &str,
+    checkpoint_path: Option<&Path>,
+    shutdown: &kres_core::Shutdown,
+) -> Option<(
+    Vec<FunctionGroup>,
+    std::collections::BTreeMap<String, (usize, usize)>,
+    CallEdges,
+)> {
+    let path = review_target_path(workspace, target);
+    let ranges = ctags_function_ranges(&path);
+    if ranges.is_empty() {
+        kres_core::async_eprintln!(
+            "[function groups] no ctags function ranges for {target}; falling back to call-graph grouping"
+        );
+        return None;
+    }
+    let source = std::fs::read_to_string(&path).ok()?;
+    let source_hash = review_target_source_hash(&path, &source).ok()?;
+    let edges = call_edges_from_source(&source, &ranges);
+
+    // A checkpoint for the same file contents is the same answer.
+    // Grouping is a model call, so it is not reproducible across fresh
+    // runs; reusing it stops the partition changing under a session
+    // that is resuming or re-submitting the same target, which is where
+    // the instability actually bites.
+    if let Some(saved) = checkpoint_path
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str::<FunctionGroupPlan>(&text).ok())
+        .filter(|saved| saved.target == target && saved.source_hash == source_hash)
+        .filter(|saved| !saved.groups.is_empty())
+    {
+        kres_core::async_eprintln!(
+            "[function groups] reusing {} checkpointed group(s) for {target}",
+            saved.groups.len()
+        );
+        return Some((saved.groups, ranges, edges));
+    }
+
+    let source_lines: Vec<&str> = source.lines().collect();
+    let purposes = infer_function_purposes(runner, target, &source_lines, &ranges, shutdown).await;
+    let proposed =
+        infer_function_groups(runner, target, &purposes, &ranges, &edges, shutdown).await?;
+    let groups = reconcile_function_groups(proposed, &ranges, &edges);
+    if groups.is_empty() {
+        return None;
+    }
+    kres_core::async_eprintln!(
+        "[function groups] {} group(s) over {} function(s), {} described",
+        groups.len(),
+        ranges.len(),
+        purposes.len()
+    );
+    if let Some(path) = checkpoint_path {
+        let plan = FunctionGroupPlan {
+            target: target.to_string(),
+            source_hash,
+            purposes,
+            groups: groups.clone(),
+        };
+        match serde_json::to_string_pretty(&plan)
+            .map_err(|e| e.to_string())
+            .and_then(|text| std::fs::write(path, text).map_err(|e| e.to_string()))
+        {
+            Ok(()) => {}
+            Err(error) => {
+                kres_core::async_eprintln!("[function groups] could not write checkpoint: {error}")
+            }
+        }
+    }
+    Some((groups, ranges, edges))
+}
+
+/// How far out from a cluster's own members the seeded source reaches.
+///
+/// Two, because that is the distance the run's other three mechanisms
+/// stop short of. On the 2026-08-21 arch/x86/kvm/mmu/mmu.c review the
+/// `fast_page_fault` cluster owned `make_mmu_pages_available`; the
+/// defect fixed upstream by 2abd5287f083 needs
+/// `__kvm_mmu_prepare_zap_page`, two hops out via
+/// `kvm_mmu_zap_oldest_mmu_pages`. Depth 1 is what
+/// `spilled_neighbours` already names, and it reached only the first
+/// hop. Depth 2 pulls in both `__kvm_mmu_prepare_zap_page` (which
+/// marks a rooted page `role.invalid` regardless of `root_count`) and
+/// `mmu_page_zap_pte` (the recursion that reaches it) — the whole
+/// proof. Measured over that run's 14 clusters, depth 2 costs a mean
+/// of 52 KB against 228 KB for the whole file, and depth 3 costs 91 KB
+/// while adding only corroboration.
+const CLUSTER_CONTEXT_DEPTH: usize = 2;
+
+/// Char ceiling for one cluster's seeded source.
+///
+/// Not a trim of the evidence a review reasons over: a cluster whose
+/// closure exceeds this is a cluster whose closure could not have been
+/// sent at all, and the drop is logged with the names. Sized against
+/// the measured transport headroom — the lens prompt on that run was
+/// 839 KB against a 1,048,576-char cap, so a block this size still
+/// leaves margin, while the largest real cluster came to 76 KB at
+/// depth 2 and 127 KB at depth 3.
+const CLUSTER_CONTEXT_BUDGET_CHARS: usize = 150_000;
+
+/// Source for every function within `CLUSTER_CONTEXT_DEPTH` hops of a
+/// cluster's members, as symbol records the gather loop can seed.
+///
+/// This is a floor under the lens, not a replacement for gathering. A
+/// lens still asks for what it thinks it needs; this makes the
+/// in-file neighbourhood present whether or not it asks. On the
+/// 2026-08-21 run 158 of the 355 distinct `source:` requeue requests
+/// named functions defined in the file under review, each costing a
+/// gather round plus a full lens fan-out to re-read the target — and
+/// the four bodies that would have settled the fault-path defect were
+/// fetched 108-287 times run-wide while reaching that cluster zero
+/// times.
+///
+/// Order is deterministic — members in cluster order, then each
+/// successive ring by name — so the block is byte-stable and the task
+/// cache layer actually hits.
+fn cluster_context_symbols(
+    members: &[String],
+    edges: &CallEdges,
+    ranges: &std::collections::BTreeMap<String, (usize, usize)>,
+    source_lines: &[&str],
+    target: &str,
+    budget: usize,
+) -> Vec<serde_json::Value> {
+    let mut ordered: Vec<&str> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for member in members {
+        if let Some((name, _)) = ranges.get_key_value(member.as_str()) {
+            if seen.insert(name.as_str()) {
+                ordered.push(name.as_str());
+            }
+        }
+    }
+    // Everything before this index is a function the step is charged
+    // with auditing, and is never dropped for budget: the neighbourhood
+    // exists to support the members, so trading a member away for a
+    // neighbour inverts the point.
+    let member_count = ordered.len();
+    let mut ring_start = 0usize;
+    for _ in 0..CLUSTER_CONTEXT_DEPTH {
+        let ring_end = ordered.len();
+        // Each ring is sorted by name so the block does not depend on
+        // the order neighbours happen to sit in the adjacency set.
+        let mut next: Vec<&str> = Vec::new();
+        for current in &ordered[ring_start..ring_end] {
+            let Some(neighbours) = edges.neighbours(current) else {
+                continue;
+            };
+            for neighbour in neighbours {
+                let Some((name, _)) = ranges.get_key_value(neighbour.as_str()) else {
+                    continue;
+                };
+                if seen.insert(name.as_str()) {
+                    next.push(name.as_str());
+                }
+            }
+        }
+        next.sort_unstable();
+        ordered.extend(next);
+        ring_start = ring_end;
+        if ring_start == ordered.len() {
+            break;
+        }
+    }
+
+    let mut out = Vec::with_capacity(ordered.len());
+    let mut spent = 0usize;
+    let mut dropped: Vec<&str> = Vec::new();
+    for (index, name) in ordered.iter().enumerate() {
+        let Some((start, end)) = ranges.get(*name).copied() else {
+            continue;
+        };
+        if start == 0 || start > source_lines.len() {
+            continue;
+        }
+        let body = source_lines[start - 1..end.min(source_lines.len())].join("\n");
+        if index >= member_count && spent + body.len() > budget {
+            // `ordered` is members, then ring 1, then ring 2, so
+            // stopping here drops from the outside in — the nearest
+            // neighbours survive and the most distant are what goes.
+            // Skipping just this one and continuing would instead keep
+            // whichever bodies happen to be small, which is not a
+            // property anyone can reason about.
+            dropped.extend_from_slice(&ordered[index..]);
+            break;
+        }
+        spent += body.len();
+        out.push(serde_json::json!({
+            "name": name,
+            "type": "function",
+            "filename": target,
+            "line": start,
+            "definition": body,
+        }));
+    }
+    if !dropped.is_empty() {
+        // Never a silent truncation: the omission and the names are
+        // stated so a lens can ask for what was left out.
+        kres_core::async_eprintln!(
+            "[cluster context] closure over the {budget}-char budget; {} outer function(s) omitted: {}",
+            dropped.len(),
+            dropped.join(", ")
+        );
+    }
+    out
+}
+
+/// Per-step seeded source for every cluster in a coverage plan.
+///
+/// Empty whenever the pieces it needs are missing — no ctags ranges,
+/// an unreadable target — for the same reason the grouping degrades
+/// rather than failing: this is an optimisation of the prompt, never a
+/// precondition for producing one.
+fn cluster_context_seeds(
+    workspace: &Path,
+    target: &str,
+    members_by_step: &std::collections::BTreeMap<String, Vec<String>>,
+    edges: &CallEdges,
+) -> std::collections::BTreeMap<String, Vec<serde_json::Value>> {
+    let mut seeds = std::collections::BTreeMap::new();
+    if members_by_step.is_empty() {
+        return seeds;
+    }
+    let path = review_target_path(workspace, target);
+    let ranges = ctags_function_ranges(&path);
+    if ranges.is_empty() {
+        return seeds;
+    }
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return seeds;
+    };
+    let source_lines: Vec<&str> = source.lines().collect();
+    for (step_id, members) in members_by_step {
+        let symbols = cluster_context_symbols(
+            members,
+            edges,
+            &ranges,
+            &source_lines,
+            target,
+            CLUSTER_CONTEXT_BUDGET_CHARS,
+        );
+        if !symbols.is_empty() {
+            seeds.insert(step_id.clone(), symbols);
+        }
+    }
+    seeds
+}
+
+/// A coverage plan plus the membership the seeded context is built
+/// from. Both come out of one accretion so the two cannot drift: a
+/// second function recomputing membership would be a second source of
+/// truth for which functions a step owns.
+struct CoveragePlan {
+    steps: Vec<kres_core::PlanStep>,
+    members_by_step: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// TEMPORARY EXPERIMENT — full-coverage plan, no risk prioritisation.
+///
+/// Builds the plan in Rust by partitioning EVERY function in the
+/// whole-file risk scan into fixed-size steps, instead of asking
+/// `define_plan` for "3-12 steps" over a ranking.
+///
+/// Measured on the 2026-08-20 arch/x86/kvm/mmu/mmu.c review: the
+/// planner was handed 312 rated functions and produced four audit
+/// steps built from the top of the ranking. The union of those steps
+/// did not include the slow fault-install path, so
+/// `make_mmu_pages_available` was fetched into exactly one prompt all
+/// run and the defect living in that window was unreachable. Every
+/// function in that chain rated at or below the median (4-10 of 45):
+/// a per-function score cannot see a bug that lives in the
+/// composition of individually-boring functions.
+///
+/// Revert this before shipping; it trades focus for exhaustiveness.
+fn coverage_plan_steps(scan: &str, per_step: usize, edges: &CallEdges) -> CoveragePlan {
+    let empty = || CoveragePlan {
+        steps: Vec::new(),
+        members_by_step: std::collections::BTreeMap::new(),
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(scan) else {
+        return empty();
+    };
+    let Some(functions) = parsed.get("functions").and_then(|v| v.as_array()) else {
+        return empty();
+    };
+    // Name order. This used to be highest-change-risk first, but the
+    // change survey that produced those ratings is gone: it cost ~102s
+    // of serial bootstrap to return "No net-diff evidence." for most of
+    // a file, and swapping two runs' ratings over identical edges moved
+    // 209 of 312 functions between steps without changing partition
+    // quality at all (65.2% vs 66.1% intra-step edge retention). Name
+    // order is at least reproducible.
+    //
+    // This is the FALLBACK partition. The primary path is
+    // `determine_function_groups`, which reads the file and groups by
+    // purpose; this runs only when that is unavailable or failed.
+    let mut ranked: Vec<(i64, &str)> = functions
+        .iter()
+        .filter_map(|f| Some((0, f.get("name")?.as_str()?)))
+        .collect();
+    ranked.sort_by(|a, b| a.1.cmp(b.1));
+    // A name listed twice must not become two members, and `dedup_by`
+    // only removes ADJACENT equals.
+    let mut seen_names: BTreeSet<&str> = BTreeSet::new();
+    ranked.retain(|(_, name)| seen_names.insert(name));
+
+    let per_step = per_step.max(1);
+    let in_scan: BTreeSet<&str> = ranked.iter().map(|(_, name)| *name).collect();
+    let clusters = accrete_clusters(&ranked, &in_scan, edges, per_step);
+
+    let mut members_by_step = std::collections::BTreeMap::new();
+    let steps = clusters
+        .iter()
+        .enumerate()
+        .map(|(idx, members)| {
+            let seed = members.first().copied().unwrap_or("");
+            let spilled = spilled_neighbours(members, &in_scan, edges);
+            let step_id = format!("audit-cluster-{:02}", idx + 1);
+            members_by_step.insert(
+                step_id.clone(),
+                members.iter().map(|m| (*m).to_string()).collect::<Vec<_>>(),
+            );
+            let mut step = kres_core::PlanStep::new(
+                step_id,
+                format!(
+                    "Audit the `{seed}` call cluster ({} functions): {} …",
+                    members.len(),
+                    members
+                        .iter()
+                        .take(3)
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            // Same three labels as the semantic path above, so the one
+            // `globals.group_audit` block explains both shapes. This
+            // fallback has no model-written rationale, so it states the
+            // only thing the BFS partition actually knows.
+            let mut description = format!(
+                "{GROUP_LABEL_WHY}they reference each other in the call graph; no \
+                 semantic rationale was available for this target.\n\
+                 {GROUP_LABEL_FUNCTIONS}{}",
+                members.join(", ")
+            );
+            if !spilled.is_empty() {
+                // The per-step cap bisects any cluster around a hub, so
+                // name what fell the other side of the cut. This turns
+                // a partition boundary into a gather instruction rather
+                // than leaving the lens to guess which callees matter.
+                description.push_str(&format!("\n{GROUP_LABEL_NEIGHBOURS}{}", spilled.join(", ")));
+            }
+            step.description = description;
+            step
+        })
+        .collect();
+    CoveragePlan {
+        steps,
+        members_by_step,
+    }
+}
+
+/// Seeded breadth-first accretion over `edges`, capped at `per_step`.
+///
+/// BFS, not "add whichever candidate has the most edges to the members
+/// so far". That greedier rule optimises the cluster's internal
+/// density, which is a different objective and the wrong one: in a
+/// dense file every chain member with a single edge (score 1) loses to
+/// any candidate with two, so a linear call chain is exactly what gets
+/// starved. Measured on the real 312-function
+/// arch/x86/kvm/mmu/mmu.c scan, max-score greedy left the motivating
+/// chain spread over four of fifteen steps — no better than the risk
+/// chunking it replaced. BFS keeps a function's own neighbours queued
+/// directly behind it, which is what "call-adjacent" means.
+///
+/// Deterministic by construction: seeds come from the risk ranking,
+/// each frontier is expanded in that same order, and every container
+/// is ordered. No `HashMap` on this path.
+///
+/// Functions with no edges into the scan are left to the trailing
+/// chunks, which is what today's partition does for everything and is
+/// correct for a static initialiser or a one-line accessor.
+fn accrete_clusters<'a>(
+    ranked: &[(i64, &'a str)],
+    in_scan: &BTreeSet<&'a str>,
+    edges: &CallEdges,
+    per_step: usize,
+) -> Vec<Vec<&'a str>> {
+    let rank_of: std::collections::BTreeMap<&str, usize> = ranked
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, name))| (*name, idx))
+        .collect();
+    // Resolve a neighbour name back to the scan's `&'a str` so members
+    // borrow from the scan, not from the edge map.
+    let interned = |name: &str| in_scan.get(name).copied();
+
+    let mut assigned: BTreeSet<&str> = BTreeSet::new();
+    let mut clusters: Vec<Vec<&'a str>> = Vec::new();
+
+    for (_, seed) in ranked {
+        if assigned.contains(seed) {
+            continue;
+        }
+        let neighbours_in_scan = |name: &str| -> Vec<&'a str> {
+            let mut out: Vec<&'a str> = edges
+                .neighbours(name)
+                .into_iter()
+                .flatten()
+                .filter_map(|n| interned(n.as_str()))
+                .collect();
+            out.sort_by_key(|n| rank_of.get(n).copied().unwrap_or(usize::MAX));
+            out
+        };
+        // A seed with no in-scan neighbour would make a one-member
+        // cluster; leave it for the trailing chunks so those stay full.
+        if neighbours_in_scan(seed).is_empty() {
+            continue;
+        }
+
+        let mut members: Vec<&'a str> = vec![seed];
+        assigned.insert(seed);
+        let mut frontier: std::collections::VecDeque<&'a str> = std::collections::VecDeque::new();
+        frontier.push_back(seed);
+        while members.len() < per_step {
+            let Some(current) = frontier.pop_front() else {
+                break;
+            };
+            for neighbour in neighbours_in_scan(current) {
+                if members.len() >= per_step {
+                    break;
+                }
+                if !assigned.insert(neighbour) {
+                    continue;
+                }
+                members.push(neighbour);
+                frontier.push_back(neighbour);
+            }
+        }
+        clusters.push(members);
+    }
+
+    // Everything the accretion left: isolated functions, and anything
+    // whose cluster filled before it was reached. Risk-ordered chunks,
+    // i.e. exactly the partition this function used to produce.
+    let leftovers: Vec<&'a str> = ranked
+        .iter()
+        .map(|(_, name)| *name)
+        .filter(|name| !assigned.contains(name))
+        .collect();
+    for chunk in leftovers.chunks(per_step) {
+        clusters.push(chunk.to_vec());
+    }
+
+    // Merge adjacent under-full clusters while the total fits. A file
+    // of many small components would otherwise produce many small
+    // steps, and every step is a todo row — the todo agent stops
+    // maintaining the pending list above roughly 60 of them.
+    let mut merged: Vec<Vec<&'a str>> = Vec::new();
+    for cluster in clusters {
+        match merged.last_mut() {
+            Some(last) if last.len() + cluster.len() <= per_step => last.extend(cluster),
+            _ => merged.push(cluster),
+        }
+    }
+    merged
+}
+
+/// Direct neighbours of `members` that are in the scan but not in this
+/// step, in order of first appearance.
+fn spilled_neighbours<'a>(
+    members: &[&'a str],
+    in_scan: &BTreeSet<&'a str>,
+    edges: &CallEdges,
+) -> Vec<&'a str> {
+    let here: BTreeSet<&str> = members.iter().copied().collect();
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for member in members {
+        let Some(neighbours) = edges.neighbours(member) else {
+            continue;
+        };
+        for neighbour in neighbours {
+            let Some(name) = in_scan.get(neighbour.as_str()) else {
+                continue;
+            };
+            if here.contains(name) || !seen.insert(name) {
+                continue;
+            }
+            out.push(name);
+        }
+    }
+    out
+}
+
 fn review_todos_from_plan(plan: &kres_core::Plan) -> Vec<kres_core::TodoItem> {
     plan.steps
         .iter()
@@ -4867,18 +6188,61 @@ fn review_todos_from_plan(plan: &kres_core::Plan) -> Vec<kres_core::TodoItem> {
 /// capping here keeps the attached-context cost bounded. Use
 /// /compact to trim the ledger itself; this cap only limits what
 /// leaks into each new task's prompt.
+/// One lossless slice of a source file: the byte range it covers.
+/// Callers re-slice the original rather than carry a copy.
+struct SourceChunk {
+    source_start: usize,
+    source_end: usize,
+}
+
+/// Split source into chunks of at most `max_chunk_bytes`, preferring a
+/// line boundary. Every byte appears in exactly one chunk: this is a
+/// partition, never a trim.
+fn split_source_for_inference(source: &str, max_chunk_bytes: usize) -> Result<Vec<SourceChunk>> {
+    if max_chunk_bytes == 0 {
+        anyhow::bail!("source chunk size must be positive");
+    }
+    if source.is_empty() {
+        return Ok(vec![SourceChunk {
+            source_start: 0,
+            source_end: 0,
+        }]);
+    }
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < source.len() {
+        let mut end = (start + max_chunk_bytes).min(source.len());
+        while end > start && !source.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end < source.len() {
+            if let Some(newline) = source[start..end].rfind('\n') {
+                end = start + newline + 1;
+            }
+        }
+        if end == start {
+            end = source[start..]
+                .char_indices()
+                .nth(1)
+                .map_or(source.len(), |(offset, _)| start + offset);
+        }
+        chunks.push(SourceChunk {
+            source_start: start,
+            source_end: end,
+        });
+        start = end;
+    }
+    Ok(chunks)
+}
+
+/// Semantic partition target for a whole-file inference pass, never a
+/// request or information ceiling. Every byte of the source is sent
+/// exactly once across the chunk bodies; provider transport may frame
+/// each prompt further without altering its visible content.
+const INFERENCE_PARTITION_BYTES: usize = 500_000;
+/// How many whole-file inference chunks may be in flight at once.
+const INFERENCE_CHUNK_CONCURRENCY: usize = 8;
 const REVIEW_FILE_SCAN_CACHE_KEY: &str = "review:file-risk-scan";
-const CHANGE_SURVEY_CHECKPOINT_VERSION: u32 = 3;
-/// A semantic partition target, never a request or information ceiling. Every
-/// byte of the diff is sent exactly once across the chunk bodies (with repeated
-/// hunk headers for orientation), and provider transport may frame each prompt
-/// further without altering its visible content.
-const CHANGE_SURVEY_DIFF_PARTITION_BYTES: usize = 500_000;
-// A large change-survey map request carries one source partition and one diff
-// partition. Keep their combined payload near the same target as the small
-// path instead of allowing two individually-large halves to double it.
-const CHANGE_SURVEY_PAIR_PARTITION_BYTES: usize = CHANGE_SURVEY_DIFF_PARTITION_BYTES / 2;
-const CHANGE_SURVEY_CHUNK_CONCURRENCY: usize = 8;
 
 /// Render every accumulated-analysis entry into the inference preamble,
 /// newest-first. Selection happens at the call-site; once selected, an entry
@@ -5132,7 +6496,7 @@ pub async fn build_agent_runner(
         client: slow_client.clone(),
         model: slow_model.clone(),
         system: Some(format!(
-            "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For a named source-file target, the prompt contains a WHOLE-FILE RISK SCAN gathered before goal selection. It includes six-month change-informed function ratings, interaction-filtered external research questions, and one final file risk rating. Use that ranked inventory to define an evidence-backed completion goal and a staged plan; never add another survey or scan step. Give retained external research questions priority only because the file survey established an interaction with the target. Return 3 or 4 independent semantic path/contract groups with no dependencies, partitioned by real code paths and prioritized by the ranked functions, plus exactly one final cross-contract completeness step depending on every group. For other targets, create one orientation/context step, a bounded middle wave, and a final completeness step. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Never partition by generic review lenses. Do not create more than 5 total steps for a scanned file. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
+            "{}\n\nREVIEW PLANNING POLICY:\nYou own the review goal, coverage plan, and completion decision. Obey the explicit TARGET KIND in the original prompt: a current-workspace source target has no implied revision or diff, while a git commit/range starts from its diff. Never invent a ref, base revision, or changed-hunk scope for a source target. For a named source-file target, the prompt contains a WHOLE-FILE FUNCTION INVENTORY gathered before goal selection: every function the file defines and how often each name is spelled. It carries no risk ratings. Use it to define an evidence-backed completion goal that covers the whole file; never add another survey or scan step. Do not partition the file yourself: bootstrap determines the functional groups and builds the coverage plan from them. For other targets, create one orientation/context step, a bounded middle wave, and a final completeness step. For define_plan, return steps with id, title, description, and depends_on (an array of earlier step IDs). Never partition by generic review lenses. Do not create more than 5 total steps for a scanned file. Preserve explicit operator scope and require typed followups for evidence that is still missing. The dependency graph is execution policy, not advisory prose.",
             kres_agents::GOAL_INSTRUCTIONS
         )),
         max_tokens: slow_max_tokens,
@@ -5792,6 +7156,32 @@ async fn run_batch_goal_check(check_inputs: BatchGoalCheck<'_>) -> BatchGoalOutc
         follow_followups,
         turns_limit,
     } = check_inputs;
+    // A whole-file review cannot be finished while part of the file
+    // has not been read. The survey groups partition every function in
+    // the target and each owns one todo row, so an outstanding row is
+    // a proven gap and the model cannot tell us anything about it that
+    // the row status does not already say.
+    //
+    // Skipping is also a correctness guard, not only a saving. On
+    // `met` this function DRAINS pending and blocked rows to the
+    // deferred list, so one premature yes would retire every group
+    // that had not run yet — the fairness gate cannot stop that,
+    // because a drain is not a dispatch.
+    //
+    // Measured on the 2026-08-22 arch/x86/kvm/mmu/mmu.c review: 22
+    // rounds, 496 items injected, every one of them naming a plan step
+    // that already had a row. Each round cost a goal call whose input
+    // grew from 15k to 114k tokens, plus a todo-agent pass to dedup
+    // the injection away again.
+    let outstanding = mgr.outstanding_survey_groups().await;
+    if outstanding > 0 {
+        kres_core::async_eprintln!(
+            "[goal check] skipped: {outstanding} survey group(s) still to run"
+        );
+        return BatchGoalOutcome {
+            missing: Vec::new(),
+        };
+    }
     let entries = accumulated.lock().await.clone();
     kres_core::async_eprintln!(
         "[goal check] checking against {} accumulated analysis/es ({}k chars)",
@@ -5931,8 +7321,6 @@ async fn reconcile_turn_cap_todos(mgr: &Arc<TaskManager>) -> (usize, usize) {
 struct CompletedReviewFileScan {
     target: String,
     source_hash: String,
-    baseline: String,
-    head: String,
     scan: String,
 }
 
@@ -5941,8 +7329,6 @@ impl CompletedReviewFileScan {
         kres_core::ReviewFileScanState {
             target: self.target.clone(),
             source_hash: self.source_hash.clone(),
-            baseline: self.baseline.clone(),
-            head: self.head.clone(),
             scan: self.scan.clone(),
         }
     }
@@ -5964,46 +7350,19 @@ fn review_target_path(workspace: &Path, target: &str) -> PathBuf {
     }
 }
 
-fn current_review_head(workspace: &Path) -> Result<String> {
-    let head = gix::discover(workspace)
-        .context("discovering review repository")?
-        .head_id()
-        .context("resolving review repository HEAD")?
-        .to_string();
-    Ok(format!("WORKTREE@{head}"))
-}
-
+/// The scan is a structural inventory of the file as it is on disk, so
+/// the file's own content is the whole cache key. It used to also pin
+/// the git HEAD and the six-month diff window, because a change survey
+/// rated a diff; with that survey gone there is no window to invalidate
+/// against, and a committed-but-unmodified file would otherwise
+/// needlessly discard a still-correct inventory.
 fn review_file_scan_matches_current_source(
     workspace: &Path,
     state: &kres_core::ReviewFileScanState,
 ) -> Result<bool> {
     let target = review_target_path(workspace, &state.target);
     let source = std::fs::read_to_string(&target)?;
-    Ok(
-        change_survey_source_hash(&target, &source)? == state.source_hash
-            && current_review_head(workspace)? == state.head,
-    )
-}
-
-async fn review_file_scan_matches_current_window(
-    workspace: &Path,
-    state: &kres_core::ReviewFileScanState,
-) -> Result<bool> {
-    if !review_file_scan_matches_current_source(workspace, state)? {
-        return Ok(false);
-    }
-    let cutoff = chrono::Utc::now()
-        .checked_sub_months(chrono::Months::new(6))
-        .context("computing six-month review scan cutoff")?
-        .timestamp();
-    let workspace = workspace.to_path_buf();
-    let target = state.target.clone();
-    let window = tokio::task::spawn_blocking(move || {
-        crate::change_survey::aggregate_target_diff(&workspace, &target, cutoff)
-    })
-    .await
-    .context("joining review scan fingerprint computation")??;
-    Ok(window.baseline == state.baseline && window.head == state.head)
+    Ok(review_target_source_hash(&target, &source)? == state.source_hash)
 }
 
 async fn review_file_scan_context(
@@ -6023,119 +7382,7 @@ async fn review_file_scan_context(
     Some(state.scan)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChangeSurveyCheckpoint {
-    version: u32,
-    target: String,
-    source_hash: String,
-    baseline: String,
-    head: String,
-    report: Option<ChangeSurveyReport>,
-}
-
-#[derive(Clone)]
-struct ChangeSurveyCheckpointStore {
-    path: PathBuf,
-    state: Arc<tokio::sync::Mutex<ChangeSurveyCheckpoint>>,
-}
-
-impl ChangeSurveyCheckpointStore {
-    fn open(
-        path: PathBuf,
-        target: String,
-        source_hash: String,
-        baseline: String,
-        head: String,
-        reuse_existing: bool,
-    ) -> Result<Self> {
-        let loaded = reuse_existing
-            .then(|| std::fs::read_to_string(&path).ok())
-            .flatten()
-            .and_then(|body| serde_json::from_str::<ChangeSurveyCheckpoint>(&body).ok())
-            .filter(|checkpoint| {
-                checkpoint.version == CHANGE_SURVEY_CHECKPOINT_VERSION
-                    && checkpoint.target == target
-                    && checkpoint.source_hash == source_hash
-                    && checkpoint.baseline == baseline
-                    && checkpoint.head == head
-            });
-        let state = loaded.unwrap_or(ChangeSurveyCheckpoint {
-            version: CHANGE_SURVEY_CHECKPOINT_VERSION,
-            target,
-            source_hash,
-            baseline,
-            head,
-            report: None,
-        });
-        save_change_survey_checkpoint(&path, &state)?;
-        Ok(Self {
-            path,
-            state: Arc::new(tokio::sync::Mutex::new(state)),
-        })
-    }
-
-    async fn report(&self) -> Option<ChangeSurveyReport> {
-        self.state.lock().await.report.clone()
-    }
-
-    async fn record(&self, report: ChangeSurveyReport) -> Result<()> {
-        let mut state = self.state.lock().await;
-        state.report = Some(report);
-        let snapshot = state.clone();
-        let path = self.path.clone();
-        tokio::task::spawn_blocking(move || save_change_survey_checkpoint(&path, &snapshot))
-            .await
-            .context("joining change-survey checkpoint write")??;
-        Ok(())
-    }
-}
-
-fn save_change_survey_checkpoint(path: &Path, checkpoint: &ChangeSurveyCheckpoint) -> Result<()> {
-    use std::io::Write;
-
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = serde_json::to_vec_pretty(checkpoint)?;
-    let temporary = path.with_extension("json.tmp");
-    {
-        let mut file = std::fs::File::create(&temporary)?;
-        file.write_all(&body)?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&temporary, path)?;
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
-    }
-    Ok(())
-}
-
-fn remove_change_survey_checkpoint(path: &Path) -> Result<bool> {
-    let mut removed = false;
-    for candidate in [path.to_path_buf(), path.with_extension("json.tmp")] {
-        match std::fs::remove_file(&candidate) {
-            Ok(()) => removed = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("removing change-survey checkpoint {}", candidate.display())
-                });
-            }
-        }
-    }
-    Ok(removed)
-}
-
-fn change_survey_source_hash(target: &Path, source: &str) -> Result<String> {
+fn review_target_source_hash(target: &Path, source: &str) -> Result<String> {
     let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
     hasher.update(source.as_bytes());
     #[cfg(unix)]
@@ -6154,23 +7401,24 @@ fn change_survey_source_hash(target: &Path, source: &str) -> Result<String> {
         .to_string())
 }
 
+/// The whole-file structural inventory: which functions the target
+/// defines and how often each name is spelled.
+///
+/// There used to be a six-month change survey in front of this, a slow
+/// call that rated every function for diff risk and whose only
+/// load-bearing consumer was the seed order of the BFS partition.
+/// Semantic grouping replaced that consumer, and the survey was
+/// measured worthless on a tree without recent churn: on the
+/// 2026-08-21 arch/x86/kvm/mmu/mmu.c reviews the six-month window was
+/// empty, so it spent ~102s of serial bootstrap and ~120k input tokens
+/// returning "No net-diff evidence." for 72-98% of functions with a
+/// maximum rating of 6 out of 100.
 async fn run_review_file_scan(
     runner: &Arc<AgentRunner>,
     workspace: &Path,
     target: &str,
-    checkpoint_path: Option<PathBuf>,
-    reuse_checkpoint: bool,
     shutdown: &kres_core::Shutdown,
 ) -> Result<CompletedReviewFileScan> {
-    let (_change_window, change_report, _checkpoint) = run_review_change_survey(
-        runner,
-        workspace,
-        target,
-        checkpoint_path,
-        reuse_checkpoint,
-        shutdown,
-    )
-    .await?;
     let survey = runner
         .fetcher
         .fetch(
@@ -6201,14 +7449,6 @@ async fn run_review_file_scan(
             .await?
         }
     };
-    let inventory_functions = inventory.function_names();
-    // The survey is a starting point, not an inventory. Keep the
-    // ratings that name a real target function, drop the rest, and
-    // never re-run: a function it never mentioned is simply unrated,
-    // which the scan renders as 0.
-    let change_report = change_report
-        .map(|report| crate::change_survey::retain_known_functions(report, &inventory_functions))
-        .unwrap_or_default();
     let target_path = if Path::new(target).is_absolute() {
         PathBuf::from(target)
     } else {
@@ -6216,143 +7456,26 @@ async fn run_review_file_scan(
     };
     let target_source = std::fs::read_to_string(&target_path)
         .with_context(|| format!("reading whole-file review target {}", target_path.display()))?;
-    // The whole-file survey is assembled by Rust from the change
-    // survey and the structural inventory. There is no second
-    // inference pass.
-    //
-    // There used to be one: a slow-agent call that combined the two
-    // into a "final" rating per function. It was measured on the
-    // 2026-08-06 mm/page_alloc.c review and did nothing. It received
-    // the change survey's ratings in its prompt and was forbidden from
-    // rating any function below them, so of 236 functions it changed
-    // 12, all upward, only one crossed into the high band, and none of
-    // the 12 produced a finding. Removing it also removes a failure
-    // mode: run standalone, without the change survey's report to
-    // enumerate the function set, it returned 251 functions instead of
-    // 236 and failed validation on two consecutive runs.
-    //
-    // `file_risk_rating` is the highest function rating, which is what
-    // the model was instructed to produce anyway ("must be at least
-    // the highest combined function rating"). Research questions are
-    // the external interactions Rust already established, one per
-    // entry, which is exactly what the model was told to emit.
-    let mut risk_of: std::collections::BTreeMap<&str, u8> = change_report
-        .target_function_risks
-        .iter()
-        .map(|risk| (risk.name.as_str(), risk.risk_rating))
-        .collect();
-    let research_questions: Vec<ReviewResearchQuestion> = change_report
-        .external_major_risks
-        .iter()
-        .filter_map(|risk| {
-            inventory
-                .interaction_kind(&risk.name, &target_source)
-                .map(|kind| ReviewResearchQuestion {
-                    question: format!(
-                        "{} interacts with {target} via {kind}: {}",
-                        risk.name, risk.reason
-                    ),
-                    function: risk.name.clone(),
-                    file: risk.file.clone(),
-                    priority: EXTERNAL_RESEARCH_PRIORITY,
-                })
-        })
-        .collect();
-    let functions: Vec<ScanFunctionRisk> = inventory
+    // Assembled by Rust from the structural inventory alone. No
+    // ratings: nothing downstream orders by them any more, and the
+    // call that produced them is gone.
+    let functions: Vec<ScanFunction> = inventory
         .functions
         .iter()
-        .map(|(name, uses)| ScanFunctionRisk {
+        .map(|(name, uses)| ScanFunction {
             name: name.as_str(),
             uses: *uses,
-            risk_rating: risk_of.remove(name.as_str()).unwrap_or_default(),
         })
         .collect();
-    let file_risk_rating = functions
-        .iter()
-        .map(|function| function.risk_rating)
-        .max()
-        .unwrap_or_default();
-    let scan = ScanFileSurvey {
-        functions,
-        research_questions: &research_questions,
-        file_risk_rating,
-    };
+    let scan = ScanFileSurvey { functions };
     let serialized = serde_json::to_string(&scan).context("serializing review scan")?;
     // Keep the completed checkpoint beside session.json so the net-diff
     // assessment remains resumable until the scan reaches the persisted plan.
     Ok(CompletedReviewFileScan {
         target: target.to_string(),
-        source_hash: change_survey_source_hash(&target_path, &target_source)?,
-        baseline: change_report.baseline,
-        head: change_report.head,
+        source_hash: review_target_source_hash(&target_path, &target_source)?,
         scan: serialized,
     })
-}
-
-async fn run_review_change_survey(
-    runner: &Arc<AgentRunner>,
-    workspace: &Path,
-    target: &str,
-    checkpoint_path: Option<PathBuf>,
-    reuse_checkpoint: bool,
-    shutdown: &kres_core::Shutdown,
-) -> Result<(
-    crate::change_survey::AggregateTargetDiff,
-    Option<ChangeSurveyReport>,
-    Option<ChangeSurveyCheckpointStore>,
-)> {
-    let cutoff = chrono::Utc::now()
-        .checked_sub_months(chrono::Months::new(6))
-        .context("computing six-month change-survey cutoff")?
-        .timestamp();
-    let diff_workspace = workspace.to_path_buf();
-    let diff_target = target.to_string();
-    let window = tokio::task::spawn_blocking(move || {
-        crate::change_survey::aggregate_target_diff(&diff_workspace, &diff_target, cutoff)
-    })
-    .await
-    .context("joining gix six-month target diff")??;
-    let target_path = if Path::new(target).is_absolute() {
-        PathBuf::from(target)
-    } else {
-        workspace.join(target)
-    };
-    let target_source = std::fs::read_to_string(&target_path)
-        .with_context(|| format!("reading whole-file review target {}", target_path.display()))?;
-    let checkpoint = if let Some(path) = checkpoint_path {
-        Some(ChangeSurveyCheckpointStore::open(
-            path,
-            target_path.to_string_lossy().into_owned(),
-            change_survey_source_hash(&target_path, &target_source)?,
-            window.baseline.clone(),
-            window.head.clone(),
-            reuse_checkpoint,
-        )?)
-    } else {
-        None
-    };
-    let mut report = if let Some(checkpoint) = &checkpoint {
-        checkpoint.report().await
-    } else {
-        None
-    };
-    if report.is_some() {
-        kres_core::async_eprintln!(
-            "[change survey] resumed completed six-month net-diff assessment"
-        );
-    } else {
-        kres_core::async_eprintln!(
-            "[change survey] generated {}-byte target-file diff from {} to {}",
-            window.diff.len(),
-            window.baseline,
-            window.head
-        );
-        report = assess_change_survey(runner, target, &target_source, &window, shutdown).await?;
-        if let (Some(checkpoint), Some(report)) = (&checkpoint, &report) {
-            checkpoint.record(report.clone()).await?;
-        }
-    }
-    Ok((window, report, checkpoint))
 }
 
 async fn infer_fallback_file_survey_inventory(
@@ -6374,7 +7497,7 @@ async fn infer_fallback_file_survey_inventory(
         .context("serializing deterministic fallback function inventory")?;
     let fallback_context = serde_json::to_string(fallback_context)
         .context("serializing local file-survey fallback evidence")?;
-    if target_source.len() > CHANGE_SURVEY_DIFF_PARTITION_BYTES {
+    if target_source.len() > INFERENCE_PARTITION_BYTES {
         return infer_fallback_file_survey_chunks(
             runner,
             target,
@@ -6442,7 +7565,7 @@ async fn infer_fallback_file_survey_chunks(
     shutdown: &kres_core::Shutdown,
 ) -> Result<FileSurveyInventory> {
     const SOURCE_OVERLAP_BYTES: usize = 4096;
-    let chunks = split_source_for_inference(target_source, CHANGE_SURVEY_DIFF_PARTITION_BYTES)?;
+    let chunks = split_source_for_inference(target_source, INFERENCE_PARTITION_BYTES)?;
     let count = chunks.len();
     let cached_prefix = format!(
         "Build a sparse structural inventory from one lossless source partition of {target}. Return exactly one raw JSON object {{\"functions\":[{{\"name\":string}}],\"calls\":[string]}}. List every function definition visible in the supplied chunk and every function call expression visible in it. Adjacent chunks overlap for syntax context; duplicates are merged by Rust. Do not report use counts; Rust computes whole-file spelling counts itself. Do not invent definitions merely because CTAGS FUNCTION FLOOR names them. No markdown or prose outside JSON.\n\nCTAGS FUNCTION FLOOR:\n{ctags_context}\n\nLOCAL FALLBACK EVIDENCE:\n{fallback_context}\n\n"
@@ -6507,7 +7630,7 @@ async fn infer_fallback_file_survey_chunks(
             anyhow::bail!(errors.join("; "))
         }
     }))
-    .buffer_unordered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
+    .buffer_unordered(INFERENCE_CHUNK_CONCURRENCY)
     .collect::<Vec<_>>()
     .await
     .into_iter()
@@ -6533,239 +7656,18 @@ async fn infer_fallback_file_survey_chunks(
     Ok(inventory)
 }
 
-/// Rate the target's functions against the six-month net diff.
-///
-/// A broad first guess, not an inventory. It reads a diff and returns
-/// ratings; whatever comes back is what we use. Unknown names are
-/// dropped by the caller and unmentioned functions stay unrated.
-///
-/// It used to be held to the authoritative function set, and that was
-/// wrong three separate ways on kernel/sched/fair.c (421 functions):
-/// demanding an exact roster produced an invented
-/// `__account_cfs_rq_runtime_placeholder`; demanding exactness per
-/// 150-name batch threw away 147 correct ratings for being three
-/// short; demanding each batch stay inside its own slice rejected
-/// `__min_slice_update` and `detach_tasks`, real functions the model
-/// rated unprompted. Each failure killed the entire review bootstrap
-/// over a heuristic. Do not reintroduce a coverage contract here.
-async fn assess_change_survey(
-    runner: &Arc<AgentRunner>,
-    target: &str,
-    target_source: &str,
-    window: &crate::change_survey::AggregateTargetDiff,
-    shutdown: &kres_core::Shutdown,
-) -> Result<Option<ChangeSurveyReport>> {
-    if shutdown.is_cancelled() {
-        anyhow::bail!("cancelled during whole-file change survey");
-    }
-    if window.diff.len().saturating_add(target_source.len()) <= CHANGE_SURVEY_DIFF_PARTITION_BYTES {
-        let prompt = change_survey_prompt(target, target_source, window, None);
-        return infer_change_survey_prompt(
-            runner,
-            &prompt,
-            ChangeSurveyWindowId {
-                baseline: &window.baseline,
-                head: &window.head,
-            },
-            ChangeSurveyCall {
-                task_kind: "change-survey net-diff",
-                cache_prefix: false,
-            },
-            shutdown,
-        )
-        .await
-        .map(Some);
-    }
-
-    // Too large for one call: partition so the INPUT fits, then union
-    // the partitions in Rust. No model reassembles the result.
-    let chunks = split_diff_for_inference(&window.diff, CHANGE_SURVEY_PAIR_PARTITION_BYTES)?;
-    let source_chunks = if target_source
-        .len()
-        .saturating_add(CHANGE_SURVEY_PAIR_PARTITION_BYTES)
-        <= CHANGE_SURVEY_DIFF_PARTITION_BYTES
-    {
-        vec![crate::change_survey::PreparedDiffChunk {
-            text: target_source.to_string(),
-            source_start: 0,
-            source_end: target_source.len(),
-        }]
-    } else {
-        split_source_for_inference(target_source, CHANGE_SURVEY_PAIR_PARTITION_BYTES)?
-    };
-    let chunk_count = chunks.len();
-    let source_count = source_chunks.len();
-    kres_core::async_eprintln!(
-        "[change survey] target-file input is large ({} diff bytes, {} source bytes); assessing {} source scope(s) against {} diff chunk(s) in {} semantic call(s), concurrency {}",
-        window.diff.len(),
-        target_source.len(),
-        source_count,
-        chunk_count,
-        chunk_count.saturating_mul(source_count),
-        CHANGE_SURVEY_CHUNK_CONCURRENCY,
-    );
-    let pairs: Vec<(usize, usize)> = (0..source_count)
-        .flat_map(|source_index| (0..chunk_count).map(move |diff_index| (source_index, diff_index)))
-        .collect();
-    let reports = stream::iter(pairs.into_iter().map(|(source_index, diff_index)| {
-        let prompt = change_survey_chunk_prompt(
-            target,
-            window,
-            None,
-            Some(ChangeSurveySourceChunk {
-                text: &source_chunks[source_index].text,
-                index: source_index,
-                count: source_count,
-            }),
-            Some(ChangeSurveyDiffChunk {
-                text: &chunks[diff_index].text,
-                index: diff_index,
-                count: chunk_count,
-            }),
-        );
-        let label = format!(
-            "change-survey source {}/{} diff {}/{}",
-            source_index + 1,
-            source_count,
-            diff_index + 1,
-            chunk_count
-        );
-        async move {
-            infer_change_survey_prompt(
-                runner,
-                &prompt,
-                ChangeSurveyWindowId {
-                    baseline: &window.baseline,
-                    head: &window.head,
-                },
-                ChangeSurveyCall {
-                    task_kind: &label,
-                    cache_prefix: true,
-                },
-                shutdown,
-            )
-            .await
-        }
-    }))
-    .buffer_unordered(CHANGE_SURVEY_CHUNK_CONCURRENCY)
-    .collect::<Vec<_>>()
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>>>()?;
-    Ok(Some(crate::change_survey::merge_change_survey_reports(
-        &window.baseline,
-        &window.head,
-        reports,
-    )))
-}
-
-/// Identity of the six-month window a change-survey call is assessing.
-/// Carried together because every call needs both halves and neither is
-/// meaningful alone.
-#[derive(Clone, Copy)]
-struct ChangeSurveyWindowId<'a> {
-    baseline: &'a str,
-    head: &'a str,
-}
-
-/// How one change-survey inference call is issued.
-#[derive(Clone, Copy)]
-struct ChangeSurveyCall<'a> {
-    task_kind: &'a str,
-    /// True only when sibling calls reuse these exact prefix bytes. A cache
-    /// write costs more than plain input, so a single-use prefix must not be
-    /// marked.
-    cache_prefix: bool,
-}
-
-async fn infer_change_survey_prompt(
-    runner: &Arc<AgentRunner>,
-    prompt: &crate::change_survey::ChangeSurveyPrompt,
-    window: ChangeSurveyWindowId<'_>,
-    call: ChangeSurveyCall<'_>,
-    shutdown: &kres_core::Shutdown,
-) -> Result<ChangeSurveyReport> {
-    let ChangeSurveyWindowId { baseline, head } = window;
-    let ChangeSurveyCall {
-        task_kind,
-        cache_prefix,
-    } = call;
-    let mut errors = Vec::new();
-    for attempt in 1..=2 {
-        if shutdown.is_cancelled() {
-            anyhow::bail!("cancelled during whole-file change survey");
-        }
-        let retry_tail;
-        let attempt_tail = if let Some(previous_error) = errors.last() {
-            retry_tail = format!(
-                "{}\n\nYour previous response failed validation: {previous_error}\nReturn a corrected complete JSON object.",
-                prompt.tail
-            );
-            retry_tail.as_str()
-        } else {
-            prompt.tail.as_str()
-        };
-        let response = runner
-            .run_primary_slow_inference_low_effort(
-                "You quickly classify code-change risk from one six-month net target-file diff. Judge the final code, use low reasoning effort, keep reasons terse, follow the requested JSON schema exactly, and do not emit markdown or commentary.",
-                &prompt.cached_prefix,
-                attempt_tail,
-                cache_prefix,
-                &format!("{task_kind} attempt {attempt}"),
-                shutdown,
-            )
-            .await;
-        match response {
-            Ok(response) => {
-                // Only the parse can fail. Coverage is not a contract:
-                // unknown names are dropped by the caller and
-                // unmentioned functions stay unrated.
-                match parse_inference_risks(&response, baseline, head) {
-                    Ok(rating) => return Ok(rating),
-                    Err(error) => errors.push(format!("attempt {attempt}: {error}")),
-                }
-            }
-            Err(error) if shutdown.is_cancelled() => {
-                return Err(anyhow::anyhow!(error.to_string()));
-            }
-            Err(error) => errors.push(format!("attempt {attempt}: {error}")),
-        }
-    }
-    anyhow::bail!(errors.join("; "))
-}
-
-/// Priority stamped on every Rust-derived external research question.
-///
-/// The retired file-survey prompt asked the model for an integer in
-/// 80-100 per question and gave it nothing to discriminate on — every
-/// retained entry had already passed the same Rust interaction filter.
-/// A constant says that plainly instead of dressing it up as judgement.
-const EXTERNAL_RESEARCH_PRIORITY: u8 = 90;
-
 /// Serialized shape of the completed scan. Same fields the agents have always
 /// seen, with `uses` and now the ratings supplied by Rust rather than echoed
 /// by the model.
 #[derive(Debug, Serialize)]
-struct ScanFunctionRisk<'a> {
+struct ScanFunction<'a> {
     name: &'a str,
     uses: u64,
-    risk_rating: u8,
 }
 
 #[derive(Debug, Serialize)]
 struct ScanFileSurvey<'a> {
-    functions: Vec<ScanFunctionRisk<'a>>,
-    research_questions: &'a [ReviewResearchQuestion],
-    file_risk_rating: u8,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReviewResearchQuestion {
-    function: String,
-    file: String,
-    question: String,
-    priority: u8,
+    functions: Vec<ScanFunction<'a>>,
 }
 
 #[derive(Debug)]
@@ -6875,32 +7777,6 @@ impl FileSurveyInventory {
         }
         Ok(())
     }
-
-    fn calls_function(&self, function: &str) -> bool {
-        let Some(function) = terminal_identifier(function) else {
-            return false;
-        };
-        self.calls.iter().any(|call| {
-            call.split(|character: char| !(character.is_alphanumeric() || character == '_'))
-                .any(|token| token == function)
-        })
-    }
-
-    fn interaction_kind(&self, function: &str, target_source: &str) -> Option<&'static str> {
-        let terminal = terminal_identifier(function)?;
-        // A target-local definition shadows a same-named external function in
-        // this translation unit. Keep the external risk in the survey report,
-        // but do not manufacture a research question from calls that resolve
-        // to the local definition.
-        if self.functions.contains_key(terminal) {
-            return None;
-        }
-        if self.calls_function(function) {
-            return Some("call");
-        }
-        source_references_function_value(target_source, terminal)
-            .then_some("function_value_reference")
-    }
 }
 
 fn ctags_function_inventory(target: &Path) -> Result<BTreeSet<String>> {
@@ -6960,51 +7836,6 @@ fn identifier_occurrences(source: &str, identifier: &str) -> u64 {
     code.split(|byte| !is_identifier_byte(*byte))
         .filter(|token| *token == identifier)
         .count() as u64
-}
-
-fn terminal_identifier(name: &str) -> Option<&str> {
-    name.split(|character: char| !(character.is_alphanumeric() || character == '_'))
-        .rfind(|token| !token.is_empty())
-}
-
-fn source_references_function_value(source: &str, identifier: &str) -> bool {
-    let code = code_without_comments_and_literals(source);
-    let identifier = identifier.as_bytes();
-    if identifier.is_empty() {
-        return false;
-    }
-    let mut offset = 0;
-    while let Some(relative) = code[offset..]
-        .windows(identifier.len())
-        .position(|window| window == identifier)
-    {
-        let start = offset + relative;
-        let end = start + identifier.len();
-        offset = end;
-        let token_start = start == 0 || !is_identifier_byte(code[start - 1]);
-        let token_end = end == code.len() || !is_identifier_byte(code[end]);
-        if !token_start || !token_end {
-            continue;
-        }
-        let next = code[end..]
-            .iter()
-            .position(|byte| !byte.is_ascii_whitespace())
-            .map(|index| end + index);
-        let next_byte = next.map(|index| code[index]);
-
-        // A following '(' is either a call (covered by the structured call
-        // inventory) or a declaration/definition, never callback evidence.
-        if next_byte == Some(b'(') {
-            continue;
-        }
-        // The external name is not a target-local definition (checked by the
-        // caller), and declarations/prototypes put '(' after the identifier.
-        // Every remaining code occurrence is conservatively an interaction:
-        // assignment, address-taking, cast, ternary, initializer, macro
-        // argument, return value, or typeof-style reference.
-        return true;
-    }
-    false
 }
 
 fn is_identifier_byte(byte: u8) -> bool {
@@ -7690,6 +8521,723 @@ pub fn expand_inline_load(text: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Members of a step, excluding the spilled-neighbour tail.
+    fn step_members(step: &kres_core::PlanStep) -> Vec<&str> {
+        let after = step
+            .description
+            .split("FUNCTIONS: ")
+            .nth(1)
+            .expect("step description lists its functions");
+        let list = after
+            .split("\nNEIGHBOURS IN OTHER GROUPS: ")
+            .next()
+            .unwrap_or(after);
+        list.trim().split(", ").map(str::trim).collect()
+    }
+
+    /// The fallback partition's scan carries names and use counts and
+    /// nothing else: the risk ratings it used to order by went with the
+    /// change survey.
+    fn scan_of(names: &[&str]) -> String {
+        serde_json::json!({
+            "functions": names
+                .iter()
+                .map(|name| serde_json::json!({ "name": name, "uses": 1 }))
+                .collect::<Vec<_>>()
+        })
+        .to_string()
+    }
+
+    /// TEMPORARY EXPERIMENT companion. A silent parse failure here
+    /// would fall back to define_plan and look like nothing happened,
+    /// so assert the partition actually covers every function.
+    #[test]
+    fn coverage_plan_covers_every_function_in_the_scan() {
+        let entries: Vec<String> = (0..53).map(|i| format!("fn_{i:02}")).collect();
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let scan = scan_of(&refs);
+
+        // No edges: the partition must be exactly what it was before
+        // grouping existed — name-ordered chunks of `per_step`.
+        let steps = coverage_plan_steps(&scan, 25, &CallEdges::default()).steps;
+        assert_eq!(steps.len(), 3, "53 functions at 25/step");
+
+        for i in 0..53 {
+            let name = format!("fn_{i:02}");
+            let hits = steps
+                .iter()
+                .filter(|s| step_members(s).contains(&name.as_str()))
+                .count();
+            assert_eq!(hits, 1, "{name} claimed by {hits} steps, want 1");
+        }
+        // Order is by name now, not by rating: the change survey that
+        // produced ratings is gone, and name order is at least
+        // reproducible between runs.
+        assert!(steps[0].description.contains("fn_00"));
+        assert!(!steps[0].description.contains("fn_52"));
+        // A malformed scan must yield nothing so the caller falls back.
+        assert!(coverage_plan_steps("not json", 25, &CallEdges::default())
+            .steps
+            .is_empty());
+        assert!(coverage_plan_steps("{}", 25, &CallEdges::default())
+            .steps
+            .is_empty());
+    }
+
+    /// The defect the FALLBACK grouping exists for: a call chain whose
+    /// members are scattered by whatever order seeds the accretion.
+    /// Sorted by name these four are spread across the roster; they
+    /// must still share a step.
+    ///
+    /// Shaped after the 2026-08-20 arch/x86/kvm/mmu/mmu.c review, where
+    /// `direct_page_fault`, `is_page_fault_stale`, `direct_map` and
+    /// `make_mmu_pages_available` fell into steps 02, 02, 03 and 09 of
+    /// 13 — 240 sorted positions apart — so no lens prompt ever held
+    /// both halves of the composition.
+    /// A scan that rates one name twice must not put it in two steps.
+    /// The ratings differ, so after sorting on (risk, name) the copies
+    /// are not adjacent and `dedup_by` would miss them.
+    /// The body slice is taken by line range out of the whole file, so
+    /// a function at the very last line, or a range ctags reported past
+    /// the end, must not panic the bootstrap.
+    #[test]
+    fn edge_extraction_survives_out_of_range_ctags_output() {
+        let source = "static int a(void) { return b(); }\nstatic int b(void) { return 0; }";
+        let mut ranges = std::collections::BTreeMap::new();
+        ranges.insert("a".to_string(), (1usize, 1usize));
+        ranges.insert("b".to_string(), (2usize, 9_000usize)); // end past EOF
+        ranges.insert("ghost".to_string(), (9_000usize, 9_001usize)); // start past EOF
+        let edges = call_edges_from_source(source, &ranges);
+        assert!(edges.neighbours("a").is_some_and(|ns| ns.contains("b")));
+        assert!(edges.neighbours("ghost").is_none());
+    }
+
+    #[test]
+    fn a_duplicate_scan_entry_yields_one_member() {
+        let scan = scan_of(&["a", "b", "a", "c"]);
+        let steps = coverage_plan_steps(&scan, 25, &CallEdges::default()).steps;
+        let members: Vec<&str> = steps.iter().flat_map(|s| step_members(s)).collect();
+        assert_eq!(members.iter().filter(|m| **m == "a").count(), 1);
+        assert_eq!(members.len(), 3, "got {members:?}");
+    }
+
+    #[test]
+    fn a_call_chain_shares_a_step_across_risk_bands() {
+        let source = r#"
+static int make_mmu_pages_available(struct kvm_vcpu *vcpu)
+{
+	return kvm_mmu_available_pages(vcpu->kvm);
+}
+
+static bool is_page_fault_stale(struct kvm_vcpu *vcpu)
+{
+	return false;
+}
+
+static int direct_map(struct kvm_vcpu *vcpu)
+{
+	return 0;
+}
+
+static int direct_page_fault(struct kvm_vcpu *vcpu)
+{
+	if (is_page_fault_stale(vcpu))
+		return 1;
+	if (make_mmu_pages_available(vcpu))
+		return 2;
+	return direct_map(vcpu);
+}
+
+static int unrelated_helper_a(void) { return 0; }
+static int unrelated_helper_b(void) { return 0; }
+"#;
+        let mut ranges = std::collections::BTreeMap::new();
+        for (name, start, end) in [
+            ("make_mmu_pages_available", 2, 5),
+            ("is_page_fault_stale", 7, 10),
+            ("direct_map", 12, 15),
+            ("direct_page_fault", 17, 25),
+            ("unrelated_helper_a", 27, 27),
+            ("unrelated_helper_b", 28, 28),
+        ] {
+            ranges.insert(name.to_string(), (start, end));
+        }
+        let edges = call_edges_from_source(source, &ranges);
+
+        // Ratings chosen so a risk sort alone splits the chain: with
+        // two per step the pairs would be (a,stale) / (fault,map) /
+        // (avail,b).
+        let scan = scan_of(&[
+            "unrelated_helper_a",
+            "is_page_fault_stale",
+            "direct_page_fault",
+            "direct_map",
+            "make_mmu_pages_available",
+            "unrelated_helper_b",
+        ]);
+
+        let steps = coverage_plan_steps(&scan, 4, &edges).steps;
+        let owner = |name: &str| {
+            steps
+                .iter()
+                .position(|s| step_members(s).contains(&name))
+                .unwrap_or_else(|| panic!("{name} is in no step"))
+        };
+        let seat = owner("direct_page_fault");
+        for name in [
+            "is_page_fault_stale",
+            "direct_map",
+            "make_mmu_pages_available",
+        ] {
+            assert_eq!(
+                owner(name),
+                seat,
+                "{name} must share direct_page_fault's step"
+            );
+        }
+        // ...and the unrelated pair must not have displaced them.
+        assert_ne!(owner("unrelated_helper_a"), seat);
+    }
+
+    #[test]
+    fn coverage_plan_is_deterministic_and_respects_the_cap() {
+        let source = r#"
+static int leaf(void) { return 0; }
+static int mid(void) { return leaf(); }
+static int hub(void) { return mid() + leaf(); }
+static int other(void) { return hub(); }
+static int lone(void) { return 0; }
+"#;
+        let mut ranges = std::collections::BTreeMap::new();
+        for (name, start, end) in [
+            ("leaf", 2, 2),
+            ("mid", 3, 3),
+            ("hub", 4, 4),
+            ("other", 5, 5),
+            ("lone", 6, 6),
+        ] {
+            ranges.insert(name.to_string(), (start, end));
+        }
+        let edges = call_edges_from_source(source, &ranges);
+        let scan = scan_of(&["hub", "other", "mid", "leaf", "lone"]);
+
+        let a = coverage_plan_steps(&scan, 2, &edges).steps;
+        let b = coverage_plan_steps(&scan, 2, &edges).steps;
+        let render = |steps: &[kres_core::PlanStep]| {
+            steps
+                .iter()
+                .map(|s| format!("{}|{}|{}", s.id, s.title, s.description))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            render(&a),
+            render(&b),
+            "same scan must give identical steps"
+        );
+
+        for step in &a {
+            assert!(step_members(step).len() <= 2, "cap exceeded: {step:?}");
+        }
+        // Exactly once each, still.
+        for name in ["hub", "other", "mid", "leaf", "lone"] {
+            let hits = a.iter().filter(|s| step_members(s).contains(&name)).count();
+            assert_eq!(hits, 1, "{name} claimed by {hits} steps");
+        }
+        // The first seed by the accretion's own order takes step 01,
+        // so `followup::is_opening_plan_step` — which is positional —
+        // keeps meaning "the plan's opening step".
+        assert_eq!(step_members(&a[0])[0], "hub");
+        assert_eq!(a[0].id, "audit-cluster-01");
+    }
+
+    fn group(name: &str, rationale: &str, members: &[&str]) -> FunctionGroup {
+        FunctionGroup {
+            name: name.into(),
+            rationale: rationale.into(),
+            members: members.iter().map(|m| (*m).to_string()).collect(),
+        }
+    }
+
+    fn ranges_of(
+        spec: &[(&str, usize, usize)],
+    ) -> std::collections::BTreeMap<String, (usize, usize)> {
+        spec.iter()
+            .map(|(n, a, b)| ((*n).to_string(), (*a, *b)))
+            .collect()
+    }
+
+    /// The model decides the shape; Rust only guarantees the partition
+    /// is total and references real functions.
+    #[test]
+    fn reconciliation_makes_the_partition_exhaustive_without_demanding_it() {
+        let ranges = ranges_of(&[
+            ("alloc", 1, 20),
+            ("free", 21, 30),
+            ("helper", 31, 33),
+            ("stray", 34, 35),
+            ("lonely", 36, 37),
+        ]);
+        let mut edges = CallEdges::default();
+        edges.link("stray", "alloc");
+        let groups = reconcile_function_groups(
+            vec![
+                group(
+                    "object lifetime",
+                    "alloc and free are the two ends of one contract",
+                    &["alloc", "free", "does_not_exist"],
+                ),
+                group("helpers", "shared leaf utilities", &["helper", "alloc"]),
+            ],
+            &ranges,
+            &edges,
+        );
+        let placed: BTreeSet<&str> = groups
+            .iter()
+            .flat_map(|g| g.members.iter().map(String::as_str))
+            .collect();
+        let all: BTreeSet<&str> = ranges.keys().map(String::as_str).collect();
+        assert_eq!(placed, all, "every function must land in exactly one group");
+        let total: usize = groups.iter().map(|g| g.members.len()).sum();
+        assert_eq!(total, ranges.len(), "no function may be placed twice");
+
+        // An invented name is dropped; a duplicate stays where it was
+        // first placed.
+        let lifetime = groups.iter().find(|g| g.name == "object lifetime").unwrap();
+        assert!(lifetime.members.contains(&"alloc".to_string()));
+        assert!(!lifetime.members.iter().any(|m| m == "does_not_exist"));
+        let helpers = groups.iter().find(|g| g.name == "helpers").unwrap();
+        assert!(!helpers.members.contains(&"alloc".to_string()));
+
+        // `stray` references a grouped function, so it joins that group
+        // rather than the ungrouped bucket; `lonely` references nothing.
+        assert!(lifetime.members.contains(&"stray".to_string()));
+        let ungrouped = groups
+            .iter()
+            .find(|g| g.name == "ungrouped functions")
+            .unwrap();
+        assert_eq!(ungrouped.members, vec!["lonely".to_string()]);
+        assert!(!ungrouped.rationale.is_empty());
+    }
+
+    /// No cap, no floor, no splitting, no merging: the agent's shape
+    /// survives. Uniform group sizes would destroy the only thing this
+    /// pass produces.
+    #[test]
+    fn reconciliation_never_resizes_a_group() {
+        let mut spec: Vec<(String, usize, usize)> = Vec::new();
+        for n in 0..60 {
+            spec.push((format!("big{n:02}"), n * 2 + 1, n * 2 + 2));
+        }
+        spec.push(("solo".into(), 400, 401));
+        let ranges: std::collections::BTreeMap<String, (usize, usize)> =
+            spec.iter().map(|(n, a, b)| (n.clone(), (*a, *b))).collect();
+        let big: Vec<&str> = spec.iter().take(60).map(|(n, _, _)| n.as_str()).collect();
+        let groups = reconcile_function_groups(
+            vec![
+                group(
+                    "the subsystem",
+                    "sixty functions implementing one state machine",
+                    &big,
+                ),
+                group("one utility", "a single unrelated helper", &["solo"]),
+            ],
+            &ranges,
+            &CallEdges::default(),
+        );
+        assert_eq!(groups.len(), 2, "no splitting and no merging");
+        assert_eq!(groups[0].members.len(), 60, "a 60-member group stays 60");
+        assert_eq!(groups[1].members.len(), 1, "a 1-member group stays 1");
+        // Largest by source bytes first.
+        assert_eq!(groups[0].name, "the subsystem");
+    }
+
+    /// The rationale is the group's only channel to the lens. It rides
+    /// in the step description, which `review_todos_from_plan` copies
+    /// into the todo `reason` and which reaches every lens prompt.
+    #[test]
+    fn the_group_rationale_reaches_the_lens_prompt() {
+        let ranges = ranges_of(&[("install", 1, 10), ("teardown", 11, 20), ("other", 21, 25)]);
+        let mut edges = CallEdges::default();
+        edges.link("install", "other");
+        let groups = vec![
+            group(
+                "SPTE installation",
+                "both write the same SPTE under mmu_lock",
+                &["install", "teardown"],
+            ),
+            group("misc", "unrelated", &["other"]),
+        ];
+        let steps = plan_steps_from_groups(&groups, &ranges, &edges);
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].id, "audit-group-01");
+        assert!(steps[0].title.contains("SPTE installation"));
+        assert!(
+            steps[0]
+                .description
+                .contains("both write the same SPTE under mmu_lock"),
+            "rationale missing from the step description: {}",
+            steps[0].description
+        );
+        assert!(steps[0]
+            .description
+            .contains("WHY THESE FUNCTIONS ARE ONE GROUP"));
+
+        // And it survives into the todo the task is built from.
+        let mut plan = kres_core::Plan::new("p", "g", kres_agents::TaskMode::Audit);
+        plan.steps = steps;
+        let todos = review_todos_from_plan(&plan);
+        assert!(todos[0]
+            .reason
+            .contains("both write the same SPTE under mmu_lock"));
+        assert_eq!(todos[0].step_id, "audit-group-01");
+
+        // Cross-group neighbours are still named for fetching.
+        assert!(todos[0].reason.contains("other"));
+    }
+
+    /// The seam between semantic grouping and fair scheduling: a step
+    /// built from a functional group must be recognisable to the
+    /// dispatcher as a survey group row, or the gate never closes and
+    /// the fairness counters never see it.
+    ///
+    /// The two halves were built separately and this is the only place
+    /// they touch. `is_survey_group_row` keys on `id ==
+    /// "review-{step_id}"`, so an id scheme change on either side
+    /// silently turns every group into an ordinary followup.
+    #[test]
+    fn group_steps_produce_rows_the_scheduler_recognises() {
+        let ranges = ranges_of(&[("a", 1, 5), ("b", 6, 10), ("c", 11, 15)]);
+        let groups = vec![
+            group("first subsystem", "a and b share a lock", &["a", "b"]),
+            group("second", "c stands alone", &["c"]),
+        ];
+        let mut plan = kres_core::Plan::new("p", "g", kres_agents::TaskMode::Audit);
+        plan.steps = plan_steps_from_groups(&groups, &ranges, &CallEdges::default());
+        let todos = review_todos_from_plan(&plan);
+
+        assert_eq!(todos.len(), 2);
+        for todo in &todos {
+            assert!(
+                kres_core::is_survey_group_row(todo),
+                "step {} produced a row the dispatcher would treat as a followup: id={} step_id={}",
+                todo.step_id,
+                todo.id,
+                todo.step_id
+            );
+        }
+        // And a followup attributed to one of those groups must NOT be
+        // mistaken for the group itself.
+        let mut followup = kres_core::TodoItem::new("read a caller", "source");
+        followup.id = "some-followup".into();
+        followup.step_id = todos[0].step_id.clone();
+        assert!(!kres_core::is_survey_group_row(&followup));
+    }
+
+    /// Pass 1 must never hand the model half a function body: it is
+    /// being asked what each function does.
+    #[test]
+    fn purpose_chunks_never_split_a_function() {
+        let source: Vec<String> = (1..=40).map(|n| format!("line {n}")).collect();
+        let lines: Vec<&str> = source.iter().map(String::as_str).collect();
+        let ranges = ranges_of(&[("a", 1, 10), ("b", 11, 20), ("c", 21, 40)]);
+        let chunks = chunk_source_on_function_boundaries(&lines, &ranges, 80);
+        assert!(chunks.len() > 1, "the target should force a split");
+        let named: Vec<String> = chunks.iter().flat_map(|(n, _)| n.clone()).collect();
+        assert_eq!(named.len(), 3, "every function named exactly once");
+        for (names, body) in &chunks {
+            for name in names {
+                let (start, end) = ranges[name];
+                for line in &lines[start - 1..end] {
+                    assert!(body.contains(line), "{name} body was cut: {line} missing");
+                }
+            }
+        }
+    }
+
+    /// A function longer than the chunk target is its own chunk rather
+    /// than being cut in half.
+    #[test]
+    fn an_oversized_function_becomes_its_own_chunk() {
+        let source: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+        let lines: Vec<&str> = source.iter().map(String::as_str).collect();
+        let ranges = ranges_of(&[("small", 1, 2), ("huge", 3, 30)]);
+        let chunks = chunk_source_on_function_boundaries(&lines, &ranges, 20);
+        let huge = chunks
+            .iter()
+            .find(|(n, _)| n.contains(&"huge".to_string()))
+            .unwrap();
+        for line in &lines[2..30] {
+            assert!(huge.1.contains(line), "huge was split: {line} missing");
+        }
+    }
+
+    /// The cap bisects any cluster round a hub. The step text has to
+    /// name what fell the other side of the cut, or the lens is left
+    /// guessing which callees matter.
+    #[test]
+    fn a_split_cluster_names_its_spilled_neighbours() {
+        let source = r#"
+static int hub(void) { return a() + b() + c(); }
+static int a(void) { return 0; }
+static int b(void) { return 0; }
+static int c(void) { return 0; }
+"#;
+        let mut ranges = std::collections::BTreeMap::new();
+        for (name, line) in [("hub", 2), ("a", 3), ("b", 4), ("c", 5)] {
+            ranges.insert(name.to_string(), (line, line));
+        }
+        let edges = call_edges_from_source(source, &ranges);
+        let scan = scan_of(&["hub", "a", "b", "c"]);
+
+        let steps = coverage_plan_steps(&scan, 2, &edges).steps;
+        let hub_step = steps
+            .iter()
+            .find(|s| step_members(s).contains(&"hub"))
+            .expect("hub is in a step");
+        assert!(
+            hub_step
+                .description
+                .contains("NEIGHBOURS IN OTHER GROUPS: "),
+            "no spill note: {}",
+            hub_step.description
+        );
+        let spilled: Vec<&str> = hub_step
+            .description
+            .split("NEIGHBOURS IN OTHER GROUPS: ")
+            .nth(1)
+            .expect("spill note names the neighbours")
+            .trim()
+            .split(", ")
+            .collect();
+        let members = step_members(hub_step);
+        for name in ["a", "b", "c"] {
+            assert!(
+                members.contains(&name) || spilled.contains(&name),
+                "{name} is neither a member nor named as spilled: {}",
+                hub_step.description
+            );
+        }
+        // A member must not also be listed as spilled -- the note is
+        // for what the lens has to go and fetch.
+        for name in &members {
+            assert!(!spilled.contains(name), "{name} is both member and spilled");
+        }
+    }
+
+    /// Shape of the 2026-08-21 mmu.c miss, reduced: the cluster owns
+    /// the caller, the invalidating frame is two hops out, and depth 1
+    /// -- which is all `spilled_neighbours` names -- stops one short.
+    fn zap_chain_fixture() -> (
+        &'static str,
+        std::collections::BTreeMap<String, (usize, usize)>,
+    ) {
+        let source = r#"
+static void prepare_zap(struct kvm *kvm)
+{
+	sp->role.invalid = 1;
+}
+
+static void zap_oldest(struct kvm *kvm)
+{
+	if (sp->root_count)
+		return;
+	prepare_zap(kvm);
+}
+
+static int make_pages_available(struct kvm_vcpu *vcpu)
+{
+	zap_oldest(vcpu->kvm);
+	return 0;
+}
+
+static int page_fault(struct kvm_vcpu *vcpu)
+{
+	if (stale(vcpu))
+		return 1;
+	return make_pages_available(vcpu);
+}
+
+static int stale(struct kvm_vcpu *vcpu) { return 0; }
+static int far_away(void) { return 0; }
+"#;
+        let mut ranges = std::collections::BTreeMap::new();
+        for (name, start, end) in [
+            ("prepare_zap", 2, 5),
+            ("zap_oldest", 7, 12),
+            ("make_pages_available", 14, 18),
+            ("page_fault", 20, 25),
+            ("stale", 27, 27),
+            ("far_away", 28, 28),
+        ] {
+            ranges.insert(name.to_string(), (start, end));
+        }
+        (source, ranges)
+    }
+
+    #[test]
+    fn cluster_context_reaches_the_second_hop() {
+        let (source, ranges) = zap_chain_fixture();
+        let edges = call_edges_from_source(source, &ranges);
+        let lines: Vec<&str> = source.lines().collect();
+        let members: Vec<String> = ["page_fault", "make_pages_available", "stale"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        // Depth 1 is what the step text already names, and it is not
+        // enough: it reaches the reclaim helper and stops there.
+        let in_scan: BTreeSet<&str> = ranges.keys().map(String::as_str).collect();
+        let member_refs: Vec<&str> = members.iter().map(String::as_str).collect();
+        let spilled = spilled_neighbours(&member_refs, &in_scan, &edges);
+        assert!(spilled.contains(&"zap_oldest"), "got {spilled:?}");
+        assert!(
+            !spilled.contains(&"prepare_zap"),
+            "depth 1 must not already reach the second hop: {spilled:?}"
+        );
+
+        let seeded = cluster_context_symbols(
+            &members,
+            &edges,
+            &ranges,
+            &lines,
+            "t.c",
+            CLUSTER_CONTEXT_BUDGET_CHARS,
+        );
+        let names: Vec<&str> = seeded
+            .iter()
+            .filter_map(|s| s.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        for expected in [
+            "page_fault",
+            "make_pages_available",
+            "zap_oldest",
+            "prepare_zap",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "{expected} missing from {names:?}"
+            );
+        }
+        // The closure is a neighbourhood, not the file.
+        assert!(!names.contains(&"far_away"), "got {names:?}");
+        // Every record carries the body, which is the whole point.
+        let zap = seeded
+            .iter()
+            .find(|s| s.get("name").and_then(serde_json::Value::as_str) == Some("prepare_zap"))
+            .expect("prepare_zap seeded");
+        assert!(zap["definition"]
+            .as_str()
+            .expect("definition is a string")
+            .contains("role.invalid = 1"));
+        assert_eq!(zap["filename"], "t.c");
+    }
+
+    #[test]
+    fn cluster_context_is_deterministic_and_respects_its_budget() {
+        let (source, ranges) = zap_chain_fixture();
+        let edges = call_edges_from_source(source, &ranges);
+        let lines: Vec<&str> = source.lines().collect();
+        let members: Vec<String> = vec!["page_fault".to_string()];
+
+        let a = cluster_context_symbols(&members, &edges, &ranges, &lines, "t.c", 100_000);
+        let b = cluster_context_symbols(&members, &edges, &ranges, &lines, "t.c", 100_000);
+        assert_eq!(
+            a, b,
+            "the block must be byte-stable or the cache never hits"
+        );
+
+        // A budget too small for the whole closure keeps every member
+        // and drops from the outside in. A member is never traded away
+        // for a neighbour, and the nearest ring outlives the furthest.
+        let tight = cluster_context_symbols(&members, &edges, &ranges, &lines, "t.c", 1);
+        let tight_names: Vec<&str> = tight
+            .iter()
+            .filter_map(|s| s.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(
+            tight_names,
+            vec!["page_fault"],
+            "members survive any budget, neighbours do not"
+        );
+        assert!(
+            tight.len() < a.len(),
+            "budget did not bind: {tight_names:?}"
+        );
+
+        // One ring's worth of headroom keeps the nearer hop and drops
+        // the further one -- not whichever bodies happen to be small.
+        let member_len = a[0]["definition"].as_str().expect("body").len();
+        let one_ring =
+            cluster_context_symbols(&members, &edges, &ranges, &lines, "t.c", member_len + 200);
+        let one_ring_names: Vec<&str> = one_ring
+            .iter()
+            .filter_map(|s| s.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(
+            one_ring_names.contains(&"make_pages_available"),
+            "{one_ring_names:?}"
+        );
+        assert!(
+            !one_ring_names.contains(&"prepare_zap"),
+            "{one_ring_names:?}"
+        );
+    }
+
+    /// No ctags, no target, no members -- the seed is skipped and the
+    /// task gathers exactly as it did before. An optimisation of the
+    /// prompt is never a precondition for producing one.
+    #[test]
+    fn cluster_context_degrades_to_gather_only() {
+        let empty = std::collections::BTreeMap::new();
+        assert!(cluster_context_seeds(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "does/not/exist.c",
+            &empty,
+            &CallEdges::default(),
+        )
+        .is_empty());
+
+        let mut members = std::collections::BTreeMap::new();
+        members.insert("audit-cluster-01".to_string(), vec!["nope".to_string()]);
+        assert!(cluster_context_seeds(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            "does/not/exist.c",
+            &members,
+            &CallEdges::default(),
+        )
+        .is_empty());
+    }
+
+    /// An ops-table entry is an assignment, not a call, and is exactly
+    /// the unchanged-dispatch relation a review is told to trace, so
+    /// the extractor must record it. Comments and string literals must
+    /// not create edges.
+    #[test]
+    fn edges_cover_dispatch_tables_but_not_comments_or_strings() {
+        let source = r#"
+static int handler(void) { return 0; }
+static int decoy(void) { return 0; }
+static int install(void)
+{
+	/* decoy() is named only in this comment */
+	const char *msg = "decoy()";
+	struct ops o = { .fn = handler };
+	return o.fn != NULL;
+}
+"#;
+        let mut ranges = std::collections::BTreeMap::new();
+        for (name, start, end) in [("handler", 2, 2), ("decoy", 3, 3), ("install", 4, 10)] {
+            ranges.insert(name.to_string(), (start, end));
+        }
+        let edges = call_edges_from_source(source, &ranges);
+        let install = edges.neighbours("install").cloned().unwrap_or_default();
+        assert!(install.contains("handler"), "assignment edge missing");
+        assert!(
+            !install.contains("decoy"),
+            "a comment or string literal created an edge"
+        );
+    }
+
     #[test]
     fn compact_response_requires_one_exact_json_object() {
         assert_eq!(
@@ -8006,8 +9554,6 @@ mod tests {
             &CompletedReviewFileScan {
                 target: "old.c".into(),
                 source_hash: "old-source".into(),
-                baseline: "old-baseline".into(),
-                head: "old-head".into(),
                 scan: "old scan".into(),
             },
         )
@@ -8158,10 +9704,10 @@ mod tests {
     #[tokio::test]
     async fn review_scan_context_does_not_parse_plan_prose() {
         let mgr = TaskManager::new();
-        let scan = r#"{"functions":[{"name":"filemap_fault","risk_rating":72}],"research_questions":[],"file_risk_rating":72}"#;
+        let scan = r#"{"functions":[{"name":"filemap_fault","uses":3}]}"#;
         let plan = kres_core::Plan::new(
             format!(
-                "review\n--- WHOLE-FILE RISK SCAN ---\n{scan}\n--- END WHOLE-FILE RISK SCAN ---"
+                "review\n--- WHOLE-FILE FUNCTION INVENTORY ---\n{scan}\n--- END WHOLE-FILE FUNCTION INVENTORY ---"
             ),
             "goal",
             kres_core::TaskMode::Audit,
@@ -8173,109 +9719,6 @@ mod tests {
             review_file_scan_context(&mgr, Path::new(env!("CARGO_MANIFEST_DIR")), "mm/filemap.c")
                 .await,
             None
-        );
-    }
-
-    #[test]
-    fn independently_large_source_crosses_every_scope_with_every_diff_chunk() {
-        let target_source = "x".repeat(1_228_126);
-        let expected = (0..191)
-            .map(|index| format!("function_{index}"))
-            .collect::<BTreeSet<_>>();
-        let window = crate::change_survey::AggregateTargetDiff {
-            baseline: "base".into(),
-            head: "head".into(),
-            diff: "d".repeat(6_885_530),
-        };
-        let chunks =
-            split_diff_for_inference(&window.diff, CHANGE_SURVEY_PAIR_PARTITION_BYTES).unwrap();
-        let source_chunks =
-            split_source_for_inference(&target_source, CHANGE_SURVEY_PAIR_PARTITION_BYTES).unwrap();
-
-        assert_eq!(
-            chunks
-                .iter()
-                .map(|chunk| &window.diff[chunk.source_start..chunk.source_end])
-                .collect::<String>(),
-            window.diff
-        );
-        assert!(chunks.len() > 1);
-        assert_eq!(
-            source_chunks
-                .iter()
-                .map(|chunk| &target_source[chunk.source_start..chunk.source_end])
-                .collect::<String>(),
-            target_source
-        );
-        assert!(source_chunks.len() > 1);
-        let pair_count = chunks.len() * source_chunks.len();
-        let source_bytes_sent: usize = source_chunks
-            .iter()
-            .map(|chunk| chunk.text.len() * chunks.len())
-            .sum();
-        let diff_bytes_sent: usize = chunks
-            .iter()
-            .map(|chunk| (chunk.source_end - chunk.source_start) * source_chunks.len())
-            .sum();
-        assert_eq!(source_bytes_sent, target_source.len() * chunks.len());
-        assert_eq!(diff_bytes_sent, window.diff.len() * source_chunks.len());
-        assert_eq!(pair_count, chunks.len() * source_chunks.len());
-        let prompt = change_survey_chunk_prompt(
-            "mm/vmscan.c",
-            &window,
-            Some(&expected),
-            Some(ChangeSurveySourceChunk {
-                text: &source_chunks[0].text,
-                index: 0,
-                count: source_chunks.len(),
-            }),
-            Some(ChangeSurveyDiffChunk {
-                text: &chunks[0].text,
-                index: 0,
-                count: chunks.len(),
-            }),
-        );
-        assert!(prompt.cached_prefix.contains(&source_chunks[0].text));
-        assert!(prompt.tail.contains(&chunks[0].text));
-    }
-
-    #[test]
-    fn change_survey_losslessly_partitions_at_a_small_semantic_target() {
-        let partition_bytes = 1024;
-        let diff = "d".repeat(2048);
-        let chunks = split_diff_for_inference(&diff, partition_bytes).unwrap();
-
-        assert_eq!(
-            chunks
-                .iter()
-                .map(|chunk| &diff[chunk.source_start..chunk.source_end])
-                .collect::<String>(),
-            diff
-        );
-        assert!(chunks.len() >= 2);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.text.len() <= partition_bytes));
-    }
-
-    /// A function the target defines itself is not an external
-    /// interaction, however the change survey rated the same name
-    /// elsewhere. The file-survey inference that used to enforce this
-    /// is gone; Rust now builds the research questions directly, so
-    /// the filter is tested where it actually runs.
-    #[test]
-    fn local_definition_shadows_same_named_external_risk() {
-        let inventory = FileSurveyInventory {
-            functions: BTreeMap::from([("folio_put".to_string(), 2)]),
-            calls: vec!["folio_put".to_string()],
-        };
-        assert_eq!(
-            inventory.interaction_kind(
-                "folio_put",
-                "static void folio_put(void) {}\nvoid use(void) { folio_put(); }",
-            ),
-            None,
-            "a locally defined function is not an external interaction"
         );
     }
 
@@ -8389,68 +9832,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_survey_checkpoint_roundtrips_net_diff_assessment() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("change-survey.json");
-        let store = ChangeSurveyCheckpointStore::open(
-            path.clone(),
-            "/repo/target.c".into(),
-            "source-hash".into(),
-            "base".into(),
-            "head".into(),
-            false,
-        )
-        .unwrap();
-        let rating = ChangeSurveyReport {
-            baseline: "base".into(),
-            head: "head".into(),
-            target_function_risks: vec![crate::change_survey::FunctionRisk {
-                name: "target".into(),
-                risk_rating: 70,
-                reason: "recent rewrite".into(),
-            }],
-            external_major_risks: Vec::new(),
-        };
-        store.record(rating.clone()).await.unwrap();
-
-        let reopened = ChangeSurveyCheckpointStore::open(
-            path.clone(),
-            "/repo/target.c".into(),
-            "source-hash".into(),
-            "base".into(),
-            "head".into(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(reopened.report().await, Some(rating));
-
-        let fresh = ChangeSurveyCheckpointStore::open(
-            path,
-            "/repo/target.c".into(),
-            "source-hash".into(),
-            "base".into(),
-            "head".into(),
-            false,
-        )
-        .unwrap();
-        assert!(fresh.report().await.is_none());
-    }
-
-    #[test]
-    fn clear_removes_change_survey_checkpoint_and_temporary_file() {
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join("change-survey.json");
-        let temporary_path = path.with_extension("json.tmp");
-        std::fs::write(&path, "checkpoint").unwrap();
-        std::fs::write(&temporary_path, "temporary").unwrap();
-
-        assert!(remove_change_survey_checkpoint(&path).unwrap());
-        assert!(!path.exists());
-        assert!(!temporary_path.exists());
-        assert!(!remove_change_survey_checkpoint(&path).unwrap());
-    }
-
-    #[tokio::test]
     async fn review_scan_context_requires_matching_target() {
         let mgr = TaskManager::new();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -8458,9 +9839,7 @@ mod tests {
         let source = std::fs::read_to_string(workspace.join(target)).unwrap();
         let scan = CompletedReviewFileScan {
             target: target.into(),
-            source_hash: change_survey_source_hash(&workspace.join(target), &source).unwrap(),
-            baseline: "test-baseline".into(),
-            head: current_review_head(workspace).unwrap(),
+            source_hash: review_target_source_hash(&workspace.join(target), &source).unwrap(),
             scan: "live scan".into(),
         };
         cache_review_file_scan(&mgr, &scan).await;
@@ -8490,12 +9869,12 @@ mod tests {
         let mut permissions = std::fs::metadata(&target).unwrap().permissions();
         permissions.set_mode(0o644);
         std::fs::set_permissions(&target, permissions).unwrap();
-        let ordinary = change_survey_source_hash(&target, source).unwrap();
+        let ordinary = review_target_source_hash(&target, source).unwrap();
 
         let mut permissions = std::fs::metadata(&target).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&target, permissions).unwrap();
-        let executable = change_survey_source_hash(&target, source).unwrap();
+        let executable = review_target_source_hash(&target, source).unwrap();
 
         assert_ne!(ordinary, executable);
     }
@@ -8583,6 +9962,7 @@ mod tests {
             reactivate: false,
             resolved_questions: vec![],
             introduced_by: None,
+            invalidation: None,
         }];
 
         let ctx = recorded_findings_goal_context(&findings);
@@ -8593,7 +9973,7 @@ mod tests {
 
     #[test]
     fn truncate_preserves_short() {
-        assert_eq!(truncate("abc", 5), "abc");
+        assert_eq!(truncate("abc", 3), "abc");
     }
 
     #[test]

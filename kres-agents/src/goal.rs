@@ -27,7 +27,11 @@ use serde_json::json;
 use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::UsageTracker;
 use kres_llm::{
-    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+    client::Client,
+    config::CallConfig,
+    model::ThinkingBudget,
+    request::{CachedPrefix, Message},
+    Model,
 };
 
 /// Dedicated system prompt for define_goal / check_goal. Swapped in
@@ -332,7 +336,15 @@ pub async fn define_goal(
 /// cache-creation tokens against 118,316 cache reads.
 ///
 /// `analysis` is the accumulator and stays in the per-call half.
-const CHECK_GOAL_STABLE_FIELDS: &[&str] = &["task", "instructions", "goal", "plan"];
+/// `plan` is deliberately NOT here. A plan step carries a status, and
+/// a reap flips at least one, so the "stable" head changed on every
+/// single call: measured on the 2026-08-22 arch/x86/kvm/mmu/mmu.c
+/// review the goal agent wrote ~23.2k tokens of head per call and read
+/// 0 of them back, while the genuinely constant part — task,
+/// instructions, goal — read 5,306 tokens every time without fail. A
+/// block that is rewritten on every call costs 1.25x for nothing;
+/// sending it uncached costs 1.0x. Keep the plan in the delta.
+const CHECK_GOAL_STABLE_FIELDS: &[&str] = &["task", "instructions", "goal"];
 
 fn build_check_goal_request(
     original_prompt: &str,
@@ -417,7 +429,9 @@ pub async fn check_goal(
         role: "user".into(),
         content: split.delta,
         cache: false,
-        cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then_some(split.stable)),
+        cached_prefixes: Vec::from_iter(
+            (!split.stable.is_empty()).then(|| CachedPrefix::short(split.stable)),
+        ),
     }];
     if let Some(lg) = &gc.logger {
         let request = cfg.request_meta();
@@ -715,7 +729,14 @@ mod tests {
     /// by TaskId), so it changes on essentially every check.
     #[test]
     fn the_cached_prefix_holds_no_per_reap_field() {
-        for volatile in ["original_prompt", "analysis"] {
+        // `plan` was in this list and is the reason the rule existed
+        // and was broken at the same time: a plan step carries a
+        // status, a reap flips at least one, so the "stable" head
+        // changed on every call. Measured on the 2026-08-22
+        // arch/x86/kvm/mmu/mmu.c review the goal agent wrote ~23.2k
+        // tokens of head per call and read none of it back, while the
+        // constant part read 5,306 tokens every time.
+        for volatile in ["original_prompt", "analysis", "plan"] {
             assert!(
                 !CHECK_GOAL_STABLE_FIELDS.contains(&volatile),
                 "`{volatile}` changes every reap and must stay in the delta half"
@@ -723,7 +744,6 @@ mod tests {
         }
         assert!(CHECK_GOAL_STABLE_FIELDS.contains(&"goal"));
         assert!(CHECK_GOAL_STABLE_FIELDS.contains(&"instructions"));
-        assert!(CHECK_GOAL_STABLE_FIELDS.contains(&"plan"));
     }
 
     #[test]

@@ -32,8 +32,6 @@ use crate::todo::{TodoItem, TodoStatus};
 pub struct ReviewFileScanState {
     pub target: String,
     pub source_hash: String,
-    pub baseline: String,
-    pub head: String,
     pub scan: String,
 }
 
@@ -215,9 +213,7 @@ mod tests {
             review_file_scan: Some(ReviewFileScanState {
                 target: "mm/vmscan.c".into(),
                 source_hash: "source-hash".into(),
-                baseline: "baseline".into(),
-                head: "head".into(),
-                scan: r#"{"functions":[{"name":"shrink_node","risk_rating":81}]}"#.into(),
+                scan: r#"{"functions":[{"name":"shrink_node","uses":4}]}"#.into(),
             }),
             ..Default::default()
         };
@@ -231,9 +227,7 @@ mod tests {
             Some(ReviewFileScanState {
                 target: "mm/vmscan.c".into(),
                 source_hash: "source-hash".into(),
-                baseline: "baseline".into(),
-                head: "head".into(),
-                scan: r#"{"functions":[{"name":"shrink_node","risk_rating":81}]}"#.into(),
+                scan: r#"{"functions":[{"name":"shrink_node","uses":4}]}"#.into(),
             })
         );
     }

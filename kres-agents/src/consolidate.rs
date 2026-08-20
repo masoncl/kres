@@ -441,6 +441,7 @@ mod tests {
             details: vec![],
             introduced_by: None,
             first_seen_at: None,
+            invalidation: None,
         }
     }
 

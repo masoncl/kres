@@ -45,7 +45,72 @@ pub struct Message {
     /// `mark_last_n_user_cached`, which budgets one marker per
     /// retained user turn. Callers choose split points with both
     /// limits in mind.
-    pub cached_prefixes: Vec<String>,
+    pub cached_prefixes: Vec<CachedPrefix>,
+}
+
+/// How long a cached block should survive without a read.
+///
+/// The provider charges more to WRITE a longer-lived block, so this is
+/// a real choice per block, not a free win. It pays only when the same
+/// bytes are re-read after the short window has already closed.
+/// Measured on the 2026-08-22 arch/x86/kvm/mmu/mmu.c review by
+/// replaying every request's block hashes against both windows:
+///
+/// * the lens session head (skills + previous findings) is stable for
+///   a whole task and re-read for 24-59 minutes, so five-minute
+///   expiry forced 3.5x the writes an hour would have. `Long` is
+///   29.6% cheaper on it.
+/// * the per-task head (question, symbols, plan) took 390 distinct
+///   values over 1499 uses -- nearly one per task -- so a longer
+///   window removes almost no writes and just pays more for each.
+///   `Long` is 26.4% MORE expensive on it.
+///
+/// Blocks cache as a chain: an entry covers everything before it too.
+/// So only the FIRST block gains from `Long` independently; giving a
+/// later block a longer window while an earlier one keeps `Short`
+/// buys nothing, because the prefix it depends on expires first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheTtl {
+    /// The provider default (five minutes).
+    #[default]
+    Short,
+    /// Extended (one hour).
+    Long,
+}
+
+/// A cached content block and the window it should live for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedPrefix {
+    pub text: String,
+    pub ttl: CacheTtl,
+}
+
+impl From<&str> for CachedPrefix {
+    fn from(text: &str) -> Self {
+        Self::short(text)
+    }
+}
+
+impl From<String> for CachedPrefix {
+    fn from(text: String) -> Self {
+        Self::short(text)
+    }
+}
+
+impl CachedPrefix {
+    pub fn short(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ttl: CacheTtl::Short,
+        }
+    }
+
+    pub fn long(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ttl: CacheTtl::Long,
+        }
+    }
 }
 
 impl Message {
@@ -71,7 +136,7 @@ impl Message {
     /// block on the wire. `content` becomes the tail. Concatenated
     /// prefix + content is what the model sees.
     pub fn with_cached_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.cached_prefixes = vec![prefix.into()];
+        self.cached_prefixes = vec![CachedPrefix::short(prefix)];
         self
     }
 
@@ -85,8 +150,8 @@ impl Message {
     {
         self.cached_prefixes = prefixes
             .into_iter()
-            .map(Into::into)
-            .filter(|p: &String| !p.is_empty())
+            .map(CachedPrefix::short)
+            .filter(|p: &CachedPrefix| !p.text.is_empty())
             .collect();
         self
     }
@@ -110,8 +175,8 @@ impl serde::Serialize for Message {
                     .map(|prefix| {
                         serde_json::json!({
                             "type": "text",
-                            "text": prefix,
-                            "cache_control": {"type": "ephemeral"},
+                            "text": prefix.text,
+                            "cache_control": CacheControl::ephemeral(prefix.ttl),
                         })
                     })
                     .collect();
@@ -156,7 +221,10 @@ pub fn strip_cache_flags(msgs: &mut [Message]) {
             // Keep the TEXT the model sees identical — fold the
             // stripped prefixes back into `content` as a plain head,
             // in the order they would have been emitted.
-            let head = std::mem::take(&mut m.cached_prefixes).concat();
+            let head: String = std::mem::take(&mut m.cached_prefixes)
+                .into_iter()
+                .map(|p| p.text)
+                .collect();
             m.content = format!("{head}{}", m.content);
         }
     }
@@ -202,7 +270,10 @@ pub fn mark_last_n_user_cached(msgs: &mut [Message], n: usize) {
         } else {
             m.cache = false;
             if !m.cached_prefixes.is_empty() {
-                let head = std::mem::take(&mut m.cached_prefixes).concat();
+                let head: String = std::mem::take(&mut m.cached_prefixes)
+                    .into_iter()
+                    .map(|p| p.text)
+                    .collect();
                 m.content = format!("{head}{}", m.content);
             }
         }
@@ -296,6 +367,45 @@ mod cache_helpers_tests {
         );
     }
 
+    /// The window is per block, and only a block that asked for the
+    /// long one carries `ttl`. Chained prefix caching is why this is
+    /// per block rather than per request: the first block's entry
+    /// stands alone, so it is the only one that can profit from
+    /// outliving the default window while a later block keeps it.
+    #[test]
+    fn only_a_long_lived_prefix_carries_an_extended_ttl() {
+        let m = Message {
+            role: "user".into(),
+            content: "DELTA".into(),
+            cache: false,
+            cached_prefixes: vec![CachedPrefix::long("SESSION"), CachedPrefix::short("TASK")],
+        };
+        let v = serde_json::to_value(&m).expect("serializes");
+        let blocks = v["content"].as_array().expect("block array");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[0]["cache_control"]["ttl"], "1h");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(
+            blocks[1]["cache_control"].get("ttl").is_none(),
+            "the default window must not be spelled out; absent means five minutes"
+        );
+    }
+
+    #[test]
+    fn a_bare_string_prefix_defaults_to_the_short_window() {
+        // Every caller that has not thought about it gets the cheap
+        // write, not the expensive one.
+        let m = Message {
+            role: "user".into(),
+            content: "DELTA".into(),
+            cache: false,
+            cached_prefixes: vec!["HEAD".into()],
+        };
+        assert_eq!(m.cached_prefixes[0].ttl, CacheTtl::Short);
+        let v = serde_json::to_value(&m).expect("serializes");
+        assert!(v["content"][0]["cache_control"].get("ttl").is_none());
+    }
+
     /// System + two heads + a cached tail is exactly Anthropic's cap of
     /// four. The lens path leaves the tail uncached, so it sits at
     /// three; this asserts the ceiling is understood, not exceeded.
@@ -380,6 +490,23 @@ pub struct SystemBlock<'a> {
 pub struct CacheControl {
     #[serde(rename = "type")]
     pub kind: &'static str, // "ephemeral"
+    /// `None` is the provider default window. Present only for the
+    /// longer one, since the provider rejects a request whose blocks
+    /// do not run longest-lived first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<&'static str>,
+}
+
+impl CacheControl {
+    pub fn ephemeral(ttl: CacheTtl) -> Self {
+        Self {
+            kind: "ephemeral",
+            ttl: match ttl {
+                CacheTtl::Short => None,
+                CacheTtl::Long => Some("1h"),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -422,12 +549,28 @@ impl<'a> MessagesRequest<'a> {
         } else {
             cfg.temperature
         };
+        // Cache blocks are processed `tools`, then `system`, then
+        // `messages`, and the provider refuses a longer-lived block
+        // that follows a shorter-lived one. The system prompt sits
+        // ahead of every message block, so its window has to be at
+        // least the longest any message asks for. It is also the most
+        // stable text in the request — one role prompt, byte-identical
+        // on every call — so widening it costs one extra write and
+        // buys the reads back immediately.
+        let system_ttl = if messages
+            .iter()
+            .any(|m| m.cached_prefixes.iter().any(|p| p.ttl == CacheTtl::Long))
+        {
+            CacheTtl::Long
+        } else {
+            CacheTtl::Short
+        };
         let system = cfg.system.as_deref().map(|s| {
             if cfg.system_cached {
                 SystemField::Cached([SystemBlock {
                     kind: "text",
                     text: s,
-                    cache_control: CacheControl { kind: "ephemeral" },
+                    cache_control: CacheControl::ephemeral(system_ttl),
                 }])
             } else {
                 SystemField::Plain(s)
@@ -608,6 +751,55 @@ mod tests {
         let t = v.get("temperature").and_then(|x| x.as_f64()).unwrap();
         assert!((t - 0.3_f64).abs() < 1e-6, "got {t}");
         assert!(v.get("thinking").is_none());
+    }
+
+    /// Reproduces a live 400: "a ttl='1h' cache_control block must
+    /// not come after a ttl='5m' cache_control block. Note that blocks
+    /// are processed in the following order: `tools`, `system`,
+    /// `messages`." The system block precedes every message block, so
+    /// its window has to cover the longest one any message asks for.
+    #[test]
+    fn a_long_lived_message_block_widens_the_system_block() {
+        let cfg = CallConfig::defaults_for(Model::opus_4_7()).with_system("role prompt");
+        assert!(cfg.system_cached, "this test needs a cached system block");
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "DELTA".into(),
+            cache: false,
+            cached_prefixes: vec![CachedPrefix::long("SESSION"), CachedPrefix::short("TASK")],
+        }];
+        let v: Value = serde_json::to_value(MessagesRequest::from_config(&cfg, &msgs, false))
+            .expect("serializes");
+
+        assert_eq!(
+            v["system"][0]["cache_control"]["ttl"], "1h",
+            "system must not be shorter-lived than a message block that follows it"
+        );
+        let blocks = v["messages"][0]["content"].as_array().expect("blocks");
+        assert_eq!(blocks[0]["cache_control"]["ttl"], "1h");
+        assert!(
+            blocks[1]["cache_control"].get("ttl").is_none(),
+            "the task block keeps the default window"
+        );
+    }
+
+    /// The common case must not pay for a wider window it never asked
+    /// for: no long-lived message block means no `ttl` anywhere.
+    #[test]
+    fn an_all_default_request_names_no_ttl() {
+        let cfg = CallConfig::defaults_for(Model::opus_4_7()).with_system("role prompt");
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "DELTA".into(),
+            cache: false,
+            cached_prefixes: vec![CachedPrefix::short("HEAD")],
+        }];
+        let v: Value = serde_json::to_value(MessagesRequest::from_config(&cfg, &msgs, false))
+            .expect("serializes");
+        assert!(v["system"][0]["cache_control"].get("ttl").is_none());
+        assert!(v["messages"][0]["content"][0]["cache_control"]
+            .get("ttl")
+            .is_none());
     }
 
     #[test]

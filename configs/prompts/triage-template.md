@@ -133,6 +133,16 @@ real, do not stop here — let the tree reach `Confirmed Latent`
 (real but no current trigger) or `Plausible` (real and
 reachable).
 
+When `metadata.yaml` carries an `invalidation:` block, that is the
+whole of the negative evidence: one `premise` plus the `evidence`
+cited for it. Check that premise against current source before
+accepting `Invalid`. Two failure modes to test for specifically —
+the premise may be false outright, or it may be true of something
+narrower than the finding needs (true of one call, one request, one
+code path, one moment) while being stated as if it held for the
+object's whole lifetime. In either case the invalidation carries
+nothing and the tree continues.
+
 ### 2. `Not A Defect`
 
 The described behaviour **does** occur — you did not disprove it — but
@@ -202,15 +212,15 @@ demonstrated. Read each tag in context; do not match by keyword.
 
 Worked examples:
 
-- `atomic_cgwb_create_gfp_sleep` — the call chain to
-  `cgwb_create(GFP_ATOMIC)` is confirmed correct; the entire
+- `atomic_alloc_may_sleep` — the call chain to
+  `widget_create(GFP_ATOMIC)` is confirmed correct; the entire
   finding is whether three callees honour the gfp flag. Nothing
   was shown to sleep. → `Unconfirmed`.
-- `dup_anon_vma_stale_dst_anon_vma` — FINDING.md's Summary opens
-  with `[UNVERIFIED — depends on cleanup_partial_anon_vmas()
+- `dup_parent_stale_child_ref` — FINDING.md's Summary opens
+  with `[UNVERIFIED — depends on widget_cleanup_partial()
   behaviour]`, and Details say "the entire finding is
-  conditional on whether `cleanup_partial_anon_vmas()` resets
-  `dst->anon_vma`". One unverified callee gates the whole bug.
+  conditional on whether `widget_cleanup_partial()` resets
+  `dst->parent`". One unverified callee gates the whole bug.
   → `Unconfirmed`, NOT `Unknown`.
 
 ### 5. `Confirmed Latent`

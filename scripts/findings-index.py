@@ -56,7 +56,16 @@ Two modes, picked by mutually exclusive flags:
         has:<filename>        — matches findings that contain the named
                                 file (e.g. has:summary.md to select only
                                 triaged findings)
-        since:<YYYY-MM-DD>    — date >= since (undated rows excluded)
+        since:<date>          — date >= since (undated rows excluded)
+
+      The bound is parsed by `parse_date_bound`: ISO first
+      (`2026-04-01`, `20260401`, `2026-04-01T09:30`), then `2026/04/01`,
+      then the month / year prefixes `2026-04` and `2026`, which mean
+      the first day of that month / year. `python-dateutil` is used for
+      anything else when it happens to be installed, so `since:1-Apr-2026`
+      works there and errors out where it isn't — the script bundles into
+      the kres binary and cannot declare a dependency. The value cannot
+      contain whitespace: the query tokenizer splits on it.
 
 A copy of this script is installed alongside the exported findings the
 first time `kres --export` (or `--export-index`) runs over a directory.
@@ -74,6 +83,92 @@ import textwrap
 
 
 SEV_RANK = {"high": 3, "medium": 2, "low": 1}
+
+
+# --- date bounds -------------------------------------------------------
+#
+# `since:` compares calendar dates, not strings. String compare
+# happened to work while every bound was written YYYY-MM-DD —
+# the same form kres stamps into metadata.yaml (`%Y-%m-%d`, see
+# kres-repl/src/export.rs) — and silently produced wrong answers for
+# anything else: "2026-4-1" sorts after "2026-12-31".
+#
+# The stdlib does the work. `python-dateutil` is consulted last, and
+# only if it imports, because this script is embedded in the kres
+# binary and copied into export trees where nothing installs its
+# dependencies. Everything the stdlib path accepts therefore behaves
+# identically everywhere; dateutil only widens what an operator with
+# it installed can type.
+
+try:  # optional, never required
+    from dateutil import parser as _dateutil_parser
+except ImportError:  # pragma: no cover - depends on the host env
+    _dateutil_parser = None
+
+
+_DATE_FORMATS = (
+    "%Y%m%d",     # 20260401
+    "%Y-%m-%d",   # 2026-4-1   (fromisoformat wants zero padding)
+    "%Y/%m/%d",   # 2026/04/01
+    "%Y-%m",      # 2026-04   -> 2026-04-01
+    "%Y/%m",      # 2026/04   -> 2026-04-01
+    "%Y",         # 2026      -> 2026-01-01
+)
+
+
+def parse_date_bound(value):
+    """Parse a date bound into a `datetime.date`.
+
+    Raises ValueError with the offending text when nothing parses, so
+    a typo in `--search` reports like a bad regex does instead of
+    silently matching nothing.
+    """
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("empty date")
+    try:
+        # Handles 2026-04-01 and, on 3.11+, the wider ISO 8601 set.
+        # A timestamp is accepted and truncated to its calendar date.
+        return datetime.date.fromisoformat(text)
+    except ValueError:
+        pass
+    try:
+        return datetime.datetime.fromisoformat(text).date()
+    except ValueError:
+        pass
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    if _dateutil_parser is not None:
+        try:
+            return _dateutil_parser.parse(text).date()
+        except (ValueError, OverflowError):
+            pass
+    raise ValueError(
+        "cannot parse date {!r} (try YYYY-MM-DD)".format(text)
+    )
+
+
+def row_date(row):
+    """Return a row's `datetime.date`, or None when it has no usable
+    date. Parsed once and memoised on the row — a query with several
+    date clauses over a few thousand findings would otherwise reparse
+    the same string repeatedly.
+    """
+    if "date_obj" in row:
+        return row["date_obj"]
+    raw = row.get("date")
+    try:
+        parsed = parse_date_bound(raw) if raw else None
+    except ValueError:
+        # A metadata.yaml carrying an unreadable date is treated the
+        # same as an undated one: excluded by any date bound, rather
+        # than aborting the whole search.
+        parsed = None
+    row["date_obj"] = parsed
+    return parsed
 
 
 def parse_top_level(yaml_text, key):
@@ -638,6 +733,8 @@ class _Clause:
     def __init__(self, key, value):
         self.key = key
         self.value = value
+        self.pattern = None
+        self.date_bound = None
         if key in _REGEX_KEYS:
             try:
                 self.pattern = re.compile(value, re.IGNORECASE)
@@ -645,8 +742,13 @@ class _Clause:
                 raise ValueError(
                     "invalid regex for {}: {}".format(key, exc)
                 )
-        else:
-            self.pattern = None
+        elif key == "since":
+            # Parse at construction time so an unusable bound reports
+            # before the walk, next to where an invalid regex reports.
+            try:
+                self.date_bound = parse_date_bound(value)
+            except ValueError as exc:
+                raise ValueError("invalid date for {}: {}".format(key, exc))
 
     def matches(self, row):
         if self.key == "severity":
@@ -680,7 +782,9 @@ class _Clause:
                 os.path.join(row["dir_path"], self.value)
             )
         if self.key == "since":
-            return bool(row["date"]) and row["date"] >= self.value
+            # An undated row can't be shown to satisfy the bound.
+            date = row_date(row)
+            return date is not None and date >= self.date_bound
         return False
 
 

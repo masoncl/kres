@@ -34,7 +34,11 @@ use kres_core::log::{LoggedUsage, TurnLogger};
 use kres_core::todo::TodoItem;
 use kres_core::UsageTracker;
 use kres_llm::{
-    client::Client, config::CallConfig, model::ThinkingBudget, request::Message, Model,
+    client::Client,
+    config::CallConfig,
+    model::ThinkingBudget,
+    request::{CachedPrefix, Message},
+    Model,
 };
 
 use crate::error::AgentError;
@@ -221,13 +225,19 @@ pub async fn prioritize_pending_with_logger(
     // until the first finding lands, and an empty text block is not
     // cacheable — it would spend one of Anthropic's four slots on
     // nothing, or be rejected outright.
+    // Long-lived, and it must MATCH the lens fan-out's head: this is
+    // the same bytes the wave's lenses send, and the whole point of
+    // building it through one constructor is that the prioritizer
+    // reads the entry they wrote. A different window on the same
+    // bytes would be a second entry.
     let messages = vec![Message {
         role: "user".into(),
         content: delta,
         cache: false,
-        cached_prefixes: Vec::new(),
-    }
-    .with_cached_prefixes([session_head])];
+        cached_prefixes: Vec::from_iter(
+            (!session_head.is_empty()).then(|| CachedPrefix::long(session_head)),
+        ),
+    }];
     if let Some(lg) = &logger {
         let meta = cfg.request_meta();
         lg.log_main_with_request(
@@ -562,7 +572,7 @@ mod tests {
             role: "user".into(),
             content: delta.clone(),
             cache: false,
-            cached_prefixes: vec![head.clone()],
+            cached_prefixes: vec![CachedPrefix::long(head.clone())],
         };
         let wire = serde_json::to_value(&message).unwrap();
         let blocks = wire["content"].as_array().unwrap();

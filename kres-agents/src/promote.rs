@@ -83,6 +83,16 @@ pub const PROMOTE_SYSTEM: &str = include_str!("prompts/promote_system.txt");
 /// which entries are invalidated. Dropping it would silently retire
 /// that behaviour.
 ///
+/// `invalidation` is here for the same reason and is the more useful
+/// half: the status says a finding was retired, the premise says on
+/// what claim. Reversing an invalidation does not require re-proving
+/// the bug — contradicting its one recorded premise is enough, since
+/// the premise is the whole of the negative evidence. A promoter that
+/// sees only `status` can spot that a finding is dead but has no way
+/// to notice the prose in front of it just refuted the reason.
+/// `None` on everything not invalidated, so this costs nothing on the
+/// common entry.
+///
 /// Measured on the 2026-08-07 kernel/sched/fair.c review: a promote
 /// request carrying 134 full findings was 1,350 KB, of which 1,328 KB
 /// was `existing_findings` and 5.6 KB was the prose being audited —
@@ -95,6 +105,8 @@ struct FindingIdentity<'a> {
     title: &'a str,
     status: kres_core::findings::Status,
     summary: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invalidation: Option<&'a kres_core::findings::InvalidationBasis>,
 }
 
 impl<'a> From<&'a Finding> for FindingIdentity<'a> {
@@ -104,6 +116,7 @@ impl<'a> From<&'a Finding> for FindingIdentity<'a> {
             title: &f.title,
             status: f.status,
             summary: &f.summary,
+            invalidation: f.invalidation.as_ref(),
         }
     }
 }
@@ -365,8 +378,11 @@ pub async fn promote_prose_bugs_with_logger(
 
 /// Filter and normalize promoted finding deltas.
 ///
-/// Same-id `status: invalidated` entries and `reactivate: true`
-/// entries are preserved: they intentionally update existing rows.
+/// Same-id status changes are preserved: `invalidated`,
+/// `unconfirmed`, and `reactivate: true` all intentionally update an
+/// existing row rather than describing a second bug. Renaming one of
+/// those would file a duplicate AND leave the original at its old
+/// status, i.e. do the opposite of what the delta asked.
 /// New active findings must have ids distinct from both the
 /// `existing` set and every other entry in `promoted`; on collision,
 /// rename by appending a `__promoted_<n>` suffix rather than
@@ -393,8 +409,10 @@ fn filter_promoted_delta(promoted: Vec<Finding>, existing: &[Finding]) -> Vec<Fi
             continue;
         }
         if let Some(prior) = existing.iter().find(|e| e.id == p.id) {
-            if p.status == kres_core::findings::Status::Invalidated
-                || (p.reactivate && prior.status == kres_core::findings::Status::Invalidated)
+            if matches!(
+                p.status,
+                kres_core::findings::Status::Invalidated | kres_core::findings::Status::Unconfirmed
+            ) || (p.reactivate && prior.status == kres_core::findings::Status::Invalidated)
             {
                 out.push(p);
                 continue;
@@ -433,6 +451,33 @@ mod tests {
     use super::*;
     use kres_core::findings::{Severity, Status};
 
+    #[test]
+    fn promoter_sees_the_invalidation_premise_of_existing_findings() {
+        // The promoter is allowed to reactivate, and the cheapest
+        // reason to reactivate is that the prose in front of it
+        // refutes the recorded premise. It cannot do that if the
+        // premise is trimmed out of the request on the way in.
+        let mut retired = f("a");
+        retired.status = Status::Invalidated;
+        retired.invalidation = Some(kres_core::findings::InvalidationBasis {
+            premise: "the two flags are rejected together".into(),
+            evidence: vec!["virt/kvm/kvm_main.c:1586".into()],
+        });
+        let wire = serde_json::to_value(FindingIdentity::from(&retired)).unwrap();
+        assert_eq!(
+            wire["invalidation"]["premise"],
+            "the two flags are rejected together"
+        );
+        assert_eq!(
+            wire["invalidation"]["evidence"][0],
+            "virt/kvm/kvm_main.c:1586"
+        );
+
+        // ...and costs nothing on the common (active) entry.
+        let live = serde_json::to_value(FindingIdentity::from(&f("b"))).unwrap();
+        assert!(live.get("invalidation").is_none());
+    }
+
     fn f(id: &str) -> Finding {
         Finding {
             id: id.to_string(),
@@ -455,6 +500,7 @@ mod tests {
             details: vec![],
             introduced_by: None,
             first_seen_at: None,
+            invalidation: None,
         }
     }
 
@@ -548,6 +594,22 @@ mod tests {
         let out = filter_promoted_delta(vec![weird, f("legit")], &[]);
         let ids: Vec<&str> = out.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec!["legit"]);
+    }
+
+    #[test]
+    fn filter_preserves_a_same_id_downgrade_to_unconfirmed() {
+        // The promoter is told to send `unconfirmed` for a finding the
+        // prose leaves unsettled rather than disproved. That is a
+        // status change on an existing id, not a second bug: renaming
+        // it to `<id>__promoted_2` would file a duplicate and leave the
+        // original untouched, which is the opposite of what was asked.
+        let existing = vec![f("a")];
+        let mut unsure = f("a");
+        unsure.status = Status::Unconfirmed;
+        let out = filter_promoted_delta(vec![unsure], &existing);
+        let ids: Vec<&str> = out.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, vec!["a"]);
+        assert_eq!(out[0].status, Status::Unconfirmed);
     }
 
     #[test]

@@ -1054,7 +1054,10 @@ async fn stage_render(
                 role: "user".into(),
                 content: split.delta,
                 cache: false,
-                cached_prefixes: Vec::from_iter((!split.stable.is_empty()).then_some(split.stable)),
+                cached_prefixes: Vec::from_iter(
+                    (!split.stable.is_empty())
+                        .then(|| kres_llm::request::CachedPrefix::short(split.stable)),
+                ),
             }]
         } else {
             vec![user_message(&serde_json::to_string(&request)?)]
@@ -1573,7 +1576,17 @@ async fn try_call_and_extract(
         let request = call.cfg.request_meta();
         let rendered = messages
             .iter()
-            .map(|message| format!("{}{}", message.cached_prefixes.concat(), message.content))
+            .map(|message| {
+                format!(
+                    "{}{}",
+                    message
+                        .cached_prefixes
+                        .iter()
+                        .map(|p| p.text.as_str())
+                        .collect::<String>(),
+                    message.content
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         logger.log_code_labeled_with_request(
@@ -1700,6 +1713,7 @@ try_call_and_extract so it is logged."
             resolved_questions: vec![],
             introduced_by: None,
             first_seen_at: None,
+            invalidation: None,
         }
     }
 

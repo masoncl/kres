@@ -28,7 +28,7 @@ use kres_llm::{
     client::Client,
     config::CallConfig,
     model::{Effort, ThinkingBudget},
-    request::{mark_last_n_user_cached, Message},
+    request::{mark_last_n_user_cached, CachedPrefix, Message},
     Model,
 };
 
@@ -824,10 +824,19 @@ fn build_cache_probe_future(
     // Two cached blocks + the system prompt = three of Anthropic's
     // four `cache_control` slots. The tail is deliberately uncached:
     // it is a throwaway instruction no sibling will ever re-send.
-    let prefixes: Vec<String> = [session_prefix, task_prefix]
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .collect();
+    // The session head is FIRST, so its cache entry stands alone and
+    // an hour-long window is worth its higher write price: the same
+    // skills and findings are re-read across a task's whole life,
+    // which routinely exceeds the five-minute default. The task head
+    // is nearly unique per task, so a longer window would remove
+    // almost no writes and just cost more for each. See `CacheTtl`.
+    let prefixes: Vec<CachedPrefix> = [
+        CachedPrefix::long(session_prefix),
+        CachedPrefix::short(task_prefix),
+    ]
+    .into_iter()
+    .filter(|p| !p.text.is_empty())
+    .collect();
     async move {
         let messages = vec![Message {
             role: "user".into(),
@@ -914,10 +923,19 @@ fn build_lens_call_future(
     let lens_label = format!("lens {lens_name} ({model_label})");
     let log_label = format!("phase=slow-lens task={task_brief} lens={lens_id} model={model_label}");
     let lens_logged = format!("{session_prefix}{task_prefix}{lens_suffix}");
-    let prefixes: Vec<String> = [session_prefix, task_prefix]
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .collect();
+    // The session head is FIRST, so its cache entry stands alone and
+    // an hour-long window is worth its higher write price: the same
+    // skills and findings are re-read across a task's whole life,
+    // which routinely exceeds the five-minute default. The task head
+    // is nearly unique per task, so a longer window would remove
+    // almost no writes and just cost more for each. See `CacheTtl`.
+    let prefixes: Vec<CachedPrefix> = [
+        CachedPrefix::long(session_prefix),
+        CachedPrefix::short(task_prefix),
+    ]
+    .into_iter()
+    .filter(|p| !p.text.is_empty())
+    .collect();
     async move {
         let messages = if use_cache {
             vec![Message {
@@ -1159,7 +1177,7 @@ impl AgentRunner {
             role: "user".into(),
             content: prompt_tail.to_string(),
             cache: cached_prefix.is_some(),
-            cached_prefixes: Vec::from_iter(cached_prefix.map(str::to_string)),
+            cached_prefixes: Vec::from_iter(cached_prefix.map(CachedPrefix::short)),
         }];
         let mut cfg = CallConfig::defaults_for(self.slow_model.clone())
             .with_max_tokens(self.slow_max_tokens)
@@ -1314,10 +1332,15 @@ impl AgentRunner {
             role: "user".into(),
             content: layered.delta,
             cache: false,
-            cached_prefixes: [layered.session, layered.task]
-                .into_iter()
-                .filter(|layer| !layer.is_empty())
-                .collect(),
+            // Session layer long, task layer short -- same reasoning
+            // as the lens fan-out; see `CacheTtl`.
+            cached_prefixes: [
+                CachedPrefix::long(layered.session),
+                CachedPrefix::short(layered.task),
+            ]
+            .into_iter()
+            .filter(|layer| !layer.text.is_empty())
+            .collect(),
         }];
         // Route the synthesis call to the fast client when the
         // caller (typically a workflow step declared `agent: fast`)
@@ -1763,12 +1786,22 @@ impl AgentRunner {
         let mut owned_ctx: Option<RunContext> = None;
         let mut requeued: u32 = 0;
         let mut requested: HashSet<String> = HashSet::new();
+        // Lenses still being re-run, and the finished output of those
+        // that are not. `active` only ever shrinks, so a lens parked
+        // here is never re-run and the two sets stay disjoint.
+        let mut active: Vec<LensSpec> = lenses.to_vec();
+        let mut parked_outputs: Vec<LensRunOutput> = Vec::new();
+        let mut parked_failures: Vec<LensRunFailure> = Vec::new();
+        // The first round is the only one that fans out over every
+        // lens, so it owns the count the "N of M did not produce
+        // output" line reports.
+        let mut first_attempted: Option<usize> = None;
         let fanout = loop {
-            let fanout = {
+            let mut fanout = {
                 let ctx_ref = owned_ctx.as_ref().unwrap_or(ctx);
                 self.run_lenses_shared_gather_repairing(
                     prompt,
-                    lenses,
+                    &active,
                     ctx_ref,
                     shutdown,
                     LensRepairPolicy {
@@ -1781,8 +1814,32 @@ impl AgentRunner {
                 )
                 .await?
             };
+            let attempted = *first_attempted.get_or_insert(fanout.attempted);
+            // Finish: hand back every lens's latest output, not just
+            // this round's, and report the full first fan-out as the
+            // count attempted.
+            macro_rules! settle {
+                () => {{
+                    fanout.outputs.append(&mut parked_outputs);
+                    fanout.failures.append(&mut parked_failures);
+                    // Back into declared lens order. Parking appends,
+                    // so without this the consolidator would see the
+                    // lenses shuffled by which of them happened to ask
+                    // for evidence last.
+                    let rank = |id: &str| {
+                        lenses
+                            .iter()
+                            .position(|lens| lens.id == id)
+                            .unwrap_or(usize::MAX)
+                    };
+                    fanout.outputs.sort_by_key(|o| rank(&o.lens_id));
+                    fanout.failures.sort_by_key(|f| rank(&f.lens_id));
+                    fanout.attempted = attempted;
+                    break fanout;
+                }};
+            }
             if !requeue_allowed {
-                break fanout;
+                settle!();
             }
             // One selection over every lens's requests pooled
             // together, so `requested` dedups across lenses and a
@@ -1796,7 +1853,7 @@ impl AgentRunner {
                 .collect();
             let wanted = crate::followup::requeue_evidence_requests(&asked, &mut requested);
             if wanted.is_empty() {
-                break fanout;
+                settle!();
             }
             // Budget is checked against real demand, so the log below
             // never claims requests were dropped when none were asked
@@ -1808,7 +1865,25 @@ impl AgentRunner {
                     crate::followup::MAX_TASK_REQUEUES,
                     wanted.len(),
                 );
-                break fanout;
+                settle!();
+            }
+            // Who re-runs: the lenses this fetch is FOR, plus any lens
+            // that produced nothing usable, since re-running is the
+            // only way to get an answer out of those at all. A lens
+            // that answered and asked for nothing keeps its answer.
+            let fetching: HashSet<String> = wanted.iter().map(|fu| fu.cache_key()).collect();
+            let mut next_ids: BTreeSet<String> = fanout
+                .outputs
+                .iter()
+                .filter(|output| {
+                    crate::followup::lens_awaits_evidence(&output.parsed.followups, &fetching)
+                        || validate_generic_lens_output(output).is_err()
+                })
+                .map(|output| output.lens_id.clone())
+                .collect();
+            next_ids.extend(fanout.failures.iter().map(|f| f.lens_id.clone()));
+            if next_ids.is_empty() {
+                settle!();
             }
             requeued += 1;
             let preview: Vec<String> = wanted
@@ -1817,13 +1892,29 @@ impl AgentRunner {
                 .map(|fu| format!("{}:{}", fu.kind, truncate(&fu.name, 40)))
                 .collect();
             kres_core::async_eprintln!(
-                "[requeue {}/{}] fetching {} blocking request(s) and re-running {} lens(es): {}",
+                "[requeue {}/{}] fetching {} blocking request(s) and re-running {} of {} lens(es): {}",
                 requeued,
                 crate::followup::MAX_TASK_REQUEUES,
                 wanted.len(),
-                lenses.len(),
+                next_ids.len(),
+                active.len(),
                 preview.join(", "),
             );
+            // Park the lenses that are done. Their output is the one
+            // the consolidator will see.
+            parked_outputs.extend(
+                fanout
+                    .outputs
+                    .drain(..)
+                    .filter(|output| !next_ids.contains(&output.lens_id)),
+            );
+            parked_failures.extend(
+                fanout
+                    .failures
+                    .drain(..)
+                    .filter(|failure| !next_ids.contains(&failure.lens_id)),
+            );
+            active.retain(|lens| next_ids.contains(&lens.id));
             // Carry the gather forward as the next round's seed so the
             // fetch is additive: a requeue must never make a lens see
             // LESS than the round that asked the question.
@@ -2741,6 +2832,28 @@ impl AgentRunner {
                 for item in fetched_context {
                     crate::symbol::append_prompt_evidence(&mut context, item);
                 }
+                // State WHY this evidence was fetched. Without it the
+                // round that receives an answer has no record of the
+                // question: a lens call is single-turn, so the model
+                // does not see its own previous output, and the prompt
+                // is otherwise byte-identical apart from the new
+                // bodies. `pending_followups` carries each request's
+                // `reason` this far and it was being consumed as a
+                // fetch key only.
+                //
+                // Measured on the 2026-08-21 arch/x86/kvm/mmu/mmu.c
+                // review: the memory-lifetime lens derived a complete
+                // guard defect, wrote it into a followup `reason`, and
+                // emitted one blocking request for the single body that
+                // would settle it. The requeue served that body. The
+                // next round never mentioned the function again.
+                let (_, served) = crate::symbol::canonicalize_prompt_evidence(
+                    &[],
+                    &[requeue_request_ledger(&novel)],
+                );
+                for item in served {
+                    crate::symbol::append_prompt_evidence(&mut context, item);
+                }
             }
         }
         let mut round_symbols = symbols.clone();
@@ -2807,7 +2920,7 @@ impl AgentRunner {
                 cached_prefixes: if split.stable.is_empty() {
                     Vec::new()
                 } else {
-                    vec![split.stable]
+                    vec![CachedPrefix::short(split.stable)]
                 },
             });
             mark_last_n_user_cached(&mut history, 2);
@@ -2817,7 +2930,11 @@ impl AgentRunner {
                         "role": message.role,
                         "content": format!(
                             "{}{}",
-                            message.cached_prefixes.concat(),
+                            message
+                                .cached_prefixes
+                                .iter()
+                                .map(|p| p.text.as_str())
+                                .collect::<String>(),
                             message.content
                         ),
                     })
@@ -3040,6 +3157,41 @@ impl AgentRunner {
 /// Drops `question` followups (the fetcher cannot answer one) and
 /// anything already served, marking the rest as served so the gather
 /// loop does not re-request them.
+/// The open questions this gather round was created to answer.
+///
+/// A lens call is single-turn: the model never sees its own previous
+/// output, and every requeue round ships the same `question`,
+/// `lens_instruction` and `plan` bytes. So a request's `reason` — the
+/// only place the suspicion is written down — has to be restated
+/// alongside the evidence it caused, or the round that receives the
+/// answer cannot know what it answers.
+///
+/// Deterministic: `pending_prefetch_targets` preserves the emitting
+/// order, so the same served set renders the same bytes and the task
+/// cache block still hits.
+fn requeue_request_ledger(served: &[Followup]) -> Value {
+    let mut body = String::from(
+        "EVIDENCE YOU ASKED FOR, NOW SUPPLIED. A previous round of this same \
+         analysis stopped short and requested the items below; they have been \
+         fetched into `symbols`/`context` for this round. Each is followed by \
+         the reason that round gave for needing it. Resolve each one \
+         explicitly: prove it, disprove it with cited evidence, or emit a \
+         Finding. Do not silently drop a question that has now been answered.\n",
+    );
+    for followup in served {
+        body.push_str(&format!(
+            "\n- [{}] {}\n  asked because: {}\n",
+            followup.kind,
+            followup.name.trim(),
+            followup.reason.trim(),
+        ));
+    }
+    serde_json::json!({
+        "source": "requeue:answered-requests",
+        "content": body,
+    })
+}
+
 fn pending_prefetch_targets(
     pending: &[Followup],
     fetched_keys: &mut HashSet<String>,
@@ -3987,6 +4139,7 @@ mod tests {
                 reactivate: false,
                 resolved_questions: vec![],
                 introduced_by: None,
+                invalidation: None,
             }
         }
 
@@ -4303,5 +4456,57 @@ mod tests {
         let mut fetched = HashSet::new();
         assert!(pending_prefetch_targets(&[], &mut fetched).is_empty());
         assert!(fetched.is_empty());
+    }
+
+    /// The regression this exists for, taken from the 2026-08-21
+    /// arch/x86/kvm/mmu/mmu.c review: a lens derived a complete guard
+    /// defect, wrote the whole mechanism into a followup `reason`, and
+    /// asked for the one body that would settle it. The requeue used
+    /// the `name` to fetch and discarded the `reason`, so the round
+    /// that received the body never mentioned the function again. The
+    /// reason has to travel with the evidence it bought.
+
+    #[test]
+    fn served_requests_restate_the_question_they_answer() {
+        let mut asked = followup("source", "kvm_mmu_zap_oldest_mmu_pages");
+        asked.reason = "[MISSING] direct_page_fault() calls make_mmu_pages_available() \
+                        between the is_page_fault_stale() TEST and the direct_map() USE."
+            .to_string();
+        let other = followup("read", "arch/x86/kvm/mmu/paging_tmpl.h:780+90");
+
+        let ledger = requeue_request_ledger(&[asked.clone(), other.clone()]);
+        let body = ledger["content"].as_str().expect("content is a string");
+
+        // Both the request and the reason for it, or the round that
+        // gets the answer cannot tell which body it was waiting on.
+        assert!(body.contains("kvm_mmu_zap_oldest_mmu_pages"), "{body}");
+        assert!(body.contains("is_page_fault_stale() TEST"), "{body}");
+        assert!(body.contains(&other.name), "{body}");
+        // And an instruction not to drop it, since the previous
+        // round's own prose is not in this prompt.
+        assert!(body.contains("Resolve each one"), "{body}");
+
+        // Byte-stable for the same served set: the ledger rides in the
+        // task cache block alongside `symbols`.
+        assert_eq!(ledger, requeue_request_ledger(&[asked, other]));
+    }
+
+    /// Only the requests actually served this round are restated. A
+    /// `question` followup is never fetched, so claiming it was
+    /// answered would be a lie the lens has no way to check.
+    #[test]
+    fn the_ledger_covers_exactly_what_was_fetched() {
+        let mut fetched = HashSet::new();
+        let pending = vec![
+            followup("source", "kvm_mmu_zap_oldest_mmu_pages"),
+            followup("question", "can an sp be root and child at once?"),
+        ];
+        let served = pending_prefetch_targets(&pending, &mut fetched);
+        let body = requeue_request_ledger(&served)["content"]
+            .as_str()
+            .expect("content is a string")
+            .to_string();
+        assert!(body.contains("kvm_mmu_zap_oldest_mmu_pages"));
+        assert!(!body.contains("can an sp be root and child"), "{body}");
     }
 }

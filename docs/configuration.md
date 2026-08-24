@@ -117,6 +117,7 @@ matching role selectors to `settings.json`:
 | `openai` | `openai.json` | Required Azure `--api-key` | GPT-5.5 for every role |
 | `claude` | `claude-codes.json` | Claude CLI login | Sonnet 5 fast/main/todo/classifier, Opus 4.8 slow |
 | `codex` | `codex-codes.json` | Codex CLI login | GPT-5.6-sol for every role |
+| `meta` | `meta.json` | Required `--api-key` | Muse Spark 1.2 for every role |
 
 The OpenAI stub uses the Azure API Management endpoint and API version shipped
 in `configs/models/openai.json`. A custom OpenAI-compatible connection may use
@@ -135,7 +136,6 @@ in `configs/models/openai.json`. A custom OpenAI-compatible connection may use
   }}
 }
 ```
-
 Azure or Azure API Management connections use the same `api_key` field plus
 `host`:
 
@@ -150,10 +150,29 @@ Azure or Azure API Management connections use the same `api_key` field plus
 }
 ```
 
+Meta uses `provider: "meta"` with `base_url` defaulting to
+`https://api.meta.ai/v1` and is likewise OpenAI-compatible. It uses the same
+`api_key` field:
+
+```json
+{
+  "provider": "meta",
+  "api_key": "...",
+  "models": {"muse-spark-1.2": {
+    "max_tokens": 131072,
+    "max_input_tokens": 900000,
+    "rate_limit": 2000000,
+    "thinking": {"type": "adaptive", "effort": "medium"}
+  }}
+}
+```
+
 GPT-5/o-series calls use the Responses API. `thinking` maps to
 OpenAI `reasoning.effort`, and kres sends text verbosity `medium` by
 default. Explicit thinking budgets are mapped onto OpenAI effort
-tiers; adaptive `low` / `medium` / `high` are sent directly.
+tiers; adaptive `low` / `medium` / `high` are sent directly. Meta
+models use the same mapping — effort values `minimal|low|medium|high|xhigh`
+are supported, `minimal` being Meta-specific.
 
 ## Codex Codes
 

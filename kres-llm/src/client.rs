@@ -26,6 +26,7 @@ use crate::{
 
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";
 const DEFAULT_OPENAI_API_VERSION: &str = "2025-04-01-preview";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
@@ -63,6 +64,10 @@ pub enum LlmCredentials {
         api_key: String,
         base_url: String,
     },
+    Meta {
+        api_key: String,
+        base_url: String,
+    },
     AzureOpenAi {
         host: String,
         api_key: String,
@@ -92,6 +97,13 @@ impl LlmCredentials {
         Self::OpenAi {
             api_key: api_key.into(),
             base_url: base_url.unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+        }
+    }
+
+    pub fn meta(api_key: impl Into<String>, base_url: Option<String>) -> Self {
+        Self::Meta {
+            api_key: api_key.into(),
+            base_url: base_url.unwrap_or_else(|| DEFAULT_META_BASE_URL.to_string()),
         }
     }
 
@@ -199,6 +211,9 @@ impl LlmCredentials {
             LlmCredentials::OpenAi { api_key, base_url } => {
                 format!("openai:{}:{api_key}", normalize_url(base_url))
             }
+            LlmCredentials::Meta { api_key, base_url } => {
+                format!("meta:{}:{api_key}", normalize_url(base_url))
+            }
             LlmCredentials::AzureOpenAi { host, api_key, .. } => {
                 format!("azure-openai:{}:{api_key}", normalize_url(host))
             }
@@ -212,6 +227,7 @@ impl LlmCredentials {
             LlmCredentials::CodexCodes { api_key, .. } => api_key.as_deref().unwrap_or(""),
             LlmCredentials::ClaudeCodes { api_key, .. } => api_key.as_deref().unwrap_or(""),
             LlmCredentials::OpenAi { api_key, .. } => api_key,
+            LlmCredentials::Meta { api_key, .. } => api_key,
             LlmCredentials::AzureOpenAi { api_key, .. } => api_key,
         }
     }
@@ -229,6 +245,7 @@ impl LlmCredentials {
                 .map(normalize_url)
                 .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
             LlmCredentials::OpenAi { base_url, .. } => normalize_url(base_url),
+            LlmCredentials::Meta { base_url, .. } => normalize_url(base_url),
             LlmCredentials::AzureOpenAi { host, .. } => normalize_url(host),
         }
     }
@@ -243,6 +260,7 @@ impl LlmCredentials {
             Self::CodexCodes { .. } => Provider::CodexCodes,
             Self::ClaudeCodes { .. } => Provider::ClaudeCodes,
             Self::OpenAi { .. } | Self::AzureOpenAi { .. } => Provider::OpenAi,
+            Self::Meta { .. } => Provider::Meta,
             Self::Anthropic { .. } => Provider::Anthropic,
         }
     }
@@ -418,7 +436,10 @@ impl Client {
         if self.credentials.provider() == Provider::ClaudeCodes {
             return self.claude_codes_messages(cfg, messages).await;
         }
-        if self.credentials.provider() == Provider::OpenAi {
+        if matches!(
+            self.credentials.provider(),
+            Provider::OpenAi | Provider::Meta
+        ) {
             return self.openai_messages(cfg, messages).await;
         }
         const MAX_RETRIES: u32 = 20;
@@ -637,7 +658,10 @@ impl Client {
         if self.credentials.provider() == Provider::ClaudeCodes {
             return self.claude_codes_messages(cfg, messages).await;
         }
-        if self.credentials.provider() == Provider::OpenAi {
+        if matches!(
+            self.credentials.provider(),
+            Provider::OpenAi | Provider::Meta
+        ) {
             return self.openai_messages(cfg, messages).await;
         }
         const MAX_RETRIES: u32 = 20;
@@ -1460,7 +1484,10 @@ fn response_text(resp: &MessagesResponse) -> String {
 
 fn use_openai_responses_api(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
-    id.starts_with("gpt-5") || id.starts_with('o')
+    id.starts_with("gpt-5")
+        || id.starts_with('o')
+        || id.starts_with("muse-spark")
+        || id.starts_with("meta-")
 }
 
 fn openai_reasoning_effort(thinking: crate::model::ThinkingBudget) -> Option<&'static str> {
@@ -2786,6 +2813,29 @@ mod tests {
             Some("Bearer secret")
         );
         assert!(headers.get("api-key").is_none());
+    }
+
+    #[test]
+    fn official_meta_uses_bearer_header_and_meta_base_url() {
+        let client = Client::builder(LlmCredentials::meta("secret", None))
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.openai_responses_url(),
+            "https://api.meta.ai/v1/responses"
+        );
+        let headers = client.openai_headers();
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer secret")
+        );
+        assert!(headers.get("api-key").is_none());
+        // Meta model detection
+        assert!(use_openai_responses_api("muse-spark-1.2"));
+        assert!(use_openai_responses_api("muse-spark-1.1"));
+        assert!(use_openai_responses_api("meta-llama-4"));
     }
 
     #[test]

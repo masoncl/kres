@@ -155,6 +155,7 @@ pub enum AgentThinkingConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentThinkingEffort {
+    Minimal,
     Low,
     Medium,
     High,
@@ -181,6 +182,7 @@ impl AgentThinkingConfig {
 impl From<AgentThinkingEffort> for Effort {
     fn from(value: AgentThinkingEffort) -> Self {
         match value {
+            AgentThinkingEffort::Minimal => Effort::Minimal,
             AgentThinkingEffort::Low => Effort::Low,
             AgentThinkingEffort::Medium => Effort::Medium,
             AgentThinkingEffort::High => Effort::High,
@@ -342,6 +344,9 @@ impl AgentConfig {
         if matches!(provider.as_deref(), Some("openai" | "open_ai")) || self.model_is_openai() {
             return Ok(LlmCredentials::openai(api_key, self.base_url.clone()));
         }
+        if matches!(provider.as_deref(), Some("meta")) || self.model_is_meta() {
+            return Ok(LlmCredentials::meta(api_key, self.base_url.clone()));
+        }
         match self.base_url.as_deref() {
             Some(base_url) => Ok(LlmCredentials::anthropic_with_base_url(api_key, base_url)),
             None => Ok(LlmCredentials::anthropic(api_key)),
@@ -439,6 +444,13 @@ impl AgentConfig {
         self.model
             .as_deref()
             .map(|id| Model::from_id(id).provider() == Provider::OpenAi)
+            .unwrap_or(false)
+    }
+
+    fn model_is_meta(&self) -> bool {
+        self.model
+            .as_deref()
+            .map(|id| Model::from_id(id).provider() == Provider::Meta)
             .unwrap_or(false)
     }
 }

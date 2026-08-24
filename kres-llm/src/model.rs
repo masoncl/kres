@@ -11,6 +11,7 @@ pub enum Provider {
     CodexCodes,
     ClaudeCodes,
     OpenAi,
+    Meta,
 }
 
 /// A model id paired with its known output-token ceiling.
@@ -43,6 +44,7 @@ impl Model {
         let max_output_tokens = match id.as_str() {
             "claude-opus-4-8" | "claude-opus-4-7" | "claude-opus-4-6" => 128_000,
             id if is_openai_model(id) => 128_000,
+            id if is_meta_model(id) => 131_072,
             _ => 64_000,
         };
         Self {
@@ -54,10 +56,17 @@ impl Model {
     pub fn provider(&self) -> Provider {
         if is_openai_model(&self.id) {
             Provider::OpenAi
+        } else if is_meta_model(&self.id) {
+            Provider::Meta
         } else {
             Provider::Anthropic
         }
     }
+}
+
+fn is_meta_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id.starts_with("muse-spark") || id.starts_with("meta-")
 }
 
 fn is_openai_model(id: &str) -> bool {
@@ -92,6 +101,7 @@ pub enum ThinkingBudget {
 /// Effort bias passed to adaptive thinking via `output_config.effort`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Effort {
+    Minimal,
     Low,
     Medium,
     High,
@@ -101,6 +111,7 @@ pub enum Effort {
 impl Effort {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Effort::Minimal => "minimal",
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
@@ -118,7 +129,7 @@ impl ThinkingBudget {
     ///   (medium).
     /// - Everything else uses an explicit budget sized for the output cap.
     pub fn default_for_model(model_id: &str, max_tokens: u32) -> Self {
-        if is_openai_model(model_id) {
+        if is_openai_model(model_id) || is_meta_model(model_id) {
             return ThinkingBudget::Adaptive(Effort::Medium);
         }
         // Model families that require adaptive schema. Keep this list
@@ -238,6 +249,7 @@ mod tests {
 
     #[test]
     fn effort_strings() {
+        assert_eq!(Effort::Minimal.as_str(), "minimal");
         assert_eq!(Effort::Low.as_str(), "low");
         assert_eq!(Effort::Medium.as_str(), "medium");
         assert_eq!(Effort::High.as_str(), "high");
@@ -281,5 +293,29 @@ mod tests {
         // Unknown ids get a conservative default rather than panicking.
         let m = Model::from_id("claude-future-model-x");
         assert_eq!(m.max_output_tokens, 64_000);
+    }
+
+    #[test]
+    fn meta_models_use_meta_provider_and_131k_ceiling() {
+        let cases = [
+            "muse-spark-latest",
+            "Meta-Muse-Spark-Preview",
+            "meta-llama-4",
+            "meta-llama-3.2-90b",
+        ];
+        for id in cases {
+            let m = Model::from_id(id);
+            assert_eq!(m.provider(), Provider::Meta, "id={id}");
+            assert_eq!(m.max_output_tokens, 131_072, "id={id}");
+        }
+    }
+
+    #[test]
+    fn meta_models_use_medium_effort() {
+        let b = ThinkingBudget::default_for_model("muse-spark-latest", 131_072);
+        assert_eq!(b, ThinkingBudget::Adaptive(Effort::Medium));
+
+        let b2 = ThinkingBudget::default_for_model("meta-llama-4", 131_072);
+        assert_eq!(b2, ThinkingBudget::Adaptive(Effort::Medium));
     }
 }

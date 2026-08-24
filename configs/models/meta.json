@@ -1,0 +1,25 @@
+{
+  "provider": "meta",
+  "base_url": "https://api.meta.ai/v1",
+  "api_key": "@API_KEY@",
+  "models": {
+    "muse-spark-1.2": {
+      "max_tokens": 131072,
+      "max_input_tokens": 900000,
+      "rate_limit": 2000000,
+      "thinking": {"type": "adaptive", "effort": "medium"}
+    },
+    "muse-spark-1.2-contributor": {
+      "max_tokens": 131072,
+      "max_input_tokens": 900000,
+      "rate_limit": 2000000,
+      "thinking": {"type": "adaptive", "effort": "medium"}
+    },
+    "muse-spark-1.1": {
+      "max_tokens": 131072,
+      "max_input_tokens": 900000,
+      "rate_limit": 2000000,
+      "thinking": {"type": "adaptive", "effort": "medium"}
+    }
+  }
+}

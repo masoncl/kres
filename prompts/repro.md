@@ -17,6 +17,47 @@ distinguishing output for both.
   under test (HEAD usually contains it).
 - `findings/<tag>/FINDING.md` only if summary is insufficient.
 
+## kverify structural analysis (if available)
+
+If `metadata.yaml` contains a `validation_result.structural_evidence`
+block, read it before writing the reproducer. It contains:
+
+- `bug_class` — what kind of memory safety issue kverify's static
+  analysis detected. Use this to pick your trigger strategy:
+  - `unsafe_copy: true` → force a boundary-crossing copy (zero-length,
+    negative, or oversized)
+  - `untrusted_input: true` → craft input that reaches the function
+    without sanitization
+  - `unchecked_return: true` → force the error path (fault injection,
+    resource exhaustion)
+  - `dead_code: true` → function may be unreachable; check
+    `reachability` before investing time
+
+- `reachability.callers` — which functions call the buggy function.
+  Start your trigger path from these callers. If `caller_count` is 0
+  but the finding has smatch evidence, the function may be reachable
+  via function pointer — check smatch caller_info.
+
+- `suggested_sanitizers` — enable these CONFIG_ options. kverify
+  derived them from the bug class; they're more specific than
+  blanket KASAN.
+
+- `staleness.status` — if `function_modified` or `deleted`, the code
+  has changed since KRES analyzed it. Verify the mechanism still
+  applies before building the reproducer. If `deleted`, skip — the
+  function no longer exists.
+
+- `upstream.fix_commits_found` — if > 0, a fix may already be in
+  the tree. Check before reproducing.
+
+- `conflicts` — if `present: true`, kverify's static stages disagreed.
+  The `contradicting` list tells you what evidence pushed against the
+  finding. Your reproducer should settle the dispute empirically.
+
+This block is informational. Absence of `structural_evidence` means
+kverify hasn't run on this finding — proceed with the existing
+workflow.
+
 ## Build the reproducer
 
 - Keep it under ~250 lines. Save to `<cwd>/<tag>_repro.c`,
